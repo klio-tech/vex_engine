@@ -1,0 +1,40 @@
+import os
+import sys
+
+# Ensure the shared package is importable when running tests without
+# installing it into the virtual-env (fallback for local dev).
+# Add `services/` to path so that `import shared.models` resolves to
+# `services/shared/models.py`.
+sys.path.insert(
+    0,
+    os.path.join(os.path.dirname(__file__), "..", ".."),
+)
+
+from unittest.mock import AsyncMock
+
+import pytest
+from app.auth import verify_api_key
+from app.main import create_app
+from fastapi.testclient import TestClient
+from shared.auth import KeyInfo
+
+
+def _fake_key_info() -> KeyInfo:
+    """Return a stub KeyInfo for test auth bypass."""
+    return KeyInfo(org_id="test-org", key_id="test-key", scopes=["ingest"])
+
+
+@pytest.fixture
+def mock_redis():
+    mock = AsyncMock()
+    mock.xadd = AsyncMock(return_value="1234567890-0")
+    return mock
+
+
+@pytest.fixture
+def client(mock_redis):
+    app = create_app()
+    app.state.redis = mock_redis
+    # Bypass auth for all test routes
+    app.dependency_overrides[verify_api_key] = _fake_key_info
+    return TestClient(app)

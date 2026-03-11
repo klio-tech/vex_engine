@@ -1,0 +1,203 @@
+# Vex — Self-Hosted Docker Compose
+# Usage:
+#   cp .env.example .env   # edit with your LLM keys
+#   docker compose up
+
+services:
+  # ── Infrastructure ─────────────────────────────────────────
+
+  postgres:
+    image: timescale/timescaledb-ha:pg16
+    environment:
+      POSTGRES_DB: agentguard
+      POSTGRES_USER: agentguard
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-agentguard_dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/home/postgres/pgdata/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentguard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-agentguard}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-agentguard_dev}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  createbuckets:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $${MINIO_ROOT_USER:-agentguard} $${MINIO_ROOT_PASSWORD:-agentguard_dev};
+      mc mb local/agentguard-traces --ignore-existing;
+      exit 0;
+      "
+
+  # ── Migrations (init container) ────────────────────────────
+
+  migrations:
+    image: 7hakurg/migrations:latest
+    build:
+      context: .
+      dockerfile: services/migrations/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://agentguard:${POSTGRES_PASSWORD:-agentguard_dev}@postgres:5432/agentguard
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ── Application Services ───────────────────────────────────
+
+  sync-gateway:
+    image: 7hakurg/sync-gateway:latest
+    build:
+      context: .
+      dockerfile: services/sync-gateway/Dockerfile
+    ports:
+      - "8080:8000"
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://agentguard:${POSTGRES_PASSWORD:-agentguard_dev}@postgres:5432/agentguard
+      LITELLM_API_URL: ${LITELLM_API_URL:-}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+      VERIFICATION_MODEL: ${VERIFICATION_MODEL:-}
+      VERIFICATION_TIMEOUT_S: ${VERIFICATION_TIMEOUT_S:-30}
+      MEMORY_ENABLED: ${MEMORY_ENABLED:-true}
+      MEMORY_EMBEDDING_MODEL: ${MEMORY_EMBEDDING_MODEL:-intfloat/multilingual-e5-large-instruct}
+      GATEWAY_TIMEOUT_S: ${GATEWAY_TIMEOUT_S:-2.0}
+      CORRECTION_TIMEOUT_S: ${CORRECTION_TIMEOUT_S:-10.0}
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  ingestion-api:
+    image: 7hakurg/ingestion-api:latest
+    build:
+      context: .
+      dockerfile: services/ingestion-api/Dockerfile
+    ports:
+      - "8081:8000"
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://agentguard:${POSTGRES_PASSWORD:-agentguard_dev}@postgres:5432/agentguard
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  async-worker:
+    image: 7hakurg/async-worker:latest
+    build:
+      context: .
+      dockerfile: services/async-worker/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://agentguard:${POSTGRES_PASSWORD:-agentguard_dev}@postgres:5432/agentguard
+      LITELLM_API_URL: ${LITELLM_API_URL:-}
+      LITELLM_API_KEY: ${LITELLM_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+      VERIFICATION_MODEL: ${VERIFICATION_MODEL:-}
+      VERIFICATION_TIMEOUT_S: ${VERIFICATION_TIMEOUT_S:-30}
+      MEMORY_ENABLED: ${MEMORY_ENABLED:-true}
+      MEMORY_EMBEDDING_MODEL: ${MEMORY_EMBEDDING_MODEL:-intfloat/multilingual-e5-large-instruct}
+      CONSUMER_NAME: async-worker-1
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  storage-worker:
+    image: 7hakurg/storage-worker:latest
+    build:
+      context: .
+      dockerfile: services/storage-worker/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://agentguard:${POSTGRES_PASSWORD:-agentguard_dev}@postgres:5432/agentguard
+      S3_ENDPOINT: http://minio:9000
+      S3_ACCESS_KEY: ${MINIO_ROOT_USER:-agentguard}
+      S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD:-agentguard_dev}
+      S3_BUCKET: agentguard-traces
+      CONSUMER_NAME: storage-worker-1
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
+
+  alert-service:
+    image: 7hakurg/alert-service:latest
+    build:
+      context: .
+      dockerfile: services/alert-service/Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379
+      DATABASE_URL: postgresql://agentguard:${POSTGRES_PASSWORD:-agentguard_dev}@postgres:5432/agentguard
+      CONSUMER_NAME: alert-worker-1
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  dashboard-api:
+    image: 7hakurg/dashboard-api:latest
+    build:
+      context: .
+      dockerfile: services/dashboard-api/Dockerfile
+    ports:
+      - "8082:8001"
+    environment:
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

@@ -1,0 +1,535 @@
+"""Shared session memory module.
+
+Provides embedding generation, pgvector read/write, semantic search,
+deduplication, fact extraction, and summary generation for agent session
+memory.  All DB access uses raw SQL via ``sqlalchemy.text()`` and pgvector's
+cosine distance operator (``<=>``) for similarity queries.
+"""
+
+import json
+import logging
+import os
+import re
+import uuid
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Optional
+
+from litellm import acompletion, aembedding
+from sqlalchemy import text
+
+logger = logging.getLogger("agentguard.shared.memory")
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+DEDUP_THRESHOLD: float = 0.92
+"""Cosine similarity threshold above which two memories are duplicates."""
+
+DEFAULT_EMBEDDING_MODEL: str = "intfloat/multilingual-e5-large-instruct"
+"""Default model used for embedding generation when env var is unset."""
+
+DEFAULT_LLM_MODEL: str = "claude-haiku-4-5-20251001"
+"""Fallback model for LLM calls when VERIFICATION_MODEL is unset."""
+
+DEFAULT_LLM_TIMEOUT_S: float = 10.0
+"""Default timeout (seconds) for LLM completion calls."""
+
+# Providers that support response_format via gateway
+_JSON_MODE_PREFIXES = ("openai/", "gpt-")
+
+
+# ---------------------------------------------------------------------------
+# Data class
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class MemoryRecord:
+    """In-memory representation of a ``session_memories`` row."""
+
+    id: uuid.UUID
+    session_id: str
+    org_id: str
+    agent_id: str
+    memory_type: str
+    content: str
+    execution_id: Optional[str] = None
+    embedding: Optional[list[float]] = None
+    confidence: Optional[float] = None
+    sequence_number: Optional[int] = None
+    scope: str = "session"
+    status: str = "active"
+    superseded_by: Optional[uuid.UUID] = None
+    metadata: dict = field(default_factory=dict)
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+# ---------------------------------------------------------------------------
+# Embedding
+# ---------------------------------------------------------------------------
+
+
+async def embed_text(text_input: str) -> Optional[list[float]]:
+    """Generate an embedding vector via ``litellm.aembedding()``.
+
+    Reads the model name from the ``MEMORY_EMBEDDING_MODEL`` env var,
+    falling back to :data:`DEFAULT_EMBEDDING_MODEL`.
+
+    Returns:
+        A list of floats representing the embedding, or ``None`` on error.
+    """
+    model = os.environ.get("MEMORY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+    api_base = os.environ.get("LITELLM_API_URL") or os.environ.get("OPENAI_API_BASE")
+    api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+
+    kwargs: dict[str, Any] = {"model": model, "input": [text_input]}
+    if api_base:
+        kwargs["api_base"] = api_base
+        kwargs["custom_llm_provider"] = "openai"
+    if api_key:
+        kwargs["api_key"] = api_key
+
+    try:
+        response = await aembedding(**kwargs)
+        item = response.data[0]
+        return item["embedding"] if isinstance(item, dict) else item.embedding
+    except Exception:
+        logger.warning("Embedding generation failed", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# LLM helper
+# ---------------------------------------------------------------------------
+
+
+def _extract_json(raw_text: str) -> Optional[dict[str, Any]]:
+    """Extract JSON from LLM response, handling markdown fences."""
+    # Direct parse
+    try:
+        return json.loads(raw_text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Markdown code fence
+    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", raw_text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # First { ... } block
+    match = re.search(r"\{.*\}", raw_text, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(0))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    return None
+
+
+async def call_llm(
+    prompt: str,
+    system: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Call an LLM via ``litellm.acompletion()`` and parse the JSON response.
+
+    Configuration is read from environment variables:
+
+    * ``VERIFICATION_MODEL`` – model name (default ``claude-haiku-4-5-20251001``)
+    * ``LITELLM_API_URL`` – optional API base URL
+    * ``LITELLM_API_KEY`` – optional API key
+
+    Returns:
+        Parsed JSON dict, or ``None`` on timeout / error.
+    """
+    model = os.environ.get("VERIFICATION_MODEL", DEFAULT_LLM_MODEL)
+    timeout_s = float(os.environ.get("VERIFICATION_TIMEOUT_S", DEFAULT_LLM_TIMEOUT_S))
+
+    messages: list[dict[str, str]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+
+    api_base = os.environ.get("LITELLM_API_URL") or os.environ.get("OPENAI_API_BASE")
+    api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "timeout": timeout_s,
+        "temperature": 0.0,
+    }
+
+    if api_base:
+        kwargs["custom_llm_provider"] = "openai"
+        kwargs["api_base"] = api_base
+    if api_key:
+        kwargs["api_key"] = api_key
+
+    try:
+        response = await acompletion(**kwargs)
+        content = response.choices[0].message.content
+        result = _extract_json(content)
+        if result is None:
+            logger.warning("LLM returned non-JSON response: %s", content[:200])
+        return result
+    except Exception:
+        logger.warning("LLM call failed", exc_info=True)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Summary & fact extraction
+# ---------------------------------------------------------------------------
+
+
+async def generate_summary(
+    output: Any,
+    task: Optional[str] = None,
+    input_data: Optional[Any] = None,
+) -> Optional[str]:
+    """Generate a compact 1-2 sentence turn summary via :func:`call_llm`.
+
+    Returns:
+        The summary string, or ``None`` if the LLM call fails.
+    """
+    parts = [f"Output: {output}"]
+    if task:
+        parts.append(f"Task: {task}")
+    if input_data:
+        parts.append(f"Input: {input_data}")
+
+    prompt = (
+        "Summarize the following agent turn in 1-2 concise sentences. "
+        "Focus on what the agent did and the outcome.\n\n"
+        + "\n".join(parts)
+        + '\n\nRespond with JSON: {"summary": "<your summary>"}'
+    )
+
+    result = await call_llm(prompt)
+    if result is None:
+        return None
+
+    return result.get("summary")
+
+
+async def extract_facts(
+    output: Any,
+    task: Optional[str] = None,
+    input_data: Optional[Any] = None,
+) -> list[str]:
+    """Extract discrete verifiable facts from an agent turn via :func:`call_llm`.
+
+    Returns:
+        A list of fact strings, or an empty list if the LLM call fails.
+    """
+    parts = [f"Output: {output}"]
+    if task:
+        parts.append(f"Task: {task}")
+    if input_data:
+        parts.append(f"Input: {input_data}")
+
+    prompt = (
+        "Extract discrete, verifiable facts from the following agent turn. "
+        "Each fact should be a short, self-contained statement.\n\n"
+        + "\n".join(parts)
+        + '\n\nRespond with JSON: {"facts": ["fact1", "fact2", ...]}'
+    )
+
+    result = await call_llm(prompt)
+    if result is None:
+        return []
+
+    facts = result.get("facts", [])
+    if not isinstance(facts, list):
+        return []
+    return facts
+
+
+# ---------------------------------------------------------------------------
+# DB helpers
+# ---------------------------------------------------------------------------
+
+
+def _row_to_record(row: tuple) -> MemoryRecord:
+    """Convert a raw DB row tuple to a :class:`MemoryRecord`.
+
+    Expected column order:
+        id, session_id, org_id, agent_id, execution_id, memory_type,
+        content, embedding, confidence, sequence_number, scope, status,
+        superseded_by, metadata, created_at, updated_at
+    """
+    return MemoryRecord(
+        id=row[0],
+        session_id=row[1],
+        org_id=row[2],
+        agent_id=row[3],
+        execution_id=row[4],
+        memory_type=row[5],
+        content=row[6],
+        embedding=row[7],
+        confidence=row[8],
+        sequence_number=row[9],
+        scope=row[10],
+        status=row[11],
+        superseded_by=row[12],
+        metadata=row[13] if row[13] is not None else {},
+        created_at=row[14],
+        updated_at=row[15],
+    )
+
+
+async def write_memory(
+    db_session: Any,
+    session_id: str,
+    org_id: str,
+    agent_id: str,
+    execution_id: str,
+    memory_type: str,
+    content: str,
+    confidence: Optional[float] = None,
+    sequence_number: Optional[int] = None,
+    metadata: Optional[dict] = None,
+) -> Optional[MemoryRecord]:
+    """Generate an embedding and INSERT a new row into ``session_memories``.
+
+    Returns:
+        A :class:`MemoryRecord` on success, or ``None`` if embedding
+        generation fails.
+    """
+    embedding = await embed_text(content)
+    if embedding is None:
+        return None
+
+    memory_id = uuid.uuid4()
+    now = datetime.now(timezone.utc)
+    meta = metadata or {}
+
+    db_session.execute(
+        text("""
+            INSERT INTO session_memories (
+                id, session_id, org_id, agent_id, execution_id,
+                memory_type, content, embedding, confidence,
+                sequence_number, scope, status, metadata,
+                created_at, updated_at
+            ) VALUES (
+                :id, :session_id, :org_id, :agent_id, :execution_id,
+                :memory_type, :content, :embedding, :confidence,
+                :sequence_number, 'session', 'active', :metadata,
+                :created_at, :updated_at
+            )
+        """),
+        {
+            "id": str(memory_id),
+            "session_id": session_id,
+            "org_id": org_id,
+            "agent_id": agent_id,
+            "execution_id": execution_id,
+            "memory_type": memory_type,
+            "content": content,
+            "embedding": str(embedding),
+            "confidence": confidence,
+            "sequence_number": sequence_number,
+            "metadata": json.dumps(meta),
+            "created_at": now,
+            "updated_at": now,
+        },
+    )
+    db_session.commit()
+
+    return MemoryRecord(
+        id=memory_id,
+        session_id=session_id,
+        org_id=org_id,
+        agent_id=agent_id,
+        execution_id=execution_id,
+        memory_type=memory_type,
+        content=content,
+        embedding=embedding,
+        confidence=confidence,
+        sequence_number=sequence_number,
+        metadata=meta,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+async def retrieve_memories(
+    db_session: Any,
+    session_id: str,
+    org_id: str,
+    query_text: str,
+    limit: int = 10,
+    include_summaries: int = 5,
+) -> list[MemoryRecord]:
+    """Retrieve relevant memories via pgvector cosine similarity search.
+
+    Performs two queries:
+
+    1. Semantic search across all active memories for the session,
+       ordered by cosine distance (``embedding <=> :embedding``).
+    2. Fetches the last *include_summaries* summaries by
+       ``sequence_number`` for recency context.
+
+    Results are deduplicated by ``id`` and returned as a combined list.
+
+    Returns:
+        A list of :class:`MemoryRecord` instances, or an empty list if
+        embedding generation fails.
+    """
+    embedding = await embed_text(query_text)
+    if embedding is None:
+        return []
+
+    embedding_str = str(embedding)
+
+    # Semantic similarity search
+    semantic_result = db_session.execute(
+        text("""
+            SELECT id, session_id, org_id, agent_id, execution_id,
+                   memory_type, content, embedding, confidence,
+                   sequence_number, scope, status, superseded_by,
+                   metadata, created_at, updated_at
+            FROM session_memories
+            WHERE session_id = :session_id
+              AND org_id = :org_id
+              AND status = 'active'
+            ORDER BY embedding <=> :embedding
+            LIMIT :limit
+        """),
+        {
+            "session_id": session_id,
+            "org_id": org_id,
+            "embedding": embedding_str,
+            "limit": limit,
+        },
+    )
+    semantic_rows = semantic_result.fetchall()
+
+    # Recent summaries by sequence_number
+    summary_result = db_session.execute(
+        text("""
+            SELECT id, session_id, org_id, agent_id, execution_id,
+                   memory_type, content, embedding, confidence,
+                   sequence_number, scope, status, superseded_by,
+                   metadata, created_at, updated_at
+            FROM session_memories
+            WHERE session_id = :session_id
+              AND org_id = :org_id
+              AND memory_type = 'summary'
+              AND status = 'active'
+            ORDER BY sequence_number DESC
+            LIMIT :limit
+        """),
+        {
+            "session_id": session_id,
+            "org_id": org_id,
+            "limit": include_summaries,
+        },
+    )
+    summary_rows = summary_result.fetchall()
+
+    # Deduplicate by id
+    seen_ids: set[uuid.UUID] = set()
+    records: list[MemoryRecord] = []
+
+    for row in semantic_rows:
+        record = _row_to_record(row)
+        if record.id not in seen_ids:
+            seen_ids.add(record.id)
+            records.append(record)
+
+    for row in summary_rows:
+        record = _row_to_record(row)
+        if record.id not in seen_ids:
+            seen_ids.add(record.id)
+            records.append(record)
+
+    return records
+
+
+async def find_similar_memory(
+    db_session: Any,
+    session_id: str,
+    org_id: str,
+    content: str,
+    threshold: float = DEDUP_THRESHOLD,
+) -> Optional[MemoryRecord]:
+    """Find the closest existing memory and return it if above *threshold*.
+
+    Similarity is computed as ``1 - (embedding <=> :embedding)`` (cosine
+    similarity from cosine distance).
+
+    Returns:
+        The matching :class:`MemoryRecord` if similarity >= *threshold*,
+        otherwise ``None``.
+    """
+    embedding = await embed_text(content)
+    if embedding is None:
+        return None
+
+    embedding_str = str(embedding)
+
+    result = db_session.execute(
+        text("""
+            SELECT id, session_id, org_id, agent_id, execution_id,
+                   memory_type, content, embedding, confidence,
+                   sequence_number, scope, status, superseded_by,
+                   metadata, created_at, updated_at,
+                   1 - (embedding <=> :embedding) AS similarity
+            FROM session_memories
+            WHERE session_id = :session_id
+              AND org_id = :org_id
+              AND status = 'active'
+            ORDER BY embedding <=> :embedding
+            LIMIT 1
+        """),
+        {
+            "session_id": session_id,
+            "org_id": org_id,
+            "embedding": embedding_str,
+        },
+    )
+
+    row = result.fetchone()
+    if row is None:
+        return None
+
+    # The similarity score is the last column (index 16)
+    similarity = row[-1]
+    if similarity >= threshold:
+        return _row_to_record(row[:16])
+
+    return None
+
+
+def supersede_memory(
+    db_session: Any,
+    old_memory_id: uuid.UUID,
+    new_memory_id: uuid.UUID,
+) -> None:
+    """Mark an old memory as superseded by a newer one.
+
+    Sets ``status = 'superseded'`` and ``superseded_by = new_memory_id``
+    on the old memory row.
+    """
+    db_session.execute(
+        text("""
+            UPDATE session_memories
+            SET status = 'superseded',
+                superseded_by = :new_memory_id,
+                updated_at = NOW()
+            WHERE id = :old_memory_id
+        """),
+        {
+            "old_memory_id": str(old_memory_id),
+            "new_memory_id": str(new_memory_id),
+        },
+    )
+    db_session.commit()

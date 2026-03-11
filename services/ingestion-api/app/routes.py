@@ -1,0 +1,90 @@
+"""API route definitions for the Vex Ingestion API.
+
+Provides:
+- ``GET /health`` -- service health check.
+- ``POST /v1/ingest`` -- single-event ingestion.
+- ``POST /v1/ingest/batch`` -- batch ingestion (up to 50 events).
+"""
+
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
+from shared.auth import KeyInfo
+from shared.models import IngestEvent, IngestResponse
+
+from app.auth import verify_api_key
+
+logger = logging.getLogger("agentguard.ingestion-api")
+
+STREAM_KEY = "executions.raw"
+
+router = APIRouter()
+
+
+class SingleIngestResponse(BaseModel):
+    """Response returned from the single-event ingestion endpoint."""
+
+    accepted: int
+    execution_id: str
+
+
+class BatchIngestRequest(BaseModel):
+    """Batch request with a hard cap of 50 events per payload.
+
+    We define this locally rather than relying on the shared
+    ``IngestBatchRequest`` so we can enforce the size limit at the
+    API boundary via Pydantic validation.
+    """
+
+    events: list[IngestEvent] = Field(..., max_length=50)
+
+
+@router.get("/health")
+async def health_check(request: Request):
+    """Return service health status with Redis dependency check."""
+    try:
+        await request.app.state.redis.ping()
+    except Exception:
+        logger.error("Health check failed: Redis unreachable", exc_info=True)
+        raise HTTPException(status_code=503, detail="Redis unreachable") from None
+    return {"status": "healthy"}
+
+
+@router.post("/v1/ingest", status_code=202, response_model=SingleIngestResponse)
+async def ingest_single(
+    event: IngestEvent,
+    request: Request,
+    auth: KeyInfo = Depends(verify_api_key),
+):
+    """Ingest a single execution event into the processing pipeline.
+
+    The event is serialised and pushed to the ``executions.raw`` Redis
+    Stream for downstream consumption by the storage worker.
+    The authenticated org_id is injected into event metadata.
+    """
+    event.metadata["org_id"] = auth.org_id
+    redis = request.app.state.redis
+    await redis.xadd(STREAM_KEY, {"data": event.model_dump_json()})
+    return SingleIngestResponse(accepted=1, execution_id=event.execution_id)
+
+
+@router.post("/v1/ingest/batch", status_code=202, response_model=IngestResponse)
+async def ingest_batch(
+    batch: BatchIngestRequest,
+    request: Request,
+    auth: KeyInfo = Depends(verify_api_key),
+):
+    """Ingest a batch of execution events (max 50).
+
+    Each event is individually pushed to the ``executions.raw`` Redis
+    Stream. Returns the count of accepted events and their IDs.
+    The authenticated org_id is injected into each event's metadata.
+    """
+    redis = request.app.state.redis
+    execution_ids: list[str] = []
+    for event in batch.events:
+        event.metadata["org_id"] = auth.org_id
+        await redis.xadd(STREAM_KEY, {"data": event.model_dump_json()})
+        execution_ids.append(event.execution_id)
+    return IngestResponse(accepted=len(execution_ids), execution_ids=execution_ids)

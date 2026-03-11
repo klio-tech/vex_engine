@@ -1,0 +1,457 @@
+"""API routes for the Vex API Gateway.
+
+Provides:
+- ``GET /health`` -- service health check.
+- ``POST /v1/verify`` -- synchronous verification of agent output,
+  with optional correction cascade (up to 2 attempts, 10 s budget).
+- ``POST /v1/ingest`` -- single-event ingestion to Redis stream.
+- ``POST /v1/ingest/batch`` -- batch ingestion (up to 50 events).
+"""
+
+import asyncio
+import json
+import logging
+import os
+from typing import Any, Optional
+
+from engine.correction import correct as run_correction
+from engine.correction import select_layer
+from engine.models import CorrectionAttempt, VerificationConfig, VerificationResult
+from engine.pipeline import verify as run_verification
+from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel, Field
+from shared.auth import KeyInfo
+from shared.memory import generate_summary, retrieve_memories, write_memory
+from shared.memory_config import is_memory_enabled
+from shared.models import (
+    CheckResult as SharedCheckResult,
+)
+from shared.models import (
+    CorrectionAttemptResponse,
+    IngestEvent,
+    IngestResponse,
+    VerifyRequest,
+    VerifyResponse,
+)
+from shared.plan_limits import get_plan_config
+
+from app.auth import verify_api_key, verify_ingest_key
+from app.guardrails_loader import load_guardrails
+
+logger = logging.getLogger("agentguard.sync-gateway")
+
+VERIFIED_STREAM_KEY = "executions.verified"
+RAW_STREAM_KEY = "executions.raw"
+GATEWAY_TIMEOUT_S = float(os.environ.get("GATEWAY_TIMEOUT_S", "2.0"))
+CORRECTION_TIMEOUT_S = float(os.environ.get("CORRECTION_TIMEOUT_S", "10.0"))
+MAX_CORRECTION_ATTEMPTS = 2
+
+router = APIRouter()
+
+
+def _is_memory_enabled() -> bool:
+    return is_memory_enabled()
+
+
+def _get_db_session():
+    """Create a SQLAlchemy session for memory operations."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+
+    db_url = os.environ.get("DATABASE_URL", "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard")
+    engine = create_engine(db_url)
+    return Session(engine)
+
+
+def _engine_checks_to_shared(
+    checks: dict[str, Any],
+) -> dict[str, SharedCheckResult]:
+    """Convert engine CheckResult dicts to shared CheckResult models."""
+    shared: dict[str, SharedCheckResult] = {}
+    for name, check in checks.items():
+        shared[name] = SharedCheckResult(
+            check_type=check.check_type,
+            score=check.score if check.score is not None else 0.0,
+            passed=check.passed,
+            details=check.details,
+        )
+    return shared
+
+
+async def _verify_and_correct(
+    event: VerifyRequest,
+    config: VerificationConfig,
+    correction_mode: str,
+    session_memories: Optional[list] = None,
+) -> tuple[VerificationResult, Any, bool, Optional[list[CorrectionAttempt]]]:
+    """Run initial verification and optional correction cascade.
+
+    This entire coroutine runs under a single ``asyncio.wait_for`` so the
+    total wall-clock time (verify + correct + re-verify) is bounded.
+
+    Returns:
+        (result, final_output, corrected, correction_attempts)
+    """
+    # --- Initial verification ---
+    result = await run_verification(
+        output=event.output,
+        task=event.task,
+        schema=event.schema_definition,
+        ground_truth=event.ground_truth,
+        conversation_history=event.conversation_history,
+        config=config,
+        steps=getattr(event, "steps", None),
+        metadata=event.metadata,
+        session_memories=session_memories,
+    )
+
+    final_output = event.output
+    corrected = False
+    correction_attempts: Optional[list[CorrectionAttempt]] = None
+
+    # --- Correction cascade (only when enabled AND initial check failed) ---
+    if correction_mode in ("cascade", "auto") and result.action != "pass":
+        original_output = event.output
+        initial_confidence = result.confidence
+        correction_attempts = []
+        current_layer = select_layer(result)
+
+        # Format session memories as grounding context for corrections
+        memory_context = None
+        if session_memories:
+            memory_lines = []
+            for m in session_memories:
+                memory_lines.append(f"- {m.content}")
+            memory_context = "The following facts have been established and verified in this session:\n" + "\n".join(
+                memory_lines
+            )
+
+        # Track the best correction seen across all attempts, even if none
+        # reached "pass".  After the loop we accept the best correction if
+        # it improved on the initial confidence score.
+        best_confidence: Optional[float] = None
+        best_output: Optional[str] = None
+        best_result: Optional[VerificationResult] = None
+
+        for _attempt_idx in range(MAX_CORRECTION_ATTEMPTS):
+            # Always correct from the original output (never from a prior fix)
+            attempt = await run_correction(
+                layer=current_layer,
+                output=original_output,
+                task=event.task,
+                checks=result.checks,
+                schema=event.schema_definition,
+                ground_truth=event.ground_truth,
+                conversation_history=event.conversation_history,
+                input_data=event.input,
+                memory_context=memory_context,
+            )
+
+            # Fill in context from the current verification result
+            attempt.input_action = result.action
+            attempt.input_confidence = result.confidence
+            correction_attempts.append(attempt)
+
+            # If correction produced no output (LLM timeout), escalate
+            if attempt.corrected_output is None:
+                current_layer = min(current_layer + 1, 3)
+                continue
+
+            # Re-verify the corrected output
+            result = await run_verification(
+                output=attempt.corrected_output,
+                task=event.task,
+                schema=event.schema_definition,
+                ground_truth=event.ground_truth,
+                conversation_history=event.conversation_history,
+                config=config,
+                steps=getattr(event, "steps", None),
+                session_memories=session_memories,
+            )
+
+            if result.action == "pass":
+                corrected = True
+                final_output = attempt.corrected_output
+                best_result = None
+                break
+
+            # Track the best correction even if it didn't reach "pass"
+            if result.confidence is not None and (best_confidence is None or result.confidence > best_confidence):
+                best_confidence = result.confidence
+                best_output = attempt.corrected_output
+                best_result = result
+
+            # Re-verification failed -- escalate to next layer
+            current_layer = min(current_layer + 1, 3)
+
+        # No attempt reached "pass", but if the best correction improved
+        # on the initial confidence, use it — the output is strictly better.
+        if not corrected and best_result is not None and best_confidence is not None:
+            if initial_confidence is None or best_confidence > initial_confidence:
+                corrected = True
+                final_output = best_output
+                result = best_result
+
+    return result, final_output, corrected, correction_attempts
+
+
+@router.get("/health")
+async def health_check(request: Request):
+    """Return service health status with Redis dependency check."""
+    try:
+        await request.app.state.redis.ping()
+    except Exception:
+        logger.error("Health check failed: Redis unreachable", exc_info=True)
+        raise HTTPException(status_code=503, detail="Redis unreachable") from None
+    return {"status": "healthy"}
+
+
+@router.post("/v1/verify", response_model=VerifyResponse)
+async def verify_endpoint(
+    event: VerifyRequest,
+    request: Request,
+    auth: KeyInfo = Depends(verify_api_key),
+):
+    """Verify an agent's output synchronously.
+
+    Behaviour depends on the ``correction`` metadata flag:
+
+    * ``correction=none`` (default) -- 2 s timeout, verify only.
+    * ``correction=cascade`` -- 10 s timeout, verify then auto-correct
+      with up to 2 graduated correction attempts if the output fails.
+
+    Always emits to Redis streams for async storage and alerting.
+    """
+    event.metadata["org_id"] = auth.org_id
+    redis = request.app.state.redis
+
+    # Extract config from request metadata
+    thresholds: dict[str, Any] = {}
+    correction_mode = "none"
+    transparency = "opaque"
+
+    if hasattr(event, "metadata") and event.metadata:
+        thresholds = event.metadata.get("thresholds", {})
+        correction_mode = event.metadata.get("correction", "none")
+        transparency = event.metadata.get("transparency", "opaque")
+
+    # Gate correction cascade behind paid plan
+    plan_config = get_plan_config(auth.plan)
+    correction_skipped = False
+    if correction_mode in ("cascade", "auto") and not plan_config.corrections_enabled:
+        correction_mode = "none"
+        correction_skipped = True
+
+    # Load guardrails from DB (agent-specific + org-wide)
+    guardrail_rules = load_guardrails(auth.org_id, event.agent_id)
+
+    config = VerificationConfig(
+        pass_threshold=thresholds.get("pass_threshold", 0.8),
+        flag_threshold=thresholds.get("flag_threshold", 0.5),
+        guardrails=guardrail_rules,
+    )
+
+    # Dynamic timeout: 10 s for correction (cascade/auto), 2 s for verify-only
+    timeout = CORRECTION_TIMEOUT_S if correction_mode in ("cascade", "auto") else GATEWAY_TIMEOUT_S
+
+    # --- Session memory retrieval ---
+    session_memories = None
+    if _is_memory_enabled() and event.session_id:
+        try:
+            db_session = _get_db_session()
+            output_str = event.output if isinstance(event.output, str) else json.dumps(event.output, default=str)
+            session_memories = await retrieve_memories(
+                db_session=db_session,
+                session_id=event.session_id,
+                org_id=auth.org_id,
+                query_text=output_str,
+            )
+            db_session.close()
+        except Exception:
+            logger.warning("Failed to retrieve session memories", exc_info=True)
+            session_memories = None
+
+    try:
+        result, final_output, corrected, correction_attempts = await asyncio.wait_for(
+            _verify_and_correct(event, config, correction_mode, session_memories=session_memories),
+            timeout=timeout,
+        )
+
+        # Build shared check results
+        checks = _engine_checks_to_shared(result.checks)
+
+        # Build correction attempt responses for the wire format.
+        # When transparency is "transparent", include ALL attempts (even failed)
+        # so callers can see which layers were tried and why they failed.
+        attempt_responses: Optional[list[CorrectionAttemptResponse]] = None
+        if transparency == "transparent" and correction_attempts:
+            attempt_responses = [
+                CorrectionAttemptResponse(
+                    layer=a.layer,
+                    layer_name=a.layer_name,
+                    corrected_output=a.corrected_output,
+                    confidence=result.confidence if a == correction_attempts[-1] else None,
+                    action=result.action if a == correction_attempts[-1] else "",
+                    success=a.success,
+                    latency_ms=a.latency_ms,
+                )
+                for a in correction_attempts
+            ]
+
+        response = VerifyResponse(
+            execution_id=event.execution_id,
+            confidence=result.confidence,
+            action=result.action,
+            output=final_output,
+            checks=checks,
+            corrected=corrected,
+            original_output=event.output if correction_attempts and transparency == "transparent" else None,
+            correction_attempts=attempt_responses,
+            correction_skipped=correction_skipped,
+            correction_skipped_reason="upgrade_required" if correction_skipped else None,
+        )
+
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Verification timed out for event %s; returning flag",
+            event.execution_id,
+            extra={"execution_id": event.execution_id, "agent_id": event.agent_id},
+        )
+        response = VerifyResponse(
+            execution_id=event.execution_id,
+            confidence=None,
+            action="flag",
+            output=event.output,
+            corrected=False,
+        )
+
+    # --- Write turn summary to session memory (fire-and-forget) ---
+    if _is_memory_enabled() and event.session_id and response.confidence is not None:
+        _summary_output = response.output
+
+        async def _write_summary():
+            try:
+                summary = await generate_summary(
+                    output=_summary_output,
+                    task=event.task,
+                    input_data=event.input,
+                )
+                if summary:
+                    db_sess = _get_db_session()
+                    await write_memory(
+                        db_session=db_sess,
+                        session_id=event.session_id,
+                        org_id=auth.org_id,
+                        agent_id=event.agent_id,
+                        execution_id=event.execution_id,
+                        memory_type="summary",
+                        content=summary,
+                        confidence=response.confidence,
+                        sequence_number=event.sequence_number,
+                    )
+                    db_sess.close()
+            except Exception:
+                logger.warning("Failed to write session memory summary", exc_info=True)
+
+        asyncio.create_task(_write_summary())
+
+    # Emit to Redis streams for async processing
+    try:
+        verified_data = {
+            "execution_id": event.execution_id,
+            "agent_id": event.agent_id,
+            "org_id": event.metadata.get("org_id", "default"),
+            "confidence": str(response.confidence) if response.confidence is not None else "",
+            "action": response.action,
+            "checks": json.dumps({k: v.model_dump(mode="json") for k, v in response.checks.items()})
+            if response.checks
+            else "{}",
+            "corrected": str(response.corrected),
+        }
+
+        if response.corrected and response.original_output is not None:
+            verified_data["original_output"] = (
+                response.original_output
+                if isinstance(response.original_output, str)
+                else json.dumps(response.original_output, default=str)
+            )
+
+        if response.correction_attempts:
+            verified_data["correction_attempts"] = json.dumps(
+                [a.model_dump(mode="json") for a in response.correction_attempts]
+            )
+
+        # Mark the raw event as already verified so the async-worker skips it
+        # (otherwise it re-verifies the original output and overwrites the
+        # corrected result).
+        event.metadata["already_verified"] = True
+
+        # Emit raw event first, then emit verified event.
+        await redis.xadd(RAW_STREAM_KEY, {"data": event.model_dump_json()})
+        await redis.xadd(VERIFIED_STREAM_KEY, {"data": json.dumps(verified_data)})
+    except Exception:
+        logger.warning(
+            "Failed to emit Redis events for %s",
+            event.execution_id,
+            exc_info=True,
+            extra={"execution_id": event.execution_id, "agent_id": event.agent_id},
+        )
+
+    return response
+
+
+# ------------------------------------------------------------------
+# Ingestion endpoints
+# ------------------------------------------------------------------
+
+
+class SingleIngestResponse(BaseModel):
+    """Response returned from the single-event ingestion endpoint."""
+
+    accepted: int
+    execution_id: str
+
+
+class BatchIngestRequest(BaseModel):
+    """Batch request with a hard cap of 50 events per payload."""
+
+    events: list[IngestEvent] = Field(..., max_length=50)
+
+
+@router.post("/v1/ingest", status_code=202, response_model=SingleIngestResponse)
+async def ingest_single(
+    event: IngestEvent,
+    request: Request,
+    auth: KeyInfo = Depends(verify_ingest_key),
+):
+    """Ingest a single execution event into the processing pipeline.
+
+    The event is serialised and pushed to the ``executions.raw`` Redis
+    Stream for downstream consumption by the async worker and storage worker.
+    The authenticated org_id is injected into event metadata.
+    """
+    event.metadata["org_id"] = auth.org_id
+    redis = request.app.state.redis
+    await redis.xadd(RAW_STREAM_KEY, {"data": event.model_dump_json()})
+    return SingleIngestResponse(accepted=1, execution_id=event.execution_id)
+
+
+@router.post("/v1/ingest/batch", status_code=202, response_model=IngestResponse)
+async def ingest_batch(
+    batch: BatchIngestRequest,
+    request: Request,
+    auth: KeyInfo = Depends(verify_ingest_key),
+):
+    """Ingest a batch of execution events (max 50).
+
+    Each event is individually pushed to the ``executions.raw`` Redis
+    Stream. Returns the count of accepted events and their IDs.
+    The authenticated org_id is injected into each event's metadata.
+    """
+    redis = request.app.state.redis
+    execution_ids: list[str] = []
+    for event in batch.events:
+        event.metadata["org_id"] = auth.org_id
+        await redis.xadd(RAW_STREAM_KEY, {"data": event.model_dump_json()})
+        execution_ids.append(event.execution_id)
+    return IngestResponse(accepted=len(execution_ids), execution_ids=execution_ids)
