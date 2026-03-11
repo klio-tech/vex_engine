@@ -65,7 +65,11 @@ def format_slack_message(
     blocks: list[dict[str, Any]] = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": f"Verification {action.capitalize()}", "emoji": True},
+            "text": {
+                "type": "plain_text",
+                "text": f"Verification {action.capitalize()}",
+                "emoji": True,
+            },
         },
         {
             "type": "section",
@@ -140,7 +144,11 @@ def format_anomaly_slack_message(
     blocks: list[dict[str, Any]] = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": f"{metric_label} Anomaly Detected", "emoji": True},
+            "text": {
+                "type": "plain_text",
+                "text": f"{metric_label} Anomaly Detected",
+                "emoji": True,
+            },
         },
         {
             "type": "section",

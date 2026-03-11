@@ -40,7 +40,9 @@ def shutdown_validator() -> None:
 
 def _validate_key(request: Request, scope: str) -> KeyInfo:
     """Extract and validate the API key from the request header."""
-    api_key = request.headers.get("X-Vex-Key") or request.headers.get("X-AgentGuard-Key")
+    api_key = request.headers.get("X-Vex-Key") or request.headers.get(
+        "X-AgentGuard-Key"
+    )
     if not api_key:
         raise HTTPException(status_code=401, detail="Missing X-Vex-Key header")
 

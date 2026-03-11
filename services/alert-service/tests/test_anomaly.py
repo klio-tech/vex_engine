@@ -33,14 +33,24 @@ def _mock_db_no_data():
 
 def test_no_anomaly_within_normal_range():
     db = _mock_db_with_stats()
-    event = {"agent_id": "bot-1", "execution_id": "e1", "cost_estimate": 0.12, "latency_ms": 550}
+    event = {
+        "agent_id": "bot-1",
+        "execution_id": "e1",
+        "cost_estimate": 0.12,
+        "latency_ms": 550,
+    }
     result = detect_anomalies(event, db)
     assert result == []
 
 
 def test_cost_anomaly_triggered():
     db = _mock_db_with_stats(cost_mean=0.10, cost_stddev=0.02)
-    event = {"agent_id": "bot-1", "execution_id": "e1", "cost_estimate": 0.50, "latency_ms": 500}
+    event = {
+        "agent_id": "bot-1",
+        "execution_id": "e1",
+        "cost_estimate": 0.50,
+        "latency_ms": 500,
+    }
     result = detect_anomalies(event, db)
     assert len(result) == 1
     assert result[0]["alert_type"] == "cost_anomaly"
@@ -49,7 +59,12 @@ def test_cost_anomaly_triggered():
 
 def test_latency_anomaly_triggered():
     db = _mock_db_with_stats(latency_mean=500.0, latency_stddev=50.0)
-    event = {"agent_id": "bot-1", "execution_id": "e1", "cost_estimate": 0.10, "latency_ms": 900}
+    event = {
+        "agent_id": "bot-1",
+        "execution_id": "e1",
+        "cost_estimate": 0.10,
+        "latency_ms": 900,
+    }
     result = detect_anomalies(event, db)
     assert len(result) == 1
     assert result[0]["alert_type"] == "latency_anomaly"
@@ -57,8 +72,15 @@ def test_latency_anomaly_triggered():
 
 
 def test_both_anomalies_triggered():
-    db = _mock_db_with_stats(cost_mean=0.10, cost_stddev=0.02, latency_mean=500.0, latency_stddev=50.0)
-    event = {"agent_id": "bot-1", "execution_id": "e1", "cost_estimate": 0.50, "latency_ms": 900}
+    db = _mock_db_with_stats(
+        cost_mean=0.10, cost_stddev=0.02, latency_mean=500.0, latency_stddev=50.0
+    )
+    event = {
+        "agent_id": "bot-1",
+        "execution_id": "e1",
+        "cost_estimate": 0.50,
+        "latency_ms": 900,
+    }
     result = detect_anomalies(event, db)
     assert len(result) == 2
     types = {r["alert_type"] for r in result}
@@ -67,14 +89,24 @@ def test_both_anomalies_triggered():
 
 def test_insufficient_samples_skips():
     db = _mock_db_with_stats(cost_count=5, latency_count=5)
-    event = {"agent_id": "bot-1", "execution_id": "e1", "cost_estimate": 999, "latency_ms": 99999}
+    event = {
+        "agent_id": "bot-1",
+        "execution_id": "e1",
+        "cost_estimate": 999,
+        "latency_ms": 99999,
+    }
     result = detect_anomalies(event, db)
     assert result == []
 
 
 def test_zero_stddev_skips():
     db = _mock_db_with_stats(cost_stddev=0.0, latency_stddev=0.0)
-    event = {"agent_id": "bot-1", "execution_id": "e1", "cost_estimate": 999, "latency_ms": 99999}
+    event = {
+        "agent_id": "bot-1",
+        "execution_id": "e1",
+        "cost_estimate": 999,
+        "latency_ms": 99999,
+    }
     result = detect_anomalies(event, db)
     assert result == []
 

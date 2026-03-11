@@ -39,7 +39,9 @@ def mock_db_session():
 
 
 def test_process_event_writes_to_s3(sample_event, mock_s3, mock_db_session):
-    process_event(sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1")
+    process_event(
+        sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1"
+    )
     mock_s3.put_object.assert_called_once()
     call_kwargs = mock_s3.put_object.call_args[1]
     assert call_kwargs["Bucket"] == "agentguard-traces"
@@ -47,14 +49,18 @@ def test_process_event_writes_to_s3(sample_event, mock_s3, mock_db_session):
 
 
 def test_process_event_writes_to_db(sample_event, mock_s3, mock_db_session):
-    process_event(sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1")
+    process_event(
+        sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1"
+    )
     # 2 execute calls: agent upsert + execution insert
     assert mock_db_session.execute.call_count == 2
     mock_db_session.commit.assert_called_once()
 
 
 def test_process_event_s3_key_format(sample_event, mock_s3, mock_db_session):
-    process_event(sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1")
+    process_event(
+        sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1"
+    )
     call_kwargs = mock_s3.put_object.call_args[1]
     key = call_kwargs["Key"]
     assert key.startswith("org-1/test-bot/")
@@ -62,7 +68,9 @@ def test_process_event_s3_key_format(sample_event, mock_s3, mock_db_session):
 
 
 def test_process_event_s3_payload_is_valid_json(sample_event, mock_s3, mock_db_session):
-    process_event(sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1")
+    process_event(
+        sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1"
+    )
     body = mock_s3.put_object.call_args[1]["Body"]
     parsed = json.loads(body)
     assert parsed["agent_id"] == "test-bot"
@@ -70,7 +78,9 @@ def test_process_event_s3_payload_is_valid_json(sample_event, mock_s3, mock_db_s
 
 
 def test_process_event_db_params(sample_event, mock_s3, mock_db_session):
-    process_event(sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1")
+    process_event(
+        sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1"
+    )
     # Second execute call is the execution insert (first is agent upsert)
     call_args = mock_db_session.execute.call_args_list[1]
     params = call_args[0][1]  # second positional arg is the params dict
@@ -82,8 +92,12 @@ def test_process_event_db_params(sample_event, mock_s3, mock_db_session):
     assert "s3://agentguard-traces/" in params["trace_payload_ref"]
 
 
-def test_process_event_db_params_include_cost_estimate(sample_event, mock_s3, mock_db_session):
-    process_event(sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1")
+def test_process_event_db_params_include_cost_estimate(
+    sample_event, mock_s3, mock_db_session
+):
+    process_event(
+        sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1"
+    )
     # Second execute call is the execution insert
     call_args = mock_db_session.execute.call_args_list[1]
     params = call_args[0][1]
@@ -119,7 +133,9 @@ def test_session_fields_default_none(sample_event, mock_s3, mock_db_session):
 
 
 def test_process_event_upserts_agent(sample_event, mock_s3, mock_db_session):
-    process_event(sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1")
+    process_event(
+        sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1"
+    )
     # First execute call is the agent upsert
     agent_call = mock_db_session.execute.call_args_list[0]
     params = agent_call[0][1]
@@ -129,7 +145,9 @@ def test_process_event_upserts_agent(sample_event, mock_s3, mock_db_session):
     assert params["task"] == "Answer questions"
 
 
-def test_process_event_returns_stored_notification(sample_event, mock_s3, mock_db_session):
+def test_process_event_returns_stored_notification(
+    sample_event, mock_s3, mock_db_session
+):
     result = process_event(
         sample_event,
         s3_client=mock_s3,
@@ -232,13 +250,23 @@ def test_process_verified_event_with_correction(mock_db_session):
         "action": "pass",
         "checks": json.dumps(
             {
-                "schema": {"check_type": "schema", "score": 1.0, "passed": True, "details": {}},
+                "schema": {
+                    "check_type": "schema",
+                    "score": 1.0,
+                    "passed": True,
+                    "details": {},
+                },
             }
         ),
         "corrected": "True",
         "correction_attempts": json.dumps(
             [
-                {"layer": 1, "layer_name": "repair", "success": True, "latency_ms": 340.0},
+                {
+                    "layer": 1,
+                    "layer_name": "repair",
+                    "success": True,
+                    "latency_ms": 340.0,
+                },
             ]
         ),
     }
@@ -302,8 +330,12 @@ def test_process_event_stores_tool_calls(mock_s3, mock_db_session):
         output="result",
         steps=[
             StepRecord(step_type="tool_call", name="search", input="q1", output="r1"),
-            StepRecord(step_type="tool_call", name="read_file", input="f1", output="content"),
-            StepRecord(step_type="llm", name="gpt-4", input="prompt", output="response"),
+            StepRecord(
+                step_type="tool_call", name="read_file", input="f1", output="content"
+            ),
+            StepRecord(
+                step_type="llm", name="gpt-4", input="prompt", output="response"
+            ),
         ],
     )
     process_event(event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1")
@@ -324,7 +356,9 @@ def test_process_event_stores_tool_calls(mock_s3, mock_db_session):
 
 def test_process_event_no_steps_no_tool_calls(sample_event, mock_s3, mock_db_session):
     """Events without steps should not insert any tool_calls rows."""
-    process_event(sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1")
+    process_event(
+        sample_event, s3_client=mock_s3, db_session=mock_db_session, org_id="org-1"
+    )
     # Only 2 base calls (agent upsert + execution insert)
     assert mock_db_session.execute.call_count == 2
 
@@ -361,7 +395,9 @@ async def test_ensure_consumer_group_creates_group():
     mock_redis = AsyncMock()
     mock_redis.xgroup_create = AsyncMock()
     await _ensure_consumer_group(mock_redis, "test.stream", "test-group")
-    mock_redis.xgroup_create.assert_called_once_with("test.stream", "test-group", id="0", mkstream=True)
+    mock_redis.xgroup_create.assert_called_once_with(
+        "test.stream", "test-group", id="0", mkstream=True
+    )
 
 
 @pytest.mark.asyncio
@@ -372,7 +408,9 @@ async def test_ensure_consumer_group_ignores_existing():
     from app.main import _ensure_consumer_group
 
     mock_redis = AsyncMock()
-    mock_redis.xgroup_create = AsyncMock(side_effect=Exception("BUSYGROUP Consumer Group name already exists"))
+    mock_redis.xgroup_create = AsyncMock(
+        side_effect=Exception("BUSYGROUP Consumer Group name already exists")
+    )
     # Should not raise
     await _ensure_consumer_group(mock_redis, "test.stream", "test-group")
 
@@ -383,7 +421,12 @@ async def test_consume_raw_processes_event_and_publishes():
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    from app.main import RAW_CONSUMER_GROUP, RAW_STREAM_KEY, STORED_STREAM_KEY, _consume_raw
+    from app.main import (
+        RAW_CONSUMER_GROUP,
+        RAW_STREAM_KEY,
+        STORED_STREAM_KEY,
+        _consume_raw,
+    )
 
     mock_redis = AsyncMock()
     mock_s3 = MagicMock()
@@ -413,7 +456,9 @@ async def test_consume_raw_processes_event_and_publishes():
     mock_session = MagicMock()
 
     with patch("app.main.SessionLocal", return_value=mock_session):
-        with patch("app.main.process_event", return_value=stored_notification) as mock_process:
+        with patch(
+            "app.main.process_event", return_value=stored_notification
+        ) as mock_process:
             with pytest.raises(asyncio.CancelledError):
                 await _consume_raw(mock_redis, mock_s3)
 
@@ -476,7 +521,12 @@ async def test_consume_verified_processes_and_publishes():
     import asyncio
     from unittest.mock import AsyncMock, MagicMock, patch
 
-    from app.main import STORED_STREAM_KEY, VERIFIED_CONSUMER_GROUP, VERIFIED_STREAM_KEY, _consume_verified
+    from app.main import (
+        STORED_STREAM_KEY,
+        VERIFIED_CONSUMER_GROUP,
+        VERIFIED_STREAM_KEY,
+        _consume_verified,
+    )
 
     mock_redis = AsyncMock()
 
@@ -507,11 +557,15 @@ async def test_consume_verified_processes_and_publishes():
     mock_session = MagicMock()
 
     with patch("app.main.SessionLocal", return_value=mock_session):
-        with patch("app.main.process_verified_event", return_value=updated_notification):
+        with patch(
+            "app.main.process_verified_event", return_value=updated_notification
+        ):
             with pytest.raises(asyncio.CancelledError):
                 await _consume_verified(mock_redis)
 
-    mock_redis.xack.assert_called_once_with(VERIFIED_STREAM_KEY, VERIFIED_CONSUMER_GROUP, "msg-1")
+    mock_redis.xack.assert_called_once_with(
+        VERIFIED_STREAM_KEY, VERIFIED_CONSUMER_GROUP, "msg-1"
+    )
     mock_redis.xadd.assert_called_once()
     assert mock_redis.xadd.call_args[0][0] == STORED_STREAM_KEY
 
@@ -550,10 +604,15 @@ async def test_consume_raw_fallback_org_id():
     mock_session = MagicMock()
 
     with patch("app.main.SessionLocal", return_value=mock_session):
-        with patch("app.main.process_event", return_value={"execution_id": "exec-no-org"}) as mock_process:
+        with patch(
+            "app.main.process_event", return_value={"execution_id": "exec-no-org"}
+        ) as mock_process:
             with pytest.raises(asyncio.CancelledError):
                 await _consume_raw(mock_redis, mock_s3)
 
     # Verify org_id fallback was used
     call_kwargs = mock_process.call_args
-    assert call_kwargs[1]["org_id"] == "default" or call_kwargs.kwargs["org_id"] == "default"
+    assert (
+        call_kwargs[1]["org_id"] == "default"
+        or call_kwargs.kwargs["org_id"] == "default"
+    )

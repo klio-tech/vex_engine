@@ -58,7 +58,10 @@ def _get_db_session():
     from sqlalchemy import create_engine
     from sqlalchemy.orm import Session
 
-    db_url = os.environ.get("DATABASE_URL", "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard")
+    db_url = os.environ.get(
+        "DATABASE_URL",
+        "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
+    )
     engine = create_engine(db_url)
     return Session(engine)
 
@@ -122,8 +125,9 @@ async def _verify_and_correct(
             memory_lines = []
             for m in session_memories:
                 memory_lines.append(f"- {m.content}")
-            memory_context = "The following facts have been established and verified in this session:\n" + "\n".join(
-                memory_lines
+            memory_context = (
+                "The following facts have been established and verified in this session:\n"
+                + "\n".join(memory_lines)
             )
 
         # Track the best correction seen across all attempts, even if none
@@ -176,7 +180,9 @@ async def _verify_and_correct(
                 break
 
             # Track the best correction even if it didn't reach "pass"
-            if result.confidence is not None and (best_confidence is None or result.confidence > best_confidence):
+            if result.confidence is not None and (
+                best_confidence is None or result.confidence > best_confidence
+            ):
                 best_confidence = result.confidence
                 best_output = attempt.corrected_output
                 best_result = result
@@ -252,14 +258,22 @@ async def verify_endpoint(
     )
 
     # Dynamic timeout: 10 s for correction (cascade/auto), 2 s for verify-only
-    timeout = CORRECTION_TIMEOUT_S if correction_mode in ("cascade", "auto") else GATEWAY_TIMEOUT_S
+    timeout = (
+        CORRECTION_TIMEOUT_S
+        if correction_mode in ("cascade", "auto")
+        else GATEWAY_TIMEOUT_S
+    )
 
     # --- Session memory retrieval ---
     session_memories = None
     if _is_memory_enabled() and event.session_id:
         try:
             db_session = _get_db_session()
-            output_str = event.output if isinstance(event.output, str) else json.dumps(event.output, default=str)
+            output_str = (
+                event.output
+                if isinstance(event.output, str)
+                else json.dumps(event.output, default=str)
+            )
             session_memories = await retrieve_memories(
                 db_session=db_session,
                 session_id=event.session_id,
@@ -273,7 +287,9 @@ async def verify_endpoint(
 
     try:
         result, final_output, corrected, correction_attempts = await asyncio.wait_for(
-            _verify_and_correct(event, config, correction_mode, session_memories=session_memories),
+            _verify_and_correct(
+                event, config, correction_mode, session_memories=session_memories
+            ),
             timeout=timeout,
         )
 
@@ -290,7 +306,9 @@ async def verify_endpoint(
                     layer=a.layer,
                     layer_name=a.layer_name,
                     corrected_output=a.corrected_output,
-                    confidence=result.confidence if a == correction_attempts[-1] else None,
+                    confidence=result.confidence
+                    if a == correction_attempts[-1]
+                    else None,
                     action=result.action if a == correction_attempts[-1] else "",
                     success=a.success,
                     latency_ms=a.latency_ms,
@@ -305,10 +323,14 @@ async def verify_endpoint(
             output=final_output,
             checks=checks,
             corrected=corrected,
-            original_output=event.output if correction_attempts and transparency == "transparent" else None,
+            original_output=event.output
+            if correction_attempts and transparency == "transparent"
+            else None,
             correction_attempts=attempt_responses,
             correction_skipped=correction_skipped,
-            correction_skipped_reason="upgrade_required" if correction_skipped else None,
+            correction_skipped_reason="upgrade_required"
+            if correction_skipped
+            else None,
         )
 
     except asyncio.TimeoutError:
@@ -361,9 +383,13 @@ async def verify_endpoint(
             "execution_id": event.execution_id,
             "agent_id": event.agent_id,
             "org_id": event.metadata.get("org_id", "default"),
-            "confidence": str(response.confidence) if response.confidence is not None else "",
+            "confidence": str(response.confidence)
+            if response.confidence is not None
+            else "",
             "action": response.action,
-            "checks": json.dumps({k: v.model_dump(mode="json") for k, v in response.checks.items()})
+            "checks": json.dumps(
+                {k: v.model_dump(mode="json") for k, v in response.checks.items()}
+            )
             if response.checks
             else "{}",
             "corrected": str(response.corrected),

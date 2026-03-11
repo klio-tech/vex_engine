@@ -94,7 +94,9 @@ async def check(
     if task:
         prompt_parts.append(f"Task context:\n{task}\n")
     if input_data:
-        input_str = input_data if isinstance(input_data, str) else json.dumps(input_data)
+        input_str = (
+            input_data if isinstance(input_data, str) else json.dumps(input_data)
+        )
         prompt_parts.append(f"User input:\n{input_str}\n")
 
     prompt_parts.append(

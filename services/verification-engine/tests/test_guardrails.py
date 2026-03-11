@@ -21,7 +21,12 @@ async def test_no_rules_skips():
 async def test_all_disabled_rules_skips():
     """All rules disabled — check skipped."""
     rules = [
-        GuardrailRule(name="r1", rule_type="keyword", condition={"keywords": ["bad"]}, enabled=False),
+        GuardrailRule(
+            name="r1",
+            rule_type="keyword",
+            condition={"keywords": ["bad"]},
+            enabled=False,
+        ),
     ]
     result = await check(output="bad output", rules=rules)
     assert result.passed is True
@@ -35,7 +40,10 @@ async def test_all_disabled_rules_skips():
 async def test_regex_match_triggers_violation():
     rules = [
         GuardrailRule(
-            name="no-emails", rule_type="regex", condition={"pattern": r"\b[\w.-]+@[\w.-]+\.\w+\b"}, action="flag"
+            name="no-emails",
+            rule_type="regex",
+            condition={"pattern": r"\b[\w.-]+@[\w.-]+\.\w+\b"},
+            action="flag",
         ),
     ]
     result = await check(output="Contact us at test@example.com", rules=rules)
@@ -48,7 +56,10 @@ async def test_regex_match_triggers_violation():
 async def test_regex_no_match_passes():
     rules = [
         GuardrailRule(
-            name="no-emails", rule_type="regex", condition={"pattern": r"\b[\w.-]+@[\w.-]+\.\w+\b"}, action="flag"
+            name="no-emails",
+            rule_type="regex",
+            condition={"pattern": r"\b[\w.-]+@[\w.-]+\.\w+\b"},
+            action="flag",
         ),
     ]
     result = await check(output="No emails here", rules=rules)
@@ -60,7 +71,10 @@ async def test_regex_no_match_passes():
 async def test_regex_case_insensitive():
     rules = [
         GuardrailRule(
-            name="no-secret", rule_type="regex", condition={"pattern": "SECRET", "ignore_case": True}, action="block"
+            name="no-secret",
+            rule_type="regex",
+            condition={"pattern": "SECRET", "ignore_case": True},
+            action="block",
         ),
     ]
     result = await check(output="this is a secret value", rules=rules)
@@ -71,7 +85,9 @@ async def test_regex_case_insensitive():
 @pytest.mark.asyncio
 async def test_regex_empty_pattern_no_violation():
     rules = [
-        GuardrailRule(name="empty", rule_type="regex", condition={"pattern": ""}, action="flag"),
+        GuardrailRule(
+            name="empty", rule_type="regex", condition={"pattern": ""}, action="flag"
+        ),
     ]
     result = await check(output="anything", rules=rules)
     assert result.passed is True
@@ -90,7 +106,9 @@ async def test_keyword_match_triggers():
             action="block",
         ),
     ]
-    result = await check(output="I recommend trying CompetitorX for better results", rules=rules)
+    result = await check(
+        output="I recommend trying CompetitorX for better results", rules=rules
+    )
     assert result.passed is False
     assert result.score == 0.0
     assert "CompetitorX" in result.details["violations"][0]["matched_keywords"]
@@ -100,7 +118,10 @@ async def test_keyword_match_triggers():
 async def test_keyword_no_match_passes():
     rules = [
         GuardrailRule(
-            name="competitor-block", rule_type="keyword", condition={"keywords": ["CompetitorX"]}, action="block"
+            name="competitor-block",
+            rule_type="keyword",
+            condition={"keywords": ["CompetitorX"]},
+            action="block",
         ),
     ]
     result = await check(output="Our product is the best", rules=rules)
@@ -186,7 +207,10 @@ async def test_threshold_less_than_operator():
 
 @pytest.mark.asyncio
 async def test_llm_rule_violation():
-    llm_response = {"violated": True, "explanation": "The output recommends a competitor"}
+    llm_response = {
+        "violated": True,
+        "explanation": "The output recommends a competitor",
+    }
     rules = [
         GuardrailRule(
             name="no-competitor-recs",
@@ -195,7 +219,9 @@ async def test_llm_rule_violation():
             action="block",
         ),
     ]
-    with patch("engine.guardrails.call_llm", new_callable=AsyncMock, return_value=llm_response):
+    with patch(
+        "engine.guardrails.call_llm", new_callable=AsyncMock, return_value=llm_response
+    ):
         result = await check(output="Try using RivalCo instead", rules=rules)
     assert result.passed is False
     assert result.score == 0.0
@@ -212,7 +238,9 @@ async def test_llm_rule_no_violation():
             action="block",
         ),
     ]
-    with patch("engine.guardrails.call_llm", new_callable=AsyncMock, return_value=llm_response):
+    with patch(
+        "engine.guardrails.call_llm", new_callable=AsyncMock, return_value=llm_response
+    ):
         result = await check(output="Our product handles this well", rules=rules)
     assert result.passed is True
     assert result.score == 1.0
@@ -223,7 +251,10 @@ async def test_llm_timeout_no_violation():
     """LLM timeout should not trigger a violation."""
     rules = [
         GuardrailRule(
-            name="safety", rule_type="llm", condition={"description": "Block harmful content"}, action="block"
+            name="safety",
+            rule_type="llm",
+            condition={"description": "Block harmful content"},
+            action="block",
         ),
     ]
     with patch("engine.guardrails.call_llm", new_callable=AsyncMock, return_value=None):
@@ -238,8 +269,18 @@ async def test_llm_timeout_no_violation():
 async def test_block_rule_overrides_score():
     """A single block violation should set score to 0.0."""
     rules = [
-        GuardrailRule(name="keyword-flag", rule_type="keyword", condition={"keywords": ["warning"]}, action="flag"),
-        GuardrailRule(name="keyword-block", rule_type="keyword", condition={"keywords": ["danger"]}, action="block"),
+        GuardrailRule(
+            name="keyword-flag",
+            rule_type="keyword",
+            condition={"keywords": ["warning"]},
+            action="flag",
+        ),
+        GuardrailRule(
+            name="keyword-block",
+            rule_type="keyword",
+            condition={"keywords": ["danger"]},
+            action="block",
+        ),
     ]
     result = await check(output="danger zone with warning signs", rules=rules)
     assert result.score == 0.0
@@ -251,9 +292,24 @@ async def test_block_rule_overrides_score():
 async def test_flag_violations_reduce_score_proportionally():
     """Flag violations reduce score based on ratio of violated rules."""
     rules = [
-        GuardrailRule(name="r1", rule_type="keyword", condition={"keywords": ["bad"]}, action="flag"),
-        GuardrailRule(name="r2", rule_type="keyword", condition={"keywords": ["evil"]}, action="flag"),
-        GuardrailRule(name="r3", rule_type="keyword", condition={"keywords": ["good"]}, action="flag"),
+        GuardrailRule(
+            name="r1",
+            rule_type="keyword",
+            condition={"keywords": ["bad"]},
+            action="flag",
+        ),
+        GuardrailRule(
+            name="r2",
+            rule_type="keyword",
+            condition={"keywords": ["evil"]},
+            action="flag",
+        ),
+        GuardrailRule(
+            name="r3",
+            rule_type="keyword",
+            condition={"keywords": ["good"]},
+            action="flag",
+        ),
     ]
     # 1 out of 3 rules violated → score = 1.0 - 1/3 = 0.6667
     result = await check(output="this is bad but nothing else", rules=rules)
@@ -265,7 +321,12 @@ async def test_flag_violations_reduce_score_proportionally():
 async def test_dict_output_serialized():
     """Dict outputs should be serialized and searchable."""
     rules = [
-        GuardrailRule(name="no-secrets", rule_type="keyword", condition={"keywords": ["api_key"]}, action="flag"),
+        GuardrailRule(
+            name="no-secrets",
+            rule_type="keyword",
+            condition={"keywords": ["api_key"]},
+            action="flag",
+        ),
     ]
     result = await check(output={"api_key": "sk-123", "data": "value"}, rules=rules)
     assert result.passed is False
@@ -274,8 +335,12 @@ async def test_dict_output_serialized():
 @pytest.mark.asyncio
 async def test_unknown_rule_type_ignored():
     rules = [
-        GuardrailRule(name="unknown", rule_type="future_type", condition={}, action="flag"),
+        GuardrailRule(
+            name="unknown", rule_type="future_type", condition={}, action="flag"
+        ),
     ]
     result = await check(output="anything", rules=rules)
     assert result.passed is True
-    assert result.details["rule_results"][0]["reason"] == "unknown rule_type 'future_type'"
+    assert (
+        result.details["rule_results"][0]["reason"] == "unknown rule_type 'future_type'"
+    )

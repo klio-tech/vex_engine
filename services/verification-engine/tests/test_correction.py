@@ -19,8 +19,15 @@ def test_select_layer_schema_only_failure():
         confidence=0.6,
         action="flag",
         checks={
-            "schema": CheckResult(check_type="schema", score=0.0, passed=False, details={"errors": ["missing field"]}),
-            "hallucination": CheckResult(check_type="hallucination", score=1.0, passed=True),
+            "schema": CheckResult(
+                check_type="schema",
+                score=0.0,
+                passed=False,
+                details={"errors": ["missing field"]},
+            ),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=1.0, passed=True
+            ),
             "drift": CheckResult(check_type="drift", score=0.9, passed=True),
         },
     )
@@ -34,7 +41,9 @@ def test_select_layer_mild_failure():
         action="flag",
         checks={
             "schema": CheckResult(check_type="schema", score=1.0, passed=True),
-            "hallucination": CheckResult(check_type="hallucination", score=0.4, passed=False),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=0.4, passed=False
+            ),
             "drift": CheckResult(check_type="drift", score=0.9, passed=True),
         },
     )
@@ -47,7 +56,9 @@ def test_select_layer_moderate_failure():
         confidence=0.4,
         action="block",
         checks={
-            "hallucination": CheckResult(check_type="hallucination", score=0.2, passed=False),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=0.2, passed=False
+            ),
         },
     )
     assert select_layer(result) == 2
@@ -59,7 +70,9 @@ def test_select_layer_severe_failure():
         confidence=0.2,
         action="block",
         checks={
-            "hallucination": CheckResult(check_type="hallucination", score=0.0, passed=False),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=0.0, passed=False
+            ),
             "drift": CheckResult(check_type="drift", score=0.1, passed=False),
         },
     )
@@ -107,7 +120,9 @@ async def test_correct_layer1_repair():
     """Layer 1 should call LLM with repair prompt and return corrected output."""
     llm_response = {"corrected_output": '{"revenue": 5200000}'}
 
-    with patch("engine.correction.call_llm", new_callable=AsyncMock, return_value=llm_response):
+    with patch(
+        "engine.correction.call_llm", new_callable=AsyncMock, return_value=llm_response
+    ):
         result = await correct(
             layer=1,
             output='{"revnue": 5200000}',
@@ -132,7 +147,9 @@ async def test_correct_layer2_constrained_regen():
     """Layer 2 should regenerate with constraints, NOT seeing the failed output."""
     llm_response = {"output": "Revenue is $5.2 billion for Q3 2025."}
 
-    with patch("engine.correction.call_llm", new_callable=AsyncMock, return_value=llm_response) as mock_llm:
+    with patch(
+        "engine.correction.call_llm", new_callable=AsyncMock, return_value=llm_response
+    ) as mock_llm:
         result = await correct(
             layer=2,
             output="Revenue is $999 trillion!",  # hallucinated
@@ -155,7 +172,9 @@ async def test_correct_layer3_full_reprompt():
     """Layer 3 should include explicit failure feedback."""
     llm_response = {"output": "I apologize, the revenue figure is $5.2B."}
 
-    with patch("engine.correction.call_llm", new_callable=AsyncMock, return_value=llm_response) as mock_llm:
+    with patch(
+        "engine.correction.call_llm", new_callable=AsyncMock, return_value=llm_response
+    ) as mock_llm:
         result = await correct(
             layer=3,
             output="bad output",
@@ -197,7 +216,11 @@ async def test_correct_llm_timeout_returns_failure():
 @pytest.mark.asyncio
 async def test_correct_llm_malformed_response():
     """LLM returns unexpected structure -> treated as failure."""
-    with patch("engine.correction.call_llm", new_callable=AsyncMock, return_value={"unexpected": "data"}):
+    with patch(
+        "engine.correction.call_llm",
+        new_callable=AsyncMock,
+        return_value={"unexpected": "data"},
+    ):
         result = await correct(
             layer=2,
             output="broken",
@@ -217,7 +240,9 @@ async def test_correct_layer2_includes_memory_context():
     """Layer 2 correction should include memory context in prompt."""
     mock_response = {"output": "corrected with memory"}
 
-    with patch("engine.correction.call_llm", new_callable=AsyncMock, return_value=mock_response) as mock_llm:
+    with patch(
+        "engine.correction.call_llm", new_callable=AsyncMock, return_value=mock_response
+    ) as mock_llm:
         attempt = await correct(
             layer=2,
             output="wrong answer",
@@ -238,7 +263,9 @@ async def test_correct_layer2_works_without_memory_context():
     """Layer 2 correction should work fine without memory context."""
     mock_response = {"output": "corrected without memory"}
 
-    with patch("engine.correction.call_llm", new_callable=AsyncMock, return_value=mock_response):
+    with patch(
+        "engine.correction.call_llm", new_callable=AsyncMock, return_value=mock_response
+    ):
         attempt = await correct(
             layer=2,
             output="wrong answer",
@@ -253,13 +280,17 @@ async def test_correct_layer3_includes_memory_context():
     """Layer 3 correction should include memory context in prompt."""
     mock_response = {"output": "corrected with memory"}
 
-    with patch("engine.correction.call_llm", new_callable=AsyncMock, return_value=mock_response) as mock_llm:
+    with patch(
+        "engine.correction.call_llm", new_callable=AsyncMock, return_value=mock_response
+    ) as mock_llm:
         attempt = await correct(
             layer=3,
             output="wrong answer",
             task="refund inquiry",
             checks={
-                "hallucination": CheckResult(check_type="hallucination", score=0.1, passed=False),
+                "hallucination": CheckResult(
+                    check_type="hallucination", score=0.1, passed=False
+                ),
             },
             memory_context="The following facts:\n- Refund takes 3-5 days",
         )
@@ -276,7 +307,9 @@ async def test_correct_layer1_ignores_memory_context():
     """Layer 1 (repair) does not use memory context -- it is surgical/minimal."""
     mock_response = {"corrected_output": "repaired"}
 
-    with patch("engine.correction.call_llm", new_callable=AsyncMock, return_value=mock_response) as mock_llm:
+    with patch(
+        "engine.correction.call_llm", new_callable=AsyncMock, return_value=mock_response
+    ) as mock_llm:
         attempt = await correct(
             layer=1,
             output="broken output",
@@ -298,7 +331,9 @@ async def test_correct_layer2_memory_adds_constraint():
     """Layer 2 with memory should add a consistency constraint."""
     mock_response = {"output": "constrained output"}
 
-    with patch("engine.correction.call_llm", new_callable=AsyncMock, return_value=mock_response) as mock_llm:
+    with patch(
+        "engine.correction.call_llm", new_callable=AsyncMock, return_value=mock_response
+    ) as mock_llm:
         await correct(
             layer=2,
             output="wrong answer",

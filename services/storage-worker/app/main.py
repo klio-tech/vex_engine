@@ -23,7 +23,12 @@ from shared.redis_config import REDIS_CLIENT_OPTIONS
 
 from app.db import SessionLocal
 from app.s3_client import get_s3_client
-from app.worker import STORED_STREAM_KEY, VERIFIED_STREAM_KEY, process_event, process_verified_event
+from app.worker import (
+    STORED_STREAM_KEY,
+    VERIFIED_STREAM_KEY,
+    process_event,
+    process_verified_event,
+)
 
 logger = logging.getLogger("agentguard.storage-worker")
 
@@ -47,7 +52,9 @@ async def _ensure_consumer_group(
             id="0",
             mkstream=True,
         )
-        logger.info("Created consumer group '%s' on stream '%s'", group_name, stream_key)
+        logger.info(
+            "Created consumer group '%s' on stream '%s'", group_name, stream_key
+        )
     except Exception:
         logger.debug(
             "Consumer group '%s' already exists on stream '%s'",
@@ -74,7 +81,11 @@ async def _consume_raw(redis_client: aioredis.Redis, s3_client: object) -> None:
                 for msg_id, data in entries:
                     try:
                         event = IngestEvent.model_validate_json(data["data"])
-                        org_id = event.metadata.get("org_id", FALLBACK_ORG) if event.metadata else FALLBACK_ORG
+                        org_id = (
+                            event.metadata.get("org_id", FALLBACK_ORG)
+                            if event.metadata
+                            else FALLBACK_ORG
+                        )
                         db_session = SessionLocal()
                         try:
                             stored_notification = process_event(
@@ -89,7 +100,9 @@ async def _consume_raw(redis_client: aioredis.Redis, s3_client: object) -> None:
                         finally:
                             db_session.close()
 
-                        await redis_client.xack(RAW_STREAM_KEY, RAW_CONSUMER_GROUP, msg_id)
+                        await redis_client.xack(
+                            RAW_STREAM_KEY, RAW_CONSUMER_GROUP, msg_id
+                        )
 
                         # Publish to executions.stored for real-time consumers
                         await redis_client.xadd(
@@ -104,12 +117,19 @@ async def _consume_raw(redis_client: aioredis.Redis, s3_client: object) -> None:
                             exc_info=True,
                             extra={
                                 "msg_id": msg_id,
-                                "execution_id": event.execution_id if "event" in locals() else None,
+                                "execution_id": event.execution_id
+                                if "event" in locals()
+                                else None,
                                 "org_id": org_id if "org_id" in locals() else None,
                             },
                         )
         except Exception as exc:
-            logger.error("Raw stream read error: %s", exc, exc_info=True, extra={"stream": RAW_STREAM_KEY})
+            logger.error(
+                "Raw stream read error: %s",
+                exc,
+                exc_info=True,
+                extra={"stream": RAW_STREAM_KEY},
+            )
             await asyncio.sleep(1)
 
 
@@ -159,11 +179,18 @@ async def _consume_verified(redis_client: aioredis.Redis) -> None:
                             exc_info=True,
                             extra={
                                 "msg_id": msg_id,
-                                "execution_id": event_data.get("execution_id") if "event_data" in locals() else None,
+                                "execution_id": event_data.get("execution_id")
+                                if "event_data" in locals()
+                                else None,
                             },
                         )
         except Exception as exc:
-            logger.error("Verified stream read error: %s", exc, exc_info=True, extra={"stream": VERIFIED_STREAM_KEY})
+            logger.error(
+                "Verified stream read error: %s",
+                exc,
+                exc_info=True,
+                extra={"stream": VERIFIED_STREAM_KEY},
+            )
             await asyncio.sleep(1)
 
 
@@ -185,7 +212,9 @@ async def run() -> None:
     # default confidence/action until the next verification.
     try:
         await redis_client.xgroup_destroy(VERIFIED_STREAM_KEY, VERIFIED_CONSUMER_GROUP)
-        logger.info("Destroyed consumer group '%s' for clean start", VERIFIED_CONSUMER_GROUP)
+        logger.info(
+            "Destroyed consumer group '%s' for clean start", VERIFIED_CONSUMER_GROUP
+        )
     except Exception:
         pass
     try:
@@ -195,7 +224,11 @@ async def run() -> None:
             id="$",
             mkstream=True,
         )
-        logger.info("Created consumer group '%s' from latest on '%s'", VERIFIED_CONSUMER_GROUP, VERIFIED_STREAM_KEY)
+        logger.info(
+            "Created consumer group '%s' from latest on '%s'",
+            VERIFIED_CONSUMER_GROUP,
+            VERIFIED_STREAM_KEY,
+        )
     except Exception:
         logger.debug("Consumer group '%s' already exists", VERIFIED_CONSUMER_GROUP)
 

@@ -83,7 +83,9 @@ class KeyValidator:
         flush_interval_s: float = 60.0,
     ) -> None:
         if required_scope not in VALID_SCOPES:
-            raise ValueError(f"Invalid scope {required_scope!r}; must be one of {VALID_SCOPES}")
+            raise ValueError(
+                f"Invalid scope {required_scope!r}; must be one of {VALID_SCOPES}"
+            )
 
         self._engine: Engine = create_engine(
             database_url,
@@ -266,7 +268,11 @@ class KeyValidator:
                 if row is None:
                     return ("free", None)
                 plan = row[0] or "free"
-                overrides = row[1] if isinstance(row[1], dict) else (json.loads(row[1]) if row[1] else None)
+                overrides = (
+                    row[1]
+                    if isinstance(row[1], dict)
+                    else (json.loads(row[1]) if row[1] else None)
+                )
                 return (plan, overrides)
         except Exception:
             logger.warning(
@@ -322,7 +328,9 @@ class KeyValidator:
             if key_entry.get("key_hash") == key_hash:
                 expires_at = None
                 if key_entry.get("expires_at"):
-                    expires_at = datetime.fromisoformat(key_entry["expires_at"].replace("Z", "+00:00"))
+                    expires_at = datetime.fromisoformat(
+                        key_entry["expires_at"].replace("Z", "+00:00")
+                    )
 
                 per_key_rpm = key_entry.get("rate_limit_rpm", 1000)
                 effective_rpm = min(per_key_rpm, plan_config.max_rpm)
@@ -358,18 +366,24 @@ class KeyValidator:
             with self._engine.connect() as conn:
                 agent_count = (
                     conn.execute(
-                        text("SELECT COUNT(DISTINCT agent_id) FROM agents WHERE org_id = :org_id"),
+                        text(
+                            "SELECT COUNT(DISTINCT agent_id) FROM agents WHERE org_id = :org_id"
+                        ),
                         {"org_id": entry.org_id},
                     ).scalar()
                     or 0
                 )
 
                 exists = conn.execute(
-                    text("SELECT 1 FROM agents WHERE org_id = :org_id AND agent_id = :agent_id"),
+                    text(
+                        "SELECT 1 FROM agents WHERE org_id = :org_id AND agent_id = :agent_id"
+                    ),
                     {"org_id": entry.org_id, "agent_id": agent_id},
                 ).fetchone()
         except Exception:
-            logger.warning("Failed to check agent limit, allowing request", exc_info=True)
+            logger.warning(
+                "Failed to check agent limit, allowing request", exc_info=True
+            )
             return
 
         if exists:

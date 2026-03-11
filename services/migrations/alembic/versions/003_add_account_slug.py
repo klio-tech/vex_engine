@@ -33,7 +33,9 @@ def upgrade() -> None:
         unique=True,
     )
     # Backfill: set slug = org_id for existing rows so the fallback lookup works
-    op.execute("UPDATE organizations SET account_slug = org_id WHERE account_slug IS NULL")
+    op.execute(
+        "UPDATE organizations SET account_slug = org_id WHERE account_slug IS NULL"
+    )
 
 
 def downgrade() -> None:

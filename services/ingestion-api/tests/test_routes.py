@@ -52,7 +52,9 @@ def test_ingest_rejects_missing_api_key(mock_redis):
     app.state.redis = mock_redis
     # No dependency_overrides → real auth runs
     client_no_auth = TestClient(app)
-    response = client_no_auth.post("/v1/ingest", json={"agent_id": "x", "input": {}, "output": {}})
+    response = client_no_auth.post(
+        "/v1/ingest", json={"agent_id": "x", "input": {}, "output": {}}
+    )
     assert response.status_code == 401
 
 
@@ -66,7 +68,11 @@ def test_ingest_rejects_invalid_payload(client):
 
 
 def test_batch_rejects_over_50_events(client):
-    events = {"events": [{"agent_id": f"bot-{i}", "input": {}, "output": {}} for i in range(51)]}
+    events = {
+        "events": [
+            {"agent_id": f"bot-{i}", "input": {}, "output": {}} for i in range(51)
+        ]
+    }
     response = client.post(
         "/v1/ingest/batch",
         json=events,
@@ -85,7 +91,9 @@ def test_health_check_redis_unreachable(mock_redis):
     mock_redis.ping = AsyncMock(side_effect=ConnectionError("Redis down"))
     app = create_app()
     app.state.redis = mock_redis
-    app.dependency_overrides[verify_api_key] = lambda: KeyInfo(org_id="test-org", key_id="test-key", scopes=["ingest"])
+    app.dependency_overrides[verify_api_key] = lambda: KeyInfo(
+        org_id="test-org", key_id="test-key", scopes=["ingest"]
+    )
     c = TestClient(app)
     response = c.get("/health")
     assert response.status_code == 503
@@ -131,7 +139,9 @@ def test_ingest_accepts_legacy_agentguard_key_header(mock_redis):
 
     with patch("app.auth.get_validator") as mock_get_validator:
         mock_validator = mock_get_validator.return_value
-        mock_validator.validate.return_value = KeyInfo(org_id="test-org", key_id="test-key", scopes=["ingest"])
+        mock_validator.validate.return_value = KeyInfo(
+            org_id="test-org", key_id="test-key", scopes=["ingest"]
+        )
         c = TestClient(app)
         response = c.post(
             "/v1/ingest",

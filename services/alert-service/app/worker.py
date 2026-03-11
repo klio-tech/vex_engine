@@ -24,7 +24,12 @@ from sqlalchemy import text
 
 from app.anomaly import detect_anomalies
 from app.dedup import AlertDeduplicator
-from app.slack import deliver_slack, format_anomaly_slack_message, format_slack_message, get_slack_webhook_url
+from app.slack import (
+    deliver_slack,
+    format_anomaly_slack_message,
+    format_slack_message,
+    get_slack_webhook_url,
+)
 from app.webhook import deliver
 
 logger = logging.getLogger("agentguard.alert-service")
@@ -117,7 +122,9 @@ async def process_verified_event(
     # Parse check results for failure details
     checks_raw = event_data.get("checks", "{}")
     checks = json.loads(checks_raw) if isinstance(checks_raw, str) else checks_raw
-    failure_types = [name for name, check in checks.items() if not check.get("passed", True)]
+    failure_types = [
+        name for name, check in checks.items() if not check.get("passed", True)
+    ]
 
     # --- Deduplication check ---
     alert_type = f"verification_{action}"
@@ -148,7 +155,9 @@ async def process_verified_event(
                 }
                 if suppressed_count > 0:
                     payload["suppressed_count"] = suppressed_count
-                    payload["summary"] += f" ({suppressed_count} similar events suppressed in last 5 min)"
+                    payload["summary"] += (
+                        f" ({suppressed_count} similar events suppressed in last 5 min)"
+                    )
                 delivered, response_status = await deliver(webhook_url, payload)
                 delivery_attempts = 3 if not delivered else 1
 

@@ -15,7 +15,11 @@ async def test_grounded_claims_high_score():
         "ungrounded": [],
         "score": 1.0,
     }
-    with patch("engine.hallucination.call_llm", new_callable=AsyncMock, return_value=mock_response):
+    with patch(
+        "engine.hallucination.call_llm",
+        new_callable=AsyncMock,
+        return_value=mock_response,
+    ):
         result = await check(
             output="Alice is 30 years old and lives in NYC.",
             ground_truth={"name": "Alice", "age": 30, "city": "NYC"},
@@ -34,7 +38,11 @@ async def test_ungrounded_claims_low_score():
         "ungrounded": ["Alice is a doctor"],
         "score": 0.3,
     }
-    with patch("engine.hallucination.call_llm", new_callable=AsyncMock, return_value=mock_response):
+    with patch(
+        "engine.hallucination.call_llm",
+        new_callable=AsyncMock,
+        return_value=mock_response,
+    ):
         result = await check(
             output="Alice is 30 and a doctor.",
             ground_truth={"name": "Alice", "age": 30},
@@ -55,7 +63,9 @@ async def test_no_ground_truth_skips():
 
 @pytest.mark.asyncio
 async def test_timeout_returns_none_score():
-    with patch("engine.hallucination.call_llm", new_callable=AsyncMock, return_value=None):
+    with patch(
+        "engine.hallucination.call_llm", new_callable=AsyncMock, return_value=None
+    ):
         result = await check(
             output="some output",
             ground_truth={"data": "reference"},
@@ -74,7 +84,11 @@ async def test_score_clamped_to_valid_range():
         "ungrounded": [],
         "score": 1.5,
     }
-    with patch("engine.hallucination.call_llm", new_callable=AsyncMock, return_value=mock_response):
+    with patch(
+        "engine.hallucination.call_llm",
+        new_callable=AsyncMock,
+        return_value=mock_response,
+    ):
         result = await check(
             output="output",
             ground_truth={"data": "truth"},
@@ -96,9 +110,15 @@ async def test_conversation_prompt_used_with_history():
         "score": 1.0,
     }
     history = [
-        ConversationTurn(sequence_number=0, input="What is revenue?", output="Revenue is $5.2B."),
+        ConversationTurn(
+            sequence_number=0, input="What is revenue?", output="Revenue is $5.2B."
+        ),
     ]
-    with patch("engine.hallucination.call_llm", new_callable=AsyncMock, return_value=mock_response) as mock_llm:
+    with patch(
+        "engine.hallucination.call_llm",
+        new_callable=AsyncMock,
+        return_value=mock_response,
+    ) as mock_llm:
         result = await check(
             output="As I said, revenue is $5.2B.",
             ground_truth={"revenue": "$5.2B"},
@@ -106,7 +126,9 @@ async def test_conversation_prompt_used_with_history():
         )
     # Verify conversation-aware system prompt was used
     call_kwargs = mock_llm.call_args
-    assert "multi-turn" in call_kwargs.kwargs.get("system", call_kwargs[1].get("system", ""))
+    assert "multi-turn" in call_kwargs.kwargs.get(
+        "system", call_kwargs[1].get("system", "")
+    )
     assert "Conversation history" in call_kwargs.args[0]
     assert result.score == 1.0
 
@@ -118,13 +140,21 @@ async def test_cross_turn_issue_detected():
         "claims": ["I said revenue was $10B"],
         "grounded": [],
         "ungrounded": ["I said revenue was $10B"],
-        "cross_turn_issues": ["Agent claims it said $10B in turn 0 but actually said $5.2B"],
+        "cross_turn_issues": [
+            "Agent claims it said $10B in turn 0 but actually said $5.2B"
+        ],
         "score": 0.2,
     }
     history = [
-        ConversationTurn(sequence_number=0, input="What is revenue?", output="Revenue is $5.2B."),
+        ConversationTurn(
+            sequence_number=0, input="What is revenue?", output="Revenue is $5.2B."
+        ),
     ]
-    with patch("engine.hallucination.call_llm", new_callable=AsyncMock, return_value=mock_response):
+    with patch(
+        "engine.hallucination.call_llm",
+        new_callable=AsyncMock,
+        return_value=mock_response,
+    ):
         result = await check(
             output="As I mentioned earlier, revenue was $10B.",
             ground_truth={"revenue": "$5.2B"},
@@ -145,7 +175,11 @@ async def test_single_shot_unchanged_with_none_history():
         "ungrounded": [],
         "score": 1.0,
     }
-    with patch("engine.hallucination.call_llm", new_callable=AsyncMock, return_value=mock_response) as mock_llm:
+    with patch(
+        "engine.hallucination.call_llm",
+        new_callable=AsyncMock,
+        return_value=mock_response,
+    ) as mock_llm:
         result = await check(
             output="Claim A",
             ground_truth={"data": "ref"},
@@ -167,7 +201,11 @@ async def test_empty_history_uses_single_shot():
         "ungrounded": [],
         "score": 1.0,
     }
-    with patch("engine.hallucination.call_llm", new_callable=AsyncMock, return_value=mock_response) as mock_llm:
+    with patch(
+        "engine.hallucination.call_llm",
+        new_callable=AsyncMock,
+        return_value=mock_response,
+    ) as mock_llm:
         result = await check(
             output="output",
             ground_truth={"data": "ref"},

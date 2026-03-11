@@ -28,7 +28,9 @@ async def test_process_event_returns_verified_dict(sample_event):
         action="pass",
         checks={
             "schema": CheckResult(check_type="schema", score=1.0, passed=True),
-            "hallucination": CheckResult(check_type="hallucination", score=0.8, passed=True),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=0.8, passed=True
+            ),
             "drift": CheckResult(check_type="drift", score=0.75, passed=True),
         },
     )
@@ -67,7 +69,11 @@ async def test_process_event_flag_action(sample_event):
 
 @pytest.mark.asyncio
 async def test_process_event_handles_engine_error(sample_event):
-    with patch("app.worker.verify", new_callable=AsyncMock, side_effect=RuntimeError("LLM down")):
+    with patch(
+        "app.worker.verify",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("LLM down"),
+    ):
         result = await process_event(sample_event)
 
     assert result["execution_id"] == "exec-test-456"
@@ -114,7 +120,9 @@ async def test_process_event_forwards_conversation_history():
         },
     )
 
-    with patch("app.worker.verify", new_callable=AsyncMock, return_value=mock_result) as mock_verify:
+    with patch(
+        "app.worker.verify", new_callable=AsyncMock, return_value=mock_result
+    ) as mock_verify:
         result = await process_event(event)
 
     assert result["action"] == "pass"
@@ -269,7 +277,9 @@ async def test_run_processes_normal_event():
 
     with patch("app.main.aioredis") as mock_aioredis:
         mock_aioredis.from_url.return_value = mock_redis
-        with patch("app.main.process_event", new_callable=AsyncMock, return_value=verified_data):
+        with patch(
+            "app.main.process_event", new_callable=AsyncMock, return_value=verified_data
+        ):
             with pytest.raises(asyncio.CancelledError):
                 await run()
 
@@ -335,10 +345,16 @@ async def test_process_event_extracts_facts_when_memory_enabled():
         patch.dict(os.environ, {"MEMORY_ENABLED": "true"}),
         patch("app.worker.verify", new_callable=AsyncMock, return_value=mock_result),
         patch(
-            "app.worker.extract_facts", new_callable=AsyncMock, return_value=["User is in NYC", "Order is #45821"]
+            "app.worker.extract_facts",
+            new_callable=AsyncMock,
+            return_value=["User is in NYC", "Order is #45821"],
         ) as mock_extract,
-        patch("app.worker.write_memory", new_callable=AsyncMock, return_value=None) as mock_write,
-        patch("app.worker.find_similar_memory", new_callable=AsyncMock, return_value=None),
+        patch(
+            "app.worker.write_memory", new_callable=AsyncMock, return_value=None
+        ) as mock_write,
+        patch(
+            "app.worker.find_similar_memory", new_callable=AsyncMock, return_value=None
+        ),
         patch("app.worker._get_db_session") as mock_db,
     ):
         mock_db.return_value.__enter__ = lambda s: s
@@ -430,7 +446,11 @@ async def test_process_event_fact_extraction_failure_does_not_break_verification
     with (
         patch.dict(os.environ, {"MEMORY_ENABLED": "true"}),
         patch("app.worker.verify", new_callable=AsyncMock, return_value=mock_result),
-        patch("app.worker.extract_facts", new_callable=AsyncMock, side_effect=Exception("LLM error")),
+        patch(
+            "app.worker.extract_facts",
+            new_callable=AsyncMock,
+            side_effect=Exception("LLM error"),
+        ),
     ):
         result = await process_event(event)
 

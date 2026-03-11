@@ -138,7 +138,11 @@ async def _eval_llm(output_str: str, condition: dict[str, Any]) -> dict[str, Any
 
     result = await call_llm(prompt, system=LLM_SYSTEM_PROMPT)
     if result is None:
-        return {"violated": False, "reason": "LLM evaluation failed", "llm_timeout": True}
+        return {
+            "violated": False,
+            "reason": "LLM evaluation failed",
+            "llm_timeout": True,
+        }
 
     return {
         "violated": result.get("violated", False),
@@ -163,7 +167,10 @@ def _eval_tool_policy(
         return {"violated": False, "reason": "no steps or tool_name"}
 
     tool_calls = [
-        s for s in steps if getattr(s, "step_type", None) == "tool_call" and getattr(s, "name", None) == tool_name
+        s
+        for s in steps
+        if getattr(s, "step_type", None) == "tool_call"
+        and getattr(s, "name", None) == tool_name
     ]
 
     if policy == "deny":
@@ -243,7 +250,10 @@ async def check(
         elif rule.rule_type == "tool_policy":
             result = _eval_tool_policy(rule.condition, steps)
         else:
-            result = {"violated": False, "reason": f"unknown rule_type '{rule.rule_type}'"}
+            result = {
+                "violated": False,
+                "reason": f"unknown rule_type '{rule.rule_type}'",
+            }
 
         entry = {
             "rule_name": rule.name,

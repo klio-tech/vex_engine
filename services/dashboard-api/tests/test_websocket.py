@@ -154,7 +154,11 @@ class TestStreamUpdates:
                         [
                             (
                                 "1234-0",
-                                {"data": json.dumps({"execution_id": "e1", "action": "pass"})},
+                                {
+                                    "data": json.dumps(
+                                        {"execution_id": "e1", "action": "pass"}
+                                    )
+                                },
                             )
                         ],
                     )

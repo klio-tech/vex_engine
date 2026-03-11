@@ -14,7 +14,9 @@ from shared.auth import KeyInfo
 
 def _fake_key_info() -> KeyInfo:
     """Return a stub KeyInfo for test auth bypass."""
-    return KeyInfo(org_id="test-org", key_id="test-key", scopes=["verify", "ingest"], plan="pro")
+    return KeyInfo(
+        org_id="test-org", key_id="test-key", scopes=["verify", "ingest"], plan="pro"
+    )
 
 
 @pytest.fixture
@@ -56,12 +58,16 @@ async def test_verify_returns_result(client, mock_redis):
         action="pass",
         checks={
             "schema": CheckResult(check_type="schema", score=1.0, passed=True),
-            "hallucination": CheckResult(check_type="hallucination", score=0.9, passed=True),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=0.9, passed=True
+            ),
             "drift": CheckResult(check_type="drift", score=0.85, passed=True),
         },
     )
 
-    with patch("app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result):
+    with patch(
+        "app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result
+    ):
         response = await client.post(
             "/v1/verify",
             json={
@@ -116,7 +122,9 @@ async def test_verify_emits_redis_events(client, mock_redis):
         },
     )
 
-    with patch("app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result):
+    with patch(
+        "app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result
+    ):
         response = await client.post(
             "/v1/verify",
             json={
@@ -165,13 +173,17 @@ async def test_verify_forwards_conversation_history(client, mock_redis):
         action="pass",
         checks={
             "schema": CheckResult(check_type="schema", score=1.0, passed=True),
-            "hallucination": CheckResult(check_type="hallucination", score=0.9, passed=True),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=0.9, passed=True
+            ),
             "drift": CheckResult(check_type="drift", score=0.85, passed=True),
             "coherence": CheckResult(check_type="coherence", score=1.0, passed=True),
         },
     )
 
-    with patch("app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result) as mock_verify:
+    with patch(
+        "app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result
+    ) as mock_verify:
         response = await client.post(
             "/v1/verify",
             json={
@@ -209,7 +221,9 @@ async def test_verify_with_threshold_config(client, mock_redis):
         checks={},
     )
 
-    with patch("app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result) as mock_verify:
+    with patch(
+        "app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result
+    ) as mock_verify:
         response = await client.post(
             "/v1/verify",
             json={
@@ -248,7 +262,9 @@ async def test_verify_no_correction_unchanged(client, mock_redis):
         },
     )
 
-    with patch("app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result):
+    with patch(
+        "app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result
+    ):
         response = await client.post(
             "/v1/verify",
             json={
@@ -275,8 +291,15 @@ async def test_verify_correction_layer1_succeeds(client, mock_redis):
         confidence=0.6,
         action="flag",
         checks={
-            "schema": CheckResult(check_type="schema", score=0.0, passed=False, details={"errors": ["missing field"]}),
-            "hallucination": CheckResult(check_type="hallucination", score=1.0, passed=True),
+            "schema": CheckResult(
+                check_type="schema",
+                score=0.0,
+                passed=False,
+                details={"errors": ["missing field"]},
+            ),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=1.0, passed=True
+            ),
             "drift": CheckResult(check_type="drift", score=0.9, passed=True),
         },
     )
@@ -285,7 +308,9 @@ async def test_verify_correction_layer1_succeeds(client, mock_redis):
         action="pass",
         checks={
             "schema": CheckResult(check_type="schema", score=1.0, passed=True),
-            "hallucination": CheckResult(check_type="hallucination", score=1.0, passed=True),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=1.0, passed=True
+            ),
             "drift": CheckResult(check_type="drift", score=0.9, passed=True),
         },
     )
@@ -301,8 +326,16 @@ async def test_verify_correction_layer1_succeeds(client, mock_redis):
     )
 
     with (
-        patch("app.routes.run_verification", new_callable=AsyncMock, side_effect=[failed_result, pass_result]),
-        patch("app.routes.run_correction", new_callable=AsyncMock, return_value=mock_correction),
+        patch(
+            "app.routes.run_verification",
+            new_callable=AsyncMock,
+            side_effect=[failed_result, pass_result],
+        ),
+        patch(
+            "app.routes.run_correction",
+            new_callable=AsyncMock,
+            return_value=mock_correction,
+        ),
     ):
         response = await client.post(
             "/v1/verify",
@@ -332,7 +365,9 @@ async def test_verify_correction_escalates_l1_to_l2(client, mock_redis):
         action="flag",
         checks={
             "schema": CheckResult(check_type="schema", score=0.0, passed=False),
-            "hallucination": CheckResult(check_type="hallucination", score=1.0, passed=True),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=1.0, passed=True
+            ),
         },
     )
     still_failed = VerificationResult(
@@ -375,11 +410,20 @@ async def test_verify_correction_escalates_l1_to_l2(client, mock_redis):
             new_callable=AsyncMock,
             side_effect=[failed_result, still_failed, pass_result],
         ),
-        patch("app.routes.run_correction", new_callable=AsyncMock, side_effect=[l1_attempt, l2_attempt]),
+        patch(
+            "app.routes.run_correction",
+            new_callable=AsyncMock,
+            side_effect=[l1_attempt, l2_attempt],
+        ),
     ):
         response = await client.post(
             "/v1/verify",
-            json={"agent_id": "test-bot", "input": "hello", "output": "broken", "metadata": {"correction": "cascade"}},
+            json={
+                "agent_id": "test-bot",
+                "input": "hello",
+                "output": "broken",
+                "metadata": {"correction": "cascade"},
+            },
             headers={"X-Vex-Key": "test-key"},
         )
 
@@ -398,14 +442,18 @@ async def test_verify_correction_all_fail_blocks(client, mock_redis):
         confidence=0.4,
         action="block",
         checks={
-            "hallucination": CheckResult(check_type="hallucination", score=0.1, passed=False),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=0.1, passed=False
+            ),
         },
     )
     still_failed = VerificationResult(
         confidence=0.35,
         action="block",
         checks={
-            "hallucination": CheckResult(check_type="hallucination", score=0.2, passed=False),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=0.2, passed=False
+            ),
         },
     )
 
@@ -420,8 +468,14 @@ async def test_verify_correction_all_fail_blocks(client, mock_redis):
     )
 
     with (
-        patch("app.routes.run_verification", new_callable=AsyncMock, side_effect=[failed, still_failed, still_failed]),
-        patch("app.routes.run_correction", new_callable=AsyncMock, return_value=attempt),
+        patch(
+            "app.routes.run_verification",
+            new_callable=AsyncMock,
+            side_effect=[failed, still_failed, still_failed],
+        ),
+        patch(
+            "app.routes.run_correction", new_callable=AsyncMock, return_value=attempt
+        ),
     ):
         response = await client.post(
             "/v1/verify",
@@ -450,7 +504,12 @@ async def test_verify_correction_timeout_flags(client, mock_redis):
     with patch("app.routes.run_verification", side_effect=slow_verify):
         response = await client.post(
             "/v1/verify",
-            json={"agent_id": "test-bot", "input": "hello", "output": "world", "metadata": {"correction": "cascade"}},
+            json={
+                "agent_id": "test-bot",
+                "input": "hello",
+                "output": "world",
+                "metadata": {"correction": "cascade"},
+            },
             headers={"X-Vex-Key": "test-key"},
         )
 
@@ -485,7 +544,11 @@ async def test_verify_correction_uses_original_output(client, mock_redis):
         )
 
     with (
-        patch("app.routes.run_verification", new_callable=AsyncMock, side_effect=[failed, still_failed, pass_result]),
+        patch(
+            "app.routes.run_verification",
+            new_callable=AsyncMock,
+            side_effect=[failed, still_failed, pass_result],
+        ),
         patch("app.routes.run_correction", side_effect=mock_correct),
     ):
         await client.post(
@@ -503,7 +566,9 @@ async def test_verify_correction_uses_original_output(client, mock_redis):
 
 
 @pytest.mark.asyncio
-async def test_verify_correction_emits_redis_with_correction_metadata(client, mock_redis):
+async def test_verify_correction_emits_redis_with_correction_metadata(
+    client, mock_redis
+):
     """Redis events should include correction metadata."""
     from engine.models import CorrectionAttempt
 
@@ -532,12 +597,23 @@ async def test_verify_correction_emits_redis_with_correction_metadata(client, mo
     )
 
     with (
-        patch("app.routes.run_verification", new_callable=AsyncMock, side_effect=[failed, pass_result]),
-        patch("app.routes.run_correction", new_callable=AsyncMock, return_value=attempt),
+        patch(
+            "app.routes.run_verification",
+            new_callable=AsyncMock,
+            side_effect=[failed, pass_result],
+        ),
+        patch(
+            "app.routes.run_correction", new_callable=AsyncMock, return_value=attempt
+        ),
     ):
         response = await client.post(
             "/v1/verify",
-            json={"agent_id": "test-bot", "input": "hello", "output": "broken", "metadata": {"correction": "cascade"}},
+            json={
+                "agent_id": "test-bot",
+                "input": "hello",
+                "output": "broken",
+                "metadata": {"correction": "cascade"},
+            },
             headers={"X-Vex-Key": "test-key"},
         )
 
@@ -565,7 +641,9 @@ async def test_verify_pass_skips_correction(client, mock_redis):
         },
     )
 
-    with patch("app.routes.run_verification", new_callable=AsyncMock, return_value=pass_result) as mock_verify:
+    with patch(
+        "app.routes.run_verification", new_callable=AsyncMock, return_value=pass_result
+    ) as mock_verify:
         response = await client.post(
             "/v1/verify",
             json={
@@ -594,7 +672,9 @@ async def test_verify_correction_improved_but_not_pass(client, mock_redis):
         confidence=0.3,
         action="block",
         checks={
-            "hallucination": CheckResult(check_type="hallucination", score=0.1, passed=False),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=0.1, passed=False
+            ),
         },
     )
     # Re-verification after correction: flag at 0.7 — better, but not pass
@@ -602,7 +682,9 @@ async def test_verify_correction_improved_but_not_pass(client, mock_redis):
         confidence=0.7,
         action="flag",
         checks={
-            "hallucination": CheckResult(check_type="hallucination", score=0.6, passed=True),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=0.6, passed=True
+            ),
         },
     )
 
@@ -617,8 +699,14 @@ async def test_verify_correction_improved_but_not_pass(client, mock_redis):
     )
 
     with (
-        patch("app.routes.run_verification", new_callable=AsyncMock, side_effect=[initial, improved, improved]),
-        patch("app.routes.run_correction", new_callable=AsyncMock, return_value=attempt),
+        patch(
+            "app.routes.run_verification",
+            new_callable=AsyncMock,
+            side_effect=[initial, improved, improved],
+        ),
+        patch(
+            "app.routes.run_correction", new_callable=AsyncMock, return_value=attempt
+        ),
     ):
         response = await client.post(
             "/v1/verify",
@@ -695,7 +783,11 @@ async def test_ingest_rejects_invalid_payload(client):
 
 @pytest.mark.asyncio
 async def test_batch_rejects_over_50_events(client):
-    events = {"events": [{"agent_id": f"bot-{i}", "input": {}, "output": {}} for i in range(51)]}
+    events = {
+        "events": [
+            {"agent_id": f"bot-{i}", "input": {}, "output": {}} for i in range(51)
+        ]
+    }
     response = await client.post(
         "/v1/ingest/batch",
         json=events,
@@ -743,7 +835,9 @@ async def test_verify_redis_emit_failure_still_returns_response(client, mock_red
     )
     mock_redis.xadd = AsyncMock(side_effect=ConnectionError("Redis down"))
 
-    with patch("app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result):
+    with patch(
+        "app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result
+    ):
         response = await client.post(
             "/v1/verify",
             json={
@@ -800,10 +894,16 @@ async def test_verify_retrieves_memories_when_enabled(client, mock_redis):
 
     with (
         patch.dict(os.environ, {"MEMORY_ENABLED": "true"}),
-        patch("app.routes.retrieve_memories", new_callable=AsyncMock, return_value=[]) as mock_retrieve,
+        patch(
+            "app.routes.retrieve_memories", new_callable=AsyncMock, return_value=[]
+        ) as mock_retrieve,
         patch("app.routes.generate_summary", new_callable=AsyncMock, return_value=None),
         patch("app.routes.write_memory", new_callable=AsyncMock, return_value=None),
-        patch("app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result) as mock_verify,
+        patch(
+            "app.routes.run_verification",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        ) as mock_verify,
         patch("app.routes._get_db_session"),
     ):
         response = await client.post(
@@ -833,7 +933,11 @@ async def test_verify_skips_memories_when_disabled(client, mock_redis):
     with (
         patch.dict(os.environ, {"MEMORY_ENABLED": "false"}),
         patch("app.routes.retrieve_memories", new_callable=AsyncMock) as mock_retrieve,
-        patch("app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result),
+        patch(
+            "app.routes.run_verification",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        ),
     ):
         response = await client.post(
             "/v1/verify",
@@ -870,14 +974,18 @@ async def test_correction_passes_memory_context(client, mock_redis):
         confidence=0.3,
         action="block",
         checks={
-            "hallucination": CheckResult(check_type="hallucination", score=0.1, passed=False),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=0.1, passed=False
+            ),
         },
     )
     passed = VerificationResult(
         confidence=0.95,
         action="pass",
         checks={
-            "hallucination": CheckResult(check_type="hallucination", score=1.0, passed=True),
+            "hallucination": CheckResult(
+                check_type="hallucination", score=1.0, passed=True
+            ),
         },
     )
 
@@ -893,12 +1001,24 @@ async def test_correction_passes_memory_context(client, mock_redis):
 
     with (
         patch.dict(os.environ, {"MEMORY_ENABLED": "true"}),
-        patch("app.routes.retrieve_memories", new_callable=AsyncMock, return_value=memories),
+        patch(
+            "app.routes.retrieve_memories",
+            new_callable=AsyncMock,
+            return_value=memories,
+        ),
         patch("app.routes.generate_summary", new_callable=AsyncMock, return_value=None),
         patch("app.routes.write_memory", new_callable=AsyncMock, return_value=None),
         patch("app.routes._get_db_session"),
-        patch("app.routes.run_verification", new_callable=AsyncMock, side_effect=[failed, passed]),
-        patch("app.routes.run_correction", new_callable=AsyncMock, return_value=mock_attempt) as mock_correct,
+        patch(
+            "app.routes.run_verification",
+            new_callable=AsyncMock,
+            side_effect=[failed, passed],
+        ),
+        patch(
+            "app.routes.run_correction",
+            new_callable=AsyncMock,
+            return_value=mock_attempt,
+        ) as mock_correct,
     ):
         response = await client.post(
             "/v1/verify",
@@ -934,7 +1054,11 @@ async def test_verify_skips_memories_when_no_session_id(client, mock_redis):
     with (
         patch.dict(os.environ, {"MEMORY_ENABLED": "true"}),
         patch("app.routes.retrieve_memories", new_callable=AsyncMock) as mock_retrieve,
-        patch("app.routes.run_verification", new_callable=AsyncMock, return_value=mock_result),
+        patch(
+            "app.routes.run_verification",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        ),
     ):
         response = await client.post(
             "/v1/verify",

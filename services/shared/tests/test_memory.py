@@ -78,7 +78,9 @@ async def test_embed_text_calls_litellm():
     mock_response = MagicMock()
     mock_response.data = [MagicMock(embedding=SAMPLE_EMBEDDING)]
 
-    with patch("shared.memory.aembedding", new_callable=AsyncMock, return_value=mock_response):
+    with patch(
+        "shared.memory.aembedding", new_callable=AsyncMock, return_value=mock_response
+    ):
         result = await embed_text("hello world")
 
     assert result == SAMPLE_EMBEDDING
@@ -87,7 +89,11 @@ async def test_embed_text_calls_litellm():
 @pytest.mark.asyncio
 async def test_embed_text_returns_none_on_error():
     """embed_text should return None when litellm raises an exception."""
-    with patch("shared.memory.aembedding", new_callable=AsyncMock, side_effect=Exception("API down")):
+    with patch(
+        "shared.memory.aembedding",
+        new_callable=AsyncMock,
+        side_effect=Exception("API down"),
+    ):
         result = await embed_text("hello world")
 
     assert result is None
@@ -102,9 +108,13 @@ async def test_embed_text_returns_none_on_error():
 async def test_call_llm_returns_parsed_json():
     """call_llm should parse JSON from the LLM response."""
     mock_response = MagicMock()
-    mock_response.choices = [MagicMock(message=MagicMock(content='{"summary": "test"}'))]
+    mock_response.choices = [
+        MagicMock(message=MagicMock(content='{"summary": "test"}'))
+    ]
 
-    with patch("shared.memory.acompletion", new_callable=AsyncMock, return_value=mock_response):
+    with patch(
+        "shared.memory.acompletion", new_callable=AsyncMock, return_value=mock_response
+    ):
         result = await call_llm("summarize this")
 
     assert result == {"summary": "test"}
@@ -113,7 +123,11 @@ async def test_call_llm_returns_parsed_json():
 @pytest.mark.asyncio
 async def test_call_llm_returns_none_on_error():
     """call_llm should return None when the LLM call fails."""
-    with patch("shared.memory.acompletion", new_callable=AsyncMock, side_effect=Exception("timeout")):
+    with patch(
+        "shared.memory.acompletion",
+        new_callable=AsyncMock,
+        side_effect=Exception("timeout"),
+    ):
         result = await call_llm("summarize this")
 
     assert result is None
@@ -128,7 +142,9 @@ async def test_call_llm_returns_none_on_error():
 async def test_generate_summary_returns_string():
     """generate_summary should return the summary string from call_llm."""
     with patch(
-        "shared.memory.call_llm", new_callable=AsyncMock, return_value={"summary": "Agent searched for X and found Y."}
+        "shared.memory.call_llm",
+        new_callable=AsyncMock,
+        return_value={"summary": "Agent searched for X and found Y."},
     ):
         result = await generate_summary(output="Found Y", task="search for X")
 
@@ -157,7 +173,9 @@ async def test_extract_facts_returns_list():
         new_callable=AsyncMock,
         return_value={"facts": ["User prefers dark mode", "Account is premium"]},
     ):
-        result = await extract_facts(output="User said they like dark mode and have premium")
+        result = await extract_facts(
+            output="User said they like dark mode and have premium"
+        )
 
     assert result == ["User prefers dark mode", "Account is premium"]
 
@@ -231,7 +249,11 @@ async def test_write_memory_inserts_row():
     db_session.execute = MagicMock()
     db_session.commit = MagicMock()
 
-    with patch("shared.memory.embed_text", new_callable=AsyncMock, return_value=SAMPLE_EMBEDDING):
+    with patch(
+        "shared.memory.embed_text",
+        new_callable=AsyncMock,
+        return_value=SAMPLE_EMBEDDING,
+    ):
         result = await write_memory(
             db_session=db_session,
             session_id="sess-1",
@@ -280,8 +302,12 @@ async def test_write_memory_returns_none_when_embedding_fails():
 @pytest.mark.asyncio
 async def test_retrieve_memories_semantic_search():
     """retrieve_memories should return combined semantic + summary results."""
-    row1 = _make_db_row(memory_id=uuid.uuid4(), content="semantic match", memory_type="fact")
-    row2 = _make_db_row(memory_id=uuid.uuid4(), content="recent summary", memory_type="summary")
+    row1 = _make_db_row(
+        memory_id=uuid.uuid4(), content="semantic match", memory_type="fact"
+    )
+    row2 = _make_db_row(
+        memory_id=uuid.uuid4(), content="recent summary", memory_type="summary"
+    )
 
     db_session = MagicMock()
     # First execute returns semantic results, second returns summaries
@@ -292,7 +318,11 @@ async def test_retrieve_memories_semantic_search():
         ]
     )
 
-    with patch("shared.memory.embed_text", new_callable=AsyncMock, return_value=SAMPLE_EMBEDDING):
+    with patch(
+        "shared.memory.embed_text",
+        new_callable=AsyncMock,
+        return_value=SAMPLE_EMBEDDING,
+    ):
         results = await retrieve_memories(
             db_session=db_session,
             session_id="sess-1",
@@ -338,7 +368,11 @@ async def test_find_similar_memory_above_threshold():
     mock_result.fetchone = MagicMock(return_value=(*row, 0.95))
     db_session.execute = MagicMock(return_value=mock_result)
 
-    with patch("shared.memory.embed_text", new_callable=AsyncMock, return_value=SAMPLE_EMBEDDING):
+    with patch(
+        "shared.memory.embed_text",
+        new_callable=AsyncMock,
+        return_value=SAMPLE_EMBEDDING,
+    ):
         result = await find_similar_memory(
             db_session=db_session,
             session_id="sess-1",
@@ -359,7 +393,11 @@ async def test_find_similar_memory_below_threshold():
     mock_result.fetchone = MagicMock(return_value=(*row, 0.5))
     db_session.execute = MagicMock(return_value=mock_result)
 
-    with patch("shared.memory.embed_text", new_callable=AsyncMock, return_value=SAMPLE_EMBEDDING):
+    with patch(
+        "shared.memory.embed_text",
+        new_callable=AsyncMock,
+        return_value=SAMPLE_EMBEDDING,
+    ):
         result = await find_similar_memory(
             db_session=db_session,
             session_id="sess-1",

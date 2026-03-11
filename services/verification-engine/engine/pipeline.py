@@ -13,10 +13,22 @@ import asyncio
 import logging
 from typing import Any, Optional
 
-from engine import coherence, drift, hallucination, memory_consistency, schema_validator, tool_loop
+from engine import (
+    coherence,
+    drift,
+    hallucination,
+    memory_consistency,
+    schema_validator,
+    tool_loop,
+)
 from engine import confidence as confidence_scorer
 from engine import guardrails as guardrails_checker
-from engine.models import CheckResult, ConversationTurn, VerificationConfig, VerificationResult
+from engine.models import (
+    CheckResult,
+    ConversationTurn,
+    VerificationConfig,
+    VerificationResult,
+)
 
 logger = logging.getLogger("agentguard.verification-engine.pipeline")
 
@@ -140,7 +152,9 @@ async def verify(
         llm_tasks.append(memory_consistency.check(output, session_memories, task))
 
     if has_guardrails:
-        llm_tasks.append(guardrails_checker.check(output, cfg.guardrails, metadata, steps=steps))
+        llm_tasks.append(
+            guardrails_checker.check(output, cfg.guardrails, metadata, steps=steps)
+        )
 
     llm_results = await asyncio.gather(*llm_tasks)
 
@@ -157,7 +171,9 @@ async def verify(
     if has_history:
         coherence_result = llm_results[2]
         checks["coherence"] = coherence_result
-        weights = _rebalance_weights(cfg.weights, COHERENCE_WEIGHT, check_name="coherence")
+        weights = _rebalance_weights(
+            cfg.weights, COHERENCE_WEIGHT, check_name="coherence"
+        )
     else:
         weights = cfg.weights
 
@@ -165,7 +181,9 @@ async def verify(
         mem_idx = 2 + (1 if has_history else 0)
         mem_result = llm_results[mem_idx]
         checks["memory_consistency"] = mem_result
-        weights = _rebalance_weights(weights, MEMORY_CONSISTENCY_WEIGHT, check_name="memory_consistency")
+        weights = _rebalance_weights(
+            weights, MEMORY_CONSISTENCY_WEIGHT, check_name="memory_consistency"
+        )
 
     if tool_loop_result is not None:
         checks["tool_loop"] = tool_loop_result

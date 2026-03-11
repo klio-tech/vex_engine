@@ -107,7 +107,9 @@ def upgrade() -> None:
     )
 
     # Convert to TimescaleDB hypertable
-    op.execute("SELECT create_hypertable('executions', 'timestamp', migrate_data => true)")
+    op.execute(
+        "SELECT create_hypertable('executions', 'timestamp', migrate_data => true)"
+    )
 
     op.create_index(
         "ix_executions_agent_id_timestamp",
@@ -147,7 +149,9 @@ def upgrade() -> None:
     )
 
     # Convert to TimescaleDB hypertable
-    op.execute("SELECT create_hypertable('check_results', 'timestamp', migrate_data => true)")
+    op.execute(
+        "SELECT create_hypertable('check_results', 'timestamp', migrate_data => true)"
+    )
 
     op.create_index(
         "ix_check_results_execution_id",

@@ -57,7 +57,9 @@ async def test_contradiction_detected():
         new_callable=AsyncMock,
         return_value=mock_response,
     ):
-        result = await check(output="Hello Bob, how can I help?", session_memories=memories)
+        result = await check(
+            output="Hello Bob, how can I help?", session_memories=memories
+        )
 
     assert result.check_type == "memory_consistency"
     assert result.score == 0.2
@@ -142,7 +144,9 @@ async def test_forgotten_context_lowers_score():
         new_callable=AsyncMock,
         return_value=mock_response,
     ):
-        result = await check(output="Here is the answer in English.", session_memories=memories)
+        result = await check(
+            output="Here is the answer in English.", session_memories=memories
+        )
 
     assert result.score == 0.6
     assert result.passed is True  # >= 0.5

@@ -45,7 +45,9 @@ async def test_contradiction_detected():
             output="Revenue is $5.2B.",
         ),
     ]
-    with patch("engine.coherence.call_llm", new_callable=AsyncMock, return_value=mock_response):
+    with patch(
+        "engine.coherence.call_llm", new_callable=AsyncMock, return_value=mock_response
+    ):
         result = await check(output="Revenue is $15B.", conversation_history=history)
 
     assert result.check_type == "coherence"
@@ -68,7 +70,9 @@ async def test_consistent_output_passes():
             output="Revenue is $5.2B.",
         ),
     ]
-    with patch("engine.coherence.call_llm", new_callable=AsyncMock, return_value=mock_response):
+    with patch(
+        "engine.coherence.call_llm", new_callable=AsyncMock, return_value=mock_response
+    ):
         result = await check(
             output="As I mentioned, revenue is $5.2B.",
             conversation_history=history,
@@ -102,7 +106,9 @@ async def test_score_clamped_to_valid_range():
     history = [
         ConversationTurn(sequence_number=0, input="q", output="a"),
     ]
-    with patch("engine.coherence.call_llm", new_callable=AsyncMock, return_value=mock_response):
+    with patch(
+        "engine.coherence.call_llm", new_callable=AsyncMock, return_value=mock_response
+    ):
         result = await check(output="output", conversation_history=history)
 
     assert result.score == 1.0

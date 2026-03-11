@@ -7,7 +7,9 @@ from engine.models import CheckResult
 def test_weighted_composite():
     checks = {
         "schema": CheckResult(check_type="schema", score=1.0, passed=True),
-        "hallucination": CheckResult(check_type="hallucination", score=0.8, passed=True),
+        "hallucination": CheckResult(
+            check_type="hallucination", score=0.8, passed=True
+        ),
         "drift": CheckResult(check_type="drift", score=0.6, passed=True),
     }
     weights = {"schema": 0.3, "hallucination": 0.4, "drift": 0.3}
@@ -20,7 +22,9 @@ def test_weighted_composite():
 def test_skip_none_scores():
     checks = {
         "schema": CheckResult(check_type="schema", score=1.0, passed=True),
-        "hallucination": CheckResult(check_type="hallucination", score=None, passed=True),
+        "hallucination": CheckResult(
+            check_type="hallucination", score=None, passed=True
+        ),
         "drift": CheckResult(check_type="drift", score=0.6, passed=True),
     }
     weights = {"schema": 0.3, "hallucination": 0.4, "drift": 0.3}
@@ -33,7 +37,9 @@ def test_skip_none_scores():
 def test_all_none_returns_none():
     checks = {
         "schema": CheckResult(check_type="schema", score=None, passed=True),
-        "hallucination": CheckResult(check_type="hallucination", score=None, passed=True),
+        "hallucination": CheckResult(
+            check_type="hallucination", score=None, passed=True
+        ),
         "drift": CheckResult(check_type="drift", score=None, passed=True),
     }
     weights = {"schema": 0.3, "hallucination": 0.4, "drift": 0.3}
@@ -44,7 +50,9 @@ def test_all_none_returns_none():
 def test_single_check_with_score():
     checks = {
         "schema": CheckResult(check_type="schema", score=0.5, passed=False),
-        "hallucination": CheckResult(check_type="hallucination", score=None, passed=True),
+        "hallucination": CheckResult(
+            check_type="hallucination", score=None, passed=True
+        ),
         "drift": CheckResult(check_type="drift", score=None, passed=True),
     }
     weights = {"schema": 0.3, "hallucination": 0.4, "drift": 0.3}
@@ -57,7 +65,9 @@ def test_single_check_with_score():
 def test_zero_weight_check_ignored():
     checks = {
         "schema": CheckResult(check_type="schema", score=1.0, passed=True),
-        "hallucination": CheckResult(check_type="hallucination", score=0.0, passed=False),
+        "hallucination": CheckResult(
+            check_type="hallucination", score=0.0, passed=False
+        ),
     }
     weights = {"schema": 1.0, "hallucination": 0.0}
     result = compute(checks, weights)

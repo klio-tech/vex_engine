@@ -14,4 +14,6 @@ def is_memory_enabled() -> bool:
 
 def get_embedding_model() -> str:
     """Get the embedding model name from MEMORY_EMBEDDING_MODEL env var."""
-    return os.environ.get("MEMORY_EMBEDDING_MODEL", "intfloat/multilingual-e5-large-instruct")
+    return os.environ.get(
+        "MEMORY_EMBEDDING_MODEL", "intfloat/multilingual-e5-large-instruct"
+    )

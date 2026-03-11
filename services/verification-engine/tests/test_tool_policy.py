@@ -53,7 +53,11 @@ async def test_tool_policy_allow_with_limit_blocks_excess():
         GuardrailRule(
             name="Limit web_search",
             rule_type="tool_policy",
-            condition={"tool_name": "web_search", "policy": "allow", "max_calls_per_execution": 3},
+            condition={
+                "tool_name": "web_search",
+                "policy": "allow",
+                "max_calls_per_execution": 3,
+            },
             action="flag",
         ),
     ]
@@ -75,7 +79,11 @@ async def test_tool_policy_allow_within_limit_passes():
         GuardrailRule(
             name="Limit web_search",
             rule_type="tool_policy",
-            condition={"tool_name": "web_search", "policy": "allow", "max_calls_per_execution": 5},
+            condition={
+                "tool_name": "web_search",
+                "policy": "allow",
+                "max_calls_per_execution": 5,
+            },
             action="flag",
         ),
     ]

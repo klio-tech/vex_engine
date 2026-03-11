@@ -79,7 +79,9 @@ async def check(
         )
 
     output_str = output if isinstance(output, str) else json.dumps(output)
-    truth_str = ground_truth if isinstance(ground_truth, str) else json.dumps(ground_truth)
+    truth_str = (
+        ground_truth if isinstance(ground_truth, str) else json.dumps(ground_truth)
+    )
 
     # Choose prompt based on whether conversation history is available
     if conversation_history:

@@ -33,8 +33,18 @@ def flag_event():
         "action": "flag",
         "checks": json.dumps(
             {
-                "schema": {"check_type": "schema", "score": 0.0, "passed": False, "details": {}},
-                "hallucination": {"check_type": "hallucination", "score": 0.9, "passed": True, "details": {}},
+                "schema": {
+                    "check_type": "schema",
+                    "score": 0.0,
+                    "passed": False,
+                    "details": {},
+                },
+                "hallucination": {
+                    "check_type": "hallucination",
+                    "score": 0.9,
+                    "passed": True,
+                    "details": {},
+                },
             }
         ),
     }
@@ -50,8 +60,18 @@ def block_event():
         "action": "block",
         "checks": json.dumps(
             {
-                "schema": {"check_type": "schema", "score": 0.0, "passed": False, "details": {}},
-                "hallucination": {"check_type": "hallucination", "score": 0.3, "passed": False, "details": {}},
+                "schema": {
+                    "check_type": "schema",
+                    "score": 0.0,
+                    "passed": False,
+                    "details": {},
+                },
+                "hallucination": {
+                    "check_type": "hallucination",
+                    "score": 0.3,
+                    "passed": False,
+                    "details": {},
+                },
             }
         ),
     }
@@ -126,7 +146,9 @@ async def test_block_event_creates_critical_alert(block_event, mock_db_session):
 async def test_webhook_delivery_on_flag(flag_event, mock_db_session):
     with (
         _mock_plan_lookup("pro"),
-        patch("app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"),
+        patch(
+            "app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"
+        ),
         patch("app.worker.deliver", new_callable=AsyncMock, return_value=(True, 200)),
         patch("app.worker.get_slack_webhook_url", return_value=None),
     ):
@@ -145,7 +167,9 @@ async def test_webhook_delivery_on_flag(flag_event, mock_db_session):
 async def test_webhook_delivery_failure(flag_event, mock_db_session):
     with (
         _mock_plan_lookup("pro"),
-        patch("app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"),
+        patch(
+            "app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"
+        ),
         patch("app.worker.deliver", new_callable=AsyncMock, return_value=(False, 500)),
         patch("app.worker.get_slack_webhook_url", return_value=None),
     ):
@@ -190,7 +214,9 @@ async def test_pro_plan_webhook_only_no_slack(flag_event, mock_db_session):
     """Pro plan: webhooks enabled, Slack disabled."""
     with (
         _mock_plan_lookup("pro"),
-        patch("app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"),
+        patch(
+            "app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"
+        ),
         patch("app.worker.deliver", new_callable=AsyncMock, return_value=(True, 200)),
         patch("app.worker.get_slack_webhook_url") as mock_slack,
     ):
@@ -206,10 +232,17 @@ async def test_team_plan_both_channels(flag_event, mock_db_session):
     """Team plan: both webhook and Slack enabled."""
     with (
         _mock_plan_lookup("team"),
-        patch("app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"),
+        patch(
+            "app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"
+        ),
         patch("app.worker.deliver", new_callable=AsyncMock, return_value=(True, 200)),
-        patch("app.worker.get_slack_webhook_url", return_value="https://hooks.slack.com/test"),
-        patch("app.worker.deliver_slack", new_callable=AsyncMock, return_value=(True, 200)),
+        patch(
+            "app.worker.get_slack_webhook_url",
+            return_value="https://hooks.slack.com/test",
+        ),
+        patch(
+            "app.worker.deliver_slack", new_callable=AsyncMock, return_value=(True, 200)
+        ),
         patch("app.worker.format_slack_message", return_value={"blocks": []}),
     ):
         result = await process_verified_event(flag_event, mock_db_session)
@@ -224,8 +257,13 @@ async def test_slack_delivery_without_webhook(flag_event, mock_db_session):
     with (
         _mock_plan_lookup("team"),
         patch("app.worker.get_webhook_url", return_value=None),
-        patch("app.worker.get_slack_webhook_url", return_value="https://hooks.slack.com/test"),
-        patch("app.worker.deliver_slack", new_callable=AsyncMock, return_value=(True, 200)),
+        patch(
+            "app.worker.get_slack_webhook_url",
+            return_value="https://hooks.slack.com/test",
+        ),
+        patch(
+            "app.worker.deliver_slack", new_callable=AsyncMock, return_value=(True, 200)
+        ),
         patch("app.worker.format_slack_message", return_value={"blocks": []}),
     ):
         result = await process_verified_event(flag_event, mock_db_session)
@@ -240,8 +278,15 @@ async def test_slack_failure_does_not_block_alert_creation(flag_event, mock_db_s
     with (
         _mock_plan_lookup("team"),
         patch("app.worker.get_webhook_url", return_value=None),
-        patch("app.worker.get_slack_webhook_url", return_value="https://hooks.slack.com/test"),
-        patch("app.worker.deliver_slack", new_callable=AsyncMock, return_value=(False, 500)),
+        patch(
+            "app.worker.get_slack_webhook_url",
+            return_value="https://hooks.slack.com/test",
+        ),
+        patch(
+            "app.worker.deliver_slack",
+            new_callable=AsyncMock,
+            return_value=(False, 500),
+        ),
         patch("app.worker.format_slack_message", return_value={"blocks": []}),
     ):
         result = await process_verified_event(flag_event, mock_db_session)
@@ -260,8 +305,12 @@ async def test_duplicate_alert_suppressed(flag_event, mock_db_session):
     """Second identical alert within window is suppressed (no delivery)."""
     with (
         _mock_plan_lookup("pro"),
-        patch("app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"),
-        patch("app.worker.deliver", new_callable=AsyncMock, return_value=(True, 200)) as mock_deliver,
+        patch(
+            "app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"
+        ),
+        patch(
+            "app.worker.deliver", new_callable=AsyncMock, return_value=(True, 200)
+        ) as mock_deliver,
         patch("app.worker.get_slack_webhook_url", return_value=None),
     ):
         # First alert — delivered
@@ -282,8 +331,12 @@ async def test_different_agent_not_deduplicated(flag_event, mock_db_session):
 
     with (
         _mock_plan_lookup("pro"),
-        patch("app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"),
-        patch("app.worker.deliver", new_callable=AsyncMock, return_value=(True, 200)) as mock_deliver,
+        patch(
+            "app.worker.get_webhook_url", return_value="https://hooks.example.com/alert"
+        ),
+        patch(
+            "app.worker.deliver", new_callable=AsyncMock, return_value=(True, 200)
+        ) as mock_deliver,
         patch("app.worker.get_slack_webhook_url", return_value=None),
     ):
         await process_verified_event(flag_event, mock_db_session)

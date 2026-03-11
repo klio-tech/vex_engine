@@ -53,7 +53,9 @@ async def run() -> None:
             id="0",
             mkstream=True,
         )
-        logger.info("Created consumer group '%s' on stream '%s'", CONSUMER_GROUP, STREAM_KEY)
+        logger.info(
+            "Created consumer group '%s' on stream '%s'", CONSUMER_GROUP, STREAM_KEY
+        )
     except Exception:
         logger.debug(
             "Consumer group '%s' already exists on stream '%s'",
@@ -108,11 +110,18 @@ async def run() -> None:
                             exc_info=True,
                             extra={
                                 "msg_id": msg_id,
-                                "execution_id": event.execution_id if "event" in locals() else None,
+                                "execution_id": event.execution_id
+                                if "event" in locals()
+                                else None,
                             },
                         )
         except Exception as exc:
-            logger.error("Stream read error: %s", exc, exc_info=True, extra={"stream": STREAM_KEY})
+            logger.error(
+                "Stream read error: %s",
+                exc,
+                exc_info=True,
+                extra={"stream": STREAM_KEY},
+            )
             await asyncio.sleep(1)
 
 

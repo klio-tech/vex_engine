@@ -66,7 +66,9 @@ def select_layer(result: VerificationResult) -> int:
 
     # Schema-only failure -> Layer 1 (Repair)
     schema = checks.get("schema")
-    non_schema_failed = any(not c.passed for name, c in checks.items() if name != "schema")
+    non_schema_failed = any(
+        not c.passed for name, c in checks.items() if name != "schema"
+    )
     if schema and not schema.passed and not non_schema_failed:
         return 1
 
@@ -96,7 +98,9 @@ def format_check_failures(checks: dict[str, CheckResult]) -> str:
     parts: list[str] = []
     for name, check in checks.items():
         if not check.passed:
-            details_str = json.dumps(check.details, default=str) if check.details else ""
+            details_str = (
+                json.dumps(check.details, default=str) if check.details else ""
+            )
             parts.append(f"- {name} (score={check.score}): {details_str}")
     return "\n".join(parts) if parts else "No specific errors identified."
 
@@ -241,12 +245,20 @@ async def _layer2_constrained_regen(
     if schema:
         constraints.append(f"You MUST follow this schema: {json.dumps(schema)}")
     if ground_truth:
-        truth_str = ground_truth if isinstance(ground_truth, str) else json.dumps(ground_truth, default=str)
+        truth_str = (
+            ground_truth
+            if isinstance(ground_truth, str)
+            else json.dumps(ground_truth, default=str)
+        )
         constraints.append(f"Ground truth facts (do NOT contradict): {truth_str}")
     if memory_context:
-        constraints.append("You MUST be consistent with the established session facts listed below")
+        constraints.append(
+            "You MUST be consistent with the established session facts listed below"
+        )
 
-    constraints_str = "\n".join(f"- {c}" for c in constraints) if constraints else "None specified."
+    constraints_str = (
+        "\n".join(f"- {c}" for c in constraints) if constraints else "None specified."
+    )
 
     history_section = ""
     if conversation_history:
@@ -259,7 +271,11 @@ async def _layer2_constrained_regen(
 
     input_section = ""
     if input_data is not None:
-        input_str = input_data if isinstance(input_data, str) else json.dumps(input_data, default=str)
+        input_str = (
+            input_data
+            if isinstance(input_data, str)
+            else json.dumps(input_data, default=str)
+        )
         input_section = f"\nINPUT CONTEXT:\n{input_str}\n"
 
     prompt = (
@@ -327,12 +343,20 @@ async def _layer3_full_reprompt(
     if schema:
         constraints.append(f"Schema: {json.dumps(schema)}")
     if ground_truth:
-        truth_str = ground_truth if isinstance(ground_truth, str) else json.dumps(ground_truth, default=str)
+        truth_str = (
+            ground_truth
+            if isinstance(ground_truth, str)
+            else json.dumps(ground_truth, default=str)
+        )
         constraints.append(f"Ground truth: {truth_str}")
     if memory_context:
-        constraints.append("You MUST be consistent with the established session facts listed below")
+        constraints.append(
+            "You MUST be consistent with the established session facts listed below"
+        )
 
-    constraints_str = "\n".join(f"- {c}" for c in constraints) if constraints else "None specified."
+    constraints_str = (
+        "\n".join(f"- {c}" for c in constraints) if constraints else "None specified."
+    )
 
     history_section = ""
     if conversation_history:
@@ -345,7 +369,11 @@ async def _layer3_full_reprompt(
 
     input_section = ""
     if input_data is not None:
-        input_str = input_data if isinstance(input_data, str) else json.dumps(input_data, default=str)
+        input_str = (
+            input_data
+            if isinstance(input_data, str)
+            else json.dumps(input_data, default=str)
+        )
         input_section = f"\nINPUT CONTEXT:\n{input_str}\n"
 
     prompt = (

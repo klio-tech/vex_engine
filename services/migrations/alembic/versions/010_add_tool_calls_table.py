@@ -43,7 +43,9 @@ def upgrade() -> None:
     )
 
     # Convert to TimescaleDB hypertable (no-op on standard Postgres)
-    op.execute("SELECT create_hypertable('tool_calls', 'timestamp', migrate_data => true, if_not_exists => true)")
+    op.execute(
+        "SELECT create_hypertable('tool_calls', 'timestamp', migrate_data => true, if_not_exists => true)"
+    )
 
     # Indexes for analytics queries
     op.create_index(
