@@ -8,6 +8,7 @@ Redis Stream consumer that processes verified events and delivers alert notifica
 - Filters for `flag` and `block` actions; skips `pass` events for alerting
 - Delivers HTTP webhook notifications with exponential backoff retry (up to 3 attempts)
 - Delivers Slack Block Kit notifications via incoming webhooks
+- Evaluates user-configured alert rules against confidence thresholds and delivers via Nango OAuth proxy
 - Runs Z-score anomaly detection on cost and latency (rolling 24h window, 3-sigma threshold)
 - Deduplicates alerts per (agent, alert_type) with a 5-minute suppression window
 - Records all alerts in the `alerts` table with delivery status
@@ -17,7 +18,8 @@ Redis Stream consumer that processes verified events and delivers alert notifica
 
 ### External
 - **Redis** — consumes `executions.verified` stream
-- **PostgreSQL** — reads `organizations` (plan lookup), `executions` (anomaly stats); writes to `alerts`
+- **PostgreSQL** — reads `organizations` (plan lookup), `executions` (anomaly stats), `alert_rules`/`alert_rule_channels`/`integration_connections` (threshold rules); writes to `alerts`
+- **Nango** — OAuth proxy for Slack API calls (threshold-based alerts)
 
 ### Internal
 - **shared** — `plan_limits.get_plan_config`, `redis_config`
@@ -34,6 +36,8 @@ Redis Stream consumer that processes verified events and delivers alert notifica
 | `SLACK_WEBHOOK_URL` | No | Default Slack incoming webhook URL |
 | `SLACK_WEBHOOK_URL_{AGENT_ID}` | No | Per-agent Slack webhook URL override |
 | `DASHBOARD_BASE_URL` | No | Base URL for "View in Dashboard" links in Slack messages |
+| `NANGO_SECRET_KEY` | No | Nango API secret key for OAuth proxy (required for threshold-based Slack alerts) |
+| `NANGO_BASE_URL` | No | Nango API base URL (default: `https://api.nango.dev`) |
 
 ## Running Locally
 

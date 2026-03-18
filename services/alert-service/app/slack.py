@@ -185,6 +185,77 @@ def format_anomaly_slack_message(
     return {"blocks": blocks}
 
 
+def format_threshold_slack_message(
+    agent_id: str,
+    execution_id: str,
+    session_id: Optional[str],
+    action: str,
+    confidence: Optional[float],
+    rule_name: str,
+    threshold: float,
+    corrected: bool,
+    dashboard_base_url: Optional[str] = None,
+    account_slug: Optional[str] = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Build a Slack Block Kit message for a threshold alert.
+
+    Returns:
+        Tuple of (fallback_text, blocks) for use with chat.postMessage.
+    """
+    emoji = ":rotating_light:" if action == "block" else ":warning:"
+    confidence_str = f"{confidence:.2f}" if confidence is not None else "N/A"
+    corrected_str = "Yes" if corrected else "No"
+
+    fallback = f"{emoji} Agent {agent_id}: confidence {confidence_str} below threshold {threshold:.2f}"
+
+    blocks: list[dict[str, Any]] = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": "Low Confidence Alert",
+                "emoji": True,
+            },
+        },
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"{emoji} Agent *{agent_id}* triggered alert rule *{rule_name}*",
+            },
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Confidence:*\n{confidence_str}"},
+                {"type": "mrkdwn", "text": f"*Threshold:*\n{threshold:.2f}"},
+                {"type": "mrkdwn", "text": f"*Action:*\n{action}"},
+                {"type": "mrkdwn", "text": f"*Corrected:*\n{corrected_str}"},
+                {"type": "mrkdwn", "text": f"*Rule:*\n{rule_name}"},
+                {"type": "mrkdwn", "text": f"*Execution:*\n`{execution_id[:12]}…`"},
+            ],
+        },
+    ]
+
+    if dashboard_base_url and account_slug and session_id:
+        blocks.append(
+            {
+                "type": "actions",
+                "elements": [
+                    {
+                        "type": "button",
+                        "text": {"type": "plain_text", "text": "View Session"},
+                        "url": f"{dashboard_base_url}/home/{account_slug}/sessions/{session_id}",
+                    },
+                ],
+            }
+        )
+
+    blocks.append({"type": "divider"})
+
+    return fallback, blocks
+
+
 async def deliver_slack(
     url: str,
     payload: dict[str, Any],

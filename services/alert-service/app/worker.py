@@ -24,10 +24,13 @@ from sqlalchemy import text
 
 from app.anomaly import detect_anomalies
 from app.dedup import AlertDeduplicator
+from app.nango import post_slack_message
+from app.rules import find_matching_rules, resolve_account_slug
 from app.slack import (
     deliver_slack,
     format_anomaly_slack_message,
     format_slack_message,
+    format_threshold_slack_message,
     get_slack_webhook_url,
 )
 from app.webhook import deliver
@@ -100,6 +103,9 @@ async def process_verified_event(
 
     # Run anomaly detection on ALL events (including pass)
     await _process_anomalies(event_data, db_session)
+
+    # Check user-configured threshold rules (all events, not just flag/block)
+    await _process_threshold_rules(event_data, db_session)
 
     # Skip pass events — only alert on flag/block
     if action == "pass":
@@ -339,4 +345,106 @@ async def _process_anomalies(
             execution_id,
             delivered,
             slack_delivered,
+        )
+
+
+async def _process_threshold_rules(
+    event_data: dict[str, Any],
+    db_session: object,
+) -> None:
+    """Check event against user-configured alert rules and deliver via Nango."""
+    agent_id = event_data.get("agent_id", "")
+    execution_id = event_data.get("execution_id", "")
+    session_id = event_data.get("session_id")
+    org_id = event_data.get("org_id", DEFAULT_ORG)
+    action = event_data.get("action", "pass")
+    corrected = event_data.get("corrected", False)
+    confidence_str = event_data.get("confidence", "")
+    confidence = float(confidence_str) if confidence_str else None
+
+    # Look up org plan for feature gating
+    plan = _get_org_plan(org_id, db_session)
+    plan_config = get_plan_config(plan)
+
+    if not plan_config.slack_alerts:
+        return
+
+    rules = find_matching_rules(org_id, confidence, db_session)
+    if not rules:
+        return
+
+    # Resolve account slug once for dashboard links
+    account_slug = resolve_account_slug(org_id, db_session)
+    now = datetime.now(timezone.utc)
+
+    for rule in rules:
+        alert_type = f"threshold_rule:{rule.rule_id}"
+
+        # Dedup: one alert per rule per agent per window
+        should_send, suppressed_count = _deduplicator.should_deliver(
+            agent_id, alert_type
+        )
+        if not should_send:
+            continue
+
+        fallback_text, blocks = format_threshold_slack_message(
+            agent_id=agent_id,
+            execution_id=execution_id,
+            session_id=session_id,
+            action=action,
+            confidence=confidence,
+            rule_name=rule.rule_name,
+            threshold=rule.confidence_threshold,
+            corrected=corrected,
+            dashboard_base_url=DASHBOARD_BASE_URL,
+            account_slug=account_slug,
+        )
+
+        delivered, error = await post_slack_message(
+            nango_connection_id=rule.nango_connection_id,
+            channel_id=rule.slack_channel_id,
+            text=fallback_text,
+            blocks=blocks,
+        )
+
+        # Record alert
+        alert_id = str(uuid.uuid4())
+        db_session.execute(
+            text("""
+                INSERT INTO alerts (
+                    alert_id, execution_id, agent_id, org_id,
+                    alert_type, severity, delivered,
+                    webhook_url, delivery_attempts, last_attempt_at,
+                    response_status, created_at
+                ) VALUES (
+                    :alert_id, :execution_id, :agent_id, :org_id,
+                    :alert_type, :severity, :delivered,
+                    :webhook_url, :delivery_attempts, :last_attempt_at,
+                    :response_status, :created_at
+                )
+            """),
+            {
+                "alert_id": alert_id,
+                "execution_id": execution_id,
+                "agent_id": agent_id,
+                "org_id": org_id,
+                "alert_type": "threshold_rule",
+                "severity": "high",
+                "delivered": delivered,
+                "webhook_url": f"nango:{rule.nango_connection_id}",
+                "delivery_attempts": 1,
+                "last_attempt_at": now,
+                "response_status": 200 if delivered else None,
+                "created_at": now,
+            },
+        )
+        db_session.commit()
+
+        logger.info(
+            "Threshold alert %s for rule '%s' (confidence=%.2f < %.2f) delivered=%s",
+            alert_id,
+            rule.rule_name,
+            confidence if confidence is not None else 0,
+            rule.confidence_threshold,
+            delivered,
         )
