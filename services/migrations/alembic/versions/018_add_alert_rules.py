@@ -22,7 +22,7 @@ def upgrade() -> None:
         """
         CREATE TABLE IF NOT EXISTS integration_connections (
             id              UUID            PRIMARY KEY DEFAULT gen_random_uuid(),
-            org_id          UUID            NOT NULL,
+            org_id          TEXT            NOT NULL,
             provider        TEXT            NOT NULL,
             nango_connection_id TEXT        NOT NULL,
             workspace_name  TEXT,
@@ -49,7 +49,7 @@ def upgrade() -> None:
         """
         CREATE TABLE IF NOT EXISTS alert_rules (
             id                      UUID                PRIMARY KEY DEFAULT gen_random_uuid(),
-            account_id              UUID                NOT NULL,
+            account_id              TEXT                NOT NULL,
             name                    TEXT                NOT NULL,
             confidence_threshold    DOUBLE PRECISION    NOT NULL,
             enabled                 BOOLEAN             NOT NULL DEFAULT true,
