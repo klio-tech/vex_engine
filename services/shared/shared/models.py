@@ -86,6 +86,8 @@ class IngestEvent(BaseModel):
     schema_definition: dict[str, Any] | None = None
     conversation_history: list[ConversationTurn] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    experiment_id: str | None = None
+    variant: str | None = None
 
 
 class IngestBatchRequest(BaseModel):
