@@ -96,12 +96,14 @@ def process_event(
                 execution_id, agent_id, org_id, timestamp,
                 session_id, parent_execution_id, sequence_number,
                 confidence, action, latency_ms, token_count,
-                cost_estimate, trace_payload_ref, status, task, metadata
+                cost_estimate, trace_payload_ref, status, task, metadata,
+                experiment_id, variant
             ) VALUES (
                 :execution_id, :agent_id, :org_id, :timestamp,
                 :session_id, :parent_execution_id, :sequence_number,
                 :confidence, :action, :latency_ms, :token_count,
-                :cost_estimate, :trace_payload_ref, :status, :task, :metadata
+                :cost_estimate, :trace_payload_ref, :status, :task, :metadata,
+                :experiment_id, :variant
             )
         """),
         {
@@ -121,6 +123,8 @@ def process_event(
             "status": "pass",
             "task": event.task,
             "metadata": json.dumps(event.metadata),
+            "experiment_id": str(event.experiment_id) if event.experiment_id else None,
+            "variant": event.variant or None,
         },
     )
     # Write tool calls to relational storage

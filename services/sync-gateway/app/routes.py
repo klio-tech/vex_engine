@@ -393,6 +393,8 @@ async def verify_endpoint(
             if response.checks
             else "{}",
             "corrected": str(response.corrected),
+            "experiment_id": str(event.experiment_id) if event.experiment_id else "",
+            "variant": event.variant or "",
         }
 
         if response.corrected and response.original_output is not None:
