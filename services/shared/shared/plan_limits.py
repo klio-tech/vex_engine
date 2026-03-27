@@ -87,6 +87,18 @@ class PlanConfig:
     # HTTP 429 and a message to upgrade. No overage charges are incurred.
     overage_allowed: bool
 
+    # Experiments
+    # ───────────
+    # A/B testing experiments allow comparing different agent configurations
+    # (prompts, models, parameters) against evaluation datasets to measure
+    # quality and performance. -1 = unlimited.
+    max_experiments: int = 0
+    # Datasets are reusable collections of test cases used to evaluate
+    # experiment variants. Each dataset contains input/expected-output pairs.
+    max_datasets: int = 0
+    # Maximum number of items (test cases) allowed per dataset.
+    max_dataset_items: int = 0
+
 
 PLAN_LIMITS: dict[str, PlanConfig] = {
     "free": PlanConfig(
@@ -100,6 +112,9 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         slack_alerts=True,
         retention_days=1,
         overage_allowed=False,
+        max_experiments=1,
+        max_datasets=1,
+        max_dataset_items=20,
     ),
     "starter": PlanConfig(
         observations_per_month=25_000,
@@ -112,6 +127,9 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         slack_alerts=True,
         retention_days=7,
         overage_allowed=False,
+        max_experiments=5,
+        max_datasets=5,
+        max_dataset_items=100,
     ),
     "pro": PlanConfig(
         observations_per_month=150_000,
@@ -124,6 +142,9 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         slack_alerts=True,
         retention_days=30,
         overage_allowed=True,
+        max_experiments=-1,
+        max_datasets=25,
+        max_dataset_items=500,
     ),
     "team": PlanConfig(
         observations_per_month=1_500_000,
@@ -136,6 +157,9 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         slack_alerts=True,
         retention_days=90,
         overage_allowed=True,
+        max_experiments=-1,
+        max_datasets=-1,
+        max_dataset_items=-1,
     ),
     "enterprise": PlanConfig(
         observations_per_month=10_000_000,
@@ -148,6 +172,9 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         slack_alerts=True,
         retention_days=365,
         overage_allowed=True,
+        max_experiments=-1,
+        max_datasets=-1,
+        max_dataset_items=-1,
     ),
 }
 
