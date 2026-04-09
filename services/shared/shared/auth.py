@@ -122,6 +122,11 @@ class KeyValidator:
         self._known_agents: dict[str, set] = {}
         self._known_agents_lock = Lock()
 
+        # Quota usage cache: org_id -> (usage_count, cached_at)
+        self._quota_cache: dict[str, tuple[int, float]] = {}
+        self._quota_cache_lock = Lock()
+        self._quota_cache_ttl_s = 30.0
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -401,7 +406,16 @@ class KeyValidator:
             )
 
     def _check_quota(self, entry: _CachedKey) -> None:
-        """Enforce monthly quota based on organization plan."""
+        """Enforce monthly quota based on organization plan.
+
+        Uses direct queries against the ``executions`` hypertable,
+        filtered by scope:
+        - ``verify`` scope → counts rows where ``confidence IS NOT NULL``
+        - ``ingest`` scope → counts all rows (observations + verifications)
+
+        Fail-closed: if the query errors, the request is denied with 503.
+        Results are cached per-org for 30 s to reduce DB pressure.
+        """
         plan_config = get_plan_config(entry.plan, entry.plan_overrides)
 
         if self._required_scope == "verify":
@@ -409,24 +423,72 @@ class KeyValidator:
         else:
             monthly_limit = plan_config.observations_per_month
 
-        try:
-            with self._engine.connect() as conn:
-                result = conn.execute(
-                    text(
-                        """
-                        SELECT COALESCE(SUM(execution_count), 0)
-                        FROM hourly_agent_stats
-                        WHERE org_id = :org_id
-                          AND bucket >= date_trunc('month', NOW())
-                        """
-                    ),
-                    {"org_id": entry.org_id},
-                )
-                current_usage = result.scalar() or 0
-        except Exception:
-            logger.warning("Failed to check quota, allowing request", exc_info=True)
+        # Unlimited plan — skip check entirely
+        if monthly_limit < 0:
             return
 
+        # Check quota cache
+        cache_key = f"{entry.org_id}:{self._required_scope}"
+        now = time.monotonic()
+        with self._quota_cache_lock:
+            cached = self._quota_cache.get(cache_key)
+            if cached is not None:
+                cached_usage, cached_at = cached
+                if (now - cached_at) < self._quota_cache_ttl_s:
+                    current_usage = cached_usage
+                    self._enforce_quota_limit(
+                        current_usage, monthly_limit, plan_config, entry,
+                    )
+                    return
+
+        # Cache miss or expired — query the DB
+        if self._required_scope == "verify":
+            query = """
+                SELECT COUNT(*)
+                FROM executions
+                WHERE org_id = :org_id
+                  AND timestamp >= date_trunc('month', NOW())
+                  AND confidence IS NOT NULL
+            """
+        else:
+            query = """
+                SELECT COUNT(*)
+                FROM executions
+                WHERE org_id = :org_id
+                  AND timestamp >= date_trunc('month', NOW())
+            """
+
+        try:
+            with self._engine.connect() as conn:
+                result = conn.execute(text(query), {"org_id": entry.org_id})
+                current_usage = result.scalar() or 0
+        except Exception:
+            logger.error(
+                "Quota check failed for org=%s scope=%s — denying request (fail-closed)",
+                entry.org_id,
+                self._required_scope,
+                exc_info=True,
+            )
+            raise AuthError(
+                503,
+                "Quota check temporarily unavailable. Please retry shortly.",
+                retry_after_seconds=30,
+            ) from None
+
+        # Update cache
+        with self._quota_cache_lock:
+            self._quota_cache[cache_key] = (current_usage, time.monotonic())
+
+        self._enforce_quota_limit(current_usage, monthly_limit, plan_config, entry)
+
+    def _enforce_quota_limit(
+        self,
+        current_usage: int,
+        monthly_limit: int,
+        plan_config: "PlanConfig",
+        entry: _CachedKey,
+    ) -> None:
+        """Raise AuthError(429) if usage exceeds the monthly limit."""
         if current_usage >= monthly_limit:
             if not plan_config.overage_allowed:
                 raise AuthError(
