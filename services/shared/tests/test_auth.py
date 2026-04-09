@@ -287,10 +287,10 @@ class TestCacheBehavior:
         validator.validate(raw_key)
         call_count_after_first = mock_conn.execute.call_count
 
-        # Second call should use cache for key lookup but still check quota
-        # So only 1 additional call (quota), not 2 (key lookup + quota)
+        # Second call should use cache for both key lookup and quota check
+        # So no additional DB calls occur
         validator.validate(raw_key)
-        assert mock_conn.execute.call_count == call_count_after_first + 1
+        assert mock_conn.execute.call_count == call_count_after_first
 
     def test_cache_expiry_re_queries_db(self):
         entry, raw_key, _ = _make_key_entry()
@@ -405,3 +405,169 @@ class TestDBErrors:
 
         assert exc_info.value.status_code == 500
         assert "Internal" in exc_info.value.detail
+
+
+# ---------------------------------------------------------------------------
+# Tests: Quota enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestQuotaEnforcement:
+    """Tests for monthly quota checks against the executions table."""
+
+    def _make_validator_with_quota(
+        self, scope="verify", plan="free", usage_count=0, plan_overrides=None,
+    ):
+        """Build a validator with configurable quota usage from DB."""
+        entry, raw_key, _ = _make_key_entry(scopes=["ingest", "verify", "read"])
+        validator, engine = _build_validator(required_scope=scope)
+
+        # Mock the DB to return key data on first call, usage on second
+        mock_conn = MagicMock()
+        key_row = _make_db_row([entry])
+        usage_result = MagicMock()
+        usage_result.scalar.return_value = usage_count
+
+        key_result = MagicMock()
+        key_result.fetchone.return_value = key_row
+
+        call_count = {"n": 0}
+
+        def side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            # First call is key lookup, subsequent are quota check
+            if call_count["n"] == 1:
+                return key_result
+            return usage_result
+
+        mock_conn.execute.side_effect = side_effect
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        engine.connect.return_value = mock_conn
+
+        # Directly set the plan on the validator's supabase query
+        validator._query_plan_from_supabase = MagicMock(
+            return_value=(plan, plan_overrides),
+        )
+
+        return validator, raw_key, mock_conn
+
+    def test_free_plan_under_verification_quota_passes(self):
+        """Free plan with 10/50 verifications should pass."""
+        validator, raw_key, _ = self._make_validator_with_quota(
+            scope="verify", plan="free", usage_count=10,
+        )
+        result = validator.validate(raw_key)
+        assert result.org_id == "test-org"
+
+    def test_free_plan_at_verification_quota_blocks(self):
+        """Free plan with 50/50 verifications should return 429."""
+        validator, raw_key, _ = self._make_validator_with_quota(
+            scope="verify", plan="free", usage_count=50,
+        )
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+        assert exc_info.value.status_code == 429
+        assert "quota exceeded" in exc_info.value.detail.lower()
+        assert exc_info.value.retry_after_seconds == 3600
+
+    def test_free_plan_over_verification_quota_blocks(self):
+        """Free plan with 589/50 verifications should return 429."""
+        validator, raw_key, _ = self._make_validator_with_quota(
+            scope="verify", plan="free", usage_count=589,
+        )
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+        assert exc_info.value.status_code == 429
+
+    def test_free_plan_under_observation_quota_passes(self):
+        """Free plan with 500/1000 observations should pass."""
+        validator, raw_key, _ = self._make_validator_with_quota(
+            scope="ingest", plan="free", usage_count=500,
+        )
+        result = validator.validate(raw_key)
+        assert result.org_id == "test-org"
+
+    def test_free_plan_at_observation_quota_blocks(self):
+        """Free plan with 1000/1000 observations should return 429."""
+        validator, raw_key, _ = self._make_validator_with_quota(
+            scope="ingest", plan="free", usage_count=1000,
+        )
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+        assert exc_info.value.status_code == 429
+
+    def test_pro_plan_overage_allowed(self):
+        """Pro plan allows overage — should log but not block."""
+        validator, raw_key, _ = self._make_validator_with_quota(
+            scope="verify", plan="pro", usage_count=20_000,
+        )
+        result = validator.validate(raw_key)
+        assert result.org_id == "test-org"
+
+    def test_starter_plan_no_overage(self):
+        """Starter plan does NOT allow overage — should block at limit."""
+        validator, raw_key, _ = self._make_validator_with_quota(
+            scope="verify", plan="starter", usage_count=1000,
+        )
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+        assert exc_info.value.status_code == 429
+
+    def test_db_error_returns_503_fail_closed(self):
+        """If quota query fails, return 503 (not silently allow)."""
+        entry, raw_key, _ = _make_key_entry()
+        validator, engine = _build_validator(required_scope="verify")
+
+        # First call succeeds (key lookup), second call fails (quota)
+        mock_conn = MagicMock()
+        key_result = MagicMock()
+        key_result.fetchone.return_value = _make_db_row([entry])
+
+        call_count = {"n": 0}
+
+        def side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                return key_result
+            raise Exception("connection lost")
+
+        mock_conn.execute.side_effect = side_effect
+        mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn.__exit__ = MagicMock(return_value=False)
+        engine.connect.return_value = mock_conn
+
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.retry_after_seconds == 30
+
+    def test_quota_cache_avoids_repeated_db_queries(self):
+        """Second call within 30s should use cached quota, not query DB."""
+        validator, raw_key, mock_conn = self._make_validator_with_quota(
+            scope="verify", plan="free", usage_count=10,
+        )
+
+        # First call
+        validator.validate(raw_key)
+        first_call_count = mock_conn.execute.call_count
+
+        # Second call — should use quota cache
+        validator.validate(raw_key)
+        second_call_count = mock_conn.execute.call_count
+
+        # No additional DB calls (key is cached, quota is cached)
+        assert second_call_count == first_call_count
+
+    def test_verify_scope_query_filters_by_confidence(self):
+        """Verify scope should query with 'confidence IS NOT NULL'."""
+        validator, raw_key, mock_conn = self._make_validator_with_quota(
+            scope="verify", plan="free", usage_count=10,
+        )
+        validator.validate(raw_key)
+
+        # Find the quota query call (second execute call)
+        calls = mock_conn.execute.call_args_list
+        assert len(calls) >= 2
+        quota_query = str(calls[1][0][0])
+        assert "confidence IS NOT NULL" in quota_query
