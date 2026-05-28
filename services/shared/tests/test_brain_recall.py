@@ -31,6 +31,27 @@ DB_URL = os.environ.get(
     "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
 )
 
+
+def _db_reachable() -> bool:
+    """True if the test Postgres is reachable. Brain recall exercises real
+    pgvector cosine search that cannot be mocked, so when no DB is available
+    (e.g. CI runs the unit-test matrix without Postgres) the whole module is
+    skipped rather than erroring."""
+    try:
+        engine = create_engine(DB_URL)
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        engine.dispose()
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _db_reachable(),
+    reason="Postgres not reachable; brain recall DB tests require the live test DB",
+)
+
 EMBED_DIM = 1024
 
 # A single deterministic 1024-dim embedding shared by the query and every seeded

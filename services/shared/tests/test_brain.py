@@ -23,6 +23,27 @@ DB_URL = os.environ.get(
 )
 
 
+def _db_reachable() -> bool:
+    """True if the test Postgres is reachable. These brain tests exercise real
+    ON CONFLICT / pgvector behaviour that cannot be mocked, so when no DB is
+    available (e.g. CI runs the unit-test matrix without Postgres) the whole
+    module is skipped rather than erroring."""
+    try:
+        engine = create_engine(DB_URL)
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        engine.dispose()
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _db_reachable(),
+    reason="Postgres not reachable; brain DB tests require the live test DB",
+)
+
+
 def _unique_org() -> str:
     """Generate a unique org id so tests don't collide on the shared dev DB."""
     return f"org_{uuid.uuid4().hex[:8]}"
