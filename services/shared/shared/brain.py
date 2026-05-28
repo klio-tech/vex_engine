@@ -119,9 +119,11 @@ def ensure_project(
         for the analogous house mitigation.
 
     Tenancy note:
-        The caller must guarantee that any supplied ``space_id`` belongs to
-        ``org_id``. The FK only enforces that the space *exists*, not that it
-        belongs to this org; cross-org leakage is not prevented at the DB layer.
+        When a ``space_id`` is supplied it is verified to belong to ``org_id``
+        before the INSERT. The FK (migration 020) only enforces that the space
+        *exists*, not that it is owned by this org, so without this guard a
+        caller could file a project under another tenant's space. A cross-org
+        ``space_id`` is rejected with ``ValueError``.
 
     Args:
         db_session: A synchronous SQLAlchemy session/connection exposing
@@ -131,6 +133,7 @@ def ensure_project(
         git_remote: Canonical git remote URL; primary dedup key when present.
         repo_root_path: Filesystem repo root; dedup key when no remote.
         space_id: Optional space the project belongs to (used only on insert).
+            When provided, must belong to ``org_id``.
 
     Returns:
         The project id as a string.
@@ -138,10 +141,33 @@ def ensure_project(
     Raises:
         ValueError: If both ``git_remote`` and ``repo_root_path`` are ``None``
             (mirrors the DB ``ck_projects_has_identity`` check; an identity-less
-            project is unrepresentable).
+            project is unrepresentable), or if a supplied ``space_id`` does not
+            belong to ``org_id`` (cross-tenant association is rejected).
     """
     if git_remote is None and repo_root_path is None:
         raise ValueError("project requires git_remote or repo_root_path")
+
+    # Defense in depth: the projects.space_id FK only enforces that the space
+    # EXISTS, not that it belongs to org_id (migration 020). Verify ownership
+    # before binding a caller-supplied space_id so a project can never be filed
+    # under another tenant's space. Skipped on the common unfiled-write path
+    # (space_id is None), so it adds no query when no space is supplied.
+    if space_id is not None:
+        owned = db_session.execute(
+            text(
+                """
+                SELECT 1 FROM spaces
+                WHERE id = :space_id AND org_id = :org_id
+                LIMIT 1
+                """
+            ),
+            {"space_id": space_id, "org_id": org_id},
+        ).fetchone()
+        if owned is None:
+            raise ValueError(
+                "space_id does not belong to org_id "
+                "(cross-tenant space association rejected)"
+            )
 
     if git_remote is not None:
         row = db_session.execute(

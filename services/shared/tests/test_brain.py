@@ -10,6 +10,7 @@ import os
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -328,3 +329,92 @@ def test_ensure_project_concurrent_calls_converge():
             )
             conn.commit()
         cleanup_eng.dispose()
+
+
+# ---------------------------------------------------------------------------
+# ensure_project: cross-tenant space_id guard (mock-based)
+#
+# These two tests exercise the defensive ownership check in isolation, without
+# a live DB. The check runs a `SELECT 1 FROM spaces WHERE id=:space_id AND
+# org_id=:org_id` before the INSERT; a missing row means the space is not owned
+# by this org (or does not exist) and the call must be rejected. A real DB is
+# unnecessary — we only need to assert the control flow around that SELECT — so
+# a tiny fake session dispatches on the SQL text to simulate the two outcomes.
+# ---------------------------------------------------------------------------
+
+
+class _FakeResult:
+    """Stand-in for a SQLAlchemy ``Result``, returning canned rows."""
+
+    def __init__(self, *, fetchone_value=None, one_value=None):
+        self._fetchone_value = fetchone_value
+        self._one_value = one_value
+
+    def fetchone(self):
+        return self._fetchone_value
+
+    def one(self):
+        return self._one_value
+
+
+class _FakeSession:
+    """Minimal db_session double for ``ensure_project``'s SQL.
+
+    Dispatches on the statement text: the ownership ``SELECT`` returns a row
+    only when ``space_owned`` is True; the project ``INSERT ... RETURNING``
+    yields a fixed id. ``commit`` is recorded so a test can assert the insert
+    path actually committed.
+    """
+
+    def __init__(self, *, space_owned: bool):
+        self.space_owned = space_owned
+        self.committed = False
+        self.executed_sql: list[str] = []
+
+    def execute(self, clause, params=None):
+        sql = str(clause)
+        self.executed_sql.append(sql)
+        if "FROM spaces" in sql:
+            return _FakeResult(fetchone_value=(1,) if self.space_owned else None)
+        # The only other statement ensure_project issues is the INSERT.
+        return _FakeResult(one_value=SimpleNamespace(id="proj-fixed-id"))
+
+    def commit(self):
+        self.committed = True
+
+
+def test_ensure_project_rejects_cross_org_space():
+    """A space_id not owned by org_id is rejected before any INSERT/commit."""
+    session = _FakeSession(space_owned=False)
+
+    with pytest.raises(ValueError, match="space_id does not belong to org_id"):
+        ensure_project(
+            session,
+            org_id="org_a",
+            display_name="X",
+            git_remote="git@github.com:acme/repo.git",
+            space_id="space-owned-by-org-b",
+        )
+
+    # The ownership SELECT ran, but the INSERT and commit must not have.
+    assert any("FROM spaces" in s for s in session.executed_sql)
+    assert not any("INSERT INTO projects" in s for s in session.executed_sql)
+    assert session.committed is False
+
+
+def test_ensure_project_accepts_same_org_space():
+    """A space_id owned by org_id passes the guard and inserts + commits."""
+    session = _FakeSession(space_owned=True)
+
+    project_id = ensure_project(
+        session,
+        org_id="org_a",
+        display_name="X",
+        git_remote="git@github.com:acme/repo.git",
+        space_id="space-owned-by-org-a",
+    )
+
+    assert project_id == "proj-fixed-id"
+    assert any("FROM spaces" in s for s in session.executed_sql)
+    assert any("INSERT INTO projects" in s for s in session.executed_sql)
+    assert session.committed is True
