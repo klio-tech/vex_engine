@@ -7,8 +7,18 @@ WORKDIR /app
 COPY services/shared /app/lib/shared
 ENV PYTHONPATH="/app/lib/shared"
 
-# Install shared package dependencies (pydantic, sqlalchemy, psycopg2).
-RUN pip install --no-cache-dir pydantic>=2.0.0 sqlalchemy>=2.0.0 psycopg2-binary>=2.9.0
+# Install the shared package's runtime dependencies. mcp-server imports
+# shared.memory, which imports litellm at module load (embeddings/LLM), and the
+# shared package also declares pgvector — both are required at startup, not just
+# pydantic/sqlalchemy/psycopg2. Keep this list in sync with
+# services/shared/pyproject.toml [dependencies]. Specifiers are quoted so the
+# shell does not interpret '>=' as an output redirection.
+RUN pip install --no-cache-dir \
+    "pydantic>=2.0.0" \
+    "sqlalchemy>=2.0.0" \
+    "psycopg2-binary>=2.9.0" \
+    "pgvector>=0.3.0" \
+    "litellm>=1.0.0"
 
 # Install the MCP server service.
 COPY services/mcp-server/pyproject.toml /app/
