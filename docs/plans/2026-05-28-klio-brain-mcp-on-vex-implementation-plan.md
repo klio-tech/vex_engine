@@ -4,7 +4,9 @@
 
 **Goal:** Add a hosted remote-MCP memory brain as an *additive* service inside the Vex engine, exposing Klio's 7 tools over Streamable HTTP, backed by Vex's existing org-scoped pgvector memory, with team-wide ("org" scope) persistent recall plus spaces/projects.
 
-**Architecture:** New `services/mcp-server/` (FastAPI + official `mcp` SDK) reuses `shared/auth.py` for `X-Vex-Key → (org_id, agent_id)` and `shared/memory.py` for storage. One new memory function (`retrieve_memories_scoped`) and one additive migration (018: `spaces`, `projects`, nullable columns). Verification services, the existing `retrieve_memories`, and the local-Klio repo are **untouched**.
+> **CORRECTION (env-validation finding):** the live alembic head is **019** (`018_add_alert_rules`, `019_add_experiments` already exist in Vex). Our migration is therefore **020**, `down_revision="019"` — NOT 018/017 as an earlier draft assumed. All "migration 020" references below are correct; the design doc's "018" is superseded by this.
+
+**Architecture:** New `services/mcp-server/` (FastAPI + official `mcp` SDK) reuses `shared/auth.py` for `X-Vex-Key → (org_id, agent_id)` and `shared/memory.py` for storage. One new memory function (`retrieve_memories_scoped`) and one additive migration (020: `spaces`, `projects`, nullable columns). Verification services, the existing `retrieve_memories`, and the local-Klio repo are **untouched**.
 
 **Tech Stack:** Python 3.12, FastAPI, SQLAlchemy (sync `create_engine` + `sessionmaker` — see gotcha), alembic, pytest, Postgres + pgvector (HNSW, `vector(1024)`), Redis, `mcp` SDK (Streamable HTTP), docker-compose.
 
@@ -21,16 +23,16 @@
 
 ## Phase A — Data model (additive)
 
-### Task A1: Migration 018 — spaces, projects, nullable columns
+### Task A1: Migration 020 — spaces, projects, nullable columns
 
 **Files:**
-- Create: `services/migrations/alembic/versions/018_klio_brain_spaces_projects.py`
-- Test: `services/migrations/tests/test_migration_018.py` (create; mirror any existing migration test, else use the inline pattern below)
+- Create: `services/migrations/alembic/versions/020_klio_brain_spaces_projects.py`
+- Test: `services/migrations/tests/test_migration_020.py` (create; mirror any existing migration test, else use the inline pattern below)
 
 **Step 1: Write the failing test**
 
 ```python
-# services/migrations/tests/test_migration_018.py
+# services/migrations/tests/test_migration_020.py
 import os
 import subprocess
 import sys
@@ -96,21 +98,21 @@ def test_existing_session_memory_row_undisturbed():
 **Step 2: Run — verify it fails**
 
 ```
-cd services/migrations && DATABASE_URL=... uv run pytest tests/test_migration_018.py -v
+cd services/migrations && DATABASE_URL=... uv run pytest tests/test_migration_020.py -v
 ```
 Expected: FAIL (`spaces`/`projects` missing).
 
-**Step 3: Write migration 018**
+**Step 3: Write migration 020**
 
 ```python
-# services/migrations/alembic/versions/018_klio_brain_spaces_projects.py
+# services/migrations/alembic/versions/020_klio_brain_spaces_projects.py
 """Klio brain: spaces + projects tables, nullable space/project on session_memories.
 
 ADDITIVE ONLY. Existing session_memories rows are unaffected (new columns
 default NULL). Verification memory paths never set these columns.
 
-Revision ID: 018
-Revises: 017
+Revision ID: 020
+Revises: 019
 Create Date: 2026-05-28
 """
 from collections.abc import Sequence
@@ -119,8 +121,8 @@ from typing import Union
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "018"
-down_revision: Union[str, None] = "017"
+revision: str = "020"
+down_revision: Union[str, None] = "019"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -174,14 +176,14 @@ def downgrade() -> None:
     op.drop_table("spaces")
 ```
 
-**Step 4: Run — verify pass.** `uv run pytest tests/test_migration_018.py -v` → 3 PASS.
+**Step 4: Run — verify pass.** `uv run pytest tests/test_migration_020.py -v` → 3 PASS.
 
 **Step 5: Commit**
 
 ```
-git add services/migrations/alembic/versions/018_klio_brain_spaces_projects.py \
-        services/migrations/tests/test_migration_018.py
-git commit -m "feat(migrations): 018 additive spaces+projects+nullable cols for Klio brain"
+git add services/migrations/alembic/versions/020_klio_brain_spaces_projects.py \
+        services/migrations/tests/test_migration_020.py
+git commit -m "feat(migrations): 020 additive spaces+projects+nullable cols for Klio brain"
 ```
 
 ---
@@ -297,7 +299,7 @@ Map each to `write_memory(db, session_id=<per-connection id>, org_id, agent_id, 
 ## Phase F — Coexistence, integration, release prep
 
 ### Task F1: Coexistence guard tests
-Assert: existing `retrieve_memories` signature/behavior unchanged (call it, verify session-scoped result); the `sync-gateway` + `verification-engine` test suites still pass; migration 018 is additive (re-run their memory tests). **Commit:** `test: coexistence — verification + existing memory paths unaffected`
+Assert: existing `retrieve_memories` signature/behavior unchanged (call it, verify session-scoped result); the `sync-gateway` + `verification-engine` test suites still pass; migration 020 is additive (re-run their memory tests). **Commit:** `test: coexistence — verification + existing memory paths unaffected`
 
 ### Task F2: End-to-end integration
 MCP client → Streamable HTTP → `remember` then `recall` round-trip against a real test org; org-isolation (org B cannot recall org A). **Commit:** `test(mcp-server): e2e memory round-trip + org isolation`
@@ -317,7 +319,7 @@ Add `mcp-server` to `docker-compose.yml` (mirror ingestion-api service block: en
 ## Verification matrix
 | Layer | Test file | Tasks |
 |---|---|---|
-| Migration 018 | `migrations/tests/test_migration_018.py` | A1 |
+| Migration 020 | `migrations/tests/test_migration_020.py` | A1 |
 | Space/project helpers | `shared/tests/test_brain.py` | A2 |
 | Brain recall | `shared/tests/test_brain_recall.py` | B1 |
 | Service health/db | `mcp-server/tests/test_health.py` | C1 |
