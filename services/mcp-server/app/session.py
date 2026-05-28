@@ -31,6 +31,11 @@ def brain_session_id(request: Any, org_id: str, agent_id: str) -> str:
         A ``"klio-brain:<suffix>"`` id, where ``<suffix>`` is the
         ``mcp-session-id`` header when present, else ``"<org_id>:<agent_id>"``.
     """
+    # The client-supplied ``mcp-session-id`` is trusted only as a dedup
+    # *grouping* key, never for authorization: tenancy is enforced separately
+    # by ``org_id`` (and ``agent_id``), which are filtered on every read/write.
+    # A spoofed value can at most pool a client's own writes into a different
+    # dedup bucket within its own org — it cannot cross the tenant boundary.
     mcp_sid = request.headers.get("mcp-session-id")
     suffix = mcp_sid if mcp_sid else f"{org_id}:{agent_id}"
     return f"{_BRAIN_SESSION_PREFIX}:{suffix}"

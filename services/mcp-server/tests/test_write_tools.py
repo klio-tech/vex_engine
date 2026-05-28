@@ -104,7 +104,7 @@ async def test_write_tool_maps_memory_type_and_scopes_org(tool_name, expected_ty
 
 @pytest.mark.asyncio
 async def test_decide_with_rationale_sets_metadata():
-    """decide passes rationale through as metadata={'rationale': ...}."""
+    """decide folds rationale into metadata while preserving the source tag."""
     fn = _get_tool_fn("decide")
     write_mock = AsyncMock(return_value=_canned_result("decision"))
 
@@ -117,7 +117,9 @@ async def test_decide_with_rationale_sets_metadata():
 
     kwargs = write_mock.await_args.kwargs
     assert kwargs["memory_type"] == "decision"
-    assert kwargs["metadata"] == {"rationale": "team aligned"}
+    # rationale is added alongside the provenance tag, not in place of it,
+    # so decide stays consistent with the other write tools.
+    assert kwargs["metadata"] == {"source": "mcp", "rationale": "team aligned"}
 
 
 @pytest.mark.asyncio

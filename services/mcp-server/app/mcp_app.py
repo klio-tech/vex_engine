@@ -294,7 +294,7 @@ def _register_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         metadata = {"source": "mcp"}
         if rationale is not None:
-            metadata = {"rationale": rationale}
+            metadata["rationale"] = rationale
         return await _perform_write(
             ctx, content=content, memory_type="decision", metadata=metadata
         )
