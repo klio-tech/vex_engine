@@ -3,12 +3,19 @@
 Builds a :class:`mcp.server.fastmcp.FastMCP` server over the
 Streamable-HTTP transport and registers the seven Klio memory tools.
 
-In D1 the tool *bodies* are stubs (they return a
-``not_implemented_yet`` marker) — the real memory logic lands in
-D2/D3/D4.  The tool *schemas*, however, are the real ones: each tool's
-signature and argument descriptions define the JSON input schema that
-``tools/list`` advertises, so the later tasks only need to fill in the
-bodies without changing the public contract.
+As of D2 the five *write* tools (``remember``, ``observe``, ``plan``,
+``decide``, ``note``) are fully implemented: they resolve the tenant
+principal, derive a stable brain ``session_id``, and persist via
+:func:`shared.brain.write_scoped_memory`.  The ``recall`` and ``space``
+tool *bodies* remain stubs (they return a ``not_implemented_yet``
+marker) — that logic lands in D3/D4.  The tool *schemas* are the real
+ones throughout: each tool's signature and argument descriptions define
+the JSON input schema that ``tools/list`` advertises, so the later tasks
+only fill in the remaining bodies without changing the public contract.
+
+The write tools take a FastMCP ``Context`` as their first parameter;
+FastMCP injects it and EXCLUDES it from the public input schema, so the
+``tools/list`` contract is unchanged.
 
 Transport notes (mcp SDK 1.27.x):
 
@@ -28,17 +35,25 @@ memories pool under one agent_id.  The server instructions and the
 to scope memory to a distinct agent.
 """
 
+import logging
 from typing import Annotated, Any, Literal, Optional
 
-from mcp.server.fastmcp import FastMCP
+from fastapi import HTTPException
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
+from shared import brain
 
+from app.auth import resolve_principal
 from app.config import (
     MCP_ALLOWED_HOSTS,
     MCP_ALLOWED_ORIGINS,
     MCP_DNS_REBINDING_PROTECTION,
 )
+from app.db import SessionLocal
+from app.session import brain_session_id
+
+logger = logging.getLogger("agentguard.mcp.tools")
 
 # Canonical, ordered list of the Klio tool names.  Tests assert the
 # registered tool set matches this exactly.
@@ -52,8 +67,9 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "space",
 )
 
-# Stub payload returned by every tool body in D1.  Real implementations
-# (D2-D4) replace these return values.
+# Stub payload returned by the still-unimplemented read/management tools
+# (``recall``, ``space``).  The five write tools are implemented in D2; the
+# remaining bodies replace this in D3/D4.
 _STUB_RESULT: dict[str, str] = {"status": "not_implemented_yet"}
 
 # Server-level guidance surfaced to MCP clients during ``initialize``.
@@ -68,6 +84,74 @@ SERVER_INSTRUCTIONS = (
     "context before acting, and the write tools (`remember`, `observe`, "
     "`plan`, `decide`, `note`) to persist what matters."
 )
+
+
+async def _perform_write(
+    ctx: Context,
+    *,
+    content: str,
+    memory_type: str,
+    metadata: Optional[dict] = None,
+) -> dict[str, Any]:
+    """Shared body for the five Klio write tools.
+
+    Resolves the tenant principal from the transport request, derives a stable
+    brain ``session_id``, opens a short-lived DB session, and delegates to
+    :func:`shared.brain.write_scoped_memory` (which dedups, inserts, and
+    promotes the row to the org brain scope).
+
+    Auth failures from :func:`resolve_principal` surface as Starlette
+    ``HTTPException``; we translate them into a clean ``unauthorized`` result
+    dict rather than letting the exception leak through the MCP layer (the MCP
+    transport has no notion of HTTP status codes for tool errors).
+
+    Args:
+        ctx: FastMCP-injected context; ``ctx.request_context.request`` is the
+            Starlette request for the Streamable-HTTP transport.
+        content: The memory text to store.
+        memory_type: The brain memory type for this tool.
+        metadata: Optional metadata persisted on the row.
+
+    Returns:
+        The result dict from :func:`shared.brain.write_scoped_memory`, or a
+        clean error dict on auth failure / unexpected error.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        # The Streamable-HTTP transport always attaches the Starlette request
+        # (mcp 1.27.x), so this only fires under a transport that does not —
+        # there is no request to authenticate, so deny rather than guess a
+        # principal.
+        logger.error("brain write got no transport request; cannot authenticate")
+        return {
+            "stored": False,
+            "error": "unauthorized",
+            "detail": "no request context",
+        }
+
+    try:
+        org_id, agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"stored": False, "error": "unauthorized", "detail": str(exc.detail)}
+
+    session_id = brain_session_id(request, org_id, agent_id)
+
+    db = SessionLocal()
+    try:
+        return await brain.write_scoped_memory(
+            db,
+            org_id=org_id,
+            agent_id=agent_id,
+            content=content,
+            memory_type=memory_type,
+            session_id=session_id,
+            metadata=metadata,
+        )
+    except Exception:
+        logger.exception("brain write failed (memory_type=%s)", memory_type)
+        return {"stored": False, "error": "write_failed"}
+    finally:
+        db.close()
 
 
 def build_mcp_server() -> FastMCP:
@@ -156,40 +240,50 @@ def _register_tools(mcp: FastMCP) -> None:
             "agent."
         ),
     )
-    def remember(
+    async def remember(
+        ctx: Context,
         content: Annotated[
             str, Field(description="The durable fact or preference to store.")
         ],
     ) -> dict[str, Any]:
-        return dict(_STUB_RESULT)
+        return await _perform_write(
+            ctx, content=content, memory_type="memory", metadata={"source": "mcp"}
+        )
 
     @mcp.tool(
         name="observe",
         description="Log something the agent saw/did this session. Arg: content.",
     )
-    def observe(
+    async def observe(
+        ctx: Context,
         content: Annotated[
             str, Field(description="What the agent observed or did this session.")
         ],
     ) -> dict[str, Any]:
-        return dict(_STUB_RESULT)
+        return await _perform_write(
+            ctx, content=content, memory_type="observation", metadata={"source": "mcp"}
+        )
 
     @mcp.tool(
         name="plan",
         description="Record a forward-looking plan. Arg: content.",
     )
-    def plan(
+    async def plan(
+        ctx: Context,
         content: Annotated[
             str, Field(description="The forward-looking plan to record.")
         ],
     ) -> dict[str, Any]:
-        return dict(_STUB_RESULT)
+        return await _perform_write(
+            ctx, content=content, memory_type="plan", metadata={"source": "mcp"}
+        )
 
     @mcp.tool(
         name="decide",
         description="Record a decision + rationale. Args: content, optional rationale.",
     )
-    def decide(
+    async def decide(
+        ctx: Context,
         content: Annotated[
             str, Field(description="The decision that was made.")
         ],
@@ -198,18 +292,26 @@ def _register_tools(mcp: FastMCP) -> None:
             Field(description="Optional rationale behind the decision."),
         ] = None,
     ) -> dict[str, Any]:
-        return dict(_STUB_RESULT)
+        metadata = {"source": "mcp"}
+        if rationale is not None:
+            metadata = {"rationale": rationale}
+        return await _perform_write(
+            ctx, content=content, memory_type="decision", metadata=metadata
+        )
 
     @mcp.tool(
         name="note",
         description="Free-form note. Arg: content.",
     )
-    def note(
+    async def note(
+        ctx: Context,
         content: Annotated[
             str, Field(description="The free-form note to store.")
         ],
     ) -> dict[str, Any]:
-        return dict(_STUB_RESULT)
+        return await _perform_write(
+            ctx, content=content, memory_type="note", metadata={"source": "mcp"}
+        )
 
     @mcp.tool(
         name="space",

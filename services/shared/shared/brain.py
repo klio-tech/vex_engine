@@ -19,6 +19,8 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
+from shared.memory import find_similar_memory, write_memory
+
 logger = logging.getLogger("agentguard.shared.brain")
 
 
@@ -194,3 +196,125 @@ def ensure_project(
 
     db_session.commit()
     return str(row.id)
+
+
+async def write_scoped_memory(
+    db_session: Any,
+    *,
+    org_id: str,
+    agent_id: str,
+    content: str,
+    memory_type: str,
+    session_id: str,
+    space_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    dedup: bool = True,
+) -> dict:
+    """Write a memory into the org-scoped Klio brain (with optional dedup).
+
+    This is the brain-scoped write path layered on top of :mod:`shared.memory`.
+    It reuses the existing primitives verbatim — :func:`find_similar_memory`
+    for deduplication and :func:`write_memory` for the insert — and then
+    *promotes* the freshly inserted row from the session scope to the brain
+    (org) scope.
+
+    Why the write-then-UPDATE: :func:`shared.memory.write_memory` hardcodes
+    ``scope='session'`` in its INSERT and does not accept ``space_id`` /
+    ``project_id``. That function is shared with the verification path and is
+    intentionally left untouched. Rather than fork or edit it, we let it insert
+    the row at ``scope='session'`` and immediately issue a follow-up UPDATE that
+    sets ``scope='org'`` and binds the brain scope columns. This keeps the
+    primitive single-purpose while the brain composes the extra behaviour it
+    needs.
+
+    Async note: this mirrors the house pattern of :func:`write_memory` /
+    :func:`find_similar_memory` — an ``async def`` performing inline synchronous
+    psycopg2 DB I/O. This is intentional and consistent across the memory
+    substrate; do not wrap the DB calls in threads here.
+
+    Args:
+        db_session: A synchronous SQLAlchemy session/connection exposing
+            ``.execute()`` and ``.commit()``.
+        org_id: Owning org id (tenant scope). Always enforced.
+        agent_id: Authoring agent principal.
+        content: The memory text to store.
+        memory_type: One of the brain memory types (e.g. ``memory``,
+            ``observation``, ``plan``, ``decision``, ``note``).
+        session_id: Stable per-connection brain session id. Has no FK, so any
+            string is acceptable; it scopes the dedup lookup.
+        space_id: Optional space the memory belongs to.
+        project_id: Optional project the memory belongs to.
+        metadata: Optional metadata dict persisted on the row.
+        dedup: When ``True`` (default), suppress the write if a sufficiently
+            similar active memory already exists in the session/org.
+
+    Returns:
+        A result dict describing the outcome:
+
+        * dedup hit →
+          ``{"stored": False, "deduplicated": True, "id": ..., "memory_type":
+          ..., "scope": "org"}``
+        * embedding failure →
+          ``{"stored": False, "error": "embedding_failed"}``
+        * success →
+          ``{"stored": True, "deduplicated": False, "id": ..., "memory_type":
+          ..., "scope": "org", "space_id": ..., "project_id": ...}``
+    """
+    if dedup:
+        existing = await find_similar_memory(db_session, session_id, org_id, content)
+        if existing is not None:
+            return {
+                "stored": False,
+                "deduplicated": True,
+                "id": str(existing.id),
+                "memory_type": existing.memory_type,
+                "scope": "org",
+            }
+
+    # write_memory's 5th positional arg is execution_id; the column is nullable
+    # and brain writes are not tied to a verification execution, so pass None.
+    record = await write_memory(
+        db_session,
+        session_id,
+        org_id,
+        agent_id,
+        None,
+        memory_type,
+        content,
+        metadata=metadata,
+    )
+    if record is None:
+        # write_memory returns None when embedding generation fails.
+        return {"stored": False, "error": "embedding_failed"}
+
+    # Promote the just-inserted session-scoped row to the org brain scope and
+    # bind the scope columns (see the write-then-UPDATE rationale above).
+    db_session.execute(
+        text(
+            """
+            UPDATE session_memories
+            SET scope = 'org',
+                space_id = :space_id,
+                project_id = :project_id,
+                updated_at = NOW()
+            WHERE id = :id
+            """
+        ),
+        {
+            "space_id": space_id,
+            "project_id": project_id,
+            "id": str(record.id),
+        },
+    )
+    db_session.commit()
+
+    return {
+        "stored": True,
+        "deduplicated": False,
+        "id": str(record.id),
+        "memory_type": memory_type,
+        "scope": "org",
+        "space_id": space_id,
+        "project_id": project_id,
+    }
