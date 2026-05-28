@@ -179,8 +179,14 @@ def _serialize_record(record: MemoryRecord) -> dict[str, Any]:
         "content": record.content,
         "scope": record.scope,
         "confidence": record.confidence,
-        "space_id": record.space_id,
-        "project_id": record.project_id,
+        # space_id/project_id are ``sa.UUID()`` columns, so a raw ``text()``
+        # SELECT yields ``uuid.UUID`` objects (not strings). Stringify them —
+        # like ``id`` above — so the result is plain-``json``-serializable and
+        # the id fields are type-consistent across the payload.
+        "space_id": str(record.space_id) if record.space_id is not None else None,
+        "project_id": (
+            str(record.project_id) if record.project_id is not None else None
+        ),
         "created_at": record.created_at.isoformat() if record.created_at else None,
         "metadata": record.metadata,
     }

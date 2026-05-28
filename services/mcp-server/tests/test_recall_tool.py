@@ -113,6 +113,54 @@ async def test_recall_happy_path_serializes_without_embedding():
 
 
 @pytest.mark.asyncio
+async def test_recall_stringifies_uuid_space_and_project_ids():
+    """space_id/project_id are sa.UUID() columns, so a raw text() SELECT yields
+    uuid.UUID objects. The serialized result must stringify them (like `id`) so
+    the payload is plain-json-serializable, not just pydantic-coercible."""
+    import json
+
+    rec = _make_record()
+    rec.space_id = uuid.uuid4()
+    rec.project_id = uuid.uuid4()
+    retrieve_mock = AsyncMock(return_value=[rec])
+
+    with (
+        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
+    ):
+        result = await _recall_fn()(_fake_ctx(), "q")
+
+    mem = result["memories"][0]
+    assert isinstance(mem["space_id"], str)
+    assert isinstance(mem["project_id"], str)
+    assert mem["space_id"] == str(rec.space_id)
+    assert mem["project_id"] == str(rec.project_id)
+    # The whole payload must survive stdlib json (not just FastMCP coercion).
+    json.dumps(result)
+
+
+@pytest.mark.asyncio
+async def test_recall_serializes_null_space_and_project_ids():
+    """When space_id/project_id are None they stay None (no 'None' string)."""
+    rec = _make_record()
+    rec.space_id = None
+    rec.project_id = None
+    retrieve_mock = AsyncMock(return_value=[rec])
+
+    with (
+        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
+    ):
+        result = await _recall_fn()(_fake_ctx(), "q")
+
+    mem = result["memories"][0]
+    assert mem["space_id"] is None
+    assert mem["project_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_recall_serializes_null_created_at():
     """A record with created_at=None serializes created_at as None, not a crash."""
     fn = _recall_fn()
