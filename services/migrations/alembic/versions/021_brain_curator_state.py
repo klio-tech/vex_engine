@@ -6,9 +6,13 @@ brain memories. Nothing existing is touched: no columns are added to or removed
 from any prior table, and the verification memory path is unaffected.
 
 The curator (see ``services/mcp-server/app/curator.py``) reads only
-``scope='org'`` RAW memories newer than ``last_processed_at`` and advances the
-cursor after each batch, so the bookmark is the sole bit of durable state it
-needs.
+``scope='org'`` RAW memories past the composite ``(last_processed_at,
+last_processed_id)`` keyset cursor and advances the cursor after each batch, so
+the bookmark is the sole bit of durable state it needs. The ``last_processed_id``
+half is a UUID matching ``session_memories.id``; together with
+``last_processed_at`` it gives a total, stable order that keyset pagination needs
+to avoid skipping rows that share an identical ``created_at`` at a batch
+boundary.
 
 Revision ID: 021
 Revises: 020
@@ -20,6 +24,7 @@ from typing import Union
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
 revision: str = "021"
@@ -33,6 +38,7 @@ def upgrade() -> None:
         "brain_curator_state",
         sa.Column("org_id", sa.Text(), primary_key=True),
         sa.Column("last_processed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("last_processed_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column(
             "last_run_at",
             sa.DateTime(timezone=True),

@@ -19,16 +19,21 @@ Separation from verification:
 No self-reprocessing:
     The curator reads only the RAW input types
     (``observation``/``note``/``memory``/``plan``/``decision``) and never its
-    own outputs (``summary``/``fact``). Combined with the per-org
-    ``last_processed_at`` cursor (it only reads rows *newer* than the cursor),
-    this makes a tick unable to loop on its own synthesised memories.
+    own outputs (``summary``/``fact``). Combined with the per-org keyset cursor
+    (it only reads rows *past* the cursor), this makes a tick unable to loop on
+    its own synthesised memories.
 
 Cursor / idempotency:
-    Progress is tracked per org in ``brain_curator_state`` (migration 021). A
-    tick advances ``last_processed_at`` to the max ``created_at`` of the batch
-    it processed. A tick that finds nothing new synthesises nothing and leaves
-    ``last_processed_at`` untouched (only ``last_run_at`` is bumped), so re-runs
-    are idempotent.
+    Progress is tracked per org in ``brain_curator_state`` (migration 021) as a
+    **keyset** cursor over the composite ``(last_processed_at,
+    last_processed_id)``. A tick advances both halves to the ``(created_at, id)``
+    of the last row of the batch it processed (the batch is ordered
+    ``created_at ASC, id ASC``). The composite tiebreaker is what prevents
+    silently skipping a row that shares an identical ``created_at`` with the
+    previous batch's last row at a ``LIMIT`` boundary — a plain
+    ``created_at > cursor`` predicate would drop such a twin. A tick that finds
+    nothing new synthesises nothing and leaves *both* cursor halves untouched
+    (only ``last_run_at`` is bumped), so re-runs are idempotent.
 
 Async / DB I/O note:
     :func:`curator_tick` is ``async def`` yet performs inline *synchronous*
@@ -46,7 +51,7 @@ Scheduling:
 
 import logging
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from sqlalchemy import text
 
@@ -76,41 +81,67 @@ DEFAULT_CURATOR_AGENT_ID: str = "klio-curator"
 """Agent principal under which synthesised memories are authored."""
 
 
+class CursorState(NamedTuple):
+    """The org's composite keyset cursor over ``(created_at, id)``.
+
+    Both halves are ``None`` together on the first-ever tick for an org (no
+    state row yet), which the new-rows query treats as "no lower bound" (read
+    from the beginning). When set, ``last_processed_id`` is the UUID of the last
+    ``session_memories`` row already processed at ``last_processed_at`` — the
+    tiebreaker that makes pagination total and stable so same-``created_at`` rows
+    are never skipped at a batch boundary.
+    """
+
+    last_processed_at: Optional[datetime]
+    last_processed_id: Optional[Any]
+
+
 def _now() -> datetime:
     """UTC now, isolated for clarity/testability."""
     return datetime.now(timezone.utc)
 
 
-def _read_cursor(db_session: Any, org_id: str) -> Optional[datetime]:
-    """Return this org's ``last_processed_at`` cursor, or ``None`` if unset.
+def _read_cursor(db_session: Any, org_id: str) -> CursorState:
+    """Return this org's composite ``(last_processed_at, last_processed_id)``.
 
-    A missing state row (first ever tick for the org) yields ``None``, which the
-    new-rows query treats as "no lower bound" (read from the beginning).
+    A missing state row (first ever tick for the org) yields a
+    :class:`CursorState` with both halves ``None``, which the new-rows query
+    treats as "no lower bound" (read from the beginning).
     """
-    return db_session.execute(
+    row = db_session.execute(
         text(
             """
-            SELECT last_processed_at
+            SELECT last_processed_at, last_processed_id
             FROM brain_curator_state
             WHERE org_id = :org_id
             """
         ),
         {"org_id": org_id},
-    ).scalar()
+    ).fetchone()
+    if row is None:
+        return CursorState(None, None)
+    return CursorState(row.last_processed_at, row.last_processed_id)
 
 
 def _read_new_raw_rows(
     db_session: Any,
     org_id: str,
-    cursor: Optional[datetime],
+    cursor: CursorState,
     batch_size: int,
 ) -> list[Any]:
-    """Read up to ``batch_size`` RAW org memories newer than ``cursor``.
+    """Read up to ``batch_size`` RAW org memories past the keyset ``cursor``.
 
     Tenant-scoped by ``org_id`` and locked to ``scope='org'`` + RAW types +
     ``status='active'`` so neither verification's session rows nor the curator's
-    own ``summary``/``fact`` output are ever returned. Ordered ASC by
-    ``created_at`` so the batch max is the last row (used to advance the cursor).
+    own ``summary``/``fact`` output are ever returned.
+
+    Pagination is **keyset** over the composite ``(created_at, id)``: a row is
+    new if its ``created_at`` is strictly past the cursor's, OR it shares the
+    cursor's ``created_at`` but has a strictly greater ``id``. Combined with the
+    matching ``ORDER BY created_at ASC, id ASC``, this gives a total, stable
+    order so a row sharing an identical ``created_at`` with the previous batch's
+    last row is never skipped at the ``LIMIT`` boundary. When there is no cursor
+    yet (both halves ``None``) the ``:cursor_ts IS NULL`` arm matches everything.
     """
     rows = db_session.execute(
         text(
@@ -121,12 +152,21 @@ def _read_new_raw_rows(
               AND scope = 'org'
               AND status = 'active'
               AND memory_type IN ({_RAW_TYPES_SQL})
-              AND (:cursor IS NULL OR created_at > :cursor)
-            ORDER BY created_at ASC
+              AND (
+                :cursor_ts IS NULL
+                OR created_at > :cursor_ts
+                OR (created_at = :cursor_ts AND id > :cursor_id)
+              )
+            ORDER BY created_at ASC, id ASC
             LIMIT :batch_size
             """
         ),
-        {"org_id": org_id, "cursor": cursor, "batch_size": batch_size},
+        {
+            "org_id": org_id,
+            "cursor_ts": cursor.last_processed_at,
+            "cursor_id": cursor.last_processed_id,
+            "batch_size": batch_size,
+        },
     ).fetchall()
     return list(rows)
 
@@ -156,25 +196,34 @@ def _advance_cursor(
     db_session: Any,
     org_id: str,
     last_processed_at: datetime,
+    last_processed_id: Any,
     processed_delta: int,
 ) -> None:
-    """Advance the cursor to ``last_processed_at`` and add to ``processed_count``.
+    """Advance the composite cursor and add to ``processed_count``.
 
-    Race-safe upsert against the ``brain_curator_state`` primary key
-    (``org_id``): a fresh org inserts; an existing org folds the cursor advance,
-    the ``processed_count`` increment, and the ``last_run_at`` bump into one
-    atomic statement (matching the upsert idiom in :mod:`shared.brain`).
+    The cursor advances to the batch's max ``(created_at, id)`` — supplied by the
+    caller as ``last_processed_at`` / ``last_processed_id`` (the last row of a
+    batch ordered ``created_at ASC, id ASC``). Race-safe upsert against the
+    ``brain_curator_state`` primary key (``org_id``): a fresh org inserts; an
+    existing org folds both cursor halves, the ``processed_count`` increment, and
+    the ``last_run_at`` bump into one atomic statement (matching the upsert idiom
+    in :mod:`shared.brain`).
     """
     db_session.execute(
         text(
             """
             INSERT INTO brain_curator_state (
-                org_id, last_processed_at, last_run_at, processed_count
+                org_id, last_processed_at, last_processed_id,
+                last_run_at, processed_count
             )
-            VALUES (:org_id, :last_processed_at, now(), :processed_delta)
+            VALUES (
+                :org_id, :last_processed_at, :last_processed_id,
+                now(), :processed_delta
+            )
             ON CONFLICT (org_id)
               DO UPDATE SET
                 last_processed_at = EXCLUDED.last_processed_at,
+                last_processed_id = EXCLUDED.last_processed_id,
                 last_run_at = now(),
                 processed_count =
                     brain_curator_state.processed_count + :processed_delta
@@ -183,6 +232,7 @@ def _advance_cursor(
         {
             "org_id": org_id,
             "last_processed_at": last_processed_at,
+            "last_processed_id": last_processed_id,
             "processed_delta": processed_delta,
         },
     )
@@ -308,12 +358,13 @@ async def curator_tick(
 ) -> dict:
     """Run one curation pass for a single org.
 
-    Reads up to ``batch_size`` RAW ``scope='org'`` memories newer than the org's
+    Reads up to ``batch_size`` RAW ``scope='org'`` memories past the org's keyset
     cursor; if at least ``min_inputs`` are found, synthesises a ``summary`` and
     discrete ``fact`` memories back into the org brain and advances the cursor to
-    the batch's max ``created_at``. Below the threshold (including zero new rows)
-    nothing is synthesised and only ``last_run_at`` is bumped, leaving the cursor
-    in place — so repeated ticks with no new input are idempotent.
+    the batch's composite max ``(created_at, id)``. Below the threshold (including
+    zero new rows) nothing is synthesised and only ``last_run_at`` is bumped,
+    leaving both cursor halves in place — so repeated ticks with no new input are
+    idempotent.
 
     Args:
         db_session: A synchronous SQLAlchemy session/connection exposing
@@ -352,14 +403,16 @@ async def curator_tick(
         input_count=len(rows),
     )
 
-    # Rows are ordered ASC by created_at, so the last row carries the batch max.
-    batch_max = rows[-1].created_at
-    _advance_cursor(db_session, org_id, batch_max, len(rows))
+    # Rows are ordered (created_at ASC, id ASC), so the LAST row carries the
+    # batch's composite max — the correct new keyset cursor.
+    batch_max_at = rows[-1].created_at
+    batch_max_id = rows[-1].id
+    _advance_cursor(db_session, org_id, batch_max_at, batch_max_id, len(rows))
 
     return {
         "synthesized": synthesized,
         "processed": len(rows),
-        "cursor": batch_max.isoformat(),
+        "cursor": batch_max_at.isoformat(),
     }
 
 

@@ -9,7 +9,9 @@ the synthesis flow can be asserted in isolation.
 The DB seam is a ``MagicMock`` whose ``.execute(...)`` is fed a ``side_effect``
 list, one entry per SQL statement the tick issues in order:
 
-    1. cursor SELECT  -> a result whose ``.scalar()`` yields ``last_processed_at``
+    1. cursor SELECT  -> a result whose ``.fetchone()`` yields a row exposing
+       ``last_processed_at`` + ``last_processed_id`` (the composite keyset
+       cursor), or ``None`` for the first-ever tick
     2. new-rows SELECT -> a result whose ``.fetchall()`` yields the raw rows
     3. cursor upsert   -> an opaque result (return value unused)
 
@@ -33,19 +35,37 @@ from app.curator import curator_tick, run_curator_once
 _BASE = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _row(idx: int, content: str, *, created_at: datetime | None = None):
+def _row(
+    idx: int,
+    content: str,
+    *,
+    created_at: datetime | None = None,
+    id: str | None = None,
+):
     """A raw session_memories row as the new-rows SELECT returns it."""
     return SimpleNamespace(
-        id=f"mem-{idx}",
+        id=id or f"mem-{idx}",
         content=content,
         created_at=created_at or (_BASE + timedelta(minutes=idx)),
     )
 
 
-def _cursor_result(last_processed_at):
-    """Fake result for the cursor SELECT: ``.scalar()`` -> last_processed_at."""
+def _cursor_result(last_processed_at, last_processed_id=None):
+    """Fake result for the cursor SELECT.
+
+    The cursor read is now keyset (composite ``(created_at, id)``), so the
+    result must surface BOTH columns: ``.fetchone()`` -> a row exposing
+    ``last_processed_at`` / ``last_processed_id`` (or ``None`` for the no-row,
+    first-ever-tick case).
+    """
     res = MagicMock()
-    res.scalar.return_value = last_processed_at
+    if last_processed_at is None and last_processed_id is None:
+        res.fetchone.return_value = None
+    else:
+        res.fetchone.return_value = SimpleNamespace(
+            last_processed_at=last_processed_at,
+            last_processed_id=last_processed_id,
+        )
     return res
 
 
@@ -56,14 +76,18 @@ def _rows_result(rows):
     return res
 
 
-def _make_session(*, cursor=None, rows=None):
+def _make_session(*, cursor=None, cursor_id=None, rows=None):
     """A MagicMock db_session wired with an execute side_effect sequence.
 
     Sequence: cursor SELECT, new-rows SELECT, then any number of subsequent
-    statements (the upsert) return a generic MagicMock.
+    statements (the upsert) return a generic MagicMock. ``cursor`` /
+    ``cursor_id`` form the composite keyset cursor the SELECT surfaces.
     """
     session = MagicMock()
-    results = [_cursor_result(cursor), _rows_result(rows or [])]
+    results = [
+        _cursor_result(cursor, cursor_id),
+        _rows_result(rows or []),
+    ]
     session.execute.side_effect = results + [MagicMock()] * 8
     return session
 
@@ -135,15 +159,18 @@ async def test_synthesis_happy_path_writes_summary_and_facts():
     assert result["synthesized"] == 4
     assert result["processed"] == 5
 
-    # The cursor upsert (the statement AFTER the two SELECTs) advanced
-    # last_processed_at to the batch's max created_at (minute 5).
+    # The cursor upsert (the statement AFTER the two SELECTs) advanced the
+    # COMPOSITE cursor to the batch's max (created_at, id) — the last row, since
+    # rows are ordered created_at ASC, id ASC.
     upsert_call = session.execute.call_args_list[2]
     upsert_sql = str(upsert_call.args[0])
     assert "brain_curator_state" in upsert_sql
     assert "ON CONFLICT" in upsert_sql
+    assert "last_processed_id" in upsert_sql
     params = upsert_call.args[1]
     assert params["last_processed_at"] == rows[-1].created_at
     assert params["last_processed_at"] == _BASE + timedelta(minutes=5)
+    assert params["last_processed_id"] == rows[-1].id
     assert params["org_id"] == "org-1"
     session.commit.assert_called()
 
@@ -159,6 +186,62 @@ async def test_synthesis_returns_iso_cursor():
         result = await curator_tick(session, "org-1", min_inputs=3)
 
     assert result["cursor"] == rows[-1].created_at.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Same-timestamp straddle regression (keyset (created_at, id) pagination)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_same_timestamp_straddle_does_not_skip_twin():
+    """Two RAW rows A and B share the EXACT same created_at (T) with id_A < id_B.
+
+    With batch_size=1 the LIMIT boundary splits them: tick 1 reads [A] and
+    advances the cursor to the COMPOSITE (T, id_A) — NOT just T. Tick 2 must
+    then bind that composite cursor and the keyset WHERE clause must keep B
+    (created_at=T, id_B>id_A) eligible — i.e. the twin is NOT silently skipped.
+    """
+    T = _BASE
+    id_a, id_b = "00000000-0000-0000-0000-00000000000a", (
+        "00000000-0000-0000-0000-00000000000b"
+    )
+    # min_inputs=1 so a single row triggers the advance path.
+    # --- tick 1: cursor empty -> read returns [A] -------------------------
+    row_a = _row(1, "content A", created_at=T, id=id_a)
+    session1 = _make_session(cursor=None, cursor_id=None, rows=[row_a])
+    gen, ext, wsm = _patch_curator(summary="s", facts=["f1"])
+    with gen, ext, wsm:
+        await curator_tick(session1, "org-1", batch_size=1, min_inputs=1)
+
+    # tick 1 advance binds BOTH composite-cursor columns to A's values.
+    upsert1 = session1.execute.call_args_list[2]
+    upsert1_sql = str(upsert1.args[0])
+    assert "last_processed_at" in upsert1_sql
+    assert "last_processed_id" in upsert1_sql
+    params1 = upsert1.args[1]
+    assert params1["last_processed_at"] == T
+    assert params1["last_processed_id"] == id_a
+
+    # --- tick 2: cursor now (T, id_A) -> read must keep B eligible ---------
+    row_b = _row(2, "content B", created_at=T, id=id_b)
+    session2 = _make_session(cursor=T, cursor_id=id_a, rows=[row_b])
+    gen2, ext2, wsm2 = _patch_curator(summary="s", facts=["f1"])
+    with gen2, ext2, wsm2:
+        await curator_tick(session2, "org-1", batch_size=1, min_inputs=1)
+
+    # The new-rows SELECT (2nd execute) binds the composite cursor...
+    read_call = session2.execute.call_args_list[1]
+    read_sql = str(read_call.args[0])
+    read_params = read_call.args[1]
+    assert read_params["cursor_ts"] == T
+    assert read_params["cursor_id"] == id_a
+    # ...and the keyset clause keeps B (same ts, greater id) returnable rather
+    # than excluding it via a bare `created_at > cursor`.
+    assert "created_at = :cursor_ts AND id > :cursor_id" in read_sql
+    assert "created_at > :cursor_ts" in read_sql
+    assert ":cursor_ts IS NULL" in read_sql
+    assert "ORDER BY created_at ASC, id ASC" in read_sql
 
 
 # ---------------------------------------------------------------------------
@@ -183,13 +266,14 @@ async def test_no_new_rows_is_idempotent_no_synthesis():
     assert result["processed"] == 0
     assert result["reason"] == "below_threshold"
 
-    # The state upsert touched only last_run_at, leaving last_processed_at
-    # absent from the bound params (or unchanged) so the cursor does not move.
+    # The state upsert touched only last_run_at, leaving BOTH composite-cursor
+    # columns absent from the statement so neither half of the cursor moves.
     upsert_call = session.execute.call_args_list[2]
     upsert_sql = str(upsert_call.args[0])
     assert "brain_curator_state" in upsert_sql
     assert "last_run_at" in upsert_sql
     assert "last_processed_at" not in upsert_sql
+    assert "last_processed_id" not in upsert_sql
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +322,10 @@ async def test_summary_none_skips_summary_but_still_extracts_and_advances():
     assert "summary" not in types_written
     assert types_written.count("fact") == 2
 
-    # Cursor still advanced to batch max.
+    # Cursor still advanced to the batch's composite (created_at, id) max.
     upsert_call = session.execute.call_args_list[2]
     assert upsert_call.args[1]["last_processed_at"] == rows[-1].created_at
+    assert upsert_call.args[1]["last_processed_id"] == rows[-1].id
     assert result["synthesized"] == 2
 
 
@@ -258,9 +343,9 @@ async def test_extract_facts_empty_still_advances():
     types_written = [c.kwargs["memory_type"] for c in mock_write.await_args_list]
     assert types_written == ["summary"]
     assert result["synthesized"] == 1
-    assert session.execute.call_args_list[2].args[1]["last_processed_at"] == (
-        rows[-1].created_at
-    )
+    advance_params = session.execute.call_args_list[2].args[1]
+    assert advance_params["last_processed_at"] == rows[-1].created_at
+    assert advance_params["last_processed_id"] == rows[-1].id
 
 
 # ---------------------------------------------------------------------------
