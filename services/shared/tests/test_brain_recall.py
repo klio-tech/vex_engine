@@ -84,6 +84,7 @@ def _seed_memory(
     *,
     org_id: str,
     content: str,
+    scope: str = "org",
     agent_id: str = "agent-1",
     session_id: str | None = None,
     space_id: str | None = None,
@@ -93,6 +94,13 @@ def _seed_memory(
     memory_type: str = "fact",
 ) -> str:
     """Insert one ``session_memories`` row with the fixed embedding literal.
+
+    ``scope`` is written explicitly to the ``scope`` column so tests can seed a
+    MIX of ``'session'`` (verification), ``'org'`` (shared brain), and
+    ``'agent'`` (agent-private) rows in the same org and prove that
+    ``retrieve_memories_scoped`` admits/excludes the right rows. Defaults to
+    ``'org'`` so brain-recall seeds pass the new scope predicate by default;
+    pass ``scope='session'`` to simulate a verification row.
 
     Returns the new row id. Uses the same vector for every row so cosine
     ordering is neutral and the scope/filter clauses are what's under test.
@@ -108,7 +116,7 @@ def _seed_memory(
                 created_at, updated_at
             ) VALUES (
                 :id, :session_id, :org_id, :agent_id, :execution_id,
-                :memory_type, :content, :embedding, 'session', :status,
+                :memory_type, :content, :embedding, :scope, :status,
                 :superseded_by, :space_id, :project_id, '{}'::jsonb,
                 :created_at, :updated_at
             )
@@ -122,6 +130,7 @@ def _seed_memory(
             "memory_type": memory_type,
             "content": content,
             "embedding": FIXED_EMBEDDING_LITERAL,
+            "scope": scope,
             "status": status,
             "superseded_by": superseded_by,
             "space_id": space_id,
@@ -169,11 +178,15 @@ async def test_scoped_recall_org_isolation(db_session):
 
 @pytest.mark.asyncio
 async def test_scoped_recall_org_spans_agents(db_session):
-    """scope='org' returns memories from multiple agents within the org."""
+    """scope='org' returns org-scope memories from multiple agents within the org."""
     org_id = _track(db_session, _unique_org())
 
-    _seed_memory(db_session, org_id=org_id, agent_id="agent-A", content="fact A")
-    _seed_memory(db_session, org_id=org_id, agent_id="agent-B", content="fact B")
+    _seed_memory(
+        db_session, org_id=org_id, scope="org", agent_id="agent-A", content="fact A"
+    )
+    _seed_memory(
+        db_session, org_id=org_id, scope="org", agent_id="agent-B", content="fact B"
+    )
 
     with _mock_embed():
         results = await retrieve_memories_scoped(
@@ -185,18 +198,92 @@ async def test_scoped_recall_org_spans_agents(db_session):
 
 
 # ---------------------------------------------------------------------------
-# Agent narrowing
+# Scope-column isolation (the visibility ladder)
+#
+# These are the regression tests for the BLOCKER: verification rows live in the
+# same table with scope='session'; the brain must filter on the scope column,
+# not just on a Python switch.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_scoped_recall_agent_narrows(db_session):
-    """scope='agent' returns only that agent's memories; agent_id is required."""
+async def test_org_recall_excludes_verification_session_rows(db_session):
+    """scope='org' recall returns the brain (org) row, NOT verification's
+    scope='session' row living in the same org/table.
+
+    REGRESSION TEST for the BLOCKER: without a scope-column predicate, an org
+    recall returns every active row in the org — including verification's
+    scope='session' rows — contaminating the brain.
+    """
     org_id = _track(db_session, _unique_org())
 
-    _seed_memory(db_session, org_id=org_id, agent_id="agent-A", content="A1")
-    _seed_memory(db_session, org_id=org_id, agent_id="agent-A", content="A2")
-    _seed_memory(db_session, org_id=org_id, agent_id="agent-B", content="B1")
+    _seed_memory(
+        db_session, org_id=org_id, scope="session", content="verification fact"
+    )
+    _seed_memory(db_session, org_id=org_id, scope="org", content="brain fact")
+
+    with _mock_embed():
+        results = await retrieve_memories_scoped(
+            db_session, org_id, "any query", scope="org", limit=10
+        )
+
+    contents = {r.content for r in results}
+    assert contents == {"brain fact"}
+    assert "verification fact" not in contents
+    assert all(r.scope == "org" for r in results)
+
+
+@pytest.mark.asyncio
+async def test_org_recall_excludes_agent_private_rows(db_session):
+    """scope='org' recall returns only org-scope rows, NOT agent-private rows."""
+    org_id = _track(db_session, _unique_org())
+
+    _seed_memory(db_session, org_id=org_id, scope="org", content="org fact")
+    _seed_memory(
+        db_session,
+        org_id=org_id,
+        scope="agent",
+        agent_id="agent-A",
+        content="agentA private",
+    )
+
+    with _mock_embed():
+        results = await retrieve_memories_scoped(
+            db_session, org_id, "any query", scope="org", limit=10
+        )
+
+    contents = {r.content for r in results}
+    assert contents == {"org fact"}
+    assert "agentA private" not in contents
+    assert all(r.scope == "org" for r in results)
+
+
+# ---------------------------------------------------------------------------
+# Agent narrowing (org + own agent-private, never another agent's private)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_recall_returns_org_plus_own_agent(db_session):
+    """scope='agent' returns the team's org rows PLUS the agent's own private
+    rows, but NOT another agent's private rows."""
+    org_id = _track(db_session, _unique_org())
+
+    _seed_memory(db_session, org_id=org_id, scope="org", content="org fact")
+    _seed_memory(
+        db_session,
+        org_id=org_id,
+        scope="agent",
+        agent_id="agent-A",
+        content="agentA private",
+    )
+    _seed_memory(
+        db_session,
+        org_id=org_id,
+        scope="agent",
+        agent_id="agent-B",
+        content="agentB private",
+    )
 
     with _mock_embed():
         results = await retrieve_memories_scoped(
@@ -209,13 +296,45 @@ async def test_scoped_recall_agent_narrows(db_session):
         )
 
     contents = {r.content for r in results}
-    assert contents == {"A1", "A2"}
-    assert all(r.agent_id == "agent-A" for r in results)
+    assert contents == {"org fact", "agentA private"}
+    assert "agentB private" not in contents
 
-    # agent_id is required when scope='agent' — raises before any DB/embed work.
+
+@pytest.mark.asyncio
+async def test_agent_scope_requires_agent_id(db_session):
+    """scope='agent' with agent_id=None raises ValueError before any DB/embed work."""
+    org_id = _track(db_session, _unique_org())
+
     with pytest.raises(ValueError):
         await retrieve_memories_scoped(
             db_session, org_id, "any query", scope="agent", agent_id=None
+        )
+
+
+# ---------------------------------------------------------------------------
+# Unsupported / unknown scope values raise (no silent org-wide read)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_scope_raises(db_session):
+    """scope='session' is unsupported here and raises (use retrieve_memories)."""
+    org_id = _track(db_session, _unique_org())
+
+    with pytest.raises(ValueError):
+        await retrieve_memories_scoped(
+            db_session, org_id, "any query", scope="session"
+        )
+
+
+@pytest.mark.asyncio
+async def test_unknown_scope_raises(db_session):
+    """An unknown scope value raises ValueError."""
+    org_id = _track(db_session, _unique_org())
+
+    with pytest.raises(ValueError):
+        await retrieve_memories_scoped(
+            db_session, org_id, "any query", scope="bogus"
         )
 
 
@@ -253,9 +372,19 @@ async def test_scoped_recall_project_filter_surfaces_null(db_session):
         )
     db_session.commit()
 
-    _seed_memory(db_session, org_id=org_id, content="x-tagged", project_id=project_x)
-    _seed_memory(db_session, org_id=org_id, content="y-tagged", project_id=project_y)
-    _seed_memory(db_session, org_id=org_id, content="unfiled", project_id=None)
+    # Seed as scope='org' so rows pass the new scope-column predicate; the
+    # project filter (NULL-surfacing) is what's under test here.
+    _seed_memory(
+        db_session, org_id=org_id, scope="org", content="x-tagged",
+        project_id=project_x,
+    )
+    _seed_memory(
+        db_session, org_id=org_id, scope="org", content="y-tagged",
+        project_id=project_y,
+    )
+    _seed_memory(
+        db_session, org_id=org_id, scope="org", content="unfiled", project_id=None
+    )
 
     try:
         with _mock_embed():

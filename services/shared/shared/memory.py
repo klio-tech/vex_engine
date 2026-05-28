@@ -562,6 +562,25 @@ async def retrieve_memories_scoped(
     ``session_id``: it spans every session in the org so the "brain" can recall
     facts learned in any prior conversation.
 
+    Scope visibility ladder (filtered on the ``scope`` *column*, not just a
+    Python switch — this is what keeps verification's ``scope='session'`` rows
+    out of brain recall, since those rows live in the same table):
+
+        * ``"org"`` (default) → ``scope = 'org'``. The shared team brain only.
+          EXCLUDES verification's ``scope='session'`` rows AND agent-private
+          ``scope='agent'`` rows.
+        * ``"agent"`` (requires ``agent_id``) →
+          ``(scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id))``.
+          An agent sees the team's org memories PLUS its own agent-private
+          memories — never another agent's private rows.
+        * ``"session"`` → not supported here; raises ``ValueError``. Use
+          :func:`retrieve_memories` for session-scoped reads instead of
+          silently reading org-wide.
+        * any other value → raises ``ValueError``.
+
+    NOTE: HNSW is an approximate index; with selective WHERE filters the result
+    may under-fill ``limit``. Acceptable for v1.
+
     Args:
         db_session: A synchronous SQLAlchemy connection/session exposing
             ``.execute()`` (same contract as :func:`retrieve_memories`).
@@ -569,17 +588,8 @@ async def retrieve_memories_scoped(
             never returned from another org.
         query_text: Natural-language query; embedded and ranked by cosine
             distance against stored memory embeddings.
-        scope: One of:
-
-            * ``"org"`` (default): all of the org's active memories, with no
-              agent or session narrowing.
-            * ``"agent"``: additionally restrict to ``agent_id = :agent_id``
-              (``agent_id`` is required; ``ValueError`` is raised if it is
-              ``None``).
-            * ``"session"``: callers should prefer the existing
-              :func:`retrieve_memories` for session-scoped reads. This function
-              does not narrow by session, so passing ``"session"`` here behaves
-              like an org-wide read.
+        scope: One of ``"org"`` or ``"agent"`` (see the visibility ladder
+            above). ``"session"`` and any unknown value raise ``ValueError``.
         agent_id: Required when ``scope == "agent"``; ignored otherwise.
         space_id: When given, match rows whose ``space_id`` equals it OR is
             ``NULL`` (unfiled memories surface in every space filter — the safe
@@ -593,10 +603,23 @@ async def retrieve_memories_scoped(
         (closest first), or an empty list if embedding generation fails.
 
     Raises:
-        ValueError: If ``scope == "agent"`` but ``agent_id`` is ``None``.
+        ValueError: If ``scope == "agent"`` but ``agent_id`` is ``None``; if
+            ``scope == "session"`` (unsupported here); or if ``scope`` is any
+            unknown value.
     """
-    if scope == "agent" and agent_id is None:
-        raise ValueError("agent_id is required when scope='agent'")
+    # Validate scope BEFORE the (expensive) embed call so bad input fails fast.
+    if scope == "org":
+        pass
+    elif scope == "agent":
+        if agent_id is None:
+            raise ValueError("agent_id is required when scope='agent'")
+    elif scope == "session":
+        raise ValueError(
+            "scope='session' is not supported by retrieve_memories_scoped; "
+            "use retrieve_memories for session-scoped reads"
+        )
+    else:
+        raise ValueError(f"unknown scope: {scope!r}")
 
     embedding = await embed_text(query_text)
     if embedding is None:
@@ -618,8 +641,14 @@ async def retrieve_memories_scoped(
         "limit": limit,
     }
 
-    if scope == "agent":
-        clauses.append("agent_id = :agent_id")
+    # Scope-column predicate (the visibility ladder). Parenthesized so the OR
+    # in the agent case binds correctly when AND-joined with the base WHERE.
+    if scope == "org":
+        clauses.append("scope = 'org'")
+    else:  # scope == "agent" (validated above; agent_id is not None)
+        clauses.append(
+            "(scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id))"
+        )
         params["agent_id"] = agent_id
 
     if space_id is not None:
