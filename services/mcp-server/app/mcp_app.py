@@ -10,15 +10,17 @@ principal, derive a stable brain ``session_id``, and persist via
 tool is implemented too: it resolves the principal, resolves optional
 ``space``/``project`` filters to ids (read-only, surfacing unknown names
 as a warning), and reads via :func:`shared.memory.retrieve_memories_scoped`.
-The ``space`` management tool *body* remains a stub (it returns a
-``not_implemented_yet`` marker) — that logic lands in D4.  The tool
-*schemas* are the real ones throughout: each tool's signature and
-argument descriptions define the JSON input schema that ``tools/list``
-advertises, so the later tasks only fill in the remaining body without
-changing the public contract.
+As of D4 the ``space`` management tool is implemented as well: it resolves
+the principal and dispatches on ``action`` (``list`` / ``create`` /
+``info`` / ``switch``) over :func:`shared.brain.list_spaces` /
+``get_space`` / ``ensure_space``.  All seven tool bodies are now live.
+The tool *schemas* have been the real ones throughout: each tool's
+signature and argument descriptions define the JSON input schema that
+``tools/list`` advertises, so filling in the bodies never changed the
+public contract.
 
-The write tools take a FastMCP ``Context`` as their first parameter;
-FastMCP injects it and EXCLUDES it from the public input schema, so the
+Every tool takes a FastMCP ``Context`` as its first parameter; FastMCP
+injects it and EXCLUDES it from the public input schema, so the
 ``tools/list`` contract is unchanged.
 
 Transport notes (mcp SDK 1.27.x):
@@ -71,11 +73,6 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "note",
     "space",
 )
-
-# Stub payload returned by the still-unimplemented read/management tools
-# (``recall``, ``space``).  The five write tools are implemented in D2; the
-# remaining bodies replace this in D3/D4.
-_STUB_RESULT: dict[str, str] = {"status": "not_implemented_yet"}
 
 # Server-level guidance surfaced to MCP clients during ``initialize``.
 # Reinforces the X-Vex-Agent contract at the protocol level (in addition
@@ -192,6 +189,151 @@ def _serialize_record(record: MemoryRecord) -> dict[str, Any]:
     }
 
 
+def _serialize_space(s: dict[str, Any]) -> dict[str, Any]:
+    """Project a brain-layer space dict to a JSON-safe dict for a tool result.
+
+    The brain helpers (:func:`shared.brain.list_spaces` / ``get_space``) already
+    stringify ``id`` (a UUID column) but leave ``created_at`` as a ``datetime``
+    so this layer controls its serialization — exactly the split used on the
+    recall path. We render ``created_at`` as an ISO-8601 string (or ``None``)
+    here so NOTHING in the returned tool result is a ``uuid.UUID`` or
+    ``datetime`` (both blow up ``json.dumps``; we just fixed this class of bug on
+    the recall path and must not reintroduce it).
+    """
+    created_at = s.get("created_at")
+    return {
+        "id": s["id"],  # already a str (brain helper stringifies the UUID column)
+        "name": s.get("name"),
+        "slug": s.get("slug"),
+        "embedding_model": s.get("embedding_model"),
+        "created_at": created_at.isoformat() if created_at is not None else None,
+    }
+
+
+async def _perform_space(
+    ctx: Context,
+    *,
+    action: str,
+    name: Optional[str],
+    slug: Optional[str],
+) -> dict[str, Any]:
+    """Shared body for the Klio ``space`` management tool.
+
+    Resolves the tenant principal from the transport request, opens a
+    short-lived DB session, and dispatches on ``action``:
+
+    * ``list``   — enumerate the org's spaces (read-only).
+    * ``create`` — get-or-create a space by ``(org_id, slug)`` via
+      :func:`shared.brain.ensure_space` (idempotent: a repeat returns the
+      existing id).
+    * ``info``   — look up a single space by slug (read-only).
+    * ``switch`` — validate a space exists and tell the caller how to scope
+      reads to it (see the switch rationale in the dispatch below).
+
+    The org_id is taken from the resolved principal (never caller-supplied
+    input), so a tenant can only ever list/create/inspect its own spaces.
+
+    Auth/session boilerplate mirrors :func:`_perform_recall` / ``_perform_write``
+    inline rather than being factored out — the three tool bodies duplicate this
+    today and a consolidation pass is tracked separately (do not refactor the
+    already-reviewed bodies here).
+
+    Args:
+        ctx: FastMCP-injected context; ``ctx.request_context.request`` is the
+            Starlette request for the Streamable-HTTP transport.
+        action: One of ``list`` | ``create`` | ``info`` | ``switch`` (the schema
+            already constrains it to this set).
+        name: Human-readable space name (required, with ``slug``, for
+            ``create``).
+        slug: Space slug (required for ``create`` / ``info`` / ``switch``).
+
+    Returns:
+        An action-tagged result dict, or a clean error dict on auth failure /
+        unexpected error.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        # The Streamable-HTTP transport always attaches the Starlette request
+        # (mcp 1.27.x); a transport that does not gives us nothing to
+        # authenticate, so deny rather than guess a principal.
+        logger.error("brain space got no transport request; cannot authenticate")
+        return {"error": "unauthorized", "detail": "no request context"}
+
+    try:
+        org_id, _agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"error": "unauthorized", "detail": str(exc.detail)}
+
+    db = SessionLocal()
+    try:
+        if action == "list":
+            spaces = brain.list_spaces(db, org_id=org_id)
+            return {
+                "action": "list",
+                "spaces": [_serialize_space(s) for s in spaces],
+                "count": len(spaces),
+            }
+
+        if action == "create":
+            # Both fields are mandatory and must be non-empty; bail before
+            # touching the DB so a half-specified create never reaches
+            # ensure_space.
+            if not (name and name.strip()) or not (slug and slug.strip()):
+                return {"action": "create", "error": "name and slug are required"}
+            # ensure_space is idempotent (race-safe upsert on (org_id, slug)); a
+            # repeat create returns the existing id, which is the intended
+            # get-or-create semantics. No embedding_model lever in v1 — created
+            # spaces inherit the default model (per-space embedding is a separate
+            # future concern).
+            space_id = brain.ensure_space(db, org_id=org_id, name=name, slug=slug)
+            return {
+                "action": "create",
+                "created": True,
+                "id": space_id,
+                "slug": slug,
+            }
+
+        if action == "info":
+            if not slug:
+                return {"action": "info", "error": "slug is required"}
+            s = brain.get_space(db, org_id=org_id, slug=slug)
+            if s is None:
+                return {"action": "info", "warning": f"unknown space: {slug}"}
+            return {"action": "info", "space": _serialize_space(s)}
+
+        if action == "switch":
+            if not slug:
+                return {"action": "switch", "error": "slug is required"}
+            s = brain.get_space(db, org_id=org_id, slug=slug)
+            if s is None:
+                return {"action": "switch", "warning": f"unknown space: {slug}"}
+            # RATIONALE: the brain server holds NO durable per-connection "active
+            # space" state — the write tools write unfiled and recall takes an
+            # explicit `space=` arg. So `switch` does not pretend to persist an
+            # active selection (which would be fake stateful behavior across
+            # stateless connections); it instead validates the space exists and
+            # instructs the caller to pass `space=<slug>` on subsequent `recall`
+            # calls. This is honest about the server's statelessness.
+            return {
+                "action": "switch",
+                "space": _serialize_space(s),
+                "note": (
+                    "Pass space='"
+                    + slug
+                    + "' to recall to scope reads to this space."
+                ),
+            }
+
+        # The schema (Literal) constrains `action` to the four handled cases, so
+        # this is unreachable via the MCP contract; guard defensively anyway.
+        return {"error": "unknown_action", "action": action}
+    except Exception:
+        logger.exception("brain space failed (action=%s)", action)
+        return {"error": "space_failed"}
+    finally:
+        db.close()
+
+
 async def _perform_recall(
     ctx: Context,
     *,
@@ -293,8 +435,8 @@ def build_mcp_server() -> FastMCP:
     """Construct a fresh :class:`FastMCP` with the seven Klio tools.
 
     Returns a new instance on every call so tests get isolated servers
-    and so the app factory controls the lifecycle.  Tool bodies are D1
-    stubs; schemas are final.
+    and so the app factory controls the lifecycle.  All seven tool bodies
+    are implemented (D2-D4); schemas are final.
     """
     # Keep the default ``streamable_http_path="/mcp"``.  ``app.main``
     # mounts this server's ASGI app at the application root, so the
@@ -336,7 +478,7 @@ def _register_tools(mcp: FastMCP) -> None:
     """Register all seven Klio tools on the given server.
 
     Each tool's typed signature drives the JSON input schema advertised
-    by ``tools/list``.  Bodies are stubs in D1.
+    by ``tools/list``.  All bodies are implemented (D2-D4).
     """
 
     @mcp.tool(
@@ -458,7 +600,8 @@ def _register_tools(mcp: FastMCP) -> None:
             "optional name/slug."
         ),
     )
-    def space(
+    async def space(
+        ctx: Context,
         action: Annotated[
             Literal["list", "create", "info", "switch"],
             Field(description="The space operation to perform."),
@@ -472,4 +615,4 @@ def _register_tools(mcp: FastMCP) -> None:
             Field(description="Space slug (for 'info'/'switch'/'create')."),
         ] = None,
     ) -> dict[str, Any]:
-        return dict(_STUB_RESULT)
+        return await _perform_space(ctx, action=action, name=name, slug=slug)

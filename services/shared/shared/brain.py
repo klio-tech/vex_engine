@@ -307,6 +307,109 @@ def find_project_id(db_session: Any, *, org_id: str, identifier: str) -> Optiona
     return str(row[0])
 
 
+def list_spaces(db_session: Any, *, org_id: str) -> list[dict]:
+    """Return all spaces for an org, newest first. Read-only.
+
+    Enumerates the org's spaces on the management (read) path for the ``space``
+    MCP tool's ``list`` action. NEVER creates a row — it only ``SELECT``s and
+    projects each row to a dict. Tenant-scoped: only ``org_id``-owned rows are
+    returned, so a slug/name collision across orgs never leaks another org's
+    space.
+
+    Each returned dict has: ``id`` (str — ``spaces.id`` is a UUID column, so it
+    is stringified here for caller convenience), ``name`` (str), ``slug`` (str),
+    ``embedding_model`` (str|None), and ``created_at`` (a ``datetime`` — left
+    as-is so the JSON-facing tool layer controls its serialization, mirroring
+    the recall path where the tool isoformats timestamps).
+
+    Threading contract:
+        Synchronous (blocking psycopg2 I/O). When called from an async handler,
+        invoke via ``anyio.to_thread.run_sync(...)`` (or a plain-``def`` FastAPI
+        route, which FastAPI runs in a threadpool) — never inline from a
+        coroutine, or you block the event loop.
+
+    Args:
+        db_session: A synchronous SQLAlchemy session/connection exposing
+            ``.execute()``.
+        org_id: Owning org id (tenant scope).
+
+    Returns:
+        A list of space dicts (possibly empty), ordered by ``created_at``
+        descending (newest first).
+    """
+    rows = db_session.execute(
+        text(
+            """
+            SELECT id, name, slug, embedding_model, created_at
+            FROM spaces
+            WHERE org_id = :org_id
+            ORDER BY created_at DESC
+            """
+        ),
+        {"org_id": org_id},
+    ).fetchall()
+    return [
+        {
+            "id": str(row.id),
+            "name": row.name,
+            "slug": row.slug,
+            "embedding_model": row.embedding_model,
+            "created_at": row.created_at,
+        }
+        for row in rows
+    ]
+
+
+def get_space(db_session: Any, *, org_id: str, slug: str) -> Optional[dict]:
+    """Return a single space by ``(org_id, slug)``, or ``None``. Read-only.
+
+    Look-up counterpart used by the ``space`` MCP tool's ``info`` / ``switch``
+    actions. Unlike :func:`find_space_id` (which returns only the id), this
+    returns the full space dict so the tool can echo human-facing fields. NEVER
+    creates a row — it only ``SELECT``s. Tenant-scoped: only an ``org_id``-owned
+    row can match.
+
+    Returns the same dict shape as :func:`list_spaces`: ``id`` (str — the UUID
+    column is stringified), ``name``, ``slug``, ``embedding_model`` (str|None),
+    and ``created_at`` (a ``datetime``, left unserialized for the tool layer).
+
+    Threading contract:
+        Synchronous (blocking psycopg2 I/O). When called from an async handler,
+        invoke via ``anyio.to_thread.run_sync(...)`` (or a plain-``def`` FastAPI
+        route, which FastAPI runs in a threadpool) — never inline from a
+        coroutine, or you block the event loop.
+
+    Args:
+        db_session: A synchronous SQLAlchemy session/connection exposing
+            ``.execute()``.
+        org_id: Owning org id (tenant scope).
+        slug: Space slug; the dedup key within an org.
+
+    Returns:
+        The space dict, or ``None`` if no matching space exists.
+    """
+    row = db_session.execute(
+        text(
+            """
+            SELECT id, name, slug, embedding_model, created_at
+            FROM spaces
+            WHERE org_id = :org_id AND slug = :slug
+            LIMIT 1
+            """
+        ),
+        {"org_id": org_id, "slug": slug},
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "slug": row.slug,
+        "embedding_model": row.embedding_model,
+        "created_at": row.created_at,
+    }
+
+
 async def write_scoped_memory(
     db_session: Any,
     *,
