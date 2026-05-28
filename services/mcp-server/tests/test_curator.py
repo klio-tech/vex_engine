@@ -203,8 +203,9 @@ async def test_same_timestamp_straddle_does_not_skip_twin():
     (created_at=T, id_B>id_A) eligible — i.e. the twin is NOT silently skipped.
     """
     T = _BASE
-    id_a, id_b = "00000000-0000-0000-0000-00000000000a", (
-        "00000000-0000-0000-0000-00000000000b"
+    id_a, id_b = (
+        "00000000-0000-0000-0000-00000000000a",
+        ("00000000-0000-0000-0000-00000000000b"),
     )
     # min_inputs=1 so a single row triggers the advance path.
     # --- tick 1: cursor empty -> read returns [A] -------------------------
@@ -361,10 +362,16 @@ async def test_deduped_synthesized_write_not_counted():
     session = _make_session(cursor=None, rows=rows)
 
     with (
-        patch("app.curator.generate_summary", new_callable=AsyncMock,
-              return_value="dup summary"),
-        patch("app.curator.extract_facts", new_callable=AsyncMock,
-              return_value=["f1", "f2"]),
+        patch(
+            "app.curator.generate_summary",
+            new_callable=AsyncMock,
+            return_value="dup summary",
+        ),
+        patch(
+            "app.curator.extract_facts",
+            new_callable=AsyncMock,
+            return_value=["f1", "f2"],
+        ),
         patch(
             "app.curator.write_scoped_memory",
             new_callable=AsyncMock,

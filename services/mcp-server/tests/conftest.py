@@ -18,11 +18,11 @@ _SERVICES_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 sys.path.insert(0, _SERVICES_DIR)
 sys.path.insert(0, os.path.join(_SERVICES_DIR, "shared"))
 
-import pytest
-from app.auth import verify_api_key
-from app.main import create_app
-from fastapi.testclient import TestClient
-from shared.auth import KeyInfo
+import pytest  # noqa: E402
+from app.auth import verify_api_key  # noqa: E402
+from app.main import create_app  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+from shared.auth import KeyInfo  # noqa: E402
 
 
 def _fake_key_info() -> KeyInfo:

@@ -44,7 +44,9 @@ def _recall_fn():
     return tool.fn
 
 
-def _make_record(*, content="a fact", memory_type="memory", scope="org") -> MemoryRecord:
+def _make_record(
+    *, content="a fact", memory_type="memory", scope="org"
+) -> MemoryRecord:
     """Build a MemoryRecord populated like retrieve_memories_scoped returns,
     including an embedding so we can assert it is NOT serialized."""
     now = datetime.now(timezone.utc)
@@ -391,7 +393,9 @@ async def test_recall_auth_failure_returns_clean_error():
     with (
         patch(
             "app.mcp_app.resolve_principal",
-            side_effect=HTTPException(status_code=401, detail="Missing X-Vex-Key header"),
+            side_effect=HTTPException(
+                status_code=401, detail="Missing X-Vex-Key header"
+            ),
         ),
         patch("app.mcp_app.SessionLocal", session_local),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),

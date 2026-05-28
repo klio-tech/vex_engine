@@ -163,9 +163,7 @@ def orgs():
         db = SessionLocal()
         try:
             db.execute(
-                text(
-                    "DELETE FROM session_memories WHERE org_id IN (:a, :b)"
-                ),
+                text("DELETE FROM session_memories WHERE org_id IN (:a, :b)"),
                 {"a": org_a, "b": org_b},
             )
             db.commit()
@@ -377,9 +375,7 @@ async def test_org_recall_excludes_verification_session_rows(_patched_seams):
 
     # Insert a verification-style row (scope='session') for org A directly.
     verif_session_id = f"e2e-verif-{uuid.uuid4()}"
-    _insert_verification_row(
-        org_a, session_id=verif_session_id, content=verif_content
-    )
+    _insert_verification_row(org_a, session_id=verif_session_id, content=verif_content)
 
     async with _mcp_session("key-A", "agent-a") as session_a:
         stored = _result_dict(

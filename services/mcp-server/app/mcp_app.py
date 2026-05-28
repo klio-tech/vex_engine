@@ -318,9 +318,7 @@ async def _perform_space(
                 "action": "switch",
                 "space": _serialize_space(s),
                 "note": (
-                    "Pass space='"
-                    + slug
-                    + "' to recall to scope reads to this space."
+                    "Pass space='" + slug + "' to recall to scope reads to this space."
                 ),
             }
 
@@ -564,9 +562,7 @@ def _register_tools(mcp: FastMCP) -> None:
     )
     async def decide(
         ctx: Context,
-        content: Annotated[
-            str, Field(description="The decision that was made.")
-        ],
+        content: Annotated[str, Field(description="The decision that was made.")],
         rationale: Annotated[
             Optional[str],
             Field(description="Optional rationale behind the decision."),
@@ -585,9 +581,7 @@ def _register_tools(mcp: FastMCP) -> None:
     )
     async def note(
         ctx: Context,
-        content: Annotated[
-            str, Field(description="The free-form note to store.")
-        ],
+        content: Annotated[str, Field(description="The free-form note to store.")],
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx, content=content, memory_type="note", metadata={"source": "mcp"}
@@ -596,8 +590,7 @@ def _register_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         name="space",
         description=(
-            "Manage spaces. Args: action (list|create|info|switch), "
-            "optional name/slug."
+            "Manage spaces. Args: action (list|create|info|switch), optional name/slug."
         ),
     )
     async def space(

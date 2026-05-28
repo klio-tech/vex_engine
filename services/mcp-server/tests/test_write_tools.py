@@ -191,7 +191,9 @@ async def test_write_tool_auth_failure_returns_clean_error():
     with (
         patch(
             "app.mcp_app.resolve_principal",
-            side_effect=HTTPException(status_code=401, detail="Missing X-Vex-Key header"),
+            side_effect=HTTPException(
+                status_code=401, detail="Missing X-Vex-Key header"
+            ),
         ),
         patch("app.mcp_app.SessionLocal", session_local),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),

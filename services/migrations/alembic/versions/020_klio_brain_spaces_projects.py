@@ -109,12 +109,8 @@ def upgrade() -> None:
             nullable=True,
         ),
     )
-    op.create_index(
-        "ix_session_memories_space", "session_memories", ["space_id"]
-    )
-    op.create_index(
-        "ix_session_memories_project", "session_memories", ["project_id"]
-    )
+    op.create_index("ix_session_memories_space", "session_memories", ["space_id"])
+    op.create_index("ix_session_memories_project", "session_memories", ["project_id"])
 
 
 def downgrade() -> None:
