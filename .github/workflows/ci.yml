@@ -28,7 +28,7 @@ jobs:
     needs: [lint]
     strategy:
       matrix:
-        service: [shared, ingestion-api, storage-worker, dashboard-api, verification-engine, sync-gateway, async-worker, alert-service]
+        service: [shared, ingestion-api, storage-worker, dashboard-api, verification-engine, sync-gateway, async-worker, alert-service, mcp-server]
         include:
           - service: sync-gateway
             extra_deps: services/verification-engine

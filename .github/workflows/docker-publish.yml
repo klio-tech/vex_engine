@@ -30,6 +30,8 @@ jobs:
             dockerfile: services/alert-service/Dockerfile
           - service: dashboard-api
             dockerfile: services/dashboard-api/Dockerfile
+          - service: mcp-server
+            dockerfile: services/mcp-server/Dockerfile
           - service: migrations
             dockerfile: services/migrations/Dockerfile
     steps:

@@ -197,6 +197,26 @@ services:
       redis:
         condition: service_healthy
 
+  mcp-server:
+    image: 7hakurg/mcp-server:latest
+    build:
+      context: .
+      dockerfile: services/mcp-server/Dockerfile
+    ports:
+      - "8085:8000"
+    environment:
+      DATABASE_URL: postgresql://agentguard:${POSTGRES_PASSWORD:-agentguard_dev}@postgres:5432/agentguard
+      SUPABASE_DATABASE_URL: ${SUPABASE_DATABASE_URL:-}
+      # MCP transport security: DNS-rebinding protection defaults OFF (auth is
+      # the real boundary; deploy Host varies per environment). Set an explicit
+      # allow-list in production via these env vars. See services/mcp-server/app/config.py.
+      MCP_DNS_REBINDING_PROTECTION: ${MCP_DNS_REBINDING_PROTECTION:-false}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS:-}
+      MCP_ALLOWED_ORIGINS: ${MCP_ALLOWED_ORIGINS:-}
+    depends_on:
+      migrations:
+        condition: service_completed_successfully
+
 volumes:
   pgdata:
   redisdata:

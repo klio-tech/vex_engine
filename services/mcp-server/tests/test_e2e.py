@@ -57,6 +57,34 @@ from sqlalchemy import text
 # it explicitly (autouse fixture below) so this never depends on ambient env.
 from shared.auth import KeyInfo
 
+# --- DB-availability skip guard -------------------------------------------
+#
+# This whole module drives the REAL Postgres test DB. CI runs unit tests only
+# (no Postgres service), so without a guard this module would ERROR there. We
+# probe the SAME engine ``app.db`` built at import time (bound to
+# ``config.DATABASE_URL``, which itself reads ``DATABASE_URL`` at import). If
+# the DB is unreachable we SKIP the whole module rather than fail.
+#
+# This is purely additive: when Postgres IS up (local default), the probe
+# succeeds, the module runs, and every assertion below is exercised unchanged.
+from app.db import engine as _engine
+
+
+def _postgres_reachable() -> bool:
+    """Return True iff a trivial SELECT 1 succeeds on the app's DB engine."""
+    try:
+        with _engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _postgres_reachable(),
+    reason="Postgres not reachable; e2e requires the live test DB (CI runs unit tests only)",
+)
+
 # A fixed embedding vector of the exact column dimension (vector(1024)). A
 # written row and any later query both embed to THIS vector, so cosine
 # distance is 0 and the row is always recalled — making the round-trip
