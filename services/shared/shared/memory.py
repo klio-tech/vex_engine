@@ -65,6 +65,8 @@ class MemoryRecord:
     metadata: dict = field(default_factory=dict)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    space_id: Optional[str] = None
+    project_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -260,10 +262,14 @@ async def extract_facts(
 def _row_to_record(row: tuple) -> MemoryRecord:
     """Convert a raw DB row tuple to a :class:`MemoryRecord`.
 
-    Expected column order:
+    Expected column order (first 16 columns, required):
         id, session_id, org_id, agent_id, execution_id, memory_type,
         content, embedding, confidence, sequence_number, scope, status,
         superseded_by, metadata, created_at, updated_at
+
+    Optional trailing columns (additive, read only if present so existing
+    16-column callers are unaffected):
+        space_id (index 16), project_id (index 17)
     """
     return MemoryRecord(
         id=row[0],
@@ -282,6 +288,8 @@ def _row_to_record(row: tuple) -> MemoryRecord:
         metadata=row[13] if row[13] is not None else {},
         created_at=row[14],
         updated_at=row[15],
+        space_id=row[16] if len(row) > 16 else None,
+        project_id=row[17] if len(row) > 17 else None,
     )
 
 
@@ -533,3 +541,108 @@ def supersede_memory(
         },
     )
     db_session.commit()
+
+
+async def retrieve_memories_scoped(
+    db_session: Any,
+    org_id: str,
+    query_text: str,
+    *,
+    scope: str = "org",
+    agent_id: Optional[str] = None,
+    space_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    limit: int = 10,
+) -> list[MemoryRecord]:
+    """Brain recall across sessions, scoped to an org (and optionally an
+    agent / space / project).
+
+    Distinct from :func:`retrieve_memories`, which is session-scoped and used
+    for verification context. This function deliberately does NOT narrow by
+    ``session_id``: it spans every session in the org so the "brain" can recall
+    facts learned in any prior conversation.
+
+    Args:
+        db_session: A synchronous SQLAlchemy connection/session exposing
+            ``.execute()`` (same contract as :func:`retrieve_memories`).
+        org_id: Tenant whose memories to search. Always enforced — results are
+            never returned from another org.
+        query_text: Natural-language query; embedded and ranked by cosine
+            distance against stored memory embeddings.
+        scope: One of:
+
+            * ``"org"`` (default): all of the org's active memories, with no
+              agent or session narrowing.
+            * ``"agent"``: additionally restrict to ``agent_id = :agent_id``
+              (``agent_id`` is required; ``ValueError`` is raised if it is
+              ``None``).
+            * ``"session"``: callers should prefer the existing
+              :func:`retrieve_memories` for session-scoped reads. This function
+              does not narrow by session, so passing ``"session"`` here behaves
+              like an org-wide read.
+        agent_id: Required when ``scope == "agent"``; ignored otherwise.
+        space_id: When given, match rows whose ``space_id`` equals it OR is
+            ``NULL`` (unfiled memories surface in every space filter — the safe
+            default so nothing is hidden by an over-narrow filter).
+        project_id: When given, match rows whose ``project_id`` equals it OR is
+            ``NULL`` (same NULL-surfacing semantics as ``space_id``).
+        limit: Maximum number of records to return.
+
+    Returns:
+        A list of :class:`MemoryRecord` ordered by ascending cosine distance
+        (closest first), or an empty list if embedding generation fails.
+
+    Raises:
+        ValueError: If ``scope == "agent"`` but ``agent_id`` is ``None``.
+    """
+    if scope == "agent" and agent_id is None:
+        raise ValueError("agent_id is required when scope='agent'")
+
+    embedding = await embed_text(query_text)
+    if embedding is None:
+        return []
+
+    # Bind the query vector exactly as retrieve_memories does: the embedding
+    # list is rendered via str() and bound as a plain parameter, which pgvector
+    # accepts directly with the cosine-distance operator (<=>).
+    embedding_str = str(embedding)
+
+    clauses = [
+        "org_id = :org_id",
+        "status = 'active'",
+        "superseded_by IS NULL",
+    ]
+    params: dict[str, Any] = {
+        "org_id": org_id,
+        "embedding": embedding_str,
+        "limit": limit,
+    }
+
+    if scope == "agent":
+        clauses.append("agent_id = :agent_id")
+        params["agent_id"] = agent_id
+
+    if space_id is not None:
+        clauses.append("(space_id = :space_id OR space_id IS NULL)")
+        params["space_id"] = space_id
+
+    if project_id is not None:
+        clauses.append("(project_id = :project_id OR project_id IS NULL)")
+        params["project_id"] = project_id
+
+    where_sql = "\n              AND ".join(clauses)
+    sql = text(f"""
+        SELECT id, session_id, org_id, agent_id, execution_id,
+               memory_type, content, embedding, confidence,
+               sequence_number, scope, status, superseded_by,
+               metadata, created_at, updated_at, space_id, project_id
+        FROM session_memories
+        WHERE {where_sql}
+        ORDER BY embedding <=> :embedding
+        LIMIT :limit
+    """)
+
+    result = db_session.execute(sql, params)
+    rows = result.fetchall()
+
+    return [_row_to_record(row) for row in rows]
