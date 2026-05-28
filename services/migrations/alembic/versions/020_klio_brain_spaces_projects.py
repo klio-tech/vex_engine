@@ -38,6 +38,7 @@ def upgrade() -> None:
             "created_at",
             sa.DateTime(timezone=True),
             server_default=sa.text("NOW()"),
+            nullable=False,
         ),
         sa.UniqueConstraint("org_id", "slug", name="uq_spaces_org_slug"),
     )
@@ -63,11 +64,17 @@ def upgrade() -> None:
             "created_at",
             sa.DateTime(timezone=True),
             server_default=sa.text("NOW()"),
+            nullable=False,
         ),
         sa.Column(
             "last_seen_at",
             sa.DateTime(timezone=True),
             server_default=sa.text("NOW()"),
+            nullable=False,
+        ),
+        sa.CheckConstraint(
+            "git_remote IS NOT NULL OR repo_root_path IS NOT NULL",
+            name="ck_projects_has_identity",
         ),
     )
     op.create_index(

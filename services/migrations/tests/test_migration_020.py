@@ -3,7 +3,9 @@ import subprocess
 import sys
 import uuid
 
+import pytest
 from sqlalchemy import create_engine, inspect, text
+from sqlalchemy.exc import IntegrityError
 
 DB_URL = os.environ.get(
     "DATABASE_URL",
@@ -68,3 +70,16 @@ def test_existing_session_memory_row_undisturbed():
         # cleanup
         c.execute(text("DELETE FROM session_memories WHERE session_id=:sid"), {"sid": sid})
     assert row.space_id is None and row.project_id is None
+
+
+def test_projects_rejects_both_identity_null():
+    """A project with neither git_remote nor repo_root_path is unrepresentable
+    (ck_projects_has_identity) — prevents unlimited duplicate anonymous rows."""
+    _alembic_upgrade_head()
+    eng = create_engine(DB_URL)
+    with pytest.raises(IntegrityError):
+        with eng.begin() as c:
+            c.execute(text("""
+                INSERT INTO projects (id, org_id, display_name)
+                VALUES (gen_random_uuid(), 'org_test', 'anon')
+            """))
