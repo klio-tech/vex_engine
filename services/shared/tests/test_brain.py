@@ -7,6 +7,7 @@ session-scoped fixture cleans up any rows created for those org ids.
 """
 
 import os
+import threading
 import time
 import uuid
 
@@ -256,3 +257,74 @@ def test_ensure_project_tenant_isolation(db_session):
     )
     assert id_a_again == id_a
     assert id_a_again != id_b
+
+
+def test_ensure_project_concurrent_calls_converge():
+    """Two concurrent ensure_project calls for the same (org_id, git_remote)
+    converge: no exception, both return the same id, exactly one row exists.
+
+    Each worker uses its own ``create_engine`` + connection so the two calls
+    genuinely race on separate DB sessions. This exercises the ON CONFLICT
+    upsert path that replaced the old SELECT-then-INSERT (which would raise an
+    unhandled IntegrityError under this race).
+    """
+    org = f"org_{uuid.uuid4().hex[:8]}"
+    remote = "git@github.com:acme/repo.git"
+    results: dict[str, str] = {}
+    errors: list[Exception] = []
+    barrier = threading.Barrier(2)
+
+    def worker(key: str) -> None:
+        try:
+            eng = create_engine(DB_URL)
+            # The brain helper commits internally, so hand it a plain
+            # Connection (matching the db_session fixture's interface) rather
+            # than a begin() block that would commit twice.
+            conn = eng.connect()
+            try:
+                # Maximize the race window: both threads attempt the insert
+                # at the same instant.
+                barrier.wait(timeout=10)
+                pid = ensure_project(
+                    conn, org_id=org, display_name="repo", git_remote=remote
+                )
+                results[key] = pid
+            finally:
+                conn.close()
+                eng.dispose()
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    t1 = threading.Thread(target=worker, args=("a",))
+    t2 = threading.Thread(target=worker, args=("b",))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    try:
+        assert not errors, f"concurrent ensure raised: {errors}"
+        assert results["a"] == results["b"], (
+            "concurrent ensures must converge to one id"
+        )
+
+        verify_eng = create_engine(DB_URL)
+        with verify_eng.connect() as conn:
+            n = conn.execute(
+                text(
+                    "SELECT count(*) FROM projects "
+                    "WHERE org_id = :o AND git_remote = :r"
+                ),
+                {"o": org, "r": remote},
+            ).scalar()
+        verify_eng.dispose()
+        assert n == 1, f"expected exactly one project row, found {n}"
+    finally:
+        # Teardown: remove the org's project rows.
+        cleanup_eng = create_engine(DB_URL)
+        with cleanup_eng.connect() as conn:
+            conn.execute(
+                text("DELETE FROM projects WHERE org_id = :o"), {"o": org}
+            )
+            conn.commit()
+        cleanup_eng.dispose()

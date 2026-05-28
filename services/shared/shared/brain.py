@@ -32,9 +32,21 @@ def ensure_space(
 ) -> str:
     """Get-or-create a space for an org, deduped by ``(org_id, slug)``.
 
-    Looks up an existing space by ``(org_id, slug)`` (the
-    ``uq_spaces_org_slug`` unique constraint). If found, its id is returned
-    unchanged. Otherwise a new row is inserted and committed.
+    Implemented as a single race-safe ``INSERT ... ON CONFLICT ... RETURNING``
+    upsert against the ``uq_spaces_org_slug`` unique constraint
+    (``(org_id, slug)``). On a fresh ``(org_id, slug)`` a new row is inserted;
+    on conflict a no-op ``DO UPDATE`` fires so ``RETURNING`` still yields the
+    existing row's id (``DO NOTHING`` would suppress ``RETURNING``). This
+    converges correctly under concurrent callers instead of raising an
+    unhandled ``IntegrityError``.
+
+    Threading contract:
+        This function is synchronous (blocking psycopg2 I/O). When called from
+        an async handler, invoke via ``anyio.to_thread.run_sync(...)`` (or a
+        FastAPI dependency / plain-``def`` route, which FastAPI runs in a
+        threadpool) — never call it inline from an async coroutine, or you
+        block the event loop. See :meth:`shared.auth.ApiKeyValidator.validate`
+        for the analogous house mitigation.
 
     Args:
         db_session: A synchronous SQLAlchemy session/connection exposing
@@ -47,38 +59,26 @@ def ensure_space(
     Returns:
         The space id as a string.
     """
-    existing = db_session.execute(
-        text(
-            """
-            SELECT id FROM spaces
-            WHERE org_id = :org_id AND slug = :slug
-            LIMIT 1
-            """
-        ),
-        {"org_id": org_id, "slug": slug},
-    ).fetchone()
-
-    if existing is not None:
-        return str(existing[0])
-
-    space_id = str(uuid.uuid4())
-    db_session.execute(
+    row = db_session.execute(
         text(
             """
             INSERT INTO spaces (id, org_id, name, slug, embedding_model)
             VALUES (:id, :org_id, :name, :slug, :embedding_model)
+            ON CONFLICT (org_id, slug)
+              DO UPDATE SET slug = EXCLUDED.slug
+            RETURNING id
             """
         ),
         {
-            "id": space_id,
+            "id": str(uuid.uuid4()),
             "org_id": org_id,
             "name": name,
             "slug": slug,
             "embedding_model": embedding_model,
         },
-    )
+    ).one()
     db_session.commit()
-    return space_id
+    return str(row.id)
 
 
 def ensure_project(
@@ -96,11 +96,30 @@ def ensure_project(
     mirrors the partial-unique indexes ``ix_projects_org_remote`` (on
     ``(org_id, git_remote)`` where ``git_remote IS NOT NULL``) and
     ``ix_projects_org_path`` (on ``(org_id, repo_root_path)`` where
-    ``git_remote IS NULL``).
+    ``git_remote IS NULL AND repo_root_path IS NOT NULL``).
 
-    On a hit, ``last_seen_at`` is set to ``NOW()`` and the existing id is
-    returned. On a miss, a new row is inserted. Either way the transaction is
-    committed.
+    Implemented as a single race-safe ``INSERT ... ON CONFLICT ... RETURNING``
+    upsert. The branch is chosen by ``git_remote`` presence so the partial
+    index predicate in the ``ON CONFLICT ... WHERE`` clause matches the
+    arbiter index exactly (Postgres requires the predicate to match for it to
+    infer a partial unique index as the conflict arbiter). On conflict the
+    ``DO UPDATE SET last_seen_at = NOW()`` folds the hit-path ``last_seen_at``
+    bump into the same atomic statement, eliminating both the insert race and
+    the read-modify-write race; on a miss a new row is inserted. Either way the
+    transaction is committed.
+
+    Threading contract:
+        This function is synchronous (blocking psycopg2 I/O). When called from
+        an async handler, invoke via ``anyio.to_thread.run_sync(...)`` (or a
+        FastAPI dependency / plain-``def`` route, which FastAPI runs in a
+        threadpool) — never call it inline from an async coroutine, or you
+        block the event loop. See :meth:`shared.auth.ApiKeyValidator.validate`
+        for the analogous house mitigation.
+
+    Tenancy note:
+        The caller must guarantee that any supplied ``space_id`` belongs to
+        ``org_id``. The FK only enforces that the space *exists*, not that it
+        belongs to this org; cross-org leakage is not prevented at the DB layer.
 
     Args:
         db_session: A synchronous SQLAlchemy session/connection exposing
@@ -123,59 +142,55 @@ def ensure_project(
         raise ValueError("project requires git_remote or repo_root_path")
 
     if git_remote is not None:
-        existing = db_session.execute(
+        row = db_session.execute(
             text(
                 """
-                SELECT id FROM projects
-                WHERE org_id = :org_id AND git_remote = :git_remote
-                LIMIT 1
+                INSERT INTO projects (
+                    id, org_id, space_id, git_remote, repo_root_path,
+                    display_name
+                ) VALUES (
+                    :id, :org_id, :space_id, :git_remote, :repo_root_path,
+                    :display_name
+                )
+                ON CONFLICT (org_id, git_remote) WHERE git_remote IS NOT NULL
+                  DO UPDATE SET last_seen_at = NOW()
+                RETURNING id
                 """
             ),
-            {"org_id": org_id, "git_remote": git_remote},
-        ).fetchone()
+            {
+                "id": str(uuid.uuid4()),
+                "org_id": org_id,
+                "space_id": space_id,
+                "git_remote": git_remote,
+                "repo_root_path": repo_root_path,
+                "display_name": display_name,
+            },
+        ).one()
     else:
-        existing = db_session.execute(
+        row = db_session.execute(
             text(
                 """
-                SELECT id FROM projects
-                WHERE org_id = :org_id
-                  AND git_remote IS NULL
-                  AND repo_root_path = :repo_root_path
-                LIMIT 1
+                INSERT INTO projects (
+                    id, org_id, space_id, git_remote, repo_root_path,
+                    display_name
+                ) VALUES (
+                    :id, :org_id, :space_id, NULL, :repo_root_path,
+                    :display_name
+                )
+                ON CONFLICT (org_id, repo_root_path)
+                  WHERE git_remote IS NULL AND repo_root_path IS NOT NULL
+                  DO UPDATE SET last_seen_at = NOW()
+                RETURNING id
                 """
             ),
-            {"org_id": org_id, "repo_root_path": repo_root_path},
-        ).fetchone()
+            {
+                "id": str(uuid.uuid4()),
+                "org_id": org_id,
+                "space_id": space_id,
+                "repo_root_path": repo_root_path,
+                "display_name": display_name,
+            },
+        ).one()
 
-    if existing is not None:
-        project_id = str(existing[0])
-        db_session.execute(
-            text("UPDATE projects SET last_seen_at = NOW() WHERE id = :id"),
-            {"id": project_id},
-        )
-        db_session.commit()
-        return project_id
-
-    project_id = str(uuid.uuid4())
-    db_session.execute(
-        text(
-            """
-            INSERT INTO projects (
-                id, org_id, space_id, git_remote, repo_root_path, display_name
-            ) VALUES (
-                :id, :org_id, :space_id, :git_remote, :repo_root_path,
-                :display_name
-            )
-            """
-        ),
-        {
-            "id": project_id,
-            "org_id": org_id,
-            "space_id": space_id,
-            "git_remote": git_remote,
-            "repo_root_path": repo_root_path,
-            "display_name": display_name,
-        },
-    )
     db_session.commit()
-    return project_id
+    return str(row.id)
