@@ -8,7 +8,7 @@ constructed — no live Postgres is required.  ``verify_api_key`` and
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -124,3 +124,27 @@ def test_x_agentguard_key_fallback_header():
 
     assert result.org_id == "org_legacy"
     mock_get_validator.return_value.validate.assert_called_once_with("ag_legacy_key")
+
+
+def test_get_validator_uses_memory_scope():
+    """Brain access is gated by the dedicated ``memory`` scope, not ``ingest``.
+
+    ``get_validator`` must construct the shared ``KeyValidator`` with
+    ``required_scope="memory"`` so a key needs the brain-specific scope to
+    drive the MCP memory tools.
+    """
+    import app.auth as auth_module
+
+    # The validator is a module-level singleton — reset around the test so
+    # a previously-built instance (or one we build here) doesn't leak.
+    auth_module._validator = None
+    try:
+        with patch("app.auth.KeyValidator") as mock_validator_cls:
+            mock_validator_cls.return_value = MagicMock()
+            auth_module.get_validator()
+
+        mock_validator_cls.assert_called_once()
+        _, kwargs = mock_validator_cls.call_args
+        assert kwargs["required_scope"] == "memory"
+    finally:
+        auth_module._validator = None

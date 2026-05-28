@@ -6,11 +6,13 @@ operations.  Authentication reuses the shared ``KeyValidator`` (the same
 machinery the ingestion API uses) so the key contract stays identical
 across services.
 
-v1 scope decision: the MCP server reuses the existing ``"ingest"`` scope
-rather than introducing a dedicated ``"memory"`` scope.  Adding a
-``"memory"`` scope to org ``api_keys`` is deferred until the memory
-product needs to gate access independently of ingestion; until then any
-key that can ingest can also drive the memory tools.
+Scope: brain access is gated by the dedicated ``"memory"`` scope (NOT
+``"ingest"``), so a key that can ingest cannot also drive the memory
+tools unless it has been explicitly granted memory access.  Keys that
+should reach the brain must carry ``"memory"`` in their ``scopes`` array.
+That provisioning happens in the external dashboard (a separate repo —
+no key-provisioning code lives here): it must grant the ``"memory"``
+scope to any key the memory product is meant to authorize.
 """
 
 import os
@@ -37,11 +39,11 @@ def get_validator() -> KeyValidator:
     """Return the module-level KeyValidator singleton (lazy init)."""
     global _validator
     if _validator is None:
-        # Reuse the "ingest" scope (see module docstring — a dedicated
-        # "memory" scope is deferred).
+        # Brain access is gated by the dedicated "memory" scope (see
+        # module docstring); keys must be provisioned with it externally.
         _validator = KeyValidator(
             database_url=DATABASE_URL,
-            required_scope="ingest",
+            required_scope="memory",
             supabase_database_url=SUPABASE_DATABASE_URL,
         )
     return _validator

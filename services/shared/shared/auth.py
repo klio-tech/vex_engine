@@ -7,7 +7,8 @@ the ``organizations.api_keys`` JSONB column in TimescaleDB.
 Features:
 - SHA-256 hash-based key lookup (keys are never stored in plaintext)
 - In-memory cache with configurable TTL (default 60 s)
-- Per-key scope enforcement (``ingest``, ``verify``, ``read``)
+- Per-key scope enforcement (``ingest``, ``verify``, ``read``,
+  ``memory`` for Klio brain tools)
 - Per-key rate limiting (sliding window, requests per minute)
 - Batched ``last_used_at`` updates (avoids write pressure on hot path)
 """
@@ -30,7 +31,7 @@ from shared.plan_limits import get_plan_config
 
 logger = logging.getLogger("agentguard.auth")
 
-VALID_SCOPES = frozenset({"ingest", "verify", "read"})
+VALID_SCOPES = frozenset({"ingest", "verify", "read", "memory"})
 
 
 @dataclass
@@ -411,7 +412,8 @@ class KeyValidator:
         Uses direct queries against the ``executions`` hypertable,
         filtered by scope:
         - ``verify`` scope → counts rows where ``confidence IS NOT NULL``
-        - ``ingest`` scope → counts all rows (observations + verifications)
+        - ``ingest``/``memory`` scope → counts all rows
+          (observations + verifications)
 
         Fail-closed: if the query errors, the request is denied with 503.
         Results are cached per-org for 30 s to reduce DB pressure.

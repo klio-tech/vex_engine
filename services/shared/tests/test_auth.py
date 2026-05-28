@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-from shared.auth import AuthError, KeyInfo, KeyValidator
+from shared.auth import VALID_SCOPES, AuthError, KeyInfo, KeyValidator
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -225,6 +225,42 @@ class TestScopeEnforcement:
                     database_url="postgresql://x:x@localhost/x",
                     required_scope="admin",
                 )
+
+    def test_memory_scope_accepted_by_constructor(self):
+        """The dedicated ``memory`` scope (Klio brain) is a valid scope."""
+        assert "memory" in VALID_SCOPES
+        # Constructing a validator with it must not raise.
+        validator, _ = _build_validator(required_scope="memory")
+        assert validator._required_scope == "memory"
+
+    def test_key_without_memory_scope_rejected_by_memory_service(self):
+        """A key lacking ``memory`` is 403'd by a memory-scoped validator.
+
+        The scope check (validate step 5) runs before rate-limit/quota, so
+        a wrong-scope key raises 403 without those steps interfering.
+        """
+        entry, raw_key, _ = _make_key_entry(scopes=["ingest", "verify", "read"])
+        validator, engine = _build_validator(required_scope="memory")
+        _mock_db_query(engine, _make_db_row([entry]))
+
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+
+        assert exc_info.value.status_code == 403
+        assert "memory" in exc_info.value.detail
+
+    def test_key_with_memory_scope_accepted_by_memory_service(self):
+        """A key carrying ``memory`` validates against a memory validator."""
+        entry, raw_key, _ = _make_key_entry(
+            scopes=["ingest", "verify", "read", "memory"]
+        )
+        validator, engine = _build_validator(required_scope="memory")
+        _mock_db_query(engine, _make_db_row([entry]))
+
+        result = validator.validate(raw_key)
+        assert isinstance(result, KeyInfo)
+        assert result.org_id == "test-org"
+        assert "memory" in result.scopes
 
 
 # ---------------------------------------------------------------------------
