@@ -198,6 +198,115 @@ def ensure_project(
     return str(row.id)
 
 
+def find_space_id(db_session: Any, *, org_id: str, slug: str) -> Optional[str]:
+    """Return the space id for ``(org_id, slug)``, or ``None`` if no such space.
+
+    Read-only counterpart to :func:`ensure_space`: it resolves a user-facing
+    slug to its id on the recall (read) path and NEVER creates a row. An unknown
+    slug returns ``None`` so the caller can surface "unknown space" rather than
+    silently widening the search. Tenant-scoped: only an ``org_id``-owned row
+    can match, so a slug collision across orgs never leaks another org's space.
+
+    Threading contract:
+        Synchronous (blocking psycopg2 I/O). When called from an async handler,
+        invoke via ``anyio.to_thread.run_sync(...)`` (or a plain-``def`` FastAPI
+        route, which FastAPI runs in a threadpool) — never inline from a
+        coroutine, or you block the event loop.
+
+    Args:
+        db_session: A synchronous SQLAlchemy session/connection exposing
+            ``.execute()``.
+        org_id: Owning org id (tenant scope).
+        slug: Space slug; the dedup key within an org.
+
+    Returns:
+        The space id as a string, or ``None`` if no matching space exists.
+    """
+    row = db_session.execute(
+        text(
+            """
+            SELECT id FROM spaces
+            WHERE org_id = :org_id AND slug = :slug
+            LIMIT 1
+            """
+        ),
+        {"org_id": org_id, "slug": slug},
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
+def find_project_id(db_session: Any, *, org_id: str, identifier: str) -> Optional[str]:
+    """Resolve a project identifier to its id within an org, or ``None``.
+
+    Read-only counterpart to :func:`ensure_project`: it resolves a user-facing
+    identifier to its id on the recall (read) path and NEVER creates a row.
+
+    Resolution order (all tenant-scoped by ``org_id``):
+
+        1. If ``identifier`` parses as a UUID, look up by ``id`` first.
+        2. Otherwise (or if the id lookup misses), match by ``git_remote`` OR
+           ``display_name``.
+
+    Returns ``None`` when nothing matches so the caller can surface "unknown
+    project" rather than silently widening the search.
+
+    Threading contract:
+        Synchronous (blocking psycopg2 I/O). When called from an async handler,
+        invoke via ``anyio.to_thread.run_sync(...)`` (or a plain-``def`` FastAPI
+        route, which FastAPI runs in a threadpool) — never inline from a
+        coroutine, or you block the event loop.
+
+    Args:
+        db_session: A synchronous SQLAlchemy session/connection exposing
+            ``.execute()``.
+        org_id: Owning org id (tenant scope).
+        identifier: A project id (UUID), git remote URL, or display name.
+
+    Returns:
+        The project id as a string, or ``None`` if no matching project exists.
+    """
+    # Prefer an exact id match when the identifier is a well-formed UUID. A
+    # raw-string compare against the UUID column would be brittle across
+    # formats, so parse first and only attempt the id query when it parses.
+    try:
+        parsed = uuid.UUID(identifier)
+    except (ValueError, AttributeError, TypeError):
+        parsed = None
+
+    if parsed is not None:
+        row = db_session.execute(
+            text(
+                """
+                SELECT id FROM projects
+                WHERE org_id = :org_id AND id = :id
+                LIMIT 1
+                """
+            ),
+            {"org_id": org_id, "id": str(parsed)},
+        ).fetchone()
+        if row is not None:
+            return str(row[0])
+        # Fall through: a UUID-shaped identifier that is not a known id may
+        # still legitimately match a git_remote / display_name.
+
+    row = db_session.execute(
+        text(
+            """
+            SELECT id FROM projects
+            WHERE org_id = :org_id
+              AND (git_remote = :ident OR display_name = :ident)
+            LIMIT 1
+            """
+        ),
+        {"org_id": org_id, "ident": identifier},
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row[0])
+
+
 async def write_scoped_memory(
     db_session: Any,
     *,

@@ -6,12 +6,16 @@ Streamable-HTTP transport and registers the seven Klio memory tools.
 As of D2 the five *write* tools (``remember``, ``observe``, ``plan``,
 ``decide``, ``note``) are fully implemented: they resolve the tenant
 principal, derive a stable brain ``session_id``, and persist via
-:func:`shared.brain.write_scoped_memory`.  The ``recall`` and ``space``
-tool *bodies* remain stubs (they return a ``not_implemented_yet``
-marker) — that logic lands in D3/D4.  The tool *schemas* are the real
-ones throughout: each tool's signature and argument descriptions define
-the JSON input schema that ``tools/list`` advertises, so the later tasks
-only fill in the remaining bodies without changing the public contract.
+:func:`shared.brain.write_scoped_memory`.  As of D3 the ``recall`` read
+tool is implemented too: it resolves the principal, resolves optional
+``space``/``project`` filters to ids (read-only, surfacing unknown names
+as a warning), and reads via :func:`shared.memory.retrieve_memories_scoped`.
+The ``space`` management tool *body* remains a stub (it returns a
+``not_implemented_yet`` marker) — that logic lands in D4.  The tool
+*schemas* are the real ones throughout: each tool's signature and
+argument descriptions define the JSON input schema that ``tools/list``
+advertises, so the later tasks only fill in the remaining body without
+changing the public contract.
 
 The write tools take a FastMCP ``Context`` as their first parameter;
 FastMCP injects it and EXCLUDES it from the public input schema, so the
@@ -43,6 +47,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 from shared import brain
+from shared.memory import MemoryRecord, retrieve_memories_scoped
 
 from app.auth import resolve_principal
 from app.config import (
@@ -154,6 +159,130 @@ async def _perform_write(
         db.close()
 
 
+# Sentinel project value meaning "search across all projects" (no project
+# filter). Compared case-insensitively so "any"/"ANY"/"Any" all work.
+_PROJECT_ANY = "any"
+
+
+def _serialize_record(record: MemoryRecord) -> dict[str, Any]:
+    """Project a :class:`MemoryRecord` to a JSON-safe dict for a recall result.
+
+    Deliberately EXCLUDES ``embedding`` (a large float vector that is useless
+    to the agent and bloats the response) and the verification-only / internal
+    fields (``session_id``, ``execution_id``, ``status``, ``superseded_by``,
+    ``sequence_number``). ``created_at`` is rendered as an ISO-8601 string (or
+    ``None``) since ``datetime`` is not JSON-serializable.
+    """
+    return {
+        "id": str(record.id),
+        "memory_type": record.memory_type,
+        "content": record.content,
+        "scope": record.scope,
+        "confidence": record.confidence,
+        "space_id": record.space_id,
+        "project_id": record.project_id,
+        "created_at": record.created_at.isoformat() if record.created_at else None,
+        "metadata": record.metadata,
+    }
+
+
+async def _perform_recall(
+    ctx: Context,
+    *,
+    query: str,
+    scope: str,
+    space: Optional[str],
+    project: Optional[str],
+) -> dict[str, Any]:
+    """Shared body for the Klio ``recall`` read tool.
+
+    Resolves the tenant principal from the transport request, resolves any
+    user-facing ``space`` slug / ``project`` identifier to ids (read-only — an
+    unknown name short-circuits to an empty result with a ``warning`` rather
+    than silently widening the search), then delegates to
+    :func:`shared.memory.retrieve_memories_scoped`.
+
+    This mirrors :func:`_perform_write` but is a pure READ: no commit, and the
+    org_id is taken from the resolved principal (never caller-supplied input)
+    so a tenant can only ever recall its own memories.
+
+    Args:
+        ctx: FastMCP-injected context; ``ctx.request_context.request`` is the
+            Starlette request for the Streamable-HTTP transport.
+        query: Natural-language search query.
+        scope: ``"org"`` (default) or ``"agent"`` (the schema restricts it to
+            these two, so :func:`retrieve_memories_scoped` never raises
+            ``ValueError`` for a valid call).
+        space: Optional space slug; resolved to a ``space_id`` filter.
+        project: Optional project identifier; resolved to a ``project_id``
+            filter. The sentinel ``"any"`` (case-insensitive) means
+            cross-project (no project filter).
+
+    Returns:
+        ``{"memories": [...], "count": N}`` on success, ``{"memories": [],
+        "count": 0, "warning": ...}`` for an unknown space/project filter, or a
+        clean error dict on auth failure / unexpected error.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        # The Streamable-HTTP transport always attaches the Starlette request
+        # (mcp 1.27.x); a transport that does not gives us nothing to
+        # authenticate, so deny rather than guess a principal.
+        logger.error("brain recall got no transport request; cannot authenticate")
+        return {"error": "unauthorized", "detail": "no request context"}
+
+    try:
+        org_id, agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"error": "unauthorized", "detail": str(exc.detail)}
+
+    db = SessionLocal()
+    try:
+        # Resolve the optional space-slug filter. An unknown slug is surfaced
+        # (not silently dropped) so an over-narrow filter never masquerades as
+        # an org-wide search returning unrelated memories.
+        space_id: Optional[str] = None
+        if space is not None:
+            space_id = brain.find_space_id(db, org_id=org_id, slug=space)
+            if space_id is None:
+                return {
+                    "memories": [],
+                    "count": 0,
+                    "warning": f"unknown space: {space}",
+                }
+
+        # Resolve the optional project filter. The "any" sentinel means
+        # cross-project: no project filter at all.
+        project_id: Optional[str] = None
+        if project is not None and project.lower() != _PROJECT_ANY:
+            project_id = brain.find_project_id(db, org_id=org_id, identifier=project)
+            if project_id is None:
+                return {
+                    "memories": [],
+                    "count": 0,
+                    "warning": f"unknown project: {project}",
+                }
+
+        # agent_id is always forwarded; retrieve_memories_scoped ignores it
+        # unless scope == "agent".
+        records = await retrieve_memories_scoped(
+            db,
+            org_id,
+            query,
+            scope=scope,
+            agent_id=agent_id,
+            space_id=space_id,
+            project_id=project_id,
+        )
+        memories = [_serialize_record(record) for record in records]
+        return {"memories": memories, "count": len(memories)}
+    except Exception:
+        logger.exception("brain recall failed (scope=%s)", scope)
+        return {"error": "recall_failed"}
+    finally:
+        db.close()
+
+
 def build_mcp_server() -> FastMCP:
     """Construct a fresh :class:`FastMCP` with the seven Klio tools.
 
@@ -213,7 +342,8 @@ def _register_tools(mcp: FastMCP) -> None:
             "scope by agent."
         ),
     )
-    def recall(
+    async def recall(
+        ctx: Context,
         query: Annotated[
             str, Field(description="What to search the team's memory for.")
         ],
@@ -230,7 +360,9 @@ def _register_tools(mcp: FastMCP) -> None:
             Field(description="Optional project identifier to scope the search."),
         ] = None,
     ) -> dict[str, Any]:
-        return dict(_STUB_RESULT)
+        return await _perform_recall(
+            ctx, query=query, scope=scope, space=space, project=project
+        )
 
     @mcp.tool(
         name="remember",
