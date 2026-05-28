@@ -8,10 +8,11 @@ later tasks.
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 
-from app.auth import shutdown_validator
+from app.auth import shutdown_validator, verify_api_key
 from app.mcp_app import build_mcp_server
+from shared.auth import KeyInfo
 
 # The MCP Streamable-HTTP ASGI app is mounted at the application root.
 # Combined with the server's default ``streamable_http_path``, the
@@ -70,6 +71,25 @@ def create_app() -> FastAPI:
     @app.get("/healthz")
     def healthz():
         return {"status": "ok"}
+
+    @app.get("/verify")
+    def verify(key_info: KeyInfo = Depends(verify_api_key)):
+        """Validate the caller's ``X-Vex-Key``.
+
+        Returns 200 with the resolved org + scopes when the key is valid AND
+        carries the required ``memory`` scope (the shared validator is built
+        with ``required_scope="memory"``); otherwise the dependency raises 401
+        (missing/invalid/expired) or 403 (key lacks the ``memory`` scope).
+
+        This is the lightweight check ``klio init`` (cloud mode) calls to
+        confirm a pasted API key before writing the agent MCP config — no MCP
+        handshake required.
+        """
+        return {
+            "valid": True,
+            "org_id": key_info.org_id,
+            "scopes": key_info.scopes,
+        }
 
     # Mount the MCP Streamable-HTTP ASGI app at the application root.
     # ``/healthz`` is registered above, so it takes precedence; all other
