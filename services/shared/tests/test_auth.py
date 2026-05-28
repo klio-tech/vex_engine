@@ -452,7 +452,11 @@ class TestQuotaEnforcement:
     """Tests for monthly quota checks against the executions table."""
 
     def _make_validator_with_quota(
-        self, scope="verify", plan="free", usage_count=0, plan_overrides=None,
+        self,
+        scope="verify",
+        plan="free",
+        usage_count=0,
+        plan_overrides=None,
     ):
         """Build a validator with configurable quota usage from DB."""
         entry, raw_key, _ = _make_key_entry(scopes=["ingest", "verify", "read"])
@@ -491,7 +495,9 @@ class TestQuotaEnforcement:
     def test_free_plan_under_verification_quota_passes(self):
         """Free plan with 10/50 verifications should pass."""
         validator, raw_key, _ = self._make_validator_with_quota(
-            scope="verify", plan="free", usage_count=10,
+            scope="verify",
+            plan="free",
+            usage_count=10,
         )
         result = validator.validate(raw_key)
         assert result.org_id == "test-org"
@@ -499,7 +505,9 @@ class TestQuotaEnforcement:
     def test_free_plan_at_verification_quota_blocks(self):
         """Free plan with 50/50 verifications should return 429."""
         validator, raw_key, _ = self._make_validator_with_quota(
-            scope="verify", plan="free", usage_count=50,
+            scope="verify",
+            plan="free",
+            usage_count=50,
         )
         with pytest.raises(AuthError) as exc_info:
             validator.validate(raw_key)
@@ -510,7 +518,9 @@ class TestQuotaEnforcement:
     def test_free_plan_over_verification_quota_blocks(self):
         """Free plan with 589/50 verifications should return 429."""
         validator, raw_key, _ = self._make_validator_with_quota(
-            scope="verify", plan="free", usage_count=589,
+            scope="verify",
+            plan="free",
+            usage_count=589,
         )
         with pytest.raises(AuthError) as exc_info:
             validator.validate(raw_key)
@@ -519,7 +529,9 @@ class TestQuotaEnforcement:
     def test_free_plan_under_observation_quota_passes(self):
         """Free plan with 500/1000 observations should pass."""
         validator, raw_key, _ = self._make_validator_with_quota(
-            scope="ingest", plan="free", usage_count=500,
+            scope="ingest",
+            plan="free",
+            usage_count=500,
         )
         result = validator.validate(raw_key)
         assert result.org_id == "test-org"
@@ -527,7 +539,9 @@ class TestQuotaEnforcement:
     def test_free_plan_at_observation_quota_blocks(self):
         """Free plan with 1000/1000 observations should return 429."""
         validator, raw_key, _ = self._make_validator_with_quota(
-            scope="ingest", plan="free", usage_count=1000,
+            scope="ingest",
+            plan="free",
+            usage_count=1000,
         )
         with pytest.raises(AuthError) as exc_info:
             validator.validate(raw_key)
@@ -536,7 +550,9 @@ class TestQuotaEnforcement:
     def test_pro_plan_overage_allowed(self):
         """Pro plan allows overage — should log but not block."""
         validator, raw_key, _ = self._make_validator_with_quota(
-            scope="verify", plan="pro", usage_count=20_000,
+            scope="verify",
+            plan="pro",
+            usage_count=20_000,
         )
         result = validator.validate(raw_key)
         assert result.org_id == "test-org"
@@ -544,7 +560,9 @@ class TestQuotaEnforcement:
     def test_starter_plan_no_overage(self):
         """Starter plan does NOT allow overage — should block at limit."""
         validator, raw_key, _ = self._make_validator_with_quota(
-            scope="verify", plan="starter", usage_count=1000,
+            scope="verify",
+            plan="starter",
+            usage_count=1000,
         )
         with pytest.raises(AuthError) as exc_info:
             validator.validate(raw_key)
@@ -581,7 +599,9 @@ class TestQuotaEnforcement:
     def test_quota_cache_avoids_repeated_db_queries(self):
         """Second call within 30s should use cached quota, not query DB."""
         validator, raw_key, mock_conn = self._make_validator_with_quota(
-            scope="verify", plan="free", usage_count=10,
+            scope="verify",
+            plan="free",
+            usage_count=10,
         )
 
         # First call
@@ -598,7 +618,9 @@ class TestQuotaEnforcement:
     def test_verify_scope_query_filters_by_confidence(self):
         """Verify scope should query with 'confidence IS NOT NULL'."""
         validator, raw_key, mock_conn = self._make_validator_with_quota(
-            scope="verify", plan="free", usage_count=10,
+            scope="verify",
+            plan="free",
+            usage_count=10,
         )
         validator.validate(raw_key)
 

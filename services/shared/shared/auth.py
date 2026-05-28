@@ -27,7 +27,7 @@ from threading import Lock
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
-from shared.plan_limits import get_plan_config
+from shared.plan_limits import PlanConfig, get_plan_config
 
 logger = logging.getLogger("agentguard.auth")
 
@@ -439,7 +439,10 @@ class KeyValidator:
                 if (now - cached_at) < self._quota_cache_ttl_s:
                     current_usage = cached_usage
                     self._enforce_quota_limit(
-                        current_usage, monthly_limit, plan_config, entry,
+                        current_usage,
+                        monthly_limit,
+                        plan_config,
+                        entry,
                     )
                     return
 

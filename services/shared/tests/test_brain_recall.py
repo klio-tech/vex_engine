@@ -322,9 +322,7 @@ async def test_session_scope_raises(db_session):
     org_id = _track(db_session, _unique_org())
 
     with pytest.raises(ValueError):
-        await retrieve_memories_scoped(
-            db_session, org_id, "any query", scope="session"
-        )
+        await retrieve_memories_scoped(db_session, org_id, "any query", scope="session")
 
 
 @pytest.mark.asyncio
@@ -333,9 +331,7 @@ async def test_unknown_scope_raises(db_session):
     org_id = _track(db_session, _unique_org())
 
     with pytest.raises(ValueError):
-        await retrieve_memories_scoped(
-            db_session, org_id, "any query", scope="bogus"
-        )
+        await retrieve_memories_scoped(db_session, org_id, "any query", scope="bogus")
 
 
 # ---------------------------------------------------------------------------
@@ -375,11 +371,17 @@ async def test_scoped_recall_project_filter_surfaces_null(db_session):
     # Seed as scope='org' so rows pass the new scope-column predicate; the
     # project filter (NULL-surfacing) is what's under test here.
     _seed_memory(
-        db_session, org_id=org_id, scope="org", content="x-tagged",
+        db_session,
+        org_id=org_id,
+        scope="org",
+        content="x-tagged",
         project_id=project_x,
     )
     _seed_memory(
-        db_session, org_id=org_id, scope="org", content="y-tagged",
+        db_session,
+        org_id=org_id,
+        scope="org",
+        content="y-tagged",
         project_id=project_y,
     )
     _seed_memory(
@@ -421,9 +423,7 @@ async def test_scoped_recall_returns_empty_when_embedding_none(db_session):
     org_id = _track(db_session, _unique_org())
     _seed_memory(db_session, org_id=org_id, content="present")
 
-    with patch(
-        "shared.memory.embed_text", new_callable=AsyncMock, return_value=None
-    ):
+    with patch("shared.memory.embed_text", new_callable=AsyncMock, return_value=None):
         results = await retrieve_memories_scoped(
             db_session, org_id, "any query", limit=10
         )

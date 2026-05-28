@@ -31,9 +31,7 @@ def upgrade() -> None:
         )
         """
     )
-    op.execute(
-        "CREATE INDEX IF NOT EXISTS ix_datasets_org_id ON datasets (org_id)"
-    )
+    op.execute("CREATE INDEX IF NOT EXISTS ix_datasets_org_id ON datasets (org_id)")
 
     # --- experiments ---
     op.execute(
@@ -63,12 +61,8 @@ def upgrade() -> None:
     )
 
     # --- add experiment columns to executions ---
-    op.execute(
-        "ALTER TABLE executions ADD COLUMN IF NOT EXISTS experiment_id UUID"
-    )
-    op.execute(
-        "ALTER TABLE executions ADD COLUMN IF NOT EXISTS variant TEXT"
-    )
+    op.execute("ALTER TABLE executions ADD COLUMN IF NOT EXISTS experiment_id UUID")
+    op.execute("ALTER TABLE executions ADD COLUMN IF NOT EXISTS variant TEXT")
     op.execute(
         "CREATE INDEX IF NOT EXISTS ix_executions_experiment "
         "ON executions (experiment_id, variant) "

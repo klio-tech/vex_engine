@@ -97,9 +97,7 @@ async def test_retrieve_memories_still_session_scoped():
         assert "session_id = :session_id" in sql, (
             f"verification query lost session scoping:\n{sql}"
         )
-        assert "org_id = :org_id" in sql, (
-            f"verification query lost org scoping:\n{sql}"
-        )
+        assert "org_id = :org_id" in sql, f"verification query lost org scoping:\n{sql}"
         # It must NOT have been turned into a brain (org-scope) query.
         assert "scope = 'org'" not in sql, (
             "verification query was accidentally turned into a brain "
@@ -205,9 +203,7 @@ async def test_retrieve_memories_scoped_agent_ladder():
     assert len(statements) == 1
     sql, params = statements[0]
 
-    assert (
-        "scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id)" in sql
-    ), (
+    assert "scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id)" in sql, (
         "agent-scope recall lost the visibility-ladder predicate — an agent "
         f"could see another agent's private rows or none of the org's:\n{sql}"
     )

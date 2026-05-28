@@ -59,9 +59,7 @@ def upgrade() -> None:
         )
         """
     )
-    op.execute(
-        "CREATE INDEX idx_alert_rules_account ON alert_rules (account_id)"
-    )
+    op.execute("CREATE INDEX idx_alert_rules_account ON alert_rules (account_id)")
 
     # --- alert_rule_channels ---
     op.execute(

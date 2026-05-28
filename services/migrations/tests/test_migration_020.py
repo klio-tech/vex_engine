@@ -18,7 +18,8 @@ def _alembic_upgrade_head():
     env["DATABASE_URL"] = DB_URL
     r = subprocess.run(
         [sys.executable, "-m", "alembic", "upgrade", "head"],
-        capture_output=True, text=True,
+        capture_output=True,
+        text=True,
         cwd=os.path.join(os.path.dirname(__file__), ".."),
         env=env,
     )
@@ -48,8 +49,13 @@ def test_projects_partial_unique_indexes():
     eng = create_engine(DB_URL)
     with eng.connect() as c:
         idx = {i["name"]: i for i in inspect(c).get_indexes("projects")}
-    assert "ix_projects_org_remote" in idx and idx["ix_projects_org_remote"]["unique"] is True
-    assert "ix_projects_org_path" in idx and idx["ix_projects_org_path"]["unique"] is True
+    assert (
+        "ix_projects_org_remote" in idx
+        and idx["ix_projects_org_remote"]["unique"] is True
+    )
+    assert (
+        "ix_projects_org_path" in idx and idx["ix_projects_org_path"]["unique"] is True
+    )
 
 
 def test_existing_session_memory_row_undisturbed():
@@ -58,17 +64,25 @@ def test_existing_session_memory_row_undisturbed():
     eng = create_engine(DB_URL)
     with eng.begin() as c:
         sid = str(uuid.uuid4())
-        c.execute(text("""
+        c.execute(
+            text("""
             INSERT INTO session_memories
               (id, session_id, org_id, agent_id, memory_type, content, scope, status)
             VALUES (gen_random_uuid(), :sid, 'org_test', 'agent_test',
                     'fact', 'legacy row', 'session', 'active')
-        """), {"sid": sid})
-        row = c.execute(text(
-            "SELECT space_id, project_id FROM session_memories WHERE session_id=:sid"
-        ), {"sid": sid}).one()
+        """),
+            {"sid": sid},
+        )
+        row = c.execute(
+            text(
+                "SELECT space_id, project_id FROM session_memories WHERE session_id=:sid"
+            ),
+            {"sid": sid},
+        ).one()
         # cleanup
-        c.execute(text("DELETE FROM session_memories WHERE session_id=:sid"), {"sid": sid})
+        c.execute(
+            text("DELETE FROM session_memories WHERE session_id=:sid"), {"sid": sid}
+        )
     assert row.space_id is None and row.project_id is None
 
 
@@ -79,7 +93,9 @@ def test_projects_rejects_both_identity_null():
     eng = create_engine(DB_URL)
     with pytest.raises(IntegrityError):
         with eng.begin() as c:
-            c.execute(text("""
+            c.execute(
+                text("""
                 INSERT INTO projects (id, org_id, display_name)
                 VALUES (gen_random_uuid(), 'org_test', 'anon')
-            """))
+            """)
+            )

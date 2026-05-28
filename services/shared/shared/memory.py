@@ -646,9 +646,7 @@ async def retrieve_memories_scoped(
     if scope == "org":
         clauses.append("scope = 'org'")
     else:  # scope == "agent" (validated above; agent_id is not None)
-        clauses.append(
-            "(scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id))"
-        )
+        clauses.append("(scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id))")
         params["agent_id"] = agent_id
 
     if space_id is not None:

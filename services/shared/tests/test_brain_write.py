@@ -18,7 +18,9 @@ from shared.brain import write_scoped_memory
 from shared.memory import MemoryRecord
 
 
-def _make_record(*, memory_id=None, memory_type="memory", content="a fact") -> MemoryRecord:
+def _make_record(
+    *, memory_id=None, memory_type="memory", content="a fact"
+) -> MemoryRecord:
     """Build a minimal MemoryRecord as write_memory/find_similar_memory return."""
     now = datetime.now(timezone.utc)
     return MemoryRecord(

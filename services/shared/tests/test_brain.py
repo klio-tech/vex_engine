@@ -74,9 +74,7 @@ def test_ensure_space_creates_then_dedupes(db_session):
     """Two calls with the same (org_id, slug) return the same space id."""
     org_id = _track(db_session, _unique_org())
 
-    first = ensure_space(
-        db_session, org_id=org_id, name="My Space", slug="my-space"
-    )
+    first = ensure_space(db_session, org_id=org_id, name="My Space", slug="my-space")
     second = ensure_space(
         db_session, org_id=org_id, name="My Space (renamed)", slug="my-space"
     )
@@ -243,12 +241,8 @@ def test_ensure_project_tenant_isolation(db_session):
     org_b = _track(db_session, _unique_org())
     remote = "git@github.com:klio-tech/shared-name.git"
 
-    id_a = ensure_project(
-        db_session, org_id=org_a, display_name="A", git_remote=remote
-    )
-    id_b = ensure_project(
-        db_session, org_id=org_b, display_name="B", git_remote=remote
-    )
+    id_a = ensure_project(db_session, org_id=org_a, display_name="A", git_remote=remote)
+    id_b = ensure_project(db_session, org_id=org_b, display_name="B", git_remote=remote)
 
     assert id_a != id_b
 
@@ -324,9 +318,7 @@ def test_ensure_project_concurrent_calls_converge():
         # Teardown: remove the org's project rows.
         cleanup_eng = create_engine(DB_URL)
         with cleanup_eng.connect() as conn:
-            conn.execute(
-                text("DELETE FROM projects WHERE org_id = :o"), {"o": org}
-            )
+            conn.execute(text("DELETE FROM projects WHERE org_id = :o"), {"o": org})
             conn.commit()
         cleanup_eng.dispose()
 
