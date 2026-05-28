@@ -1,0 +1,112 @@
+"""API key validation and principal resolution for the MCP server.
+
+Bridges an incoming Vex API key to a tenant principal
+``(org_id, agent_id)`` that the MCP tools use to scope memory
+operations.  Authentication reuses the shared ``KeyValidator`` (the same
+machinery the ingestion API uses) so the key contract stays identical
+across services.
+
+v1 scope decision: the MCP server reuses the existing ``"ingest"`` scope
+rather than introducing a dedicated ``"memory"`` scope.  Adding a
+``"memory"`` scope to org ``api_keys`` is deferred until the memory
+product needs to gate access independently of ingestion; until then any
+key that can ingest can also drive the memory tools.
+"""
+
+import os
+from typing import Optional
+
+from fastapi import HTTPException, Request
+from shared.auth import AuthError, KeyInfo, KeyValidator
+
+from app.config import DATABASE_URL
+
+SUPABASE_DATABASE_URL = os.environ.get("SUPABASE_DATABASE_URL")
+
+# Agent principal used when a request does not carry an ``X-Vex-Agent``
+# header.  MCP clients that never set an agent (e.g. a single-agent
+# integration) all share this stable default so their memory stays
+# scoped to one consistent agent_id rather than scattering across
+# generated values.
+DEFAULT_AGENT_ID = "mcp-default"
+
+_validator: Optional[KeyValidator] = None
+
+
+def get_validator() -> KeyValidator:
+    """Return the module-level KeyValidator singleton (lazy init)."""
+    global _validator
+    if _validator is None:
+        # Reuse the "ingest" scope (see module docstring — a dedicated
+        # "memory" scope is deferred).
+        _validator = KeyValidator(
+            database_url=DATABASE_URL,
+            required_scope="ingest",
+            supabase_database_url=SUPABASE_DATABASE_URL,
+        )
+    return _validator
+
+
+def shutdown_validator() -> None:
+    """Flush usage and close DB connections.  Called at app shutdown."""
+    global _validator
+    if _validator is not None:
+        _validator.close()
+        _validator = None
+
+
+def verify_api_key(request: Request) -> KeyInfo:
+    """FastAPI dependency that validates the API key and returns org info.
+
+    Extracts the key from the ``X-Vex-Key`` header (falling back to the
+    legacy ``X-AgentGuard-Key`` header), validates it through the
+    ``KeyValidator``, and returns a ``KeyInfo`` containing the resolved
+    ``org_id``, ``key_id``, and ``scopes``.
+
+    Raises:
+        HTTPException: 401 if the key is missing, invalid, revoked, or
+            expired.  403 if the key lacks the required scope.  429 if
+            the key's rate limit is exceeded (with a ``Retry-After``
+            header).
+    """
+    api_key = request.headers.get("X-Vex-Key") or request.headers.get(
+        "X-AgentGuard-Key"
+    )
+    if not api_key:
+        raise HTTPException(status_code=401, detail="Missing X-Vex-Key header")
+
+    try:
+        return get_validator().validate(api_key)
+    except AuthError as e:
+        headers = {}
+        if e.retry_after_seconds is not None:
+            headers["Retry-After"] = str(e.retry_after_seconds)
+        raise HTTPException(
+            status_code=e.status_code,
+            detail=e.detail,
+            headers=headers or None,
+        ) from e
+
+
+def resolve_principal(request: Request) -> tuple[str, str]:
+    """Resolve the tenant principal ``(org_id, agent_id)`` for a request.
+
+    Authenticates the request via :func:`verify_api_key` to derive the
+    ``org_id`` from the validated key, then reads the ``agent_id`` from
+    the ``X-Vex-Agent`` header.  When that header is absent the stable
+    :data:`DEFAULT_AGENT_ID` is used so a client that never declares an
+    agent still maps to one consistent principal.
+
+    The MCP tools (D1+) call this to scope every memory operation to a
+    single tenant.
+
+    Returns:
+        A ``(org_id, agent_id)`` tuple.
+
+    Raises:
+        HTTPException: Propagated from :func:`verify_api_key` on any
+            authentication failure.
+    """
+    key_info = verify_api_key(request)
+    agent_id = request.headers.get("X-Vex-Agent") or DEFAULT_AGENT_ID
+    return key_info.org_id, agent_id
