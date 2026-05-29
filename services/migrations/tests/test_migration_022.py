@@ -2,8 +2,9 @@ import importlib.util
 import os
 import subprocess
 import sys
+import uuid
 
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import create_engine, inspect, text
 
 DB_URL = os.environ.get(
     "DATABASE_URL",
@@ -97,6 +98,35 @@ def test_brain_recall_events_indexes():
         "org_id",
         "agent_id",
     ]
+
+
+def test_insert_minimal_row_uses_server_defaults():
+    """Inserting only the required fields lets the server defaults fire:
+    ``result_count`` defaults to 0 and ``created_at`` defaults to now()."""
+    _alembic_upgrade_head()
+    eng = create_engine(DB_URL)
+    row_id = uuid.uuid4()
+    with eng.begin() as c:
+        c.execute(
+            text("""
+            INSERT INTO brain_recall_events (id, org_id)
+            VALUES (:id, :org_id)
+        """),
+            {"id": str(row_id), "org_id": "org_test"},
+        )
+        row = c.execute(
+            text(
+                "SELECT result_count, created_at FROM brain_recall_events WHERE id=:id"
+            ),
+            {"id": str(row_id)},
+        ).one()
+        # cleanup
+        c.execute(
+            text("DELETE FROM brain_recall_events WHERE id=:id"),
+            {"id": str(row_id)},
+        )
+    assert row.result_count == 0
+    assert row.created_at is not None
 
 
 def test_downgrade_removes_table_and_indexes():

@@ -15,6 +15,11 @@ shapes: most-recent activity per org (``org_id, created_at``) and per-agent
 drill-down (``org_id, agent_id``). A plain ``(org_id, created_at)`` btree index
 backs a ``created_at DESC`` scan fine, so no descending expression is needed.
 
+``project_id`` is intentionally a bare UUID with no foreign key (unlike
+``session_memories.project_id``, which references ``projects.id``) because this
+is an append-only audit log that must outlive project deletion, so we avoid the
+FK-check overhead and cascade coupling on the write path.
+
 Revision ID: 022
 Revises: 021
 Create Date: 2026-05-29
@@ -38,7 +43,7 @@ def upgrade() -> None:
     op.create_table(
         "brain_recall_events",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("org_id", sa.Text(), nullable=False),
+        sa.Column("org_id", sa.String(64), nullable=False),
         sa.Column("agent_id", sa.Text(), nullable=True),
         sa.Column("project_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("query_text", sa.Text(), nullable=True),
