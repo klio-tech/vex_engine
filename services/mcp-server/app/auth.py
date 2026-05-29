@@ -18,7 +18,7 @@ scope to any key the memory product is meant to authorize.
 import os
 from typing import Optional
 
-from fastapi import HTTPException, Request
+from fastapi import Depends, HTTPException, Request
 from shared.auth import AuthError, KeyInfo, KeyValidator
 
 from app.config import DATABASE_URL
@@ -110,5 +110,39 @@ def resolve_principal(request: Request) -> tuple[str, str]:
             authentication failure.
     """
     key_info = verify_api_key(request)
+    agent_id = request.headers.get("X-Vex-Agent") or DEFAULT_AGENT_ID
+    return key_info.org_id, agent_id
+
+
+def resolve_principal_dep(
+    request: Request,
+    key_info: KeyInfo = Depends(verify_api_key),
+) -> tuple[str, str]:
+    """FastAPI-dependency form of :func:`resolve_principal` for REST routes.
+
+    Unlike :func:`resolve_principal` (a plain function the MCP tool bodies call
+    inline, because FastMCP tools are not FastAPI routes), this is wired through
+    ``Depends(verify_api_key)``.  That has two concrete benefits on the REST
+    capture path:
+
+    * FastAPI runs the (blocking psycopg2) key validation in its threadpool,
+      so the event loop is not blocked while the key is checked — the inline
+      MCP pattern does block it.
+    * Tests can override ``verify_api_key`` via ``app.dependency_overrides`` to
+      bypass auth (see ``tests/conftest.py``), which a plain inline call could
+      not intercept.
+
+    The ``org_id`` comes from the validated key (never caller input); the
+    ``agent_id`` is read from the ``X-Vex-Agent`` header, falling back to
+    :data:`DEFAULT_AGENT_ID` so a client that never declares an agent still maps
+    to one consistent principal.
+
+    Returns:
+        A ``(org_id, agent_id)`` tuple.
+
+    Raises:
+        HTTPException: Propagated from :func:`verify_api_key` on any
+            authentication failure (401/403/429).
+    """
     agent_id = request.headers.get("X-Vex-Agent") or DEFAULT_AGENT_ID
     return key_info.org_id, agent_id

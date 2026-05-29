@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI
 
 from app.auth import shutdown_validator, verify_api_key
+from app.capture import router as capture_router
 from app.mcp_app import build_mcp_server
 from shared.auth import KeyInfo
 
@@ -91,10 +92,15 @@ def create_app() -> FastAPI:
             "scopes": key_info.scopes,
         }
 
+    # REST capture layer (passive memory for the thin `klio hook` client).
+    # Registered BEFORE the root MCP mount so its ``/capture/*`` routes take
+    # precedence over the catch-all mount below.
+    app.include_router(capture_router)
+
     # Mount the MCP Streamable-HTTP ASGI app at the application root.
-    # ``/healthz`` is registered above, so it takes precedence; all other
-    # paths fall through to the mounted MCP app, whose transport serves
-    # the endpoint at ``MCP_ENDPOINT_PATH`` ("/mcp").
+    # ``/healthz`` / ``/verify`` / ``/capture/*`` are registered above, so they
+    # take precedence; all other paths fall through to the mounted MCP app,
+    # whose transport serves the endpoint at ``MCP_ENDPOINT_PATH`` ("/mcp").
     app.mount(MCP_MOUNT_PATH, mcp_server.streamable_http_app())
 
     return app
