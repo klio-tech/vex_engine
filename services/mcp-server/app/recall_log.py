@@ -48,4 +48,8 @@ def log_recall_event(
         )
         db.commit()
     except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         logger.warning("recall log failed for org %s; ignoring", org_id, exc_info=True)

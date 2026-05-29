@@ -298,7 +298,8 @@ def test_recall_caps_limit(client):
 
 def test_recall_logs_event(client):
     """The vector-search path logs a recall event tagged source=hook with the
-    returned result_count, query_text, and resolved project_id."""
+    returned result_count, query_text, resolved project_id, and the agent_id
+    resolved from the X-Vex-Agent header."""
     retr = AsyncMock(return_value=[_memrow(id="a"), _memrow(id="b")])
     log = MagicMock()
     db_patch, session = _patch_db()
@@ -308,7 +309,11 @@ def test_recall_logs_event(client):
         patch("app.capture.log_recall_event", log),
         patch.object(capture.brain, "find_project_id", MagicMock(return_value=None)),
     ):
-        resp = client.post("/capture/recall", json={"query": "auth flow", "limit": 5})
+        resp = client.post(
+            "/capture/recall",
+            json={"query": "auth flow", "limit": 5},
+            headers={"X-Vex-Agent": "klio-test-agent"},
+        )
 
     assert resp.json()["count"] == 2
     log.assert_called_once()
@@ -316,6 +321,7 @@ def test_recall_logs_event(client):
     assert kw["source"] == "hook"
     assert kw["result_count"] == 2
     assert kw["org_id"] == "test-org"
+    assert kw["agent_id"] == "klio-test-agent"
     assert kw["query_text"] == "auth flow"
     assert kw["project_id"] is None
     session.close.assert_called_once()
@@ -323,7 +329,8 @@ def test_recall_logs_event(client):
 
 def test_recall_logs_event_on_recency_branch(client):
     """The empty-query recency path ALSO logs a recall event (source=hook) with
-    the recency result_count and a null query_text."""
+    the recency result_count, a null query_text, and the agent_id resolved from
+    the X-Vex-Agent header."""
     session = MagicMock()
     session.execute.return_value.fetchall.return_value = [
         _memrow(id="r1"),
@@ -337,7 +344,11 @@ def test_recall_logs_event_on_recency_branch(client):
         patch("app.capture.log_recall_event", log),
         patch.object(capture.brain, "find_project_id", MagicMock(return_value=None)),
     ):
-        resp = client.post("/capture/recall", json={"query": "   "})
+        resp = client.post(
+            "/capture/recall",
+            json={"query": "   "},
+            headers={"X-Vex-Agent": "klio-test-agent"},
+        )
 
     assert resp.json()["count"] == 2
     retr.assert_not_called()  # recency path, not vector search
@@ -345,4 +356,5 @@ def test_recall_logs_event_on_recency_branch(client):
     kw = log.call_args.kwargs
     assert kw["source"] == "hook"
     assert kw["result_count"] == 2
+    assert kw["agent_id"] == "klio-test-agent"
     assert kw["query_text"] is None

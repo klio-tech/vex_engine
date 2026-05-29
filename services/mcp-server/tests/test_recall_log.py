@@ -42,7 +42,7 @@ def test_log_recall_event_inserts_row():
 
 
 def test_log_recall_event_swallows_errors():
-    """A failing execute is caught and swallowed: never raises, never commits."""
+    """A failing execute is caught and swallowed: rolls back, never raises, never commits."""
     db = MagicMock()
     db.execute.side_effect = RuntimeError("boom")
 
@@ -54,7 +54,8 @@ def test_log_recall_event_swallows_errors():
         project_id=None,
         query_text=None,
         result_count=0,
-        source="capture",
+        source="hook",
     )
 
+    db.rollback.assert_called_once()
     db.commit.assert_not_called()
