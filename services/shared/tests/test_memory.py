@@ -434,3 +434,59 @@ def test_constants():
     """Verify module constants are set correctly."""
     assert DEDUP_THRESHOLD == 0.92
     assert DEFAULT_EMBEDDING_MODEL == "intfloat/multilingual-e5-large-instruct"
+
+
+# ---------------------------------------------------------------------------
+# find_similar_memory: dedup window (default session-scoped vs agent-scoped)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_find_similar_memory_default_is_session_scoped():
+    """Default dedup query filters by session_id (historical behavior)."""
+    db_session = MagicMock()
+    db_session.execute.return_value.fetchone.return_value = None
+
+    with patch(
+        "shared.memory.embed_text",
+        new_callable=AsyncMock,
+        return_value=SAMPLE_EMBEDDING,
+    ):
+        await find_similar_memory(db_session, "sess-1", "org-1", "some content")
+
+    sql = str(db_session.execute.call_args.args[0])
+    params = db_session.execute.call_args.args[1]
+    assert "session_id = :session_id" in sql
+    assert "scope = 'agent'" not in sql
+    assert params["session_id"] == "sess-1"
+    assert "agent_id" not in params
+
+
+@pytest.mark.asyncio
+async def test_find_similar_memory_agent_scope_filters_agent():
+    """scope='agent' dedup query filters scope='agent' AND agent_id, and drops
+    the session_id filter (dedups against the same agent's private rows)."""
+    db_session = MagicMock()
+    db_session.execute.return_value.fetchone.return_value = None
+
+    with patch(
+        "shared.memory.embed_text",
+        new_callable=AsyncMock,
+        return_value=SAMPLE_EMBEDDING,
+    ):
+        await find_similar_memory(
+            db_session,
+            "sess-1",
+            "org-1",
+            "some content",
+            scope="agent",
+            agent_id="mf-userA-game1",
+        )
+
+    sql = str(db_session.execute.call_args.args[0])
+    params = db_session.execute.call_args.args[1]
+    assert "scope = 'agent'" in sql
+    assert "agent_id = :agent_id" in sql
+    assert "session_id = :session_id" not in sql
+    assert params["agent_id"] == "mf-userA-game1"
+    assert "session_id" not in params

@@ -448,8 +448,9 @@ async def write_scoped_memory(
     project_id: Optional[str] = None,
     metadata: Optional[dict] = None,
     dedup: bool = True,
+    scope: str = "org",
 ) -> dict:
-    """Write a memory into the org-scoped Klio brain (with optional dedup).
+    """Write a memory into the Klio brain at org or agent scope (with dedup).
 
     This is the brain-scoped write path layered on top of :mod:`shared.memory`.
     It reuses the existing primitives verbatim — :func:`find_similar_memory`
@@ -462,9 +463,21 @@ async def write_scoped_memory(
     ``project_id``. That function is shared with the verification path and is
     intentionally left untouched. Rather than fork or edit it, we let it insert
     the row at ``scope='session'`` and immediately issue a follow-up UPDATE that
-    sets ``scope='org'`` and binds the brain scope columns. This keeps the
-    primitive single-purpose while the brain composes the extra behaviour it
-    needs.
+    sets the final scope (``'org'`` or ``'agent'``) and binds the brain scope
+    columns. This keeps the primitive single-purpose while the brain composes
+    the extra behaviour it needs.
+
+    Scope:
+        * ``scope='org'`` (default) — the row is promoted to the shared team
+          brain (``scope='org'``). Visible to every agent in the org on recall.
+          Dedup is session-scoped (historical behavior). Backward compatible:
+          callers that omit ``scope`` are unaffected.
+        * ``scope='agent'`` — the row is promoted to ``scope='agent'`` and stays
+          private to ``agent_id``. :func:`retrieve_memories_scoped` with
+          ``scope='agent'`` returns it to that agent (plus org rows) but never to
+          another agent. Dedup is agent-scoped (only against this agent's own
+          private rows), so one agent's write never dedups against the org brain
+          or another agent's row.
 
     Async note: this mirrors the house pattern of :func:`write_memory` /
     :func:`find_similar_memory` — an ``async def`` performing inline synchronous
@@ -485,29 +498,49 @@ async def write_scoped_memory(
         project_id: Optional project the memory belongs to.
         metadata: Optional metadata dict persisted on the row.
         dedup: When ``True`` (default), suppress the write if a sufficiently
-            similar active memory already exists in the session/org.
+            similar active memory already exists in the dedup window (see Scope).
+        scope: ``'org'`` (default) or ``'agent'``. Determines the final scope the
+            row is promoted to and the dedup window.
 
     Returns:
-        A result dict describing the outcome:
+        A result dict describing the outcome (``scope`` echoes the requested
+        scope):
 
         * dedup hit →
           ``{"stored": False, "deduplicated": True, "id": ..., "memory_type":
-          ..., "scope": "org"}``
+          ..., "scope": <scope>}``
         * embedding failure →
           ``{"stored": False, "error": "embedding_failed"}``
         * success →
           ``{"stored": True, "deduplicated": False, "id": ..., "memory_type":
-          ..., "scope": "org", "space_id": ..., "project_id": ...}``
+          ..., "scope": <scope>, "space_id": ..., "project_id": ...}``
+
+    Raises:
+        ValueError: If ``scope`` is neither ``'org'`` nor ``'agent'``.
     """
+    if scope not in ("org", "agent"):
+        raise ValueError(
+            f"unsupported scope: {scope!r} (write_scoped_memory accepts 'org' or 'agent')"
+        )
+
     if dedup:
-        existing = await find_similar_memory(db_session, session_id, org_id, content)
+        existing = await find_similar_memory(
+            db_session,
+            session_id,
+            org_id,
+            content,
+            # Agent-private writes dedup only against the same agent's private
+            # rows; org writes keep the session-scoped dedup window.
+            scope="agent" if scope == "agent" else None,
+            agent_id=agent_id if scope == "agent" else None,
+        )
         if existing is not None:
             return {
                 "stored": False,
                 "deduplicated": True,
                 "id": str(existing.id),
                 "memory_type": existing.memory_type,
-                "scope": "org",
+                "scope": scope,
             }
 
     # write_memory's 5th positional arg is execution_id; the column is nullable
@@ -526,13 +559,15 @@ async def write_scoped_memory(
         # write_memory returns None when embedding generation fails.
         return {"stored": False, "error": "embedding_failed"}
 
-    # Promote the just-inserted session-scoped row to the org brain scope and
-    # bind the scope columns (see the write-then-UPDATE rationale above).
+    # Promote the just-inserted session-scoped row to the final brain scope
+    # ('org' or 'agent') and bind the scope columns (see the write-then-UPDATE
+    # rationale above). The row already carries agent_id from write_memory, so
+    # an 'agent'-scoped row is private to that agent on recall.
     db_session.execute(
         text(
             """
             UPDATE session_memories
-            SET scope = 'org',
+            SET scope = :scope,
                 space_id = :space_id,
                 project_id = :project_id,
                 updated_at = NOW()
@@ -540,6 +575,7 @@ async def write_scoped_memory(
             """
         ),
         {
+            "scope": scope,
             "space_id": space_id,
             "project_id": project_id,
             "id": str(record.id),
@@ -552,7 +588,7 @@ async def write_scoped_memory(
         "deduplicated": False,
         "id": str(record.id),
         "memory_type": memory_type,
-        "scope": "org",
+        "scope": scope,
         "space_id": space_id,
         "project_id": project_id,
     }

@@ -206,3 +206,35 @@ async def test_write_tool_auth_failure_returns_clean_error():
     write_mock.assert_not_called()
     # No DB session should be opened when auth fails before session creation.
     session_local.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_write_tool_scope_agent_forwarded():
+    """Passing scope='agent' to a write tool flows to write_scoped_memory."""
+    fn = _get_tool_fn("remember")
+    write_mock = AsyncMock(return_value=_canned_result("memory"))
+
+    with (
+        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+    ):
+        await fn(_fake_ctx({}), "a private fact", scope="agent")
+
+    assert write_mock.await_args.kwargs["scope"] == "agent"
+
+
+@pytest.mark.asyncio
+async def test_write_tool_scope_defaults_to_org():
+    """A write tool with no scope arg writes scope='org' (backward compatible)."""
+    fn = _get_tool_fn("observe")
+    write_mock = AsyncMock(return_value=_canned_result("observation"))
+
+    with (
+        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+    ):
+        await fn(_fake_ctx({}), "an observation")
+
+    assert write_mock.await_args.kwargs["scope"] == "org"

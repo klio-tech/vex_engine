@@ -358,3 +358,43 @@ def test_recall_logs_event_on_recency_branch(client):
     assert kw["result_count"] == 2
     assert kw["agent_id"] == "klio-test-agent"
     assert kw["query_text"] is None
+
+
+# ---------------------------------------------------------------------------
+# /capture/event scope forwarding (agent isolation)
+# ---------------------------------------------------------------------------
+
+
+def test_event_scope_agent_is_forwarded(client):
+    """scope='agent' in the request flows to write_scoped_memory."""
+    write = AsyncMock(return_value={"stored": True, "scope": "agent"})
+    db_patch, _ = _patch_db()
+    with (
+        db_patch,
+        patch.object(capture.brain, "write_scoped_memory", write),
+        patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
+    ):
+        resp = client.post("/capture/event", json={"content": "x", "scope": "agent"})
+    assert resp.status_code == 200
+    assert write.await_args.kwargs["scope"] == "agent"
+
+
+def test_event_scope_defaults_to_org(client):
+    """Omitting scope writes scope='org' (backward compatible)."""
+    write = AsyncMock(return_value={"stored": True})
+    db_patch, _ = _patch_db()
+    with (
+        db_patch,
+        patch.object(capture.brain, "write_scoped_memory", write),
+        patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
+    ):
+        client.post("/capture/event", json={"content": "x"})
+    assert write.await_args.kwargs["scope"] == "org"
+
+
+def test_event_rejects_unknown_scope(client):
+    """A scope outside org|agent is a 422 (Literal validation)."""
+    db_patch, _ = _patch_db()
+    with db_patch:
+        resp = client.post("/capture/event", json={"content": "x", "scope": "session"})
+    assert resp.status_code == 422

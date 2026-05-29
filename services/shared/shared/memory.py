@@ -468,11 +468,26 @@ async def find_similar_memory(
     org_id: str,
     content: str,
     threshold: float = DEDUP_THRESHOLD,
+    *,
+    scope: Optional[str] = None,
+    agent_id: Optional[str] = None,
 ) -> Optional[MemoryRecord]:
     """Find the closest existing memory and return it if above *threshold*.
 
     Similarity is computed as ``1 - (embedding <=> :embedding)`` (cosine
     similarity from cosine distance).
+
+    Dedup window (which existing rows a write is compared against):
+
+        * Default (``scope=None``) — session-scoped: rows sharing
+          ``session_id`` within the org. This is the historical behavior used
+          by the verification and org-brain write paths; unchanged.
+        * ``scope='agent'`` (with ``agent_id``) — agent-private: rows where
+          ``scope='agent' AND agent_id=:agent_id`` within the org, IGNORING
+          ``session_id``. This makes an agent-private write dedup only against
+          the *same agent's* private rows — never against the org brain, and
+          never against another agent's private rows. (Required so per-agent
+          isolation holds at write time, not just recall time.)
 
     Returns:
         The matching :class:`MemoryRecord` if similarity >= *threshold*,
@@ -484,25 +499,46 @@ async def find_similar_memory(
 
     embedding_str = str(embedding)
 
+    if scope == "agent":
+        # Agent-private dedup: compare only against this agent's own private
+        # rows (org-wide, not session-scoped). agent_id must be supplied.
+        where_clause = (
+            "org_id = :org_id\n"
+            "              AND scope = 'agent'\n"
+            "              AND agent_id = :agent_id\n"
+            "              AND status = 'active'"
+        )
+        params: dict[str, Any] = {
+            "org_id": org_id,
+            "agent_id": agent_id,
+            "embedding": embedding_str,
+        }
+    else:
+        # Default session-scoped dedup (historical behavior; unchanged).
+        where_clause = (
+            "session_id = :session_id\n"
+            "              AND org_id = :org_id\n"
+            "              AND status = 'active'"
+        )
+        params = {
+            "session_id": session_id,
+            "org_id": org_id,
+            "embedding": embedding_str,
+        }
+
     result = db_session.execute(
-        text("""
+        text(f"""
             SELECT id, session_id, org_id, agent_id, execution_id,
                    memory_type, content, embedding, confidence,
                    sequence_number, scope, status, superseded_by,
                    metadata, created_at, updated_at,
                    1 - (embedding <=> :embedding) AS similarity
             FROM session_memories
-            WHERE session_id = :session_id
-              AND org_id = :org_id
-              AND status = 'active'
+            WHERE {where_clause}
             ORDER BY embedding <=> :embedding
             LIMIT 1
         """),
-        {
-            "session_id": session_id,
-            "org_id": org_id,
-            "embedding": embedding_str,
-        },
+        params,
     )
 
     row = result.fetchone()

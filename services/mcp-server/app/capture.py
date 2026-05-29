@@ -108,6 +108,15 @@ class CaptureEventRequest(BaseModel):
         default=None,
         description="Client session id; groups dedup within a session.",
     )
+    scope: Literal["org", "agent"] = Field(
+        default="org",
+        description=(
+            "Memory scope. 'org' (default) writes the shared team brain — "
+            "visible to every agent on recall (backward compatible). 'agent' "
+            "writes a row private to the caller's X-Vex-Agent, returned only by "
+            "recall(scope='agent') for that same agent."
+        ),
+    )
     git_remote: Optional[str] = Field(
         default=None, description="Canonical git remote URL of the working repo."
     )
@@ -352,6 +361,7 @@ async def capture_event(
             session_id=_capture_session_id(org_id, agent_id, req.session_id),
             project_id=project_id,
             metadata=metadata,
+            scope=req.scope,
         )
     except Exception:
         logger.exception("capture event failed (memory_type=%s)", memory_type)

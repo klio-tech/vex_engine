@@ -249,3 +249,139 @@ async def test_write_scoped_memory_embedding_failure():
     assert result == {"stored": False, "error": "embedding_failed"}
     db_session.execute.assert_not_called()
     db_session.commit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Agent scope: write_scoped_memory(scope='agent') keeps the row private.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_write_scoped_memory_agent_scope_promotes_to_agent():
+    """scope='agent' promotes the row to scope='agent' (not 'org'), dedups
+    against the same agent's private rows, and echoes scope='agent'."""
+    record = _make_record(memory_type="observation", content="userA D7 retention")
+    db_session = MagicMock()
+
+    with (
+        patch(
+            "shared.brain.find_similar_memory",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as mock_find,
+        patch(
+            "shared.brain.write_memory",
+            new_callable=AsyncMock,
+            return_value=record,
+        ),
+    ):
+        result = await write_scoped_memory(
+            db_session,
+            org_id="org-1",
+            agent_id="mf-userA-game1",
+            content="userA D7 retention",
+            memory_type="observation",
+            session_id="klio-hook:s1",
+            scope="agent",
+        )
+
+    # Dedup window scoped to THIS agent's private rows.
+    assert mock_find.await_args.kwargs["scope"] == "agent"
+    assert mock_find.await_args.kwargs["agent_id"] == "mf-userA-game1"
+
+    # The promote UPDATE binds scope='agent'.
+    update_params = db_session.execute.call_args_list[0].args[1]
+    assert update_params["scope"] == "agent"
+    assert update_params["id"] == str(record.id)
+    db_session.commit.assert_called_once()
+
+    assert result["stored"] is True
+    assert result["scope"] == "agent"
+
+
+@pytest.mark.asyncio
+async def test_write_scoped_memory_default_dedup_is_session_scoped():
+    """Default (org) write keeps the historical session-scoped dedup: it does
+    NOT pass scope/agent_id to find_similar_memory (regression guard)."""
+    record = _make_record()
+    db_session = MagicMock()
+
+    with (
+        patch(
+            "shared.brain.find_similar_memory",
+            new_callable=AsyncMock,
+            return_value=None,
+        ) as mock_find,
+        patch(
+            "shared.brain.write_memory",
+            new_callable=AsyncMock,
+            return_value=record,
+        ),
+    ):
+        result = await write_scoped_memory(
+            db_session,
+            org_id="org-1",
+            agent_id="agent-1",
+            content="a fact",
+            memory_type="memory",
+            session_id="sess-1",
+        )
+
+    # Org write → dedup not scoped to an agent.
+    assert mock_find.await_args.kwargs.get("scope") is None
+    assert mock_find.await_args.kwargs.get("agent_id") is None
+    # Promote still lands at org (backward compatible).
+    assert db_session.execute.call_args_list[0].args[1]["scope"] == "org"
+    assert result["scope"] == "org"
+
+
+@pytest.mark.asyncio
+async def test_write_scoped_memory_agent_dedup_hit_returns_agent_scope():
+    """An agent-scoped dedup hit reports scope='agent' (not 'org')."""
+    existing = _make_record(memory_type="observation", content="already private")
+    db_session = MagicMock()
+
+    with (
+        patch(
+            "shared.brain.find_similar_memory",
+            new_callable=AsyncMock,
+            return_value=existing,
+        ) as mock_find,
+        patch("shared.brain.write_memory", new_callable=AsyncMock) as mock_write,
+    ):
+        result = await write_scoped_memory(
+            db_session,
+            org_id="org-1",
+            agent_id="mf-userA-game1",
+            content="already private (rephrased)",
+            memory_type="observation",
+            session_id="klio-hook:s1",
+            scope="agent",
+        )
+
+    assert mock_find.await_args.kwargs["scope"] == "agent"
+    mock_write.assert_not_called()
+    assert result == {
+        "stored": False,
+        "deduplicated": True,
+        "id": str(existing.id),
+        "memory_type": "observation",
+        "scope": "agent",
+    }
+
+
+@pytest.mark.asyncio
+async def test_write_scoped_memory_rejects_unknown_scope():
+    """A scope other than 'org'/'agent' fails fast before any DB work."""
+    db_session = MagicMock()
+    with pytest.raises(ValueError, match="unsupported scope"):
+        await write_scoped_memory(
+            db_session,
+            org_id="org-1",
+            agent_id="agent-1",
+            content="x",
+            memory_type="memory",
+            session_id="sess-1",
+            scope="session",
+        )
+    db_session.execute.assert_not_called()

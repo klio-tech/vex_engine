@@ -95,6 +95,7 @@ async def _perform_write(
     content: str,
     memory_type: str,
     metadata: Optional[dict] = None,
+    scope: str = "org",
 ) -> dict[str, Any]:
     """Shared body for the five Klio write tools.
 
@@ -114,6 +115,9 @@ async def _perform_write(
         content: The memory text to store.
         memory_type: The brain memory type for this tool.
         metadata: Optional metadata persisted on the row.
+        scope: ``"org"`` (default) for the shared team brain, or ``"agent"`` to
+            write a row private to the caller's resolved ``agent_id`` (only
+            ``recall(scope='agent')`` for that same agent sees it).
 
     Returns:
         The result dict from :func:`shared.brain.write_scoped_memory`, or a
@@ -149,6 +153,7 @@ async def _perform_write(
             memory_type=memory_type,
             session_id=session_id,
             metadata=metadata,
+            scope=scope,
         )
     except Exception:
         logger.exception("brain write failed (memory_type=%s)", memory_type)
@@ -536,9 +541,22 @@ def _register_tools(mcp: FastMCP) -> None:
         content: Annotated[
             str, Field(description="The durable fact or preference to store.")
         ],
+        scope: Annotated[
+            Literal["org", "agent"],
+            Field(
+                description=(
+                    "'org' (default, shared team brain) or 'agent' "
+                    "(private to this X-Vex-Agent)."
+                )
+            ),
+        ] = "org",
     ) -> dict[str, Any]:
         return await _perform_write(
-            ctx, content=content, memory_type="memory", metadata={"source": "mcp"}
+            ctx,
+            content=content,
+            memory_type="memory",
+            metadata={"source": "mcp"},
+            scope=scope,
         )
 
     @mcp.tool(
@@ -550,9 +568,22 @@ def _register_tools(mcp: FastMCP) -> None:
         content: Annotated[
             str, Field(description="What the agent observed or did this session.")
         ],
+        scope: Annotated[
+            Literal["org", "agent"],
+            Field(
+                description=(
+                    "'org' (default, shared team brain) or 'agent' "
+                    "(private to this X-Vex-Agent)."
+                )
+            ),
+        ] = "org",
     ) -> dict[str, Any]:
         return await _perform_write(
-            ctx, content=content, memory_type="observation", metadata={"source": "mcp"}
+            ctx,
+            content=content,
+            memory_type="observation",
+            metadata={"source": "mcp"},
+            scope=scope,
         )
 
     @mcp.tool(
@@ -564,9 +595,22 @@ def _register_tools(mcp: FastMCP) -> None:
         content: Annotated[
             str, Field(description="The forward-looking plan to record.")
         ],
+        scope: Annotated[
+            Literal["org", "agent"],
+            Field(
+                description=(
+                    "'org' (default, shared team brain) or 'agent' "
+                    "(private to this X-Vex-Agent)."
+                )
+            ),
+        ] = "org",
     ) -> dict[str, Any]:
         return await _perform_write(
-            ctx, content=content, memory_type="plan", metadata={"source": "mcp"}
+            ctx,
+            content=content,
+            memory_type="plan",
+            metadata={"source": "mcp"},
+            scope=scope,
         )
 
     @mcp.tool(
@@ -580,12 +624,25 @@ def _register_tools(mcp: FastMCP) -> None:
             Optional[str],
             Field(description="Optional rationale behind the decision."),
         ] = None,
+        scope: Annotated[
+            Literal["org", "agent"],
+            Field(
+                description=(
+                    "'org' (default, shared team brain) or 'agent' "
+                    "(private to this X-Vex-Agent)."
+                )
+            ),
+        ] = "org",
     ) -> dict[str, Any]:
         metadata = {"source": "mcp"}
         if rationale is not None:
             metadata["rationale"] = rationale
         return await _perform_write(
-            ctx, content=content, memory_type="decision", metadata=metadata
+            ctx,
+            content=content,
+            memory_type="decision",
+            metadata=metadata,
+            scope=scope,
         )
 
     @mcp.tool(
@@ -595,9 +652,22 @@ def _register_tools(mcp: FastMCP) -> None:
     async def note(
         ctx: Context,
         content: Annotated[str, Field(description="The free-form note to store.")],
+        scope: Annotated[
+            Literal["org", "agent"],
+            Field(
+                description=(
+                    "'org' (default, shared team brain) or 'agent' "
+                    "(private to this X-Vex-Agent)."
+                )
+            ),
+        ] = "org",
     ) -> dict[str, Any]:
         return await _perform_write(
-            ctx, content=content, memory_type="note", metadata={"source": "mcp"}
+            ctx,
+            content=content,
+            memory_type="note",
+            metadata={"source": "mcp"},
+            scope=scope,
         )
 
     @mcp.tool(
