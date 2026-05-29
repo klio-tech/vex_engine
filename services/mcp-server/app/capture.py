@@ -45,6 +45,7 @@ threads here.
 import logging
 from typing import Any, Literal, Optional
 
+import anyio
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from shared import brain
@@ -334,8 +335,12 @@ async def capture_event(
 
     db = SessionLocal()
     try:
-        project_id = _ensure_project_id(
-            db, org_id=org_id, git_remote=req.git_remote, repo_root=req.repo_root
+        # ensure_project is synchronous (blocking psycopg2); run it off the
+        # event loop per its documented threading contract (shared.brain).
+        project_id = await anyio.to_thread.run_sync(
+            lambda: _ensure_project_id(
+                db, org_id=org_id, git_remote=req.git_remote, repo_root=req.repo_root
+            )
         )
         return await brain.write_scoped_memory(
             db,
@@ -374,8 +379,10 @@ async def capture_transcript(
 
     db = SessionLocal()
     try:
-        project_id = _ensure_project_id(
-            db, org_id=org_id, git_remote=req.git_remote, repo_root=req.repo_root
+        project_id = await anyio.to_thread.run_sync(
+            lambda: _ensure_project_id(
+                db, org_id=org_id, git_remote=req.git_remote, repo_root=req.repo_root
+            )
         )
         session_id = _capture_session_id(org_id, agent_id, req.session_id)
         base_meta = {"source": "hook-transcript"}
@@ -449,19 +456,27 @@ async def capture_recall(
 
     db = SessionLocal()
     try:
-        project_id = _find_project_id(db, org_id=org_id, git_remote=req.git_remote)
+        # The synchronous brain/recency reads run off the event loop per the
+        # shared.brain threading contract (blocking psycopg2 I/O).
+        project_id = await anyio.to_thread.run_sync(
+            lambda: _find_project_id(db, org_id=org_id, git_remote=req.git_remote)
+        )
         query = req.query.strip()
 
         if not query:
-            memories = _recent_memories(
-                db, org_id=org_id, project_id=project_id, limit=limit
+            memories = await anyio.to_thread.run_sync(
+                lambda: _recent_memories(
+                    db, org_id=org_id, project_id=project_id, limit=limit
+                )
             )
             return {"memories": memories, "count": len(memories)}
 
         # Best-effort space filter: unknown slug → org-wide (None), never empty.
         space_id: Optional[str] = None
         if req.space:
-            space_id = brain.find_space_id(db, org_id=org_id, slug=req.space)
+            space_id = await anyio.to_thread.run_sync(
+                lambda: brain.find_space_id(db, org_id=org_id, slug=req.space)
+            )
 
         records = await retrieve_memories_scoped(
             db,
