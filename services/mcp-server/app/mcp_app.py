@@ -58,6 +58,7 @@ from app.config import (
     MCP_DNS_REBINDING_PROTECTION,
 )
 from app.db import SessionLocal
+from app.recall_log import log_recall_event
 from app.session import brain_session_id
 
 logger = logging.getLogger("agentguard.mcp.tools")
@@ -419,6 +420,18 @@ async def _perform_recall(
             agent_id=agent_id,
             space_id=space_id,
             project_id=project_id,
+        )
+        # Best-effort recall activity log. This tool body already does its DB I/O
+        # inline (no anyio), so call the helper directly; it swallows its own
+        # errors so a logging failure can never break the recall.
+        log_recall_event(
+            db,
+            org_id=org_id,
+            agent_id=agent_id,
+            project_id=project_id,
+            query_text=(query or None),
+            result_count=len(records),
+            source="mcp",
         )
         memories = [_serialize_record(record) for record in records]
         return {"memories": memories, "count": len(memories)}

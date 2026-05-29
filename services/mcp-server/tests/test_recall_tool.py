@@ -182,6 +182,41 @@ async def test_recall_serializes_null_created_at():
 
 
 # ---------------------------------------------------------------------------
+# Recall-event logging (best-effort): the tool logs source='mcp'.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recall_logs_event():
+    """recall logs a brain_recall_event tagged source='mcp' with the resolved
+    principal and the returned result_count, after retrieving the records."""
+    fn = _recall_fn()
+    records = [_make_record(content="first"), _make_record(content="second")]
+    retrieve_mock = AsyncMock(return_value=records)
+    log_mock = MagicMock()
+    session = MagicMock()
+
+    with (
+        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=session)),
+        patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
+        patch("app.mcp_app.log_recall_event", log_mock),
+    ):
+        result = await fn(_fake_ctx(), "what did we decide")
+
+    assert result["count"] == 2
+    log_mock.assert_called_once()
+    kw = log_mock.call_args.kwargs
+    assert kw["source"] == "mcp"
+    assert kw["result_count"] == 2
+    assert kw["org_id"] == "org-x"
+    assert kw["agent_id"] == "agent-y"
+    assert kw["query_text"] == "what did we decide"
+    # The log call receives the same DB session the tool opened.
+    assert log_mock.call_args.args[0] is session
+
+
+# ---------------------------------------------------------------------------
 # Org isolation: the org passed to retrieve comes from resolve_principal.
 # ---------------------------------------------------------------------------
 

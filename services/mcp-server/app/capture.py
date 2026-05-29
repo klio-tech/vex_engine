@@ -54,6 +54,7 @@ from sqlalchemy import text
 
 from app.auth import resolve_principal_dep
 from app.db import SessionLocal
+from app.recall_log import log_recall_event
 
 logger = logging.getLogger("agentguard.mcp.capture")
 
@@ -469,26 +470,43 @@ async def capture_recall(
                     db, org_id=org_id, project_id=project_id, limit=limit
                 )
             )
-            return {"memories": memories, "count": len(memories)}
+        else:
+            # Best-effort space filter: unknown slug → org-wide (None), never
+            # empty.
+            space_id: Optional[str] = None
+            if req.space:
+                space_id = await anyio.to_thread.run_sync(
+                    lambda: brain.find_space_id(db, org_id=org_id, slug=req.space)
+                )
 
-        # Best-effort space filter: unknown slug → org-wide (None), never empty.
-        space_id: Optional[str] = None
-        if req.space:
-            space_id = await anyio.to_thread.run_sync(
-                lambda: brain.find_space_id(db, org_id=org_id, slug=req.space)
+            records = await retrieve_memories_scoped(
+                db,
+                org_id,
+                query,
+                scope=req.scope,
+                agent_id=agent_id,
+                space_id=space_id,
+                project_id=project_id,
+                limit=limit,
             )
+            memories = [_serialize_memory(r) for r in records]
 
-        records = await retrieve_memories_scoped(
-            db,
-            org_id,
-            query,
-            scope=req.scope,
-            agent_id=agent_id,
-            space_id=space_id,
-            project_id=project_id,
-            limit=limit,
+        # Best-effort recall activity log for BOTH the recency and vector paths.
+        # log_recall_event swallows its own errors, but it does synchronous
+        # psycopg2 I/O, so run it off the event loop per the shared.brain
+        # threading contract. A logging failure must NEVER break the recall, so
+        # this stays inside the try (the finally still closes the session).
+        await anyio.to_thread.run_sync(
+            lambda: log_recall_event(
+                db,
+                org_id=org_id,
+                agent_id=agent_id,
+                project_id=project_id,
+                query_text=(query or None),
+                result_count=len(memories),
+                source="hook",
+            )
         )
-        memories = [_serialize_memory(r) for r in records]
         return {"memories": memories, "count": len(memories)}
     except Exception:
         logger.exception("capture recall failed (scope=%s)", req.scope)

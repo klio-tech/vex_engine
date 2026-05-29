@@ -294,3 +294,55 @@ def test_recall_caps_limit(client):
     ):
         client.post("/capture/recall", json={"query": "x", "limit": 9999})
     assert retr.await_args.kwargs["limit"] == capture._MAX_RECALL_LIMIT
+
+
+def test_recall_logs_event(client):
+    """The vector-search path logs a recall event tagged source=hook with the
+    returned result_count, query_text, and resolved project_id."""
+    retr = AsyncMock(return_value=[_memrow(id="a"), _memrow(id="b")])
+    log = MagicMock()
+    db_patch, session = _patch_db()
+    with (
+        db_patch,
+        patch("app.capture.retrieve_memories_scoped", retr),
+        patch("app.capture.log_recall_event", log),
+        patch.object(capture.brain, "find_project_id", MagicMock(return_value=None)),
+    ):
+        resp = client.post("/capture/recall", json={"query": "auth flow", "limit": 5})
+
+    assert resp.json()["count"] == 2
+    log.assert_called_once()
+    kw = log.call_args.kwargs
+    assert kw["source"] == "hook"
+    assert kw["result_count"] == 2
+    assert kw["org_id"] == "test-org"
+    assert kw["query_text"] == "auth flow"
+    assert kw["project_id"] is None
+    session.close.assert_called_once()
+
+
+def test_recall_logs_event_on_recency_branch(client):
+    """The empty-query recency path ALSO logs a recall event (source=hook) with
+    the recency result_count and a null query_text."""
+    session = MagicMock()
+    session.execute.return_value.fetchall.return_value = [
+        _memrow(id="r1"),
+        _memrow(id="r2"),
+    ]
+    log = MagicMock()
+    retr = AsyncMock()
+    with (
+        patch("app.capture.SessionLocal", MagicMock(return_value=session)),
+        patch("app.capture.retrieve_memories_scoped", retr),
+        patch("app.capture.log_recall_event", log),
+        patch.object(capture.brain, "find_project_id", MagicMock(return_value=None)),
+    ):
+        resp = client.post("/capture/recall", json={"query": "   "})
+
+    assert resp.json()["count"] == 2
+    retr.assert_not_called()  # recency path, not vector search
+    log.assert_called_once()
+    kw = log.call_args.kwargs
+    assert kw["source"] == "hook"
+    assert kw["result_count"] == 2
+    assert kw["query_text"] is None
