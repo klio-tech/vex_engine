@@ -434,6 +434,22 @@ async def test_new_rows_select_filters_status_active():
 
 
 @pytest.mark.asyncio
+async def test_new_rows_select_includes_scope_columns():
+    """The new-rows SELECT must also read space_id + project_id so the tick can
+    partition the batch by project/space."""
+    rows = [_row(i, f"c{i}") for i in range(1, 6)]
+    session = _make_session(cursor=None, rows=rows)
+    gen, ext, wsm = _patch_curator()
+
+    with gen, ext, wsm:
+        await curator_tick(session, "org-1", min_inputs=3)
+
+    new_rows_sql = str(session.execute.call_args_list[1].args[0])
+    assert "project_id" in new_rows_sql
+    assert "space_id" in new_rows_sql
+
+
+@pytest.mark.asyncio
 async def test_writes_target_org_scope_via_curator_agent():
     """Synthesized memories are written through write_scoped_memory for the same
     org under the klio-curator agent id and a curator session id."""

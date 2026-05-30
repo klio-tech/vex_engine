@@ -146,7 +146,7 @@ def _read_new_raw_rows(
     rows = db_session.execute(
         text(
             f"""
-            SELECT id, content, created_at
+            SELECT id, content, created_at, space_id, project_id
             FROM session_memories
             WHERE org_id = :org_id
               AND scope = 'org'
