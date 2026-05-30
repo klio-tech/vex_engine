@@ -146,7 +146,7 @@ def _read_new_raw_rows(
     rows = db_session.execute(
         text(
             f"""
-            SELECT id, content, created_at
+            SELECT id, content, created_at, space_id, project_id
             FROM session_memories
             WHERE org_id = :org_id
               AND scope = 'org'
@@ -246,6 +246,8 @@ async def _synthesize_and_store(
     agent_id: str,
     combined: str,
     input_count: int,
+    space_id: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> int:
     """Run the LLM synthesis over ``combined`` and store the results.
 
@@ -278,6 +280,8 @@ async def _synthesize_and_store(
             memory_type="summary",
             session_id=session_id,
             metadata=base_meta,
+            space_id=space_id,
+            project_id=project_id,
         ):
             stored += 1
     else:
@@ -305,6 +309,8 @@ async def _synthesize_and_store(
             memory_type="fact",
             session_id=session_id,
             metadata=base_meta,
+            space_id=space_id,
+            project_id=project_id,
         ):
             stored += 1
 
@@ -320,6 +326,8 @@ async def _store_one(
     memory_type: str,
     session_id: str,
     metadata: dict,
+    space_id: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> bool:
     """Write a single synthesised memory; return True only if newly stored.
 
@@ -335,6 +343,8 @@ async def _store_one(
             content=content,
             memory_type=memory_type,
             session_id=session_id,
+            space_id=space_id,
+            project_id=project_id,
             metadata=metadata,
         )
     except Exception:
@@ -394,14 +404,29 @@ async def curator_tick(
             "reason": "below_threshold",
         }
 
-    combined = "\n".join(r.content for r in rows if r.content)
-    synthesized = await _synthesize_and_store(
-        db_session,
-        org_id=org_id,
-        agent_id=agent_id,
-        combined=combined,
-        input_count=len(rows),
-    )
+    # Partition the batch by (space_id, project_id), preserving order so each
+    # partition's combined text and the cursor advance stay deterministic.
+    # NULL space/project => a genuinely org-wide partition (surfaces everywhere).
+    partitions: dict[tuple, list] = {}
+    for r in rows:
+        partitions.setdefault((r.space_id, r.project_id), []).append(r)
+
+    synthesized = 0
+    for (space_id, project_id), part_rows in partitions.items():
+        # Per-partition threshold: a project needs real signal before it gets a
+        # distilled fact. Sub-threshold rows stay recallable as raw observations.
+        if len(part_rows) < min_inputs:
+            continue
+        combined = "\n".join(r.content for r in part_rows if r.content)
+        synthesized += await _synthesize_and_store(
+            db_session,
+            org_id=org_id,
+            agent_id=agent_id,
+            combined=combined,
+            input_count=len(part_rows),
+            space_id=space_id,
+            project_id=project_id,
+        )
 
     # Rows are ordered (created_at ASC, id ASC), so the LAST row carries the
     # batch's composite max — the correct new keyset cursor.

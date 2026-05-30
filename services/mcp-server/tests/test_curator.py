@@ -41,12 +41,16 @@ def _row(
     *,
     created_at: datetime | None = None,
     id: str | None = None,
+    space_id: str | None = None,
+    project_id: str | None = None,
 ):
     """A raw session_memories row as the new-rows SELECT returns it."""
     return SimpleNamespace(
         id=id or f"mem-{idx}",
         content=content,
         created_at=created_at or (_BASE + timedelta(minutes=idx)),
+        space_id=space_id,
+        project_id=project_id,
     )
 
 
@@ -434,6 +438,22 @@ async def test_new_rows_select_filters_status_active():
 
 
 @pytest.mark.asyncio
+async def test_new_rows_select_includes_scope_columns():
+    """The new-rows SELECT must also read space_id + project_id so the tick can
+    partition the batch by project/space."""
+    rows = [_row(i, f"c{i}") for i in range(1, 6)]
+    session = _make_session(cursor=None, rows=rows)
+    gen, ext, wsm = _patch_curator()
+
+    with gen, ext, wsm:
+        await curator_tick(session, "org-1", min_inputs=3)
+
+    new_rows_sql = str(session.execute.call_args_list[1].args[0])
+    assert "project_id" in new_rows_sql
+    assert "space_id" in new_rows_sql
+
+
+@pytest.mark.asyncio
 async def test_writes_target_org_scope_via_curator_agent():
     """Synthesized memories are written through write_scoped_memory for the same
     org under the klio-curator agent id and a curator session id."""
@@ -559,3 +579,96 @@ async def test_run_curator_once_closes_session_even_if_tick_raises():
     org_b_session.close.assert_called_once()
     assert result["orgs"] == 2
     assert result["synthesized_total"] == 4
+
+
+# ---------------------------------------------------------------------------
+# Project-awareness: distill per (space_id, project_id), tag the output
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_distills_each_project_separately_and_tags_scope():
+    """A batch spanning two projects (each >= min_inputs) distills per project,
+    tagging every write with that partition's project_id/space_id."""
+    rows = (
+        [_row(i, f"a{i}", project_id="proj-A", space_id="sp-A") for i in range(1, 4)]
+        + [_row(i, f"b{i}", project_id="proj-B", space_id="sp-B") for i in range(4, 7)]
+    )
+    session = _make_session(cursor=None, rows=rows)
+    gen, ext, wsm = _patch_curator(summary="s", facts=["f1"])
+
+    with gen as mock_gen, ext as mock_ext, wsm as mock_write:
+        result = await curator_tick(session, "org-1", min_inputs=3)
+
+    # Two partitions => synthesis ran once per partition.
+    assert mock_gen.await_count == 2
+    assert mock_ext.await_count == 2
+
+    # Every write is tagged with a real project_id/space_id (never None here),
+    # and each project's writes carry only that project's scope.
+    by_project = {}
+    for c in mock_write.await_args_list:
+        by_project.setdefault(c.kwargs["project_id"], set()).add(c.kwargs["space_id"])
+    assert by_project == {"proj-A": {"sp-A"}, "proj-B": {"sp-B"}}
+    # processed counts the whole batch.
+    assert result["processed"] == 6
+
+
+@pytest.mark.asyncio
+async def test_null_project_partition_stays_org_wide():
+    """Rows with no project_id distill with project_id=None (genuinely org-wide,
+    the now-correct meaning of NULL)."""
+    rows = [_row(i, f"c{i}") for i in range(1, 4)]  # project_id defaults to None
+    session = _make_session(cursor=None, rows=rows)
+    gen, ext, wsm = _patch_curator(summary="s", facts=["f1"])
+
+    with gen, ext, wsm as mock_write:
+        await curator_tick(session, "org-1", min_inputs=3)
+
+    for c in mock_write.await_args_list:
+        assert c.kwargs["project_id"] is None
+        assert c.kwargs["space_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_subthreshold_partition_is_not_distilled():
+    """When the batch total >= min_inputs but a single project's partition is
+    below it, that partition is skipped (no writes) while a qualifying one runs.
+    The cursor still advances over the whole batch."""
+    rows = (
+        [_row(i, f"a{i}", project_id="proj-A") for i in range(1, 4)]  # 3 -> distilled
+        + [_row(i, f"b{i}", project_id="proj-B") for i in range(4, 6)]  # 2 -> skipped
+    )
+    session = _make_session(cursor=None, rows=rows)
+    gen, ext, wsm = _patch_curator(summary="s", facts=["f1"])
+
+    with gen, ext, wsm as mock_write:
+        result = await curator_tick(session, "org-1", min_inputs=3)
+
+    written_projects = {c.kwargs["project_id"] for c in mock_write.await_args_list}
+    assert written_projects == {"proj-A"}  # proj-B skipped
+    assert result["processed"] == 5  # whole batch counted
+    # Cursor advanced to the whole batch's max (created_at, id) = last row.
+    advance_params = session.execute.call_args_list[2].args[1]
+    assert advance_params["last_processed_at"] == rows[-1].created_at
+    assert advance_params["last_processed_id"] == rows[-1].id
+
+
+@pytest.mark.asyncio
+async def test_input_count_is_per_partition():
+    """metadata.input_count reflects the partition's row count, not the batch."""
+    rows = (
+        [_row(i, f"a{i}", project_id="proj-A") for i in range(1, 4)]  # 3
+        + [_row(i, f"b{i}", project_id="proj-B") for i in range(4, 8)]  # 4
+    )
+    session = _make_session(cursor=None, rows=rows)
+    gen, ext, wsm = _patch_curator(summary="s", facts=[])  # summary-only keeps it simple
+
+    with gen, ext, wsm as mock_write:
+        await curator_tick(session, "org-1", min_inputs=3)
+
+    counts = {
+        c.kwargs["project_id"]: c.kwargs["metadata"]["input_count"]
+        for c in mock_write.await_args_list
+    }
+    assert counts == {"proj-A": 3, "proj-B": 4}
