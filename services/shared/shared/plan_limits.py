@@ -3,6 +3,10 @@
 These constants define the quotas, rate limits, and feature flags
 for each plan. The ``PLAN_LIMITS`` dict is keyed by the ``plan``
 column value in the ``organizations`` table.
+
+The memory-tier fields (memories_per_month / recalls_per_month /
+memory_retention_days / memory_sync_enabled) are mirrored on the marketing
+site at Dashboard/apps/landing/lib/pricing.ts — keep the two in sync.
 """
 
 from __future__ import annotations
@@ -99,6 +103,14 @@ class PlanConfig:
     # Maximum number of items (test cases) allowed per dataset.
     max_dataset_items: int = 0
 
+    # Memory (Klio) — value metric for the memory product. Mirror at
+    # Dashboard/apps/landing/lib/pricing.ts (keep in sync). -1 = unlimited,
+    # 0 = disabled.
+    memories_per_month: int = -1
+    recalls_per_month: int = -1
+    memory_retention_days: int = 30
+    memory_sync_enabled: bool = False
+
 
 PLAN_LIMITS: dict[str, PlanConfig] = {
     "free": PlanConfig(
@@ -115,6 +127,10 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         max_experiments=1,
         max_datasets=1,
         max_dataset_items=20,
+        memories_per_month=1_000,
+        recalls_per_month=10_000,
+        memory_retention_days=1,
+        memory_sync_enabled=False,
     ),
     "starter": PlanConfig(
         observations_per_month=25_000,
@@ -130,6 +146,10 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         max_experiments=5,
         max_datasets=5,
         max_dataset_items=100,
+        memories_per_month=25_000,
+        recalls_per_month=100_000,
+        memory_retention_days=7,
+        memory_sync_enabled=True,
     ),
     "pro": PlanConfig(
         observations_per_month=150_000,
@@ -145,6 +165,10 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         max_experiments=-1,
         max_datasets=25,
         max_dataset_items=500,
+        memories_per_month=150_000,
+        recalls_per_month=1_000_000,
+        memory_retention_days=30,
+        memory_sync_enabled=True,
     ),
     "team": PlanConfig(
         observations_per_month=1_500_000,
@@ -160,6 +184,10 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         max_experiments=-1,
         max_datasets=-1,
         max_dataset_items=-1,
+        memories_per_month=1_500_000,
+        recalls_per_month=10_000_000,
+        memory_retention_days=90,
+        memory_sync_enabled=True,
     ),
     "enterprise": PlanConfig(
         observations_per_month=10_000_000,
@@ -175,6 +203,10 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         max_experiments=-1,
         max_datasets=-1,
         max_dataset_items=-1,
+        memories_per_month=-1,
+        recalls_per_month=-1,
+        memory_retention_days=365,
+        memory_sync_enabled=True,
     ),
 }
 

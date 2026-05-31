@@ -114,6 +114,25 @@ def resolve_principal(request: Request) -> tuple[str, str]:
     return key_info.org_id, agent_id
 
 
+def resolve_principal_plan(request: Request) -> tuple[str, str, str, dict | None]:
+    """Like :func:`resolve_principal` but also returns the resolved plan + overrides.
+
+    Used by the memory-metering checks, which need the plan AND any per-account
+    plan overrides to look up the effective per-plan memory quota. Returning the
+    overrides alongside the plan keeps real-time enforcement consistent with the
+    retention sweep, which also merges overrides via ``get_plan_config(plan,
+    overrides)`` — without them a custom cap would be silently enforced at the
+    base tier. Validates the key once (no extra round trip beyond what
+    :func:`resolve_principal` already does).
+
+    Returns:
+        A ``(org_id, agent_id, plan, plan_overrides)`` tuple.
+    """
+    key_info = verify_api_key(request)
+    agent_id = request.headers.get("X-Vex-Agent") or DEFAULT_AGENT_ID
+    return key_info.org_id, agent_id, key_info.plan, key_info.plan_overrides
+
+
 def resolve_principal_dep(
     request: Request,
     key_info: KeyInfo = Depends(verify_api_key),

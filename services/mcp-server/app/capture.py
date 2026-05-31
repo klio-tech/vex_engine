@@ -46,19 +46,49 @@ import logging
 from typing import Any, Literal, Optional
 
 import anyio
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from shared import brain
+from shared.auth import KeyInfo
 from shared.memory import extract_facts, generate_summary, retrieve_memories_scoped
+from shared.plan_limits import get_plan_config
+from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from sqlalchemy import text
 
-from app.auth import resolve_principal_dep
+from app.auth import resolve_principal_dep, verify_api_key
 from app.db import SessionLocal
 from app.recall_log import log_recall_event
 
 logger = logging.getLogger("agentguard.mcp.capture")
 
 router = APIRouter(prefix="/capture", tags=["capture"])
+
+
+def _check_memory_quota_402(
+    db, org_id: str, plan: str, kind: str, overrides: dict | None = None
+) -> bool:
+    """Run the memory quota check, translating a hard block to HTTP 402.
+
+    Returns ``over_cap``. Synchronous; call via anyio.to_thread from handlers.
+    ``overrides`` is the account's ``plan_overrides`` (from the validated key);
+    passing it keeps real-time enforcement consistent with the retention sweep,
+    which also merges overrides via ``get_plan_config(plan, overrides)``.
+    """
+    try:
+        return check_memory_quota(
+            db, org_id, get_plan_config(plan, overrides), kind, plan_name=plan
+        )
+    except MemoryQuotaExceeded as exc:
+        raise HTTPException(
+            status_code=402,
+            detail={
+                "error": "quota_exceeded",
+                "metric": exc.metric,
+                "limit": exc.limit,
+                "message": exc.message,
+                "suggested_plan": exc.suggested_plan,
+            },
+        ) from exc
 
 # Memory types a passive capture *event* is allowed to write.  Deliberately
 # EXCLUDES the curator's output types ('summary'/'fact') so a hook can never
@@ -326,6 +356,7 @@ def _recent_memories(
 async def capture_event(
     req: CaptureEventRequest,
     principal: tuple[str, str] = Depends(resolve_principal_dep),
+    key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Store one passive memory (default ``observation``).
 
@@ -352,7 +383,12 @@ async def capture_event(
                 db, org_id=org_id, git_remote=req.git_remote, repo_root=req.repo_root
             )
         )
-        return await brain.write_scoped_memory(
+        over_cap = await anyio.to_thread.run_sync(
+            lambda: _check_memory_quota_402(
+                db, org_id, key_info.plan, "memory", key_info.plan_overrides
+            )
+        )
+        result = await brain.write_scoped_memory(
             db,
             org_id=org_id,
             agent_id=agent_id,
@@ -363,6 +399,13 @@ async def capture_event(
             metadata=metadata,
             scope=req.scope,
         )
+        if result.get("stored"):
+            await anyio.to_thread.run_sync(
+                lambda: record_usage(db, org_id, "memory", over_cap=over_cap)
+            )
+        return result
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("capture event failed (memory_type=%s)", memory_type)
         return {"stored": False, "error": "capture_failed"}
@@ -374,6 +417,7 @@ async def capture_event(
 async def capture_transcript(
     req: CaptureTranscriptRequest,
     principal: tuple[str, str] = Depends(resolve_principal_dep),
+    key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Distil a finished session into discrete ``fact`` rows and one ``summary``.
 
@@ -398,6 +442,11 @@ async def capture_transcript(
         session_id = _capture_session_id(org_id, agent_id, req.session_id)
         base_meta = {"source": "hook-transcript"}
         stored = 0
+        over_cap = await anyio.to_thread.run_sync(
+            lambda: _check_memory_quota_402(
+                db, org_id, key_info.plan, "memory", key_info.plan_overrides
+            )
+        )
 
         try:
             summary = await generate_summary(combined)
@@ -417,6 +466,9 @@ async def capture_transcript(
             )
             if result.get("stored"):
                 stored += 1
+                await anyio.to_thread.run_sync(
+                    lambda: record_usage(db, org_id, "memory", over_cap=over_cap)
+                )
 
         try:
             facts = await extract_facts(combined)
@@ -438,8 +490,13 @@ async def capture_transcript(
             )
             if result.get("stored"):
                 stored += 1
+                await anyio.to_thread.run_sync(
+                    lambda: record_usage(db, org_id, "memory", over_cap=over_cap)
+                )
 
         return {"stored": stored, "facts": len(facts), "summary": bool(summary)}
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("capture transcript failed")
         return {"stored": 0, "error": "capture_failed"}
@@ -451,6 +508,7 @@ async def capture_transcript(
 async def capture_recall(
     req: RecallRequest,
     principal: tuple[str, str] = Depends(resolve_principal_dep),
+    key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Return memories for context injection.
 
@@ -473,6 +531,11 @@ async def capture_recall(
             lambda: _find_project_id(db, org_id=org_id, git_remote=req.git_remote)
         )
         query = req.query.strip()
+        recall_over_cap = await anyio.to_thread.run_sync(
+            lambda: _check_memory_quota_402(
+                db, org_id, key_info.plan, "recall", key_info.plan_overrides
+            )
+        )
 
         if not query:
             memories = await anyio.to_thread.run_sync(
@@ -517,7 +580,12 @@ async def capture_recall(
                 source="hook",
             )
         )
+        await anyio.to_thread.run_sync(
+            lambda: record_usage(db, org_id, "recall", over_cap=recall_over_cap)
+        )
         return {"memories": memories, "count": len(memories)}
+    except HTTPException:
+        raise
     except Exception:
         logger.exception("capture recall failed (scope=%s)", req.scope)
         return {"memories": [], "count": 0, "error": "recall_failed"}

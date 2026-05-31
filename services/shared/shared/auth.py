@@ -42,6 +42,12 @@ class KeyInfo:
     key_id: str
     scopes: list[str]
     plan: str = "free"
+    # Per-account plan overrides (from ``accounts.vex_plan_overrides``), if any.
+    # Additive with a ``None`` default so existing callers that construct a
+    # ``KeyInfo`` without it (ingestion-api / sync-gateway) stay valid. Callers
+    # that enforce per-plan quotas must pass this into ``get_plan_config`` so a
+    # custom cap is honored at the boundary, exactly as the retention sweep does.
+    plan_overrides: dict | None = None
 
 
 @dataclass
@@ -196,6 +202,7 @@ class KeyValidator:
             key_id=entry.key_id,
             scopes=entry.scopes,
             plan=entry.plan,
+            plan_overrides=entry.plan_overrides,
         )
 
     def flush_usage(self) -> None:

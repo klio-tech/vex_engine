@@ -50,8 +50,10 @@ from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 from shared import brain
 from shared.memory import MemoryRecord, retrieve_memories_scoped
+from shared.plan_limits import get_plan_config
+from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 
-from app.auth import resolve_principal
+from app.auth import resolve_principal, resolve_principal_plan
 from app.config import (
     MCP_ALLOWED_HOSTS,
     MCP_ALLOWED_ORIGINS,
@@ -137,7 +139,7 @@ async def _perform_write(
         }
 
     try:
-        org_id, agent_id = resolve_principal(request)
+        org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
     except HTTPException as exc:
         return {"stored": False, "error": "unauthorized", "detail": str(exc.detail)}
 
@@ -145,7 +147,30 @@ async def _perform_write(
 
     db = SessionLocal()
     try:
-        return await brain.write_scoped_memory(
+        # Enforce the org's monthly memory quota BEFORE doing any write work.
+        # ``check_memory_quota`` raises ``MemoryQuotaExceeded`` for a hard block
+        # (capped plan at/over limit, no overage) and otherwise returns an
+        # ``over_cap`` flag (True when allowed via overage). It fails OPEN on any
+        # metering error, so a counter hiccup never blocks a real write. Pass the
+        # account's ``plan_overrides`` so a custom cap is honored here exactly as
+        # the retention sweep honors it.
+        try:
+            over_cap = check_memory_quota(
+                db,
+                org_id,
+                get_plan_config(plan, plan_overrides),
+                "memory",
+                plan_name=plan,
+            )
+        except MemoryQuotaExceeded as exc:
+            return {
+                "stored": False,
+                "error": "quota_exceeded",
+                "detail": exc.message,
+                "suggested_plan": exc.suggested_plan,
+            }
+
+        result = await brain.write_scoped_memory(
             db,
             org_id=org_id,
             agent_id=agent_id,
@@ -155,6 +180,11 @@ async def _perform_write(
             metadata=metadata,
             scope=scope,
         )
+        # Only meter an actual insert: a deduplicated write stores no new row, so
+        # it must not consume the org's monthly memory allowance.
+        if result.get("stored"):
+            record_usage(db, org_id, "memory", over_cap=over_cap)
+        return result
     except Exception:
         logger.exception("brain write failed (memory_type=%s)", memory_type)
         return {"stored": False, "error": "write_failed"}
@@ -384,12 +414,34 @@ async def _perform_recall(
         return {"error": "unauthorized", "detail": "no request context"}
 
     try:
-        org_id, agent_id = resolve_principal(request)
+        org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
     except HTTPException as exc:
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
     db = SessionLocal()
     try:
+        # Enforce the org's monthly recall quota BEFORE any retrieval work, so a
+        # capped tenant is blocked cleanly rather than after spending an
+        # embedding/search round trip. ``check_memory_quota`` raises
+        # ``MemoryQuotaExceeded`` on a hard block and otherwise returns the
+        # ``over_cap`` flag; it fails OPEN on any metering error. Pass the
+        # account's ``plan_overrides`` so a custom cap is honored here exactly as
+        # the retention sweep honors it.
+        try:
+            recall_over_cap = check_memory_quota(
+                db,
+                org_id,
+                get_plan_config(plan, plan_overrides),
+                "recall",
+                plan_name=plan,
+            )
+        except MemoryQuotaExceeded as exc:
+            return {
+                "error": "quota_exceeded",
+                "detail": exc.message,
+                "suggested_plan": exc.suggested_plan,
+            }
+
         # Resolve the optional space-slug filter. An unknown slug is surfaced
         # (not silently dropped) so an over-narrow filter never masquerades as
         # an org-wide search returning unrelated memories.
@@ -438,6 +490,10 @@ async def _perform_recall(
             result_count=len(records),
             source="mcp",
         )
+        # Meter the recall against the org's monthly allowance (best-effort;
+        # ``record_usage`` never raises). A successful recall always counts,
+        # regardless of how many records it returned.
+        record_usage(db, org_id, "recall", over_cap=recall_over_cap)
         memories = [_serialize_record(record) for record in records]
         return {"memories": memories, "count": len(memories)}
     except Exception:
