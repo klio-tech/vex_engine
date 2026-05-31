@@ -93,6 +93,16 @@ def main() -> None:
                     org_id,
                     plan,
                 )
+                tsdb_conn.execute(
+                    text("SELECT enforce_memory_retention(:org_id, :days)"),
+                    {"org_id": org_id, "days": config.memory_retention_days},
+                )
+                logger.info(
+                    "Enforced %d-day MEMORY retention for org=%s plan=%s",
+                    config.memory_retention_days,
+                    org_id,
+                    plan,
+                )
 
             tsdb_conn.commit()
 
