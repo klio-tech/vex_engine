@@ -18,11 +18,13 @@ def _ctx():
 @pytest.mark.asyncio
 async def test_write_blocked_returns_error_dict():
     with patch.object(
-        mcp_app, "resolve_principal_plan", return_value=("org-1", "a1", "free")
+        mcp_app, "resolve_principal_plan", return_value=("org-1", "a1", "free", None)
     ), patch.object(
         mcp_app,
         "check_memory_quota",
-        side_effect=MemoryQuotaExceeded(metric="memory", limit=1000, plan_used=1000),
+        side_effect=MemoryQuotaExceeded(
+            metric="memory", limit=1000, plan_used=1000, suggested_plan="starter"
+        ),
     ):
         result = await mcp_app._perform_write(
             _ctx(), content="x", memory_type="memory"
@@ -31,12 +33,13 @@ async def test_write_blocked_returns_error_dict():
     assert result["error"] == "quota_exceeded"
     assert "detail" in result
     assert "limit" in result["detail"].lower()
+    assert result["suggested_plan"] == "starter"
 
 
 @pytest.mark.asyncio
 async def test_write_records_only_when_stored():
     with patch.object(
-        mcp_app, "resolve_principal_plan", return_value=("org-1", "a1", "free")
+        mcp_app, "resolve_principal_plan", return_value=("org-1", "a1", "free", None)
     ), patch.object(mcp_app, "check_memory_quota", return_value=False), patch.object(
         mcp_app, "record_usage"
     ) as rec, patch.object(
@@ -51,7 +54,7 @@ async def test_write_records_only_when_stored():
 @pytest.mark.asyncio
 async def test_write_skips_record_when_deduped():
     with patch.object(
-        mcp_app, "resolve_principal_plan", return_value=("org-1", "a1", "free")
+        mcp_app, "resolve_principal_plan", return_value=("org-1", "a1", "free", None)
     ), patch.object(mcp_app, "check_memory_quota", return_value=False), patch.object(
         mcp_app, "record_usage"
     ) as rec, patch.object(
@@ -66,11 +69,13 @@ async def test_write_skips_record_when_deduped():
 @pytest.mark.asyncio
 async def test_recall_blocked_returns_error_dict():
     with patch.object(
-        mcp_app, "resolve_principal_plan", return_value=("org-1", "a1", "free")
+        mcp_app, "resolve_principal_plan", return_value=("org-1", "a1", "free", None)
     ), patch.object(
         mcp_app,
         "check_memory_quota",
-        side_effect=MemoryQuotaExceeded(metric="recall", limit=10000, plan_used=10000),
+        side_effect=MemoryQuotaExceeded(
+            metric="recall", limit=10000, plan_used=10000, suggested_plan="starter"
+        ),
     ):
         result = await mcp_app._perform_recall(
             _ctx(), query="q", scope="org", space=None, project=None
@@ -78,12 +83,13 @@ async def test_recall_blocked_returns_error_dict():
     assert result["error"] == "quota_exceeded"
     assert "detail" in result
     assert "limit" in result["detail"].lower()
+    assert result["suggested_plan"] == "starter"
 
 
 @pytest.mark.asyncio
 async def test_recall_records_usage_on_success():
     with patch.object(
-        mcp_app, "resolve_principal_plan", return_value=("org-1", "a1", "free")
+        mcp_app, "resolve_principal_plan", return_value=("org-1", "a1", "free", None)
     ), patch.object(mcp_app, "check_memory_quota", return_value=False), patch.object(
         mcp_app, "SessionLocal", return_value=MagicMock()
     ), patch.object(

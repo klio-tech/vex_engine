@@ -64,13 +64,20 @@ logger = logging.getLogger("agentguard.mcp.capture")
 router = APIRouter(prefix="/capture", tags=["capture"])
 
 
-def _check_memory_quota_402(db, org_id: str, plan: str, kind: str) -> bool:
+def _check_memory_quota_402(
+    db, org_id: str, plan: str, kind: str, overrides: dict | None = None
+) -> bool:
     """Run the memory quota check, translating a hard block to HTTP 402.
 
     Returns ``over_cap``. Synchronous; call via anyio.to_thread from handlers.
+    ``overrides`` is the account's ``plan_overrides`` (from the validated key);
+    passing it keeps real-time enforcement consistent with the retention sweep,
+    which also merges overrides via ``get_plan_config(plan, overrides)``.
     """
     try:
-        return check_memory_quota(db, org_id, get_plan_config(plan), kind)
+        return check_memory_quota(
+            db, org_id, get_plan_config(plan, overrides), kind, plan_name=plan
+        )
     except MemoryQuotaExceeded as exc:
         raise HTTPException(
             status_code=402,
@@ -79,6 +86,7 @@ def _check_memory_quota_402(db, org_id: str, plan: str, kind: str) -> bool:
                 "metric": exc.metric,
                 "limit": exc.limit,
                 "message": exc.message,
+                "suggested_plan": exc.suggested_plan,
             },
         ) from exc
 
@@ -376,7 +384,9 @@ async def capture_event(
             )
         )
         over_cap = await anyio.to_thread.run_sync(
-            lambda: _check_memory_quota_402(db, org_id, key_info.plan, "memory")
+            lambda: _check_memory_quota_402(
+                db, org_id, key_info.plan, "memory", key_info.plan_overrides
+            )
         )
         result = await brain.write_scoped_memory(
             db,
@@ -433,7 +443,9 @@ async def capture_transcript(
         base_meta = {"source": "hook-transcript"}
         stored = 0
         over_cap = await anyio.to_thread.run_sync(
-            lambda: _check_memory_quota_402(db, org_id, key_info.plan, "memory")
+            lambda: _check_memory_quota_402(
+                db, org_id, key_info.plan, "memory", key_info.plan_overrides
+            )
         )
 
         try:
@@ -520,7 +532,9 @@ async def capture_recall(
         )
         query = req.query.strip()
         recall_over_cap = await anyio.to_thread.run_sync(
-            lambda: _check_memory_quota_402(db, org_id, key_info.plan, "recall")
+            lambda: _check_memory_quota_402(
+                db, org_id, key_info.plan, "recall", key_info.plan_overrides
+            )
         )
 
         if not query:

@@ -9,8 +9,8 @@ them with a hand-built fake :class:`Context` whose
 
 The seams patched at the ``app.mcp_app`` module boundary:
 
-* ``resolve_principal_plan`` → returns a fixed ``(org_id, agent_id, plan)``
-  (or raises to drive the auth-failure path).
+* ``resolve_principal_plan`` → returns a fixed ``(org_id, agent_id, plan,
+  plan_overrides)`` (or raises to drive the auth-failure path).
 * ``brain.write_scoped_memory`` → an ``AsyncMock`` that captures kwargs and
   returns a canned result, so no DB/embedding is touched.
 * ``SessionLocal`` → a ``MagicMock`` so ``SessionLocal()`` yields a fake
@@ -95,7 +95,7 @@ async def test_write_tool_maps_memory_type_and_scopes_org(tool_name, expected_ty
     with (
         patch(
             "app.mcp_app.resolve_principal_plan",
-            return_value=("org-x", "agent-y", "free"),
+            return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", session_local),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
@@ -122,7 +122,7 @@ async def test_decide_with_rationale_sets_metadata():
     write_mock = AsyncMock(return_value=_canned_result("decision"))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free")),
+        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -142,7 +142,7 @@ async def test_decide_without_rationale_omits_rationale_metadata():
     write_mock = AsyncMock(return_value=_canned_result("decision"))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free")),
+        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -160,7 +160,7 @@ async def test_session_id_falls_back_to_principal_without_header():
     write_mock = AsyncMock(return_value=_canned_result("memory"))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free")),
+        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -228,7 +228,7 @@ async def test_write_tool_scope_agent_forwarded():
     write_mock = AsyncMock(return_value=_canned_result("memory"))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free")),
+        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -244,7 +244,7 @@ async def test_write_tool_scope_defaults_to_org():
     write_mock = AsyncMock(return_value=_canned_result("observation"))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free")),
+        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):

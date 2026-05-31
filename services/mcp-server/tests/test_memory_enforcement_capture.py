@@ -15,16 +15,19 @@ async def test_capture_event_quota_exceeded_raises_402():
     req = MagicMock()
     req.memory_type = "observation"
     req.metadata = None
-    info = MagicMock(plan="free")
+    info = MagicMock(plan="free", plan_overrides=None)
     with patch.object(
         capture, "check_memory_quota",
-        side_effect=MemoryQuotaExceeded(metric="memory", limit=1000, plan_used=1000),
+        side_effect=MemoryQuotaExceeded(
+            metric="memory", limit=1000, plan_used=1000, suggested_plan="starter"
+        ),
     ), patch.object(capture, "SessionLocal", return_value=MagicMock()), patch.object(
         capture, "_ensure_project_id", return_value=None
     ):
         with pytest.raises(HTTPException) as exc:
             await capture.capture_event(req, principal=("org-1", "a1"), key_info=info)
     assert exc.value.status_code == 402
+    assert exc.value.detail["suggested_plan"] == "starter"
 
 
 @pytest.mark.asyncio
@@ -32,7 +35,7 @@ async def test_capture_event_records_when_stored():
     req = MagicMock()
     req.memory_type = "observation"
     req.metadata = None
-    info = MagicMock(plan="free")
+    info = MagicMock(plan="free", plan_overrides=None)
     with patch.object(capture, "check_memory_quota", return_value=False), patch.object(
         capture, "record_usage"
     ) as rec, patch.object(

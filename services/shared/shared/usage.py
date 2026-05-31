@@ -26,17 +26,33 @@ logger = logging.getLogger("shared.usage")
 
 Kind = Literal["memory", "recall"]
 
+# Upgrade ladder: maps a plan name to the next tier up. Used to surface a
+# machine-readable upgrade target on a quota block so clients can deep-link to
+# the right plan. ``enterprise`` is terminal (already the top tier) and maps to
+# itself; any unknown plan also resolves to ``enterprise`` via ``.get`` default.
+NEXT_TIER: dict[str, str] = {
+    "free": "starter",
+    "starter": "pro",
+    "pro": "team",
+    "team": "enterprise",
+    "enterprise": "enterprise",
+}
+
 
 class MemoryQuotaExceeded(Exception):
     """Raised when a hard-capped plan is at/over its monthly memory quota."""
 
-    def __init__(self, *, metric: Kind, limit: int, plan_used: int) -> None:
+    def __init__(
+        self, *, metric: Kind, limit: int, plan_used: int, suggested_plan: str
+    ) -> None:
         self.metric = metric
         self.limit = limit
         self.used = plan_used
+        self.suggested_plan = suggested_plan
         self.message = (
             f"Monthly {metric} limit reached ({limit:,}). "
-            "Upgrade your plan at https://app.klio.tech to continue."
+            f"Upgrade to the {suggested_plan} plan at https://app.klio.tech "
+            "to continue."
         )
         super().__init__(self.message)
 
@@ -74,13 +90,18 @@ def get_counters(db: Any, org_id: str) -> Counters:
 
 
 def check_memory_quota(
-    db: Any, org_id: str, plan_config: PlanConfig, kind: Kind
+    db: Any, org_id: str, plan_config: PlanConfig, kind: Kind, plan_name: str = "free"
 ) -> bool:
     """Check the org's quota for *kind* this month.
 
     Returns ``over_cap`` (True when at/over the limit but allowed via overage).
     Raises ``MemoryQuotaExceeded`` when at/over the limit and overage is not
     allowed. Fails OPEN (returns False) on any DB/unexpected error.
+
+    ``plan_name`` is the resolved plan tier; it only drives the
+    ``suggested_plan`` upgrade target on a hard block (the quota math itself
+    comes from ``plan_config``). It defaults to ``"free"`` so existing positional
+    callers stay valid while the upgrade hint degrades gracefully.
     """
     limit = (
         plan_config.memories_per_month
@@ -100,7 +121,12 @@ def check_memory_quota(
     if used >= limit:
         if plan_config.overage_allowed:
             return True
-        raise MemoryQuotaExceeded(metric=kind, limit=limit, plan_used=used)
+        raise MemoryQuotaExceeded(
+            metric=kind,
+            limit=limit,
+            plan_used=used,
+            suggested_plan=NEXT_TIER.get(plan_name, "enterprise"),
+        )
     return False
 
 

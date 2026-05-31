@@ -43,9 +43,23 @@ def test_under_cap_allows_no_overage():
 def test_at_cap_free_raises():
     db = _db_with_counters(memories=1_000, recalls=0)
     with pytest.raises(MemoryQuotaExceeded) as exc:
-        check_memory_quota(db, "org-1", get_plan_config("free"), "memory")
+        check_memory_quota(db, "org-1", get_plan_config("free"), "memory", plan_name="free")
     assert exc.value.metric == "memory"
     assert exc.value.limit == 1_000
+    # The block carries the machine-readable upgrade target one tier up.
+    assert exc.value.suggested_plan == "starter"
+
+
+def test_override_cap_is_enforced():
+    # An account override that lowers the cap must be honored in real-time
+    # enforcement, exactly as the retention sweep honors it. A counter at the
+    # overridden cap (5) blocks even though the base free cap is 1,000.
+    db = _db_with_counters(memories=5, recalls=0)
+    plan_config = get_plan_config("free", {"memories_per_month": 5})
+    with pytest.raises(MemoryQuotaExceeded) as exc:
+        check_memory_quota(db, "org-1", plan_config, "memory", plan_name="free")
+    assert exc.value.limit == 5
+    assert exc.value.suggested_plan == "starter"
 
 
 def test_at_cap_pro_allows_overage():

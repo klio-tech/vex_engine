@@ -139,7 +139,7 @@ async def _perform_write(
         }
 
     try:
-        org_id, agent_id, plan = resolve_principal_plan(request)
+        org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
     except HTTPException as exc:
         return {"stored": False, "error": "unauthorized", "detail": str(exc.detail)}
 
@@ -151,11 +151,24 @@ async def _perform_write(
         # ``check_memory_quota`` raises ``MemoryQuotaExceeded`` for a hard block
         # (capped plan at/over limit, no overage) and otherwise returns an
         # ``over_cap`` flag (True when allowed via overage). It fails OPEN on any
-        # metering error, so a counter hiccup never blocks a real write.
+        # metering error, so a counter hiccup never blocks a real write. Pass the
+        # account's ``plan_overrides`` so a custom cap is honored here exactly as
+        # the retention sweep honors it.
         try:
-            over_cap = check_memory_quota(db, org_id, get_plan_config(plan), "memory")
+            over_cap = check_memory_quota(
+                db,
+                org_id,
+                get_plan_config(plan, plan_overrides),
+                "memory",
+                plan_name=plan,
+            )
         except MemoryQuotaExceeded as exc:
-            return {"stored": False, "error": "quota_exceeded", "detail": exc.message}
+            return {
+                "stored": False,
+                "error": "quota_exceeded",
+                "detail": exc.message,
+                "suggested_plan": exc.suggested_plan,
+            }
 
         result = await brain.write_scoped_memory(
             db,
@@ -401,7 +414,7 @@ async def _perform_recall(
         return {"error": "unauthorized", "detail": "no request context"}
 
     try:
-        org_id, agent_id, plan = resolve_principal_plan(request)
+        org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
     except HTTPException as exc:
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
@@ -411,13 +424,23 @@ async def _perform_recall(
         # capped tenant is blocked cleanly rather than after spending an
         # embedding/search round trip. ``check_memory_quota`` raises
         # ``MemoryQuotaExceeded`` on a hard block and otherwise returns the
-        # ``over_cap`` flag; it fails OPEN on any metering error.
+        # ``over_cap`` flag; it fails OPEN on any metering error. Pass the
+        # account's ``plan_overrides`` so a custom cap is honored here exactly as
+        # the retention sweep honors it.
         try:
             recall_over_cap = check_memory_quota(
-                db, org_id, get_plan_config(plan), "recall"
+                db,
+                org_id,
+                get_plan_config(plan, plan_overrides),
+                "recall",
+                plan_name=plan,
             )
         except MemoryQuotaExceeded as exc:
-            return {"error": "quota_exceeded", "detail": exc.message}
+            return {
+                "error": "quota_exceeded",
+                "detail": exc.message,
+                "suggested_plan": exc.suggested_plan,
+            }
 
         # Resolve the optional space-slug filter. An unknown slug is surfaced
         # (not silently dropped) so an over-narrow filter never masquerades as
