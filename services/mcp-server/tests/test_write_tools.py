@@ -9,8 +9,8 @@ them with a hand-built fake :class:`Context` whose
 
 The seams patched at the ``app.mcp_app`` module boundary:
 
-* ``resolve_principal`` → returns a fixed ``(org_id, agent_id)`` (or raises
-  to drive the auth-failure path).
+* ``resolve_principal_plan`` → returns a fixed ``(org_id, agent_id, plan)``
+  (or raises to drive the auth-failure path).
 * ``brain.write_scoped_memory`` → an ``AsyncMock`` that captures kwargs and
   returns a canned result, so no DB/embedding is touched.
 * ``SessionLocal`` → a ``MagicMock`` so ``SessionLocal()`` yields a fake
@@ -40,7 +40,7 @@ def _fake_ctx(headers: dict | None = None):
     """Build a minimal stand-in for the FastMCP Context.
 
     The tool bodies only read ``ctx.request_context.request`` and pass it to
-    ``resolve_principal`` / the session-id helper, which in turn read
+    ``resolve_principal_plan`` / the session-id helper, which in turn read
     ``request.headers.get(...)``. A nested ``SimpleNamespace`` with a real
     dict for ``headers`` satisfies both without a real ASGI scope.
     """
@@ -81,8 +81,8 @@ async def test_write_tool_maps_memory_type_and_scopes_org(tool_name, expected_ty
 
     with (
         patch(
-            "app.mcp_app.resolve_principal",
-            return_value=("org-x", "agent-y"),
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free"),
         ),
         patch("app.mcp_app.SessionLocal", session_local),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
@@ -109,7 +109,7 @@ async def test_decide_with_rationale_sets_metadata():
     write_mock = AsyncMock(return_value=_canned_result("decision"))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free")),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -129,7 +129,7 @@ async def test_decide_without_rationale_omits_rationale_metadata():
     write_mock = AsyncMock(return_value=_canned_result("decision"))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free")),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -147,7 +147,7 @@ async def test_session_id_falls_back_to_principal_without_header():
     write_mock = AsyncMock(return_value=_canned_result("memory"))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free")),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -166,7 +166,7 @@ async def test_write_tool_no_request_context_returns_unauthorized():
     ctx = SimpleNamespace(request_context=SimpleNamespace(request=None))
 
     with (
-        patch("app.mcp_app.resolve_principal") as resolve_mock,
+        patch("app.mcp_app.resolve_principal_plan") as resolve_mock,
         patch("app.mcp_app.SessionLocal", session_local),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -181,7 +181,7 @@ async def test_write_tool_no_request_context_returns_unauthorized():
 
 @pytest.mark.asyncio
 async def test_write_tool_auth_failure_returns_clean_error():
-    """When resolve_principal raises HTTPException, the tool returns a clean
+    """When resolve_principal_plan raises HTTPException, the tool returns a clean
     unauthorized dict and never calls write_scoped_memory."""
     fn = _get_tool_fn("remember")
     write_mock = AsyncMock()
@@ -190,7 +190,7 @@ async def test_write_tool_auth_failure_returns_clean_error():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal",
+            "app.mcp_app.resolve_principal_plan",
             side_effect=HTTPException(
                 status_code=401, detail="Missing X-Vex-Key header"
             ),
@@ -215,7 +215,7 @@ async def test_write_tool_scope_agent_forwarded():
     write_mock = AsyncMock(return_value=_canned_result("memory"))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free")),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -231,7 +231,7 @@ async def test_write_tool_scope_defaults_to_org():
     write_mock = AsyncMock(return_value=_canned_result("observation"))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free")),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
