@@ -3,6 +3,10 @@
 These constants define the quotas, rate limits, and feature flags
 for each plan. The ``PLAN_LIMITS`` dict is keyed by the ``plan``
 column value in the ``organizations`` table.
+
+The memory-tier fields (memories_per_month / recalls_per_month /
+memory_retention_days / memory_sync_enabled) are mirrored on the marketing
+site at Dashboard/apps/landing/lib/pricing.ts — keep the two in sync.
 """
 
 from __future__ import annotations
