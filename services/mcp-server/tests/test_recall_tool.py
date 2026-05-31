@@ -29,6 +29,18 @@ from app.mcp_app import build_mcp_server
 from shared.memory import MemoryRecord
 
 
+@pytest.fixture(autouse=True)
+def _no_metering():
+    """Isolate recall tool tests from quota enforcement.
+
+    These tests focus on tool wiring and payload mapping, not metering.
+    Patch quota checks to always pass (no-op) so tests stay focused.
+    """
+    with patch("app.mcp_app.check_memory_quota", return_value=False), \
+         patch("app.mcp_app.record_usage"):
+        yield
+
+
 def _fake_ctx(headers: dict | None = None):
     """Minimal stand-in for the FastMCP Context (only request.headers is read)."""
     request = SimpleNamespace(headers=headers if headers is not None else {})

@@ -26,6 +26,19 @@ from fastapi import HTTPException
 import app.mcp_app as mcp_app
 from app.mcp_app import build_mcp_server
 
+
+@pytest.fixture(autouse=True)
+def _no_metering():
+    """Isolate write tool tests from quota enforcement.
+
+    These tests focus on tool wiring and payload mapping, not metering.
+    Patch quota checks to always pass (no-op) so tests stay focused.
+    """
+    with patch("app.mcp_app.check_memory_quota", return_value=False), \
+         patch("app.mcp_app.record_usage"):
+        yield
+
+
 # Tool name -> expected memory_type the body must map it to.
 _TOOL_MEMORY_TYPE = {
     "remember": "memory",
