@@ -251,3 +251,38 @@ async def test_write_tool_scope_defaults_to_org():
         await fn(_fake_ctx({}), "an observation")
 
     assert write_mock.await_args.kwargs["scope"] == "org"
+
+
+# ---------------------------------------------------------------------------
+# Task 10 (Step F): header-project filing on writes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_write_files_under_header_project(monkeypatch):
+    """A write with X-Vex-Project resolved files the row under that project.
+
+    Monkeypatches resolve_project_from_request on the mcp_app module to return
+    "proj-9", then confirms write_scoped_memory is called with project_id="proj-9".
+    """
+    import app.mcp_app as mcp_mod
+
+    fn = _get_tool_fn("remember")
+    seen = {}
+
+    async def _fake_write(db, **kwargs):
+        seen.update(kwargs)
+        return {"stored": True, "deduplicated": False, "id": "x", "scope": "org"}
+
+    with (
+        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", _fake_write),
+        patch("app.mcp_app.resolve_project_from_request", return_value="proj-9"),
+    ):
+        await fn(
+            _fake_ctx({"X-Vex-Project": "git@github.com:acme/widgets.git"}),
+            "a fact about the project",
+        )
+
+    assert seen.get("project_id") == "proj-9"

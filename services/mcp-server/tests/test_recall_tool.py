@@ -110,15 +110,18 @@ async def test_recall_happy_path_serializes_without_embedding():
         assert "embedding" not in mem
         assert isinstance(mem["id"], str)
         assert isinstance(mem["created_at"], (str, type(None)))
-        # Spot-check the serialized shape.
+        # Spot-check the serialized shape (additive update: includes
+        # 'relevance' and 'project' added in Task 10).
         assert set(mem.keys()) == {
             "id",
             "memory_type",
             "content",
             "scope",
             "confidence",
+            "relevance",
             "space_id",
             "project_id",
+            "project",
             "created_at",
             "metadata",
         }
@@ -474,3 +477,52 @@ async def test_recall_no_request_context_returns_unauthorized():
     resolve_mock.assert_not_called()
     retrieve_mock.assert_not_called()
     session_local.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Task 10: relevance + project label in serialized output
+# ---------------------------------------------------------------------------
+
+
+def test_recall_result_includes_relevance_and_project_name():
+    """_serialize_record carries relevance and project label fields."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from app.mcp_app import _serialize_record
+    from shared.memory import MemoryRecord
+
+    record = MemoryRecord(
+        id=uuid.uuid4(),
+        session_id="s",
+        org_id="o",
+        agent_id="a",
+        memory_type="fact",
+        content="x",
+        created_at=datetime.now(timezone.utc),
+        relevance=0.873,
+    )
+    out = _serialize_record(record, project_label={"slug": "widgets", "name": "Widgets"})
+    assert out["relevance"] == 0.873
+    assert out["project"] == {"slug": "widgets", "name": "Widgets"}
+
+
+# ---------------------------------------------------------------------------
+# Task 10: recall tool schema advertises `limit`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_recall_schema_has_limit_field():
+    """The recall tool schema must expose a `limit` input field (1-50, default 10)."""
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    mcp = build_mcp_server()
+    async with create_connected_server_and_client_session(mcp) as session:
+        result = await session.list_tools()
+
+    recall_tool = next(t for t in result.tools if t.name == "recall")
+    schema = recall_tool.inputSchema
+    assert "limit" in schema.get("properties", {}), (
+        "recall schema missing 'limit' property"
+    )

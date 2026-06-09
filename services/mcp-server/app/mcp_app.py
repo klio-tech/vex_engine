@@ -52,8 +52,9 @@ from shared import brain
 from shared.memory import MemoryRecord, retrieve_memories_scoped
 from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
+from sqlalchemy import text
 
-from app.auth import resolve_principal, resolve_principal_plan
+from app.auth import resolve_principal, resolve_principal_plan, resolve_project_from_request
 from app.config import (
     MCP_ALLOWED_HOSTS,
     MCP_ALLOWED_ORIGINS,
@@ -170,6 +171,10 @@ async def _perform_write(
                 "suggested_plan": exc.suggested_plan,
             }
 
+        # Best-effort project filing from the X-Vex-Project header (read-only
+        # resolve; fail open to unfiled — filing is relevance, not security).
+        header_project_id = resolve_project_from_request(request, db, org_id=org_id)
+
         result = await brain.write_scoped_memory(
             db,
             org_id=org_id,
@@ -177,6 +182,7 @@ async def _perform_write(
             content=content,
             memory_type=memory_type,
             session_id=session_id,
+            project_id=header_project_id,
             metadata=metadata,
             scope=scope,
         )
@@ -197,7 +203,10 @@ async def _perform_write(
 _PROJECT_ANY = "any"
 
 
-def _serialize_record(record: MemoryRecord) -> dict[str, Any]:
+def _serialize_record(
+    record: MemoryRecord,
+    project_label: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Project a :class:`MemoryRecord` to a JSON-safe dict for a recall result.
 
     Deliberately EXCLUDES ``embedding`` (a large float vector that is useless
@@ -205,6 +214,14 @@ def _serialize_record(record: MemoryRecord) -> dict[str, Any]:
     fields (``session_id``, ``execution_id``, ``status``, ``superseded_by``,
     ``sequence_number``). ``created_at`` is rendered as an ISO-8601 string (or
     ``None``) since ``datetime`` is not JSON-serializable.
+
+    ``relevance`` carries the cosine-similarity score (0–1, rounded to 3 dp)
+    populated by :func:`shared.memory.retrieve_memories_scoped`; ``None`` when
+    not available (e.g. direct construction in tests).
+
+    ``project`` carries the human-readable project label dict
+    (``{"slug": ..., "name": ...}``) resolved once per recall response, or
+    ``None`` when no project scope is active.
     """
     return {
         "id": str(record.id),
@@ -212,6 +229,7 @@ def _serialize_record(record: MemoryRecord) -> dict[str, Any]:
         "content": record.content,
         "scope": record.scope,
         "confidence": record.confidence,
+        "relevance": record.relevance,
         # space_id/project_id are ``sa.UUID()`` columns, so a raw ``text()``
         # SELECT yields ``uuid.UUID`` objects (not strings). Stringify them —
         # like ``id`` above — so the result is plain-``json``-serializable and
@@ -220,6 +238,7 @@ def _serialize_record(record: MemoryRecord) -> dict[str, Any]:
         "project_id": (
             str(record.project_id) if record.project_id is not None else None
         ),
+        "project": project_label,
         "created_at": record.created_at.isoformat() if record.created_at else None,
         "metadata": record.metadata,
     }
@@ -375,6 +394,7 @@ async def _perform_recall(
     scope: str,
     space: Optional[str],
     project: Optional[str],
+    limit: int = 10,
 ) -> dict[str, Any]:
     """Shared body for the Klio ``recall`` read tool.
 
@@ -398,7 +418,12 @@ async def _perform_recall(
         space: Optional space slug; resolved to a ``space_id`` filter.
         project: Optional project identifier; resolved to a ``project_id``
             filter. The sentinel ``"any"`` (case-insensitive) means
-            cross-project (no project filter).
+            cross-project (no project filter). When ``None`` AND the caller
+            sends an ``X-Vex-Project`` header, the header is resolved as a
+            fail-open fallback (unresolvable header yields org-wide recall, not
+            an error — explicit ``project`` args keep their strict warn-and-empty
+            semantics).
+        limit: Maximum number of memories to return (clamped to 1–50).
 
     Returns:
         ``{"memories": [...], "count": N}`` on success, ``{"memories": [],
@@ -467,6 +492,12 @@ async def _perform_recall(
                     "warning": f"unknown project: {project}",
                 }
 
+        # No explicit project arg: fall back to the X-Vex-Project header
+        # (fail-open — an unresolvable header means org-wide, matching the
+        # read-path philosophy; explicit args keep strict warn-and-empty).
+        if project is None:
+            project_id = resolve_project_from_request(request, db, org_id=org_id)
+
         # agent_id is always forwarded; retrieve_memories_scoped ignores it
         # unless scope == "agent".
         records = await retrieve_memories_scoped(
@@ -477,6 +508,7 @@ async def _perform_recall(
             agent_id=agent_id,
             space_id=space_id,
             project_id=project_id,
+            limit=min(max(limit, 1), 50),
         )
         # Best-effort recall activity log. This tool body already does its DB I/O
         # inline (no anyio), so call the helper directly; it swallows its own
@@ -494,7 +526,22 @@ async def _perform_recall(
         # ``record_usage`` never raises). A successful recall always counts,
         # regardless of how many records it returned.
         record_usage(db, org_id, "recall", over_cap=recall_over_cap)
-        memories = [_serialize_record(record) for record in records]
+
+        # Resolve a human-readable project label once for the entire response.
+        project_label: Optional[dict[str, Any]] = None
+        if project_id is not None:
+            row = db.execute(
+                text(
+                    "SELECT display_name FROM projects "
+                    "WHERE id = :id AND org_id = :org_id"
+                ),
+                {"id": project_id, "org_id": org_id},
+            ).fetchone()
+            if row is not None:
+                project_label = {"slug": project_id, "name": row.display_name}
+        memories = [
+            _serialize_record(r, project_label=project_label) for r in records
+        ]
         return {"memories": memories, "count": len(memories)}
     except Exception:
         logger.exception("brain recall failed (scope=%s)", scope)
@@ -558,7 +605,7 @@ def _register_tools(mcp: FastMCP) -> None:
         description=(
             "Retrieve relevant memories for the current org/team. "
             "Args: query (required); optional scope ('org' default | "
-            "'agent'), space, project. Set the X-Vex-Agent header to "
+            "'agent'), space, project, limit. Set the X-Vex-Agent header to "
             "scope by agent."
         ),
     )
@@ -579,9 +626,17 @@ def _register_tools(mcp: FastMCP) -> None:
             Optional[str],
             Field(description="Optional project identifier to scope the search."),
         ] = None,
+        limit: Annotated[
+            int,
+            Field(
+                description="Max memories to return (1-50, default 10).",
+                ge=1,
+                le=50,
+            ),
+        ] = 10,
     ) -> dict[str, Any]:
         return await _perform_recall(
-            ctx, query=query, scope=scope, space=space, project=project
+            ctx, query=query, scope=scope, space=space, project=project, limit=limit
         )
 
     @mcp.tool(

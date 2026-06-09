@@ -75,6 +75,7 @@ class MemoryRecord:
     updated_at: Optional[datetime] = None
     space_id: Optional[str] = None
     project_id: Optional[str] = None
+    relevance: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -660,21 +661,31 @@ async def retrieve_memories_scoped(
             ``.execute()`` (same contract as :func:`retrieve_memories`).
         org_id: Tenant whose memories to search. Always enforced — results are
             never returned from another org.
-        query_text: Natural-language query; embedded and ranked by cosine
-            distance against stored memory embeddings.
+        query_text: Natural-language query; embedded and ranked by a blended
+            score (``0.85 * similarity + 0.15 * recency_norm``) over a 30-day
+            recency window so that stale near-duplicates are demoted relative
+            to recent relevant memories. Each returned :class:`MemoryRecord`
+            has its ``relevance`` field populated with the raw cosine-similarity
+            score (``1 - cosine distance``).
         scope: One of ``"org"`` or ``"agent"`` (see the visibility ladder
             above). ``"session"`` and any unknown value raise ``ValueError``.
         agent_id: Required when ``scope == "agent"``; ignored otherwise.
         space_id: When given, match rows whose ``space_id`` equals it OR is
             ``NULL`` (unfiled memories surface in every space filter — the safe
             default so nothing is hidden by an over-narrow filter).
-        project_id: When given, match rows whose ``project_id`` equals it OR is
-            ``NULL`` (same NULL-surfacing semantics as ``space_id``).
+        project_id: Two-tier scoping. When given:
+            * **Tier 1** — rows where ``project_id = :project_id`` fill the
+              first ``limit`` slots.
+            * **Tier 2** — unfiled rows (``project_id IS NULL``) fill any
+              remaining slots.
+            * Rows filed under OTHER projects are NEVER surfaced. This replaces
+              the old flat ``(project_id = X OR project_id IS NULL)`` filter.
         limit: Maximum number of records to return.
 
     Returns:
-        A list of :class:`MemoryRecord` ordered by ascending cosine distance
-        (closest first), or an empty list if embedding generation fails.
+        A list of :class:`MemoryRecord` ordered by blended score (descending),
+        or an empty list if embedding generation fails. Each record's
+        ``relevance`` field holds the rounded cosine-similarity score (0–1).
 
     Raises:
         ValueError: If ``scope == "agent"`` but ``agent_id`` is ``None``; if
@@ -704,7 +715,7 @@ async def retrieve_memories_scoped(
     # accepts directly with the cosine-distance operator (<=>).
     embedding_str = str(embedding)
 
-    clauses = [
+    base_clauses = [
         "org_id = :org_id",
         "status = 'active'",
         "superseded_by IS NULL",
@@ -716,35 +727,61 @@ async def retrieve_memories_scoped(
         "limit": limit,
     }
 
-    # Scope-column predicate (the visibility ladder). Parenthesized so the OR
-    # in the agent case binds correctly when AND-joined with the base WHERE.
     if scope == "org":
-        clauses.append("scope = 'org'")
+        base_clauses.append("scope = 'org'")
     else:  # scope == "agent" (validated above; agent_id is not None)
-        clauses.append("(scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id))")
+        base_clauses.append(
+            "(scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id))"
+        )
         params["agent_id"] = agent_id
 
     if space_id is not None:
-        clauses.append("(space_id = :space_id OR space_id IS NULL)")
+        base_clauses.append("(space_id = :space_id OR space_id IS NULL)")
         params["space_id"] = space_id
 
-    if project_id is not None:
-        clauses.append("(project_id = :project_id OR project_id IS NULL)")
-        params["project_id"] = project_id
-
-    where_sql = "\n              AND ".join(clauses)
-    sql = text(f"""
+    # Blended ranking: similarity dominates, recency breaks ties and
+    # demotes stale near-duplicates. recency_norm is age over a 30-day
+    # window clamped to [0, 1].
+    select_sql = """
         SELECT id, session_id, org_id, agent_id, execution_id,
                memory_type, content, embedding, confidence,
                sequence_number, scope, status, superseded_by,
-               metadata, created_at, updated_at, space_id, project_id
+               metadata, created_at, updated_at, space_id, project_id,
+               (1 - (embedding <=> :embedding)) AS relevance,
+               (0.85 * (1 - (embedding <=> :embedding))
+                + 0.15 * GREATEST(
+                    0, 1 - EXTRACT(EPOCH FROM (NOW() - created_at))
+                           / (30 * 86400)
+                  )) AS blended_score
         FROM session_memories
-        WHERE {where_sql}
-        ORDER BY embedding <=> :embedding
+        WHERE {where}
+        ORDER BY blended_score DESC
         LIMIT :limit
-    """)
+    """
 
-    result = db_session.execute(sql, params)
-    rows = result.fetchall()
+    def _fetch(extra_clause: str, extra_params: dict[str, Any]) -> list:
+        where_sql = "\n              AND ".join(base_clauses + [extra_clause])
+        return db_session.execute(
+            text(select_sql.format(where=where_sql)),
+            {**params, **extra_params},
+        ).fetchall()
 
-    return [_row_to_record(row) for row in rows]
+    if project_id is not None:
+        # Two-tier: same-project rows fill first; remaining slots come from
+        # unfiled (org-level) rows. Rows filed under OTHER projects never
+        # surface.
+        tier1 = _fetch("project_id = :project_id", {"project_id": project_id})
+        remaining = limit - len(tier1)
+        tier2 = []
+        if remaining > 0:
+            tier2 = _fetch("project_id IS NULL", {"limit": remaining})
+        rows = list(tier1) + list(tier2)
+    else:
+        rows = _fetch("TRUE", {})
+
+    records = []
+    for row in rows:
+        record = _row_to_record(row[:18])
+        record.relevance = round(float(row[18]), 3) if row[18] is not None else None
+        records.append(record)
+    return records
