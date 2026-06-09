@@ -13,7 +13,7 @@ as a warning), and reads via :func:`shared.memory.retrieve_memories_scoped`.
 As of D4 the ``space`` management tool is implemented as well: it resolves
 the principal and dispatches on ``action`` (``list`` / ``create`` /
 ``info`` / ``switch``) over :func:`shared.brain.list_spaces` /
-``get_space`` / ``ensure_space``.  All seven tool bodies are now live.
+``get_space`` / ``ensure_space``.  All eight tool bodies are now live.
 The tool *schemas* have been the real ones throughout: each tool's
 signature and argument descriptions define the JSON input schema that
 ``tools/list`` advertises, so filling in the bodies never changed the

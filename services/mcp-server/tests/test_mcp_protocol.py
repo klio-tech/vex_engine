@@ -45,7 +45,7 @@ async def test_initialize_succeeds():
         await session.send_ping()
 
 
-async def test_tools_list_returns_seven():
+async def test_tools_list_returns_eight():
     """``tools/list`` returns exactly the eight expected Klio tools."""
     mcp = build_mcp_server()
     async with create_connected_server_and_client_session(mcp) as session:

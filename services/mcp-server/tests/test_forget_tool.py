@@ -2,7 +2,6 @@
 
 import uuid
 
-import pytest
 
 from shared.memory import retract_memory
 
