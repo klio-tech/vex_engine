@@ -99,7 +99,15 @@ RECONCILE_CANDIDATES_PER_FACT = 5
 
 
 def _reconcile_budget() -> int:
-    """Max LLM contradiction judgments per curator tick (cost bound)."""
+    """Max LLM judge calls (``call_llm`` attempts) across all facts in one curator tick.
+
+    Each unit of budget consumed by :func:`reconcile_fact` corresponds to one
+    ``call_llm`` attempt (including attempts that fail and are skipped).  Because
+    :func:`_synthesize_and_store` passes ``max_judgments=reconcile_budget`` into
+    every :func:`reconcile_fact` call and decrements by ``judged`` (the number of
+    attempts actually made), the total ``call_llm`` invocations for the tick is
+    bounded by this value — not merely accounted after the fact.
+    """
     return int(os.environ.get("CURATOR_RECONCILE_MAX", "50"))
 
 
@@ -110,14 +118,22 @@ async def reconcile_fact(
     new_fact_id: Any,
     new_fact_content: str,
     embedding: list[float],
-) -> int:
+    max_judgments: int,
+) -> tuple[int, int]:
     """Supersede older active facts that the new fact directly contradicts.
 
     Vector-searches the org's older active visible facts within
     RECONCILE_SIMILARITY_THRESHOLD of the new fact (top
     RECONCILE_CANDIDATES_PER_FACT), asks the LLM judge per candidate, and
     marks contradicted rows superseded_by the new fact. A judge failure
-    skips that pair (never raises). Returns the number superseded.
+    skips that pair (never raises).
+
+    The ``max_judgments`` parameter is a hard cap on the number of ``call_llm``
+    attempts issued in this call: the candidate list is sliced to
+    ``rows[:max_judgments]`` before the loop begins, so the caller can enforce a
+    strict budget without relying solely on post-hoc accounting.
+
+    Returns (superseded, judged): rows superseded and judge calls attempted.
     """
     rows = db_session.execute(
         text(
@@ -144,7 +160,9 @@ async def reconcile_fact(
     ).fetchall()
 
     superseded = 0
-    for row in rows:
+    judged = 0
+    for row in rows[:max_judgments]:
+        judged += 1
         prompt = (
             "Two facts from a team knowledge base:\n"
             f'OLDER: "{row.content}"\n'
@@ -162,7 +180,7 @@ async def reconcile_fact(
         if verdict and verdict.get("contradicts") is True:
             supersede_memory(db_session, row.id, new_fact_id)
             superseded += 1
-    return superseded
+    return superseded, judged
 
 
 class CursorState(NamedTuple):
@@ -403,14 +421,15 @@ async def _synthesize_and_store(
             if reconcile_budget > 0:
                 fact_embedding = await embed_text(fact)
                 if fact_embedding is not None:
-                    done = await reconcile_fact(
+                    superseded, judged = await reconcile_fact(
                         db_session,
                         org_id=org_id,
                         new_fact_id=new_id,
                         new_fact_content=fact,
                         embedding=fact_embedding,
+                        max_judgments=reconcile_budget,
                     )
-                    reconcile_budget -= max(done, 1)
+                    reconcile_budget -= max(judged, 1)
 
     return stored
 

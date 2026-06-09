@@ -709,14 +709,15 @@ async def test_reconcile_supersedes_direct_contradiction(monkeypatch):
 
             return R()
 
-    count = await curator_mod.reconcile_fact(
+    sup_count, judged = await curator_mod.reconcile_fact(
         _DB(),
         org_id="org-1",
         new_fact_id=new_id,
         new_fact_content="Stripe MCP is connected to the MoonForge account",
         embedding=[0.1, 0.2],
+        max_judgments=5,
     )
-    assert count == 1
+    assert sup_count == 1 and judged == 1
     assert superseded == [(old_id, new_id)]
 
 
@@ -747,14 +748,15 @@ async def test_reconcile_related_but_not_contradicting_is_untouched(monkeypatch)
 
             return R()
 
-    count = await curator_mod.reconcile_fact(
+    sup_count, judged = await curator_mod.reconcile_fact(
         _DB(),
         org_id="org-1",
         new_fact_id=uuid.uuid4(),
         new_fact_content="Stripe MCP is connected to the MoonForge account",
         embedding=[0.1, 0.2],
+        max_judgments=5,
     )
-    assert count == 0
+    assert sup_count == 0 and judged == 1
     assert superseded == []
 
 
@@ -780,14 +782,15 @@ async def test_reconcile_judge_error_skips_pair(monkeypatch):
 
             return R()
 
-    count = await curator_mod.reconcile_fact(
+    sup_count, judged = await curator_mod.reconcile_fact(
         _DB(),
         org_id="org-1",
         new_fact_id=uuid.uuid4(),
         new_fact_content="new fact",
         embedding=[0.1],
+        max_judgments=5,
     )
-    assert count == 0  # skipped, no raise
+    assert sup_count == 0 and judged == 1  # call attempted, skipped on failure, no raise
 
 
 # ---------------------------------------------------------------------------
@@ -880,16 +883,26 @@ async def test_synthesize_and_store_reconciles_facts_not_summaries(monkeypatch):
     )
     reconcile_calls = []
 
-    async def _fake_reconcile(db_session, *, org_id, new_fact_id, new_fact_content, embedding):
+    async def _fake_reconcile(
+        db_session,
+        *,
+        org_id,
+        new_fact_id,
+        new_fact_content,
+        embedding,
+        max_judgments,
+    ):
         reconcile_calls.append(
             {
                 "org_id": org_id,
                 "new_fact_id": new_fact_id,
                 "new_fact_content": new_fact_content,
                 "embedding": embedding,
+                "max_judgments": max_judgments,
             }
         )
-        return 0
+        # Return (superseded, judged) tuple as the real implementation does.
+        return 0, 1
 
     monkeypatch.setattr(curator_mod, "reconcile_fact", _fake_reconcile)
 
@@ -910,3 +923,6 @@ async def test_synthesize_and_store_reconciles_facts_not_summaries(monkeypatch):
     for c in reconcile_calls:
         assert c["org_id"] == "org-1"
         assert c["embedding"] == fake_embedding
+    # max_judgments kwarg must be forwarded (budget enforcement).
+    for c in reconcile_calls:
+        assert isinstance(c["max_judgments"], int) and c["max_judgments"] > 0
