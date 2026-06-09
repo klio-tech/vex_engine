@@ -10,6 +10,7 @@ import logging
 import uuid
 from typing import Any, Optional
 
+from shared.redaction import redact
 from sqlalchemy import text
 
 logger = logging.getLogger("agentguard.mcp.recall_log")
@@ -25,7 +26,18 @@ def log_recall_event(
     result_count: int,
     source: str,
 ) -> None:
-    """Append one brain_recall_events row. Best-effort; never raises."""
+    """Append one brain_recall_events row. Best-effort; never raises.
+
+    ``query_text`` is redacted via :func:`shared.redaction.redact` before it
+    is bound into the INSERT — secrets and PII in a recall query never reach
+    the audit table.  On redaction error ``query_text`` is stored as ``None``
+    (best-effort log; unscreened text is never persisted).
+    """
+    if query_text:
+        try:
+            query_text = redact(query_text).clean_text
+        except Exception:
+            query_text = None  # best-effort log; never store unscreened
     try:
         db.execute(
             text(

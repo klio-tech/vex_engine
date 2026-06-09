@@ -15,7 +15,11 @@ Three endpoints, all mounted under ``/capture``:
 * ``POST /capture/transcript`` — distil a finished session: extract discrete
   ``fact`` rows and one ``summary`` from the transcript, e.g. from a ``Stop``
   hook.  The transcript is the richest source and only exists at session end,
-  so we mine it then rather than storing the whole thing.
+  so we mine it then rather than storing the whole thing.  Secrets and PII in
+  the transcript are redacted via :func:`shared.redaction.redact` BEFORE the
+  text is sent to the external LLM for fact extraction/summarisation (defense
+  in depth: :func:`shared.brain.write_scoped_memory` re-screens whatever
+  comes back at the storage chokepoint).
 * ``POST /capture/recall`` — read memories for context injection at
   ``SessionStart``.  With a query it does vector recall; with an empty query it
   falls back to recency (most-recent first), so a fresh session always gets
@@ -51,6 +55,7 @@ from pydantic import BaseModel, Field
 from shared import brain
 from shared.auth import KeyInfo
 from shared.memory import extract_facts, generate_summary, retrieve_memories_scoped
+from shared.redaction import redact
 from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from sqlalchemy import text
@@ -276,11 +281,18 @@ def _find_project_id(
 
 
 def _combine_messages(messages: list[TranscriptMessage]) -> str:
-    """Flatten transcript messages into one text blob, tail-capped.
+    """Flatten transcript messages into one text blob, tail-capped and redacted.
 
     Empty messages are dropped; a role prefix is added when known.  The result
     is truncated to the most-recent :data:`_MAX_TRANSCRIPT_CHARS` characters so
     a very long session does not blow up the LLM call.
+
+    Secrets and PII are redacted via :func:`shared.redaction.redact` BEFORE
+    the text is sent to an external LLM for fact extraction/summarisation —
+    secrets never leave the infrastructure via the mining path.
+    :func:`shared.brain.write_scoped_memory` re-screens whatever comes back
+    (defense in depth), so a redaction failure here can fail open to the
+    chokepoint guarantee.
     """
     parts: list[str] = []
     for m in messages:
@@ -292,6 +304,15 @@ def _combine_messages(messages: list[TranscriptMessage]) -> str:
     combined = "\n".join(parts)
     if len(combined) > _MAX_TRANSCRIPT_CHARS:
         combined = combined[-_MAX_TRANSCRIPT_CHARS:]
+    # Redact BEFORE this text is sent to the external LLM for fact
+    # extraction/summarisation — secrets never leave the infrastructure via
+    # the mining path. write_scoped_memory re-screens whatever comes back
+    # (defense in depth), so a redaction failure here can fail open to the
+    # chokepoint guarantee.
+    try:
+        combined = redact(combined).clean_text
+    except Exception:
+        logger.warning("capture: transcript redaction failed; relying on chokepoint")
     return combined
 
 

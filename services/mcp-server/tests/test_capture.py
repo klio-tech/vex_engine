@@ -398,3 +398,32 @@ def test_event_rejects_unknown_scope(client):
     with db_patch:
         resp = client.post("/capture/event", json={"content": "x", "scope": "session"})
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Pre-LLM redaction (Task 3)
+# ---------------------------------------------------------------------------
+
+SECRET_T3 = (
+    "sk_test_51TcfsTP4cXbUl5jnQJG2Ou9BUcBChSVqEDNj7d65uQjZXtAVzI1XR2"
+    "eewh5KDq8GmCfrr1a1xRNcSdB1c7TtWrU00GsK8y8Je"
+)
+
+
+def test_combine_messages_redacts_before_llm():
+    """_combine_messages must redact secrets before the text is sent to the LLM.
+
+    The raw Stripe test key must be replaced by a [REDACTED:stripe_secret_key:…]
+    placeholder; non-secret content is preserved unchanged.
+    """
+    from app.capture import TranscriptMessage, _combine_messages
+
+    combined = _combine_messages(
+        [
+            TranscriptMessage(role="user", content=f"here is my key {SECRET_T3}"),
+            TranscriptMessage(role="assistant", content="thanks, configuring now"),
+        ]
+    )
+    assert SECRET_T3 not in combined
+    assert "[REDACTED:stripe_secret_key:" in combined
+    assert "configuring now" in combined
