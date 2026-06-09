@@ -30,6 +30,7 @@ _REQUIRED_SCHEMA_FIELD = {
     "decide": "content",
     "note": "content",
     "space": "action",
+    "forget": "memory_id",
 }
 
 
@@ -45,7 +46,7 @@ async def test_initialize_succeeds():
 
 
 async def test_tools_list_returns_seven():
-    """``tools/list`` returns exactly the seven expected Klio tools."""
+    """``tools/list`` returns exactly the eight expected Klio tools."""
     mcp = build_mcp_server()
     async with create_connected_server_and_client_session(mcp) as session:
         result = await session.list_tools()
@@ -54,7 +55,7 @@ async def test_tools_list_returns_seven():
     assert names == set(EXPECTED_TOOL_NAMES), (
         f"expected {sorted(EXPECTED_TOOL_NAMES)}, got {sorted(names)}"
     )
-    # Exactly seven, no duplicates or extras.
+    # Exactly eight, no duplicates or extras.
     assert len(result.tools) == len(EXPECTED_TOOL_NAMES)
 
 

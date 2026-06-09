@@ -504,5 +504,42 @@ def test_recent_memories_sql_excludes_hidden(client):
     from app.capture import _recent_memories
 
     _recent_memories(session, org_id="org-1", project_id=None, limit=5)
-
     assert "recall_hidden = FALSE" in captured_sql["sql"]
+
+
+# ---------------------------------------------------------------------------
+# /capture/forget
+# ---------------------------------------------------------------------------
+
+
+def test_capture_forget_returns_404_for_unknown_id(client):
+    """forget returns 404 when retract_memory reports not_found."""
+    import uuid
+
+    db_patch, _ = _patch_db()
+    with (
+        db_patch,
+        patch("app.capture.retract_memory", return_value={"forgotten": False, "error": "not_found"}),
+    ):
+        resp = client.post(
+            "/capture/forget", json={"memory_id": str(uuid.uuid4())}
+        )
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "not_found"
+
+
+def test_capture_forget_returns_200_on_success(client):
+    """forget returns 200 with forgotten=True on a valid retraction."""
+    import uuid
+
+    mem_id = str(uuid.uuid4())
+    db_patch, _ = _patch_db()
+    with (
+        db_patch,
+        patch("app.capture.retract_memory", return_value={"forgotten": True, "id": mem_id}),
+    ):
+        resp = client.post("/capture/forget", json={"memory_id": mem_id})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["forgotten"] is True
+    assert body["id"] == mem_id

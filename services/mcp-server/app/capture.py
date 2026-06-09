@@ -8,7 +8,7 @@ recall for session-start context injection, all over plain REST.  A hook script
 therefore needs only an HTTP ``POST`` — no MCP handshake — which keeps the
 client a dumb forwarder.
 
-Three endpoints, all mounted under ``/capture``:
+Four endpoints, all mounted under ``/capture``:
 
 * ``POST /capture/event`` — store one passive memory (default an
   ``observation``), e.g. from a ``UserPromptSubmit`` hook.
@@ -24,6 +24,9 @@ Three endpoints, all mounted under ``/capture``:
   ``SessionStart``.  With a query it does vector recall; with an empty query it
   falls back to recency (most-recent first), so a fresh session always gets
   *something* even before the curator has synthesised anything.
+* ``POST /capture/forget`` — retract one memory by id (hook-client mirror of
+  the MCP ``forget`` tool).  Returns 404 for unknown or cross-org ids, 403
+  for cross-agent scope='agent' rows.
 
 Auth reuses the same ``X-Vex-Key`` (+ optional ``X-Vex-Agent``) bridge as the
 MCP tools, via :func:`app.auth.resolve_principal_dep`, so capture is scoped to
@@ -54,7 +57,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from shared import brain
 from shared.auth import KeyInfo
-from shared.memory import extract_facts, generate_summary, retrieve_memories_scoped
+from shared.memory import (
+    extract_facts,
+    generate_summary,
+    retract_memory,
+    retrieve_memories_scoped,
+)
 from shared.redaction import redact
 from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
@@ -619,5 +627,49 @@ async def capture_recall(
     except Exception:
         logger.exception("capture recall failed (scope=%s)", req.scope)
         return {"memories": [], "count": 0, "error": "recall_failed"}
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# /capture/forget
+# ---------------------------------------------------------------------------
+
+
+class ForgetRequest(BaseModel):
+    """Retract one memory by id (hook-client mirror of the MCP forget tool)."""
+
+    memory_id: str = Field(min_length=1, description="Memory id to retract.")
+
+
+@router.post("/forget")
+async def capture_forget(
+    req: ForgetRequest,
+    principal: tuple[str, str] = Depends(resolve_principal_dep),
+) -> dict[str, Any]:
+    """Retract a memory. 404 unknown/cross-org, 403 cross-agent.
+
+    Delegates to :func:`shared.memory.retract_memory` (synchronous DB I/O)
+    which enforces org_id on every query and rejects cross-agent scope='agent'
+    rows.  The route maps the storage-layer error codes to HTTP status codes:
+    ``not_found`` / ``invalid_id`` → 404, ``forbidden`` → 403.
+    """
+    org_id, agent_id = principal
+    db = SessionLocal()
+    try:
+        result = await anyio.to_thread.run_sync(
+            lambda: retract_memory(
+                db,
+                org_id=org_id,
+                agent_id=agent_id,
+                memory_id=req.memory_id,
+                via="hook",
+            )
+        )
+        if result.get("error") in ("not_found", "invalid_id"):
+            raise HTTPException(status_code=404, detail=result["error"])
+        if result.get("error") == "forbidden":
+            raise HTTPException(status_code=403, detail="forbidden")
+        return result
     finally:
         db.close()

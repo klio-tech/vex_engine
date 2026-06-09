@@ -1,7 +1,7 @@
 """MCP protocol layer for the Klio memory product.
 
 Builds a :class:`mcp.server.fastmcp.FastMCP` server over the
-Streamable-HTTP transport and registers the seven Klio memory tools.
+Streamable-HTTP transport and registers the eight Klio memory tools.
 
 As of D2 the five *write* tools (``remember``, ``observe``, ``plan``,
 ``decide``, ``note``) are fully implemented: they resolve the tenant
@@ -49,7 +49,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 from shared import brain
-from shared.memory import MemoryRecord, retrieve_memories_scoped
+from shared.memory import MemoryRecord, retract_memory, retrieve_memories_scoped
 from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from sqlalchemy import text
@@ -76,6 +76,7 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "decide",
     "note",
     "space",
+    "forget",
 )
 
 # Server-level guidance surfaced to MCP clients during ``initialize``.
@@ -87,8 +88,9 @@ SERVER_INSTRUCTIONS = (
     "X-Vex-Agent header. Set the X-Vex-Agent header to a stable "
     "per-agent identifier; clients that omit it share a single default "
     "agent and their memories pool together. Use `recall` to retrieve "
-    "context before acting, and the write tools (`remember`, `observe`, "
-    "`plan`, `decide`, `note`) to persist what matters."
+    "context before acting, the write tools (`remember`, `observe`, "
+    "`plan`, `decide`, `note`) to persist what matters, and `forget` "
+    "to retract a memory by id so it never surfaces again."
 )
 
 
@@ -550,12 +552,55 @@ async def _perform_recall(
         db.close()
 
 
+async def _perform_forget(ctx: Context, *, memory_id: str) -> dict[str, Any]:
+    """Shared body for the Klio ``forget`` tool: retract one memory by id.
+
+    Resolves the tenant principal from the transport request and delegates to
+    :func:`shared.memory.retract_memory`, which enforces org_id and agent
+    authorization (cross-org ids and cross-agent scope='agent' rows are each
+    rejected with distinct clean error dicts).
+
+    Auth failures from :func:`resolve_principal` surface as a clean
+    ``unauthorized`` result dict rather than letting an HTTPException propagate
+    through the MCP layer (no HTTP status codes in tool errors).
+
+    Args:
+        ctx: FastMCP-injected context; ``ctx.request_context.request`` is the
+            Starlette request for the Streamable-HTTP transport.
+        memory_id: UUID string of the memory to retract (from a prior recall).
+
+    Returns:
+        ``{"forgotten": True, "id": <id>}`` on success, or a clean error dict
+        on auth failure, id validation failure, or unexpected error.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        logger.error("brain forget got no transport request; cannot authenticate")
+        return {"forgotten": False, "error": "unauthorized", "detail": "no request context"}
+
+    try:
+        org_id, agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"forgotten": False, "error": "unauthorized", "detail": str(exc.detail)}
+
+    db = SessionLocal()
+    try:
+        return retract_memory(
+            db, org_id=org_id, agent_id=agent_id, memory_id=memory_id, via="mcp"
+        )
+    except Exception:
+        logger.exception("brain forget failed")
+        return {"forgotten": False, "error": "forget_failed"}
+    finally:
+        db.close()
+
+
 def build_mcp_server() -> FastMCP:
-    """Construct a fresh :class:`FastMCP` with the seven Klio tools.
+    """Construct a fresh :class:`FastMCP` with the eight Klio tools.
 
     Returns a new instance on every call so tests get isolated servers
-    and so the app factory controls the lifecycle.  All seven tool bodies
-    are implemented (D2-D4); schemas are final.
+    and so the app factory controls the lifecycle.  All eight tool bodies
+    are implemented (D2-D4, T11); schemas are final.
     """
     # Keep the default ``streamable_http_path="/mcp"``.  ``app.main``
     # mounts this server's ASGI app at the application root, so the
@@ -594,10 +639,10 @@ def _build_transport_security() -> TransportSecuritySettings:
 
 
 def _register_tools(mcp: FastMCP) -> None:
-    """Register all seven Klio tools on the given server.
+    """Register all eight Klio tools on the given server.
 
     Each tool's typed signature drives the JSON input schema advertised
-    by ``tools/list``.  All bodies are implemented (D2-D4).
+    by ``tools/list``.  All bodies are implemented (D2-D4, T11).
     """
 
     @mcp.tool(
@@ -803,3 +848,18 @@ def _register_tools(mcp: FastMCP) -> None:
         ] = None,
     ) -> dict[str, Any]:
         return await _perform_space(ctx, action=action, name=name, slug=slug)
+
+    @mcp.tool(
+        name="forget",
+        description=(
+            "Retract a memory by id (from a prior recall result) so it never "
+            "surfaces again. Arg: memory_id."
+        ),
+    )
+    async def forget(
+        ctx: Context,
+        memory_id: Annotated[
+            str, Field(description="The id of the memory to retract.")
+        ],
+    ) -> dict[str, Any]:
+        return await _perform_forget(ctx, memory_id=memory_id)

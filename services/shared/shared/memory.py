@@ -613,6 +613,65 @@ def supersede_memory(
     db_session.commit()
 
 
+def retract_memory(
+    db_session: Any,
+    *,
+    org_id: str,
+    agent_id: str,
+    memory_id: str,
+    via: str,
+) -> dict:
+    """Explicitly retract a memory (the ``forget`` tool's storage primitive).
+
+    Authorization ladder (org_id always enforced):
+      * unknown / cross-org id → not_found (indistinguishable by design)
+      * scope='agent' row owned by another agent → forbidden
+      * otherwise → status='retracted' + audit metadata; recall never
+        returns non-'active' rows, so the memory disappears immediately.
+
+    Synchronous (inline psycopg2 I/O), matching the house pattern.
+    """
+    try:
+        parsed = uuid.UUID(memory_id)
+    except (ValueError, AttributeError, TypeError):
+        return {"forgotten": False, "error": "invalid_id"}
+
+    row = db_session.execute(
+        text(
+            """
+            SELECT scope, agent_id FROM session_memories
+            WHERE id = :id AND org_id = :org_id AND status = 'active'
+            LIMIT 1
+            """
+        ),
+        {"id": str(parsed), "org_id": org_id},
+    ).fetchone()
+    if row is None:
+        return {"forgotten": False, "error": "not_found"}
+    if row.scope == "agent" and row.agent_id != agent_id:
+        return {"forgotten": False, "error": "forbidden"}
+
+    db_session.execute(
+        text(
+            """
+            UPDATE session_memories
+            SET status = 'retracted',
+                metadata = COALESCE(metadata, '{}'::jsonb)
+                           || jsonb_build_object(
+                               'retracted_by', :agent_id::text,
+                               'retracted_at', NOW()::text,
+                               'retracted_via', :via::text
+                           ),
+                updated_at = NOW()
+            WHERE id = :id AND org_id = :org_id
+            """
+        ),
+        {"id": str(parsed), "org_id": org_id, "agent_id": agent_id, "via": via},
+    )
+    db_session.commit()
+    return {"forgotten": True, "id": str(parsed)}
+
+
 async def retrieve_memories_scoped(
     db_session: Any,
     org_id: str,
