@@ -23,6 +23,16 @@ No self-reprocessing:
     (it only reads rows *past* the cursor), this makes a tick unable to loop on
     its own synthesised memories.
 
+Reconciliation:
+    After storing each new ``fact`` the curator runs a bounded reconciliation
+    pass (:func:`reconcile_fact`): it vector-searches similar older active
+    facts and asks an LLM judge whether the new fact directly contradicts each
+    candidate. Contradicted older facts are marked superseded by the new one
+    and excluded from subsequent recall. The pass is deliberately conservative
+    — a stale fact surviving is acceptable; a live fact hidden by a false
+    positive is not. The number of LLM judgments per tick is budget-capped via
+    ``CURATOR_RECONCILE_MAX`` (default 50).
+
 Cursor / idempotency:
     Progress is tracked per org in ``brain_curator_state`` (migration 021) as a
     **keyset** cursor over the composite ``(last_processed_at,
@@ -50,13 +60,14 @@ Scheduling:
 """
 
 import logging
+import os
 from datetime import datetime, timezone
 from typing import Any, Callable, NamedTuple, Optional
 
 from sqlalchemy import text
 
 from shared.brain import write_scoped_memory
-from shared.memory import extract_facts, generate_summary
+from shared.memory import call_llm, embed_text, extract_facts, generate_summary, supersede_memory
 
 logger = logging.getLogger("agentguard.mcp.curator")
 
@@ -79,6 +90,79 @@ _RAW_TYPES_SQL: str = ", ".join(f"'{t}'" for t in RAW_MEMORY_TYPES)
 
 DEFAULT_CURATOR_AGENT_ID: str = "klio-curator"
 """Agent principal under which synthesised memories are authored."""
+
+# Reconciliation: a new fact supersedes an older one only on DIRECT
+# contradiction. Conservative by design — a stale fact surviving is
+# acceptable; a live fact hidden is not.
+RECONCILE_SIMILARITY_THRESHOLD = 0.85
+RECONCILE_CANDIDATES_PER_FACT = 5
+
+
+def _reconcile_budget() -> int:
+    """Max LLM contradiction judgments per curator tick (cost bound)."""
+    return int(os.environ.get("CURATOR_RECONCILE_MAX", "50"))
+
+
+async def reconcile_fact(
+    db_session: Any,
+    *,
+    org_id: str,
+    new_fact_id: Any,
+    new_fact_content: str,
+    embedding: list[float],
+) -> int:
+    """Supersede older active facts that the new fact directly contradicts.
+
+    Vector-searches the org's older active visible facts within
+    RECONCILE_SIMILARITY_THRESHOLD of the new fact (top
+    RECONCILE_CANDIDATES_PER_FACT), asks the LLM judge per candidate, and
+    marks contradicted rows superseded_by the new fact. A judge failure
+    skips that pair (never raises). Returns the number superseded.
+    """
+    rows = db_session.execute(
+        text(
+            """
+            SELECT id, content
+            FROM session_memories
+            WHERE org_id = :org_id
+              AND scope = 'org'
+              AND status = 'active'
+              AND memory_type = 'fact'
+              AND id != :new_id
+              AND 1 - (embedding <=> :embedding) >= :threshold
+            ORDER BY embedding <=> :embedding
+            LIMIT :k
+            """
+        ),
+        {
+            "org_id": org_id,
+            "new_id": str(new_fact_id),
+            "embedding": str(embedding),
+            "threshold": RECONCILE_SIMILARITY_THRESHOLD,
+            "k": RECONCILE_CANDIDATES_PER_FACT,
+        },
+    ).fetchall()
+
+    superseded = 0
+    for row in rows:
+        prompt = (
+            "Two facts from a team knowledge base:\n"
+            f'OLDER: "{row.content}"\n'
+            f'NEWER: "{new_fact_content}"\n\n'
+            "Does the NEWER fact DIRECTLY contradict the OLDER one — i.e. "
+            "they cannot both be true now? Merely related, overlapping, or "
+            "complementary facts do NOT contradict. Respond with JSON: "
+            '{"contradicts": true|false}'
+        )
+        try:
+            verdict = await call_llm(prompt)
+        except Exception:
+            logger.warning("reconcile: judge raised; skipping pair", exc_info=True)
+            continue
+        if verdict and verdict.get("contradicts") is True:
+            supersede_memory(db_session, row.id, new_fact_id)
+            superseded += 1
+    return superseded
 
 
 class CursorState(NamedTuple):
@@ -272,7 +356,7 @@ async def _synthesize_and_store(
         summary = None
 
     if summary:
-        if await _store_one(
+        new_id = await _store_one(
             db_session,
             org_id=org_id,
             agent_id=agent_id,
@@ -282,7 +366,8 @@ async def _synthesize_and_store(
             metadata=base_meta,
             space_id=space_id,
             project_id=project_id,
-        ):
+        )
+        if new_id:
             stored += 1
     else:
         logger.info("curator: no summary produced for org %s", org_id)
@@ -298,10 +383,11 @@ async def _synthesize_and_store(
         )
         facts = []
 
+    reconcile_budget = _reconcile_budget()
     for fact in facts:
         if not fact:
             continue
-        if await _store_one(
+        new_id = await _store_one(
             db_session,
             org_id=org_id,
             agent_id=agent_id,
@@ -311,8 +397,20 @@ async def _synthesize_and_store(
             metadata=base_meta,
             space_id=space_id,
             project_id=project_id,
-        ):
+        )
+        if new_id:
             stored += 1
+            if reconcile_budget > 0:
+                fact_embedding = await embed_text(fact)
+                if fact_embedding is not None:
+                    done = await reconcile_fact(
+                        db_session,
+                        org_id=org_id,
+                        new_fact_id=new_id,
+                        new_fact_content=fact,
+                        embedding=fact_embedding,
+                    )
+                    reconcile_budget -= max(done, 1)
 
     return stored
 
@@ -328,12 +426,14 @@ async def _store_one(
     metadata: dict,
     space_id: Optional[str] = None,
     project_id: Optional[str] = None,
-) -> bool:
-    """Write a single synthesised memory; return True only if newly stored.
+) -> Optional[str]:
+    """Write a single synthesised memory; return the new row id when newly stored.
 
-    A dedup hit (``stored=False``) or an embedding failure counts as
-    processed-but-not-new and returns ``False``. A raised exception is logged
-    and swallowed (returns ``False``) so one bad write never aborts the tick.
+    Returns the id string of the newly written row when ``stored=True``.
+    Returns ``None`` on a dedup hit (``stored=False``), an embedding failure,
+    or any raised exception. Exceptions are logged and swallowed so one bad
+    write never aborts the tick. Callers treat a non-None return as a new
+    stored row (truthiness preserved for counting).
     """
     try:
         result = await write_scoped_memory(
@@ -354,8 +454,8 @@ async def _store_one(
             memory_type,
             exc_info=True,
         )
-        return False
-    return bool(result.get("stored"))
+        return None
+    return result.get("id") if result.get("stored") else None
 
 
 async def curator_tick(

@@ -672,3 +672,241 @@ async def test_input_count_is_per_partition():
         for c in mock_write.await_args_list
     }
     assert counts == {"proj-A": 3, "proj-B": 4}
+
+
+# ---------------------------------------------------------------------------
+# reconcile_fact: LLM-judge supersession
+# ---------------------------------------------------------------------------
+
+
+async def test_reconcile_supersedes_direct_contradiction(monkeypatch):
+    import app.curator as curator_mod
+
+    superseded = []
+
+    def _fake_supersede(db, old_id, new_id):
+        superseded.append((old_id, new_id))
+
+    async def _fake_judge(prompt, system=None):
+        return {"contradicts": True}
+
+    monkeypatch.setattr(curator_mod, "supersede_memory", _fake_supersede)
+    monkeypatch.setattr(curator_mod, "call_llm", _fake_judge)
+
+    import uuid
+
+    old_id, new_id = uuid.uuid4(), uuid.uuid4()
+
+    class _DB:
+        def execute(self, sql, params=None):
+            class R:
+                def fetchall(self_inner):
+                    class Row:
+                        id = old_id
+                        content = "Stripe MCP is connected to LoopReel sandbox"
+
+                    return [Row()]
+
+            return R()
+
+    count = await curator_mod.reconcile_fact(
+        _DB(),
+        org_id="org-1",
+        new_fact_id=new_id,
+        new_fact_content="Stripe MCP is connected to the MoonForge account",
+        embedding=[0.1, 0.2],
+    )
+    assert count == 1
+    assert superseded == [(old_id, new_id)]
+
+
+async def test_reconcile_related_but_not_contradicting_is_untouched(monkeypatch):
+    import app.curator as curator_mod
+
+    superseded = []
+    monkeypatch.setattr(
+        curator_mod, "supersede_memory", lambda db, o, n: superseded.append((o, n))
+    )
+
+    async def _fake_judge(prompt, system=None):
+        return {"contradicts": False}
+
+    monkeypatch.setattr(curator_mod, "call_llm", _fake_judge)
+
+    import uuid
+
+    class _DB:
+        def execute(self, sql, params=None):
+            class R:
+                def fetchall(self_inner):
+                    class Row:
+                        id = uuid.uuid4()
+                        content = "The team uses Stripe for billing"
+
+                    return [Row()]
+
+            return R()
+
+    count = await curator_mod.reconcile_fact(
+        _DB(),
+        org_id="org-1",
+        new_fact_id=uuid.uuid4(),
+        new_fact_content="Stripe MCP is connected to the MoonForge account",
+        embedding=[0.1, 0.2],
+    )
+    assert count == 0
+    assert superseded == []
+
+
+async def test_reconcile_judge_error_skips_pair(monkeypatch):
+    import app.curator as curator_mod
+
+    async def _boom(prompt, system=None):
+        return None  # LLM failure path of call_llm
+
+    monkeypatch.setattr(curator_mod, "call_llm", _boom)
+
+    import uuid
+
+    class _DB:
+        def execute(self, sql, params=None):
+            class R:
+                def fetchall(self_inner):
+                    class Row:
+                        id = uuid.uuid4()
+                        content = "old fact"
+
+                    return [Row()]
+
+            return R()
+
+    count = await curator_mod.reconcile_fact(
+        _DB(),
+        org_id="org-1",
+        new_fact_id=uuid.uuid4(),
+        new_fact_content="new fact",
+        embedding=[0.1],
+    )
+    assert count == 0  # skipped, no raise
+
+
+# ---------------------------------------------------------------------------
+# _store_one: returns id string on new store, None on dedup
+# ---------------------------------------------------------------------------
+
+
+async def test_store_one_returns_id_on_success(monkeypatch):
+    """_store_one returns the new row id string when write_scoped_memory stored=True."""
+    import app.curator as curator_mod
+
+    monkeypatch.setattr(
+        curator_mod,
+        "write_scoped_memory",
+        AsyncMock(
+            return_value={"stored": True, "deduplicated": False, "id": "abc-123"}
+        ),
+    )
+    result = await curator_mod._store_one(
+        object(),
+        org_id="org-1",
+        agent_id="agent-1",
+        content="some fact",
+        memory_type="fact",
+        session_id="agent-1:org-1",
+        metadata={"source": "curator"},
+    )
+    assert result == "abc-123"
+
+
+async def test_store_one_returns_none_on_dedup(monkeypatch):
+    """_store_one returns None when write_scoped_memory reports stored=False (dedup)."""
+    import app.curator as curator_mod
+
+    monkeypatch.setattr(
+        curator_mod,
+        "write_scoped_memory",
+        AsyncMock(
+            return_value={"stored": False, "deduplicated": True, "id": "existing-id"}
+        ),
+    )
+    result = await curator_mod._store_one(
+        object(),
+        org_id="org-1",
+        agent_id="agent-1",
+        content="duplicate fact",
+        memory_type="fact",
+        session_id="agent-1:org-1",
+        metadata={"source": "curator"},
+    )
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _synthesize_and_store: reconcile_fact called for facts only, not summaries
+# ---------------------------------------------------------------------------
+
+
+async def test_synthesize_and_store_reconciles_facts_not_summaries(monkeypatch):
+    """reconcile_fact is called once per newly stored fact, never for summaries."""
+    import app.curator as curator_mod
+
+    monkeypatch.setattr(
+        curator_mod,
+        "generate_summary",
+        AsyncMock(return_value="a summary"),
+    )
+    monkeypatch.setattr(
+        curator_mod,
+        "extract_facts",
+        AsyncMock(return_value=["fact one", "fact two"]),
+    )
+    monkeypatch.setattr(
+        curator_mod,
+        "write_scoped_memory",
+        AsyncMock(
+            side_effect=[
+                # summary stored
+                {"stored": True, "deduplicated": False, "id": "sum-1"},
+                # fact one stored
+                {"stored": True, "deduplicated": False, "id": "fact-1"},
+                # fact two stored
+                {"stored": True, "deduplicated": False, "id": "fact-2"},
+            ]
+        ),
+    )
+    fake_embedding = [0.1, 0.2, 0.3]
+    monkeypatch.setattr(
+        curator_mod, "embed_text", AsyncMock(return_value=fake_embedding)
+    )
+    reconcile_calls = []
+
+    async def _fake_reconcile(db_session, *, org_id, new_fact_id, new_fact_content, embedding):
+        reconcile_calls.append(
+            {
+                "org_id": org_id,
+                "new_fact_id": new_fact_id,
+                "new_fact_content": new_fact_content,
+                "embedding": embedding,
+            }
+        )
+        return 0
+
+    monkeypatch.setattr(curator_mod, "reconcile_fact", _fake_reconcile)
+
+    stored = await curator_mod._synthesize_and_store(
+        object(),
+        org_id="org-1",
+        agent_id="agent-1",
+        combined="content one\ncontent two",
+        input_count=2,
+    )
+
+    assert stored == 3  # summary + 2 facts
+    # reconcile_fact called once per stored fact (2 facts), never for summary.
+    assert len(reconcile_calls) == 2
+    fact_contents = {c["new_fact_content"] for c in reconcile_calls}
+    assert fact_contents == {"fact one", "fact two"}
+    # org_id forwarded correctly
+    for c in reconcile_calls:
+        assert c["org_id"] == "org-1"
+        assert c["embedding"] == fake_embedding
