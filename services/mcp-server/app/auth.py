@@ -13,15 +13,27 @@ should reach the brain must carry ``"memory"`` in their ``scopes`` array.
 That provisioning happens in the external dashboard (a separate repo —
 no key-provisioning code lives here): it must grant the ``"memory"``
 scope to any key the memory product is meant to authorize.
+
+Project scoping: MCP clients have no current-working-directory concept,
+so a workspace may declare its project via the optional ``X-Vex-Project``
+header (a git remote URL or project slug).  Resolution is read-only
+(``shared.brain.find_project_id``) and FAILS OPEN — an absent header,
+unknown identifier, or lookup error all yield ``None`` (org-wide recall).
+Project scoping is a relevance feature, not a security boundary
+(``org_id`` enforces tenancy).
 """
 
+import logging
 import os
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import Depends, HTTPException, Request
+from shared import brain
 from shared.auth import AuthError, KeyInfo, KeyValidator
 
 from app.config import DATABASE_URL
+
+logger = logging.getLogger("agentguard.mcp.auth")
 
 SUPABASE_DATABASE_URL = os.environ.get("SUPABASE_DATABASE_URL")
 
@@ -31,6 +43,36 @@ SUPABASE_DATABASE_URL = os.environ.get("SUPABASE_DATABASE_URL")
 # scoped to one consistent agent_id rather than scattering across
 # generated values.
 DEFAULT_AGENT_ID = "mcp-default"
+
+# Optional per-client project scoping. MCP clients have no cwd, so a
+# workspace declares its project via this header (a git remote URL or
+# project slug). Resolution is read-only and FAILS OPEN to org-wide:
+# scoping is a relevance feature, not a security boundary (org_id is).
+PROJECT_HEADER = "X-Vex-Project"
+
+
+def resolve_project_from_request(
+    request: Request, db: Any, *, org_id: str
+) -> Optional[str]:
+    """Resolve the X-Vex-Project header to a project id, or None.
+
+    Read-only (never creates a project), tenant-scoped by org_id, and
+    fails open: a missing header, unknown identifier, or lookup error all
+    yield None (org-wide recall).
+    """
+    identifier = request.headers.get(PROJECT_HEADER)
+    if not identifier:
+        return None
+    try:
+        return brain.find_project_id(db, org_id=org_id, identifier=identifier)
+    except Exception:
+        logger.warning(
+            "X-Vex-Project resolution failed for org %s; org-wide",
+            org_id,
+            exc_info=True,
+        )
+        return None
+
 
 _validator: Optional[KeyValidator] = None
 
