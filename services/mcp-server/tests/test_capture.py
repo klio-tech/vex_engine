@@ -427,3 +427,82 @@ def test_combine_messages_redacts_before_llm():
     assert SECRET_T3 not in combined
     assert "[REDACTED:stripe_secret_key:" in combined
     assert "configuring now" in combined
+
+
+# ---------------------------------------------------------------------------
+# recall_hidden threading (Task 7)
+# ---------------------------------------------------------------------------
+
+
+def test_capture_event_observation_is_recall_hidden(client, monkeypatch):
+    """Passive hook observations are written recall_hidden=True.
+
+    Observations are raw curator fuel and must not surface in agent recall,
+    so capture_event must pass recall_hidden=True for memory_type='observation'.
+    """
+    import shared.brain as brain_mod
+
+    seen = {}
+
+    async def _fake_write(db, **kwargs):
+        seen.update(kwargs)
+        return {"stored": True, "deduplicated": False, "id": "x", "scope": "org"}
+
+    monkeypatch.setattr(brain_mod, "write_scoped_memory", _fake_write)
+    db_patch, _ = _patch_db()
+    with db_patch:
+        resp = client.post(
+            "/capture/event",
+            json={"content": "Used tool Bash", "memory_type": "observation"},
+        )
+    assert resp.status_code == 200
+    assert seen["recall_hidden"] is True
+
+
+def test_capture_event_note_is_visible(client, monkeypatch):
+    """Deliberate writes (note/plan/decision/memory) are NOT recall-hidden.
+
+    Only raw observations feed the curator as hidden rows; note/plan/decision/
+    memory types must remain visible (recall_hidden=False) so agents can
+    recall them directly.
+    """
+    import shared.brain as brain_mod
+
+    seen = {}
+
+    async def _fake_write(db, **kwargs):
+        seen.update(kwargs)
+        return {"stored": True, "deduplicated": False, "id": "x", "scope": "org"}
+
+    monkeypatch.setattr(brain_mod, "write_scoped_memory", _fake_write)
+    db_patch, _ = _patch_db()
+    with db_patch:
+        resp = client.post(
+            "/capture/event", json={"content": "decision made", "memory_type": "note"}
+        )
+    assert resp.status_code == 200
+    assert seen["recall_hidden"] is False
+
+
+def test_recent_memories_sql_excludes_hidden(client):
+    """_recent_memories must include recall_hidden = FALSE in its WHERE clause.
+
+    The recency fallback (empty-query path) must not surface hidden curator-fuel
+    rows to agents at session start.
+    """
+    captured_sql = {}
+    session = MagicMock()
+
+    def _fake_execute(sql, params=None):
+        captured_sql["sql"] = str(sql)
+        result = MagicMock()
+        result.fetchall.return_value = []
+        return result
+
+    session.execute.side_effect = _fake_execute
+
+    from app.capture import _recent_memories
+
+    _recent_memories(session, org_id="org-1", project_id=None, limit=5)
+
+    assert "recall_hidden = FALSE" in captured_sql["sql"]

@@ -342,6 +342,10 @@ def _recent_memories(
     Used when recall is called with an empty query (session start).  Tenant- and
     brain-scoped (``org_id`` + ``scope='org'`` + ``status='active'``) so neither
     verification's ``scope='session'`` rows nor other orgs' rows are returned.
+    Rows with ``recall_hidden = TRUE`` are excluded: these are raw passive-hook
+    observations stored as curator fuel and must not surface to agents at
+    session start (mirrors the hidden-row contract of
+    :func:`shared.memory.retrieve_memories_scoped`).
     When ``project_id`` is given, rows for that project OR unfiled (``NULL``)
     rows surface — the same NULL-surfacing semantics as
     :func:`shared.memory.retrieve_memories_scoped`.
@@ -354,6 +358,7 @@ def _recent_memories(
             WHERE org_id = :org_id
               AND scope = 'org'
               AND status = 'active'
+              AND recall_hidden = FALSE
               AND (
                 :project_id IS NULL
                 OR project_id = :project_id
@@ -409,6 +414,9 @@ async def capture_event(
                 db, org_id, key_info.plan, "memory", key_info.plan_overrides
             )
         )
+        # Raw tool/prompt observations are curator fuel, not recall
+        # results; deliberate types (note/plan/decision/memory) stay
+        # visible.
         result = await brain.write_scoped_memory(
             db,
             org_id=org_id,
@@ -419,6 +427,7 @@ async def capture_event(
             project_id=project_id,
             metadata=metadata,
             scope=req.scope,
+            recall_hidden=(memory_type == "observation"),
         )
         if result.get("stored"):
             await anyio.to_thread.run_sync(

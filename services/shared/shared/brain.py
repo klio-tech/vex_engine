@@ -451,6 +451,7 @@ async def write_scoped_memory(
     metadata: Optional[dict] = None,
     dedup: bool = True,
     scope: str = "org",
+    recall_hidden: bool = False,
 ) -> dict:
     """Write a memory into the Klio brain at org or agent scope (with dedup).
 
@@ -503,6 +504,11 @@ async def write_scoped_memory(
             similar active memory already exists in the dedup window (see Scope).
         scope: ``'org'`` (default) or ``'agent'``. Determines the final scope the
             row is promoted to and the dedup window.
+        recall_hidden: When ``True`` the row is stored but excluded from agent
+            recall results (``retrieve_memories_scoped`` and the recency
+            fallback). Raw ``observation`` rows written by passive hooks should
+            pass ``True``; deliberate types (``note``, ``plan``, ``decision``,
+            ``memory``) should keep the default ``False``.
 
     Returns:
         A result dict describing the outcome (``scope`` echoes the requested
@@ -589,6 +595,7 @@ async def write_scoped_memory(
         memory_type,
         content,
         metadata=metadata,
+        recall_hidden=recall_hidden,
     )
     if record is None:
         # write_memory returns None when embedding generation fails.

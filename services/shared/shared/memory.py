@@ -316,8 +316,28 @@ async def write_memory(
     confidence: Optional[float] = None,
     sequence_number: Optional[int] = None,
     metadata: Optional[dict] = None,
+    recall_hidden: bool = False,
 ) -> Optional[MemoryRecord]:
     """Generate an embedding and INSERT a new row into ``session_memories``.
+
+    Args:
+        db_session: A synchronous SQLAlchemy session/connection.
+        session_id: The session this memory belongs to.
+        org_id: Owning org id (tenant scope).
+        agent_id: Authoring agent principal.
+        execution_id: Verification execution id (nullable — pass ``None`` for
+            brain writes that are not tied to a specific execution).
+        memory_type: The memory type string (e.g. ``observation``, ``fact``).
+        content: The memory text to store.
+        confidence: Optional confidence score.
+        sequence_number: Optional ordering sequence within a session.
+        metadata: Optional metadata dict persisted on the row.
+        recall_hidden: When ``True`` the row is stored but excluded from agent
+            recall results (``retrieve_memories_scoped`` and the recency
+            fallback). Raw ``observation`` rows written by passive hooks are
+            stored recall-hidden so they act as curator fuel without polluting
+            the recall surface. Deliberate writes (``note``, ``plan``,
+            ``decision``, ``memory``) keep the default ``False``.
 
     Returns:
         A :class:`MemoryRecord` on success, or ``None`` if embedding
@@ -337,12 +357,12 @@ async def write_memory(
                 id, session_id, org_id, agent_id, execution_id,
                 memory_type, content, embedding, confidence,
                 sequence_number, scope, status, metadata,
-                created_at, updated_at
+                created_at, updated_at, recall_hidden
             ) VALUES (
                 :id, :session_id, :org_id, :agent_id, :execution_id,
                 :memory_type, :content, :embedding, :confidence,
                 :sequence_number, 'session', 'active', :metadata,
-                :created_at, :updated_at
+                :created_at, :updated_at, :recall_hidden
             )
         """),
         {
@@ -359,6 +379,7 @@ async def write_memory(
             "metadata": json.dumps(meta),
             "created_at": now,
             "updated_at": now,
+            "recall_hidden": recall_hidden,
         },
     )
     db_session.commit()
@@ -629,6 +650,11 @@ async def retrieve_memories_scoped(
     NOTE: HNSW is an approximate index; with selective WHERE filters the result
     may under-fill ``limit``. Acceptable for v1.
 
+    Hidden-row contract: rows with ``recall_hidden = TRUE`` are **always**
+    excluded from results regardless of scope or other filters. These rows
+    are raw passive-hook observations stored as curator fuel; only the curator
+    process reads them (it does not filter on ``recall_hidden``).
+
     Args:
         db_session: A synchronous SQLAlchemy connection/session exposing
             ``.execute()`` (same contract as :func:`retrieve_memories`).
@@ -682,6 +708,7 @@ async def retrieve_memories_scoped(
         "org_id = :org_id",
         "status = 'active'",
         "superseded_by IS NULL",
+        "recall_hidden = FALSE",
     ]
     params: dict[str, Any] = {
         "org_id": org_id,
