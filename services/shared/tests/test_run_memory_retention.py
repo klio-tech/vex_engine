@@ -48,3 +48,15 @@ def test_calls_enforce_memory_retention_with_memory_days():
         "enforce_memory_retention" in sql and params.get("days") == 30
         for sql, params in calls
     )
+
+
+def test_hidden_raw_ttl_sql_present():
+    """run_retention must sweep recall_hidden rows on a fixed short TTL."""
+    import os
+
+    path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "scripts", "run_retention.py"
+    )
+    source = open(path).read()
+    assert "recall_hidden = TRUE" in source
+    assert "RAW_OBSERVATION_TTL_DAYS" in source
