@@ -72,10 +72,13 @@ _PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
         ),
     ),
     # --- Database / service connection strings (only when password present) --
-    # Capture group 1 = the password portion after the colon.
+    # Capture group 1 = the password, which is the segment between the LAST ":"
+    # and the LAST "@" of the authority.  The optional first sub-group allows an
+    # email address as the username (e.g. Cloud SQL IAM auth, MongoDB Atlas):
+    #   mongodb://jane.doe@example.com:p4ssw0rdXYZ@host:27017/db
     (
         "connection_string",
-        re.compile(r"\b[a-z][a-z0-9+.\-]*://[^\s:/@]+:([^\s@]+)@[^\s]+"),
+        re.compile(r"(?:\b[a-z][a-z0-9+.\-]*://)(?:[^\s/@]+@)?[^\s:/@]+:([^\s@]+)@[^\s]+"),
     ),
     # --- HTTP Bearer token ---------------------------------------------------
     # Capture group 1 = the token value.
@@ -92,9 +95,11 @@ _PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
     # --- PII ------------------------------------------------------------------
     ("email", re.compile(r"\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b")),
     # credit_card: Luhn-validated in _should_redact_match; length 13–19 digits.
+    # Pattern is digit-terminated (\b\d…\d\b) so a trailing separator (space,
+    # dash) is never consumed — the character after the card number is preserved.
     (
         "credit_card",
-        re.compile(r"\b(?:\d[ \-]?){13,19}\b"),
+        re.compile(r"\b\d(?:[ \-]?\d){12,18}\b"),
     ),
     # phone: international format with "+" prefix, 10–14 digits total.
     ("phone", re.compile(r"(?<![\d.])\+\d{10,14}\b")),
@@ -112,8 +117,8 @@ _VALUE_GROUP_KINDS: dict[str, int] = {
 _PLACEHOLDER_RE = re.compile(r"\[REDACTED:[a-z_]+:[0-9a-f]{4}\]")
 
 # Entropy thresholds used for the credential_assignment entropy gate.
-_ENTROPY_THRESHOLD_WITH_DIGIT = 3.0
-_ENTROPY_THRESHOLD_WITHOUT_DIGIT = 3.0
+# Values of 8–11 chars require higher entropy (2.5) than longer values (3.0).
+_ENTROPY_THRESHOLD = 3.0
 _MIN_VALUE_LEN_FOR_ENTROPY = 12
 
 
@@ -174,7 +179,42 @@ def _luhn_valid(digits: str) -> bool:
     return total % 10 == 0
 
 
-def _should_redact_match(kind: str, match: re.Match, secret: str) -> bool:  # noqa: C901
+def _credit_card_guard(match: re.Match) -> bool:
+    """Return True when the match looks like a real credit-card number.
+
+    Strips separators then validates digit count and Luhn checksum.
+    """
+    digits = re.sub(r"[ \-]", "", match.group(0))
+    if not (13 <= len(digits) <= 19):
+        return False
+    return _luhn_valid(digits)
+
+
+def _credential_assignment_guard(secret: str) -> bool:
+    """Return True when *secret* has sufficient entropy to be a real credential.
+
+    Short values (8–11 chars) require entropy ≥ 2.5 bits; longer values
+    require entropy ≥ _ENTROPY_THRESHOLD (3.0 bits).
+    """
+    entropy = _shannon_entropy(secret)
+    if len(secret) >= _MIN_VALUE_LEN_FOR_ENTROPY:
+        return entropy >= _ENTROPY_THRESHOLD
+    return entropy >= 2.5
+
+
+def _normalize_secret_for_fingerprint(kind: str, secret: str) -> str:
+    """Return the canonical form of *secret* used for fingerprinting.
+
+    Credit-card numbers may appear with or without separators; normalising to
+    digits-only ensures the same card always yields the same fingerprint
+    regardless of formatting.
+    """
+    if kind == "credit_card":
+        return re.sub(r"[ \-]", "", secret)
+    return secret
+
+
+def _should_redact_match(kind: str, match: re.Match, secret: str) -> bool:
     """Apply kind-specific guards beyond the regex match.
 
     Returns True when the match should be redacted, False when it should be
@@ -184,29 +224,11 @@ def _should_redact_match(kind: str, match: re.Match, secret: str) -> bool:  # no
     if _PLACEHOLDER_RE.search(match.group(0)):
         return False
 
-    if kind == "credit_card":
-        digits = re.sub(r"[ \-]", "", match.group(0))
-        if not (13 <= len(digits) <= 19):
-            return False
-        if not _luhn_valid(digits):
-            return False
+    if kind == "credit_card" and not _credit_card_guard(match):
+        return False
 
-    if kind == "credential_assignment":
-        # Entropy-gate: skip low-entropy values that look like prose words.
-        has_digit = bool(re.search(r"\d", secret))
-        entropy = _shannon_entropy(secret)
-        if len(secret) >= _MIN_VALUE_LEN_FOR_ENTROPY:
-            # Longer values: allow slightly lower entropy when digits present.
-            if has_digit:
-                if entropy < _ENTROPY_THRESHOLD_WITH_DIGIT:
-                    return False
-            else:
-                if entropy < _ENTROPY_THRESHOLD_WITHOUT_DIGIT:
-                    return False
-        else:
-            # Short values (8–11 chars): require higher entropy.
-            if entropy < 2.5:
-                return False
+    if kind == "credential_assignment" and not _credential_assignment_guard(secret):
+        return False
 
     return True
 
@@ -253,7 +275,7 @@ def redact(content: str) -> RedactionResult:
             if not _should_redact_match(kind, match, secret):
                 continue
 
-            fp = _fingerprint(secret)
+            fp = _fingerprint(_normalize_secret_for_fingerprint(kind, secret))
             findings.append(Finding(kind=kind, fingerprint=fp))
             placeholder = f"[REDACTED:{kind}:{fp}]"
 

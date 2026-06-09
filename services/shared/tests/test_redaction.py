@@ -112,3 +112,26 @@ def test_result_is_immutable():
 def test_empty_and_none_safe():
     assert redact("").redacted is False
     assert redact("").clean_text == ""
+
+
+# ---- regression: connection-string with email-as-username ----------------
+
+def test_connection_string_with_email_username_masks_password():
+    result = redact("mongodb://jane.doe@example.com:p4ssw0rdXYZ@host:27017/db")
+    assert "p4ssw0rdXYZ" not in result.clean_text
+    assert "connection_string" in {f.kind for f in result.findings}
+
+
+# ---- regression: credit-card boundary and fingerprint normalization ------
+
+def test_credit_card_mask_preserves_following_space():
+    result = redact("card 4111 1111 1111 1111 exp 12/28")
+    assert "] exp" in result.clean_text
+
+
+def test_credit_card_fingerprint_normalized_across_formats():
+    spaced = redact("card 4111 1111 1111 1111")
+    plain = redact("card 4111111111111111")
+    fp_s = [f for f in spaced.findings if f.kind == "credit_card"][0].fingerprint
+    fp_p = [f for f in plain.findings if f.kind == "credit_card"][0].fingerprint
+    assert fp_s == fp_p
