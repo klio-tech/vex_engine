@@ -117,7 +117,8 @@ _VALUE_GROUP_KINDS: dict[str, int] = {
 _PLACEHOLDER_RE = re.compile(r"\[REDACTED:[a-z_]+:[0-9a-f]{4}\]")
 
 # Entropy thresholds used for the credential_assignment entropy gate.
-# Values of 8–11 chars require higher entropy (2.5) than longer values (3.0).
+# Values of 8–11 chars need only entropy ≥ 2.5; values of 12+ chars must
+# meet the stricter ≥ 3.0 bar (long low-entropy strings are usually prose).
 _ENTROPY_THRESHOLD = 3.0
 _MIN_VALUE_LEN_FOR_ENTROPY = 12
 
