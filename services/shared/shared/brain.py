@@ -525,8 +525,8 @@ async def write_scoped_memory(
         ``redacted`` is ``True`` when at least one secret/PII pattern was
         detected and masked. ``redaction_kinds`` is a sorted list of the
         distinct kind strings (e.g. ``["stripe_secret_key"]``); it is empty
-        when no secrets were found.  Both keys are omitted when
-        ``MEMORY_REDACTION_DISABLED=1``.
+        when no secrets were found.  When ``MEMORY_REDACTION_DISABLED=1``
+        both keys are still present with their no-op values (``False`` / ``[]``).
 
     Raises:
         ValueError: If ``scope`` is neither ``'org'`` nor ``'agent'``.
