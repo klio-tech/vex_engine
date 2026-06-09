@@ -648,6 +648,13 @@ async def retrieve_memories_scoped(
           silently reading org-wide.
         * any other value → raises ``ValueError``.
 
+    NOTE: HNSW candidate-pool trade-off — the inner query fetches
+    ``candidate_pool = limit * 4`` approximate nearest neighbours, then the
+    outer query re-ranks them by the blended score and returns the top
+    ``limit``.  A relevant-but-stale row that falls outside the top-4× ANN
+    candidates will not be rescued by the recency bonus; this is accepted,
+    matching the v1 under-fill acceptance documented below.
+
     NOTE: HNSW is an approximate index; with selective WHERE filters the result
     may under-fill ``limit``. Acceptable for v1.
 
@@ -663,10 +670,13 @@ async def retrieve_memories_scoped(
             never returned from another org.
         query_text: Natural-language query; embedded and ranked by a blended
             score (``0.85 * similarity + 0.15 * recency_norm``) over a 30-day
-            recency window so that stale near-duplicates are demoted relative
-            to recent relevant memories. Each returned :class:`MemoryRecord`
-            has its ``relevance`` field populated with the raw cosine-similarity
-            score (``1 - cosine distance``).
+            recency window (recency_norm clamped to [0, 1]) so that stale
+            near-duplicates are demoted relative to recent relevant memories.
+            Each returned :class:`MemoryRecord` has its ``relevance`` field
+            populated with the raw cosine-similarity score (``1 - cosine
+            distance``).  The inner query is HNSW-accelerated
+            (``ORDER BY embedding <=> :embedding LIMIT :candidate_pool``);
+            the outer re-ranks the bounded candidate pool by blended score.
         scope: One of ``"org"`` or ``"agent"`` (see the visibility ladder
             above). ``"session"`` and any unknown value raise ``ValueError``.
         agent_id: Required when ``scope == "agent"``; ignored otherwise.
@@ -725,6 +735,7 @@ async def retrieve_memories_scoped(
         "org_id": org_id,
         "embedding": embedding_str,
         "limit": limit,
+        "candidate_pool": limit * 4,
     }
 
     if scope == "org":
@@ -739,23 +750,32 @@ async def retrieve_memories_scoped(
         base_clauses.append("(space_id = :space_id OR space_id IS NULL)")
         params["space_id"] = space_id
 
-    # Blended ranking: similarity dominates, recency breaks ties and
-    # demotes stale near-duplicates. recency_norm is age over a 30-day
-    # window clamped to [0, 1].
+    # ANN-inner / re-rank-outer shape:
+    #   Inner query — HNSW-accelerated cosine-distance ORDER BY fetches a
+    #     bounded candidate pool (:candidate_pool = limit * 4).
+    #   Outer query — re-ranks the candidates by blended score:
+    #     0.85 * similarity + 0.15 * recency_norm, where recency_norm is the
+    #     fraction of the 30-day window still remaining, clamped to [0, 1].
+    # The outer SELECT * preserves the 18 record columns plus relevance at
+    # index 18.  blended_score is used only in the ORDER BY and is not a
+    # selected column, so each row has exactly 19 elements (indices 0–18).
     select_sql = """
-        SELECT id, session_id, org_id, agent_id, execution_id,
-               memory_type, content, embedding, confidence,
-               sequence_number, scope, status, superseded_by,
-               metadata, created_at, updated_at, space_id, project_id,
-               (1 - (embedding <=> :embedding)) AS relevance,
-               (0.85 * (1 - (embedding <=> :embedding))
-                + 0.15 * GREATEST(
-                    0, 1 - EXTRACT(EPOCH FROM (NOW() - created_at))
-                           / (30 * 86400)
-                  )) AS blended_score
-        FROM session_memories
-        WHERE {where}
-        ORDER BY blended_score DESC
+        SELECT * FROM (
+            SELECT id, session_id, org_id, agent_id, execution_id,
+                   memory_type, content, embedding, confidence,
+                   sequence_number, scope, status, superseded_by,
+                   metadata, created_at, updated_at, space_id, project_id,
+                   (1 - (embedding <=> :embedding)) AS relevance
+            FROM session_memories
+            WHERE {where}
+            ORDER BY embedding <=> :embedding
+            LIMIT :candidate_pool
+        ) candidates
+        ORDER BY (0.85 * relevance
+                  + 0.15 * LEAST(1, GREATEST(
+                      0, 1 - EXTRACT(EPOCH FROM (NOW() - created_at))
+                             / (30 * 86400)
+                    ))) DESC
         LIMIT :limit
     """
 
@@ -774,13 +794,20 @@ async def retrieve_memories_scoped(
         remaining = limit - len(tier1)
         tier2 = []
         if remaining > 0:
-            tier2 = _fetch("project_id IS NULL", {"limit": remaining})
+            # Override both limit and candidate_pool for the tier-2 fill so
+            # the inner ANN pool is proportional to the actual remaining slots.
+            tier2 = _fetch(
+                "project_id IS NULL",
+                {"limit": remaining, "candidate_pool": remaining * 4},
+            )
         rows = list(tier1) + list(tier2)
     else:
         rows = _fetch("TRUE", {})
 
     records = []
     for row in rows:
+        # row[:18] = the 18 record columns; row[18] = relevance (cosine sim).
+        # blended_score is not selected as a column — it only drives ORDER BY.
         record = _row_to_record(row[:18])
         record.relevance = round(float(row[18]), 3) if row[18] is not None else None
         records.append(record)

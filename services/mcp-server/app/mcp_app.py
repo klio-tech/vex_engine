@@ -220,7 +220,7 @@ def _serialize_record(
     not available (e.g. direct construction in tests).
 
     ``project`` carries the human-readable project label dict
-    (``{"slug": ..., "name": ...}``) resolved once per recall response, or
+    (``{"id": ..., "name": ...}``) resolved once per recall response, or
     ``None`` when no project scope is active.
     """
     return {
@@ -538,7 +538,7 @@ async def _perform_recall(
                 {"id": project_id, "org_id": org_id},
             ).fetchone()
             if row is not None:
-                project_label = {"slug": project_id, "name": row.display_name}
+                project_label = {"id": project_id, "name": row.display_name}
         memories = [
             _serialize_record(r, project_label=project_label) for r in records
         ]

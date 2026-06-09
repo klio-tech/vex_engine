@@ -485,7 +485,11 @@ async def test_recall_no_request_context_returns_unauthorized():
 
 
 def test_recall_result_includes_relevance_and_project_name():
-    """_serialize_record carries relevance and project label fields."""
+    """_serialize_record carries relevance and project label fields.
+
+    The project label uses the key ``"id"`` (not ``"slug"``) because
+    project_id is a UUID, not a slug.
+    """
     import uuid
     from datetime import datetime, timezone
 
@@ -502,9 +506,9 @@ def test_recall_result_includes_relevance_and_project_name():
         created_at=datetime.now(timezone.utc),
         relevance=0.873,
     )
-    out = _serialize_record(record, project_label={"slug": "widgets", "name": "Widgets"})
+    out = _serialize_record(record, project_label={"id": "widgets", "name": "Widgets"})
     assert out["relevance"] == 0.873
-    assert out["project"] == {"slug": "widgets", "name": "Widgets"}
+    assert out["project"] == {"id": "widgets", "name": "Widgets"}
 
 
 # ---------------------------------------------------------------------------
