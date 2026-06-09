@@ -39,6 +39,14 @@ DEFAULT_LLM_TIMEOUT_S: float = 10.0
 # Providers that support response_format via gateway
 _JSON_MODE_PREFIXES = ("openai/", "gpt-")
 
+# Credential-reproduction guard injected into every synthesis prompt so that
+# the LLM is explicitly instructed not to echo secrets even in prose form.
+_NO_CREDENTIALS_RULE = (
+    "Never reproduce credentials, API keys, tokens, passwords, or other "
+    "secrets — not even partially. If the content contains one, refer to it "
+    "generically (e.g. 'a Stripe test key was provided'). "
+)
+
 
 # ---------------------------------------------------------------------------
 # Data class
@@ -209,7 +217,9 @@ async def generate_summary(
 
     prompt = (
         "Summarize the following agent turn in 1-2 concise sentences. "
-        "Focus on what the agent did and the outcome.\n\n"
+        "Focus on what the agent did and the outcome. "
+        + _NO_CREDENTIALS_RULE
+        + "\n\n"
         + "\n".join(parts)
         + '\n\nRespond with JSON: {"summary": "<your summary>"}'
     )
@@ -239,7 +249,9 @@ async def extract_facts(
 
     prompt = (
         "Extract discrete, verifiable facts from the following agent turn. "
-        "Each fact should be a short, self-contained statement.\n\n"
+        "Each fact should be a short, self-contained statement. "
+        + _NO_CREDENTIALS_RULE
+        + "\n\n"
         + "\n".join(parts)
         + '\n\nRespond with JSON: {"facts": ["fact1", "fact2", ...]}'
     )
