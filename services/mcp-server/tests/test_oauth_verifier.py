@@ -7,7 +7,7 @@ import jwt as pyjwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
-from app.oauth import OAuthIdentity, SupabaseTokenVerifier
+from app.oauth import OAuthIdentity, SupabaseTokenVerifier, VerifierUnavailable
 
 ISSUER = "https://proj.supabase.co/auth/v1"
 KID = "test-key-1"
@@ -113,7 +113,17 @@ async def test_unknown_kid_triggers_refetch_then_rejects(
     assert calls["n"] >= 1  # refreshed on miss
 
 
-async def test_jwks_fetch_failure_fails_closed(rsa_key, monkeypatch):
+async def test_jwks_fetch_failure_raises_unavailable(rsa_key, monkeypatch):
+    """A JWKS fetch error must raise VerifierUnavailable, not return None.
+
+    This is the intentional behavior change from the original ``None``
+    (fail-closed) to a raised sentinel so the middleware can distinguish a
+    temporarily-unreachable JWKS endpoint (503 + Retry-After) from a token
+    that is structurally invalid (401 challenge).
+
+    The test preserves the original intent — JWKS failure must NOT yield a
+    valid identity — but now expects the raised sentinel instead of ``None``.
+    """
     v = SupabaseTokenVerifier(issuer=ISSUER)
 
     def boom():
@@ -121,7 +131,8 @@ async def test_jwks_fetch_failure_fails_closed(rsa_key, monkeypatch):
 
     monkeypatch.setattr(v, "_fetch_jwks", boom)
     token = _mint(rsa_key)
-    assert await v.verify_token(token) is None
+    with pytest.raises(VerifierUnavailable):
+        await v.verify_token(token)
 
 
 async def test_unknown_kid_flood_is_backoff_limited(verifier, rsa_key, monkeypatch):

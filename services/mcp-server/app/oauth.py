@@ -10,6 +10,14 @@ docs/superpowers/specs/2026-06-10-mcp-oauth-design.md.
 Fail-closed: any validation or lookup failure yields ``None`` / no
 principal. Authentication is never fail-open (unlike the read-path
 relevance lookups elsewhere in this service).
+
+Availability sentinel
+---------------------
+``VerifierUnavailable`` is raised (never caught internally) when the JWKS
+endpoint is unreachable due to a network or HTTP error.  It is distinct from a
+token being invalid: invalid tokens yield ``None``; an unreachable JWKS endpoint
+raises ``VerifierUnavailable`` so the caller can return 503 + Retry-After
+instead of the 401 OAuth challenge (spec section 5).
 """
 
 import logging
@@ -22,6 +30,17 @@ import httpx
 import jwt as pyjwt
 
 logger = logging.getLogger("agentguard.mcp.oauth")
+
+
+class VerifierUnavailable(Exception):
+    """The JWKS endpoint is temporarily unreachable.
+
+    Raised by :meth:`SupabaseTokenVerifier._verify_sync` (and therefore by
+    :meth:`SupabaseTokenVerifier.verify_token`) when a network or HTTP error
+    prevents key acquisition.  Distinct from an invalid token (which yields
+    ``None``): callers should map this to 503 + Retry-After, not 401.
+    """
+
 
 _JWKS_TTL_S = 300.0
 _JWKS_TIMEOUT_S = 5.0
@@ -70,7 +89,12 @@ class SupabaseTokenVerifier:
     # -- JWKS ---------------------------------------------------------------
 
     def _fetch_jwks(self) -> dict:
-        """GET the JWKS document. Isolated for test monkeypatching."""
+        """GET the JWKS document. Isolated for test monkeypatching.
+
+        Any exception raised here (network errors, HTTP errors, or those
+        injected by test monkeypatches) is caught by ``_key_for`` and
+        re-raised as :class:`VerifierUnavailable`.
+        """
         response = httpx.get(self._jwks_url, timeout=_JWKS_TIMEOUT_S)
         response.raise_for_status()
         return response.json()
@@ -87,6 +111,12 @@ class SupabaseTokenVerifier:
 
         The TTL-based refresh path (``refresh=False`` but cache stale or
         empty) is not subject to the backoff — it proceeds unconditionally.
+
+        Raises:
+            VerifierUnavailable: when ``_fetch_jwks`` raises for any reason
+                (network error, HTTP error, or test-injected exception).  An
+                unknown kid after a *successful* refresh still returns ``None``
+                (401 path), not this exception.
         """
         with self._lock:
             stale = (time.monotonic() - self._fetched_at) > _JWKS_TTL_S
@@ -96,7 +126,12 @@ class SupabaseTokenVerifier:
                 if now - self._last_forced_refresh < _JWKS_REFRESH_BACKOFF_S:
                     # Already refreshed recently; serve from the current cache.
                     return self._keys.get(kid)
-                jwks = self._fetch_jwks()
+                try:
+                    jwks = self._fetch_jwks()
+                except Exception as exc:
+                    raise VerifierUnavailable(
+                        f"JWKS endpoint unreachable: {self._jwks_url}"
+                    ) from exc
                 self._keys = {
                     k.get("kid"): pyjwt.algorithms.RSAAlgorithm.from_jwk(k)
                     for k in jwks.get("keys", [])
@@ -106,7 +141,12 @@ class SupabaseTokenVerifier:
                 self._last_forced_refresh = self._fetched_at
             elif stale or not self._keys:
                 # TTL-based or cold-load refresh: no backoff applied.
-                jwks = self._fetch_jwks()
+                try:
+                    jwks = self._fetch_jwks()
+                except Exception as exc:
+                    raise VerifierUnavailable(
+                        f"JWKS endpoint unreachable: {self._jwks_url}"
+                    ) from exc
                 self._keys = {
                     k.get("kid"): pyjwt.algorithms.RSAAlgorithm.from_jwk(k)
                     for k in jwks.get("keys", [])
@@ -117,17 +157,41 @@ class SupabaseTokenVerifier:
 
     # -- Verification ---------------------------------------------------------
 
-    async def verify_token(self, token: str) -> Optional[OAuthIdentity]:
-        """Validate ``token``; return the identity or ``None`` (fail closed)."""
+    def _verify_sync(self, token: str) -> Optional[OAuthIdentity]:
+        """Validate ``token`` synchronously; return the identity or ``None``.
+
+        This is the real verification logic — all work is CPU-bound or makes
+        a synchronous JWKS HTTP fetch.  Keeping it sync lets the middleware
+        offload it to a thread pool via ``anyio.to_thread.run_sync`` without
+        a nested-event-loop problem.
+
+        Raises:
+            VerifierUnavailable: when the JWKS endpoint cannot be reached due
+                to a network or HTTP error (propagated from ``_key_for`` →
+                ``_fetch_jwks``).  Token-structural failures (bad signature,
+                expiry, wrong issuer, unknown kid after successful refresh) all
+                return ``None`` — fail closed, not unavailable.
+        """
+        # VerifierUnavailable from _key_for/_fetch_jwks propagates to the
+        # caller; all other exceptions are caught below (fail closed).
         try:
             header = pyjwt.get_unverified_header(token)
-            kid = header.get("kid")
-            key = self._key_for(kid)
-            if key is None:
-                key = self._key_for(kid, refresh=True)
-            if key is None:
-                logger.info("oauth: unknown kid after JWKS refresh")
-                return None
+        except Exception:
+            logger.info("oauth: token validation failed", exc_info=True)
+            return None
+
+        kid = header.get("kid")
+
+        # _key_for may raise VerifierUnavailable on JWKS fetch failure;
+        # we let that propagate intentionally.
+        key = self._key_for(kid)
+        if key is None:
+            key = self._key_for(kid, refresh=True)
+        if key is None:
+            logger.info("oauth: unknown kid after JWKS refresh")
+            return None
+
+        try:
             claims = pyjwt.decode(
                 token,
                 key=key,
@@ -154,6 +218,20 @@ class SupabaseTokenVerifier:
             logger.info("oauth: token lacks client identity; rejected")
             return None
         return OAuthIdentity(user_id=str(sub), client_id=str(client_id))
+
+    async def verify_token(self, token: str) -> Optional[OAuthIdentity]:
+        """Async wrapper around :meth:`_verify_sync`.
+
+        Preserves the ``async def verify_token`` interface so external callers
+        and tests that ``await verifier.verify_token(...)`` continue to work
+        without modification.  The middleware uses ``_verify_sync`` directly
+        (via ``anyio.to_thread.run_sync``) to avoid blocking the event loop.
+
+        Raises:
+            VerifierUnavailable: propagated from ``_verify_sync`` when the
+                JWKS endpoint is temporarily unreachable.
+        """
+        return self._verify_sync(token)
 
 
 # ---------------------------------------------------------------------------

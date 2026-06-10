@@ -15,6 +15,7 @@ clients is byte-for-byte unchanged.
 import logging
 from typing import Any, Optional
 
+import anyio
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -25,6 +26,7 @@ from app.oauth import (
     OAuthIdentity,
     OAuthPrincipal,
     SupabaseTokenVerifier,
+    VerifierUnavailable,
 )
 
 logger = logging.getLogger("agentguard.mcp.oauth")
@@ -59,8 +61,15 @@ def _get_resolver() -> GrantResolver:
 
 
 # Seams for tests (monkeypatched in test_oauth_middleware.py).
-async def _verify_token(token: str) -> Optional[OAuthIdentity]:
-    return await _get_verifier().verify_token(token)
+#
+# Both are SYNC functions so the middleware can offload them to a thread pool
+# via ``anyio.to_thread.run_sync``, keeping blocking I/O (JWKS fetch,
+# SQLAlchemy queries) off the asyncio event loop.
+#
+# ``_verify_token`` may raise ``VerifierUnavailable`` when the JWKS endpoint
+# is unreachable; the middleware maps that to 503 + Retry-After.
+def _verify_token(token: str) -> Optional[OAuthIdentity]:
+    return _get_verifier()._verify_sync(token)
 
 
 def _resolve_grant(identity: OAuthIdentity) -> Optional[OAuthPrincipal]:
@@ -112,11 +121,21 @@ class OAuthLadderMiddleware:
         authorization = request.headers.get("Authorization", "")
         if authorization.lower().startswith("bearer "):
             token = authorization[7:].strip()
-            identity = await _verify_token(token)
+            try:
+                identity = await anyio.to_thread.run_sync(_verify_token, token)
+            except VerifierUnavailable:
+                logger.warning("oauth: JWKS endpoint unreachable; returning 503")
+                response = JSONResponse(
+                    status_code=503,
+                    content={"error": "verifier_unavailable"},
+                    headers={"Retry-After": "5"},
+                )
+                await response(scope, receive, send)
+                return
             if identity is None:
                 await _challenge()(scope, receive, send)
                 return
-            principal = _resolve_grant(identity)
+            principal = await anyio.to_thread.run_sync(_resolve_grant, identity)
             if principal is None:
                 response = JSONResponse(
                     status_code=403,

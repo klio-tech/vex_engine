@@ -6,6 +6,7 @@ factory and a health endpoint. Auth and MCP tools are layered on in
 later tasks.
 """
 
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
@@ -103,6 +104,22 @@ def create_app() -> FastAPI:
 
     # --- MCP OAuth (flag-gated; spec 2026-06-10-mcp-oauth-design.md) -------
     if config.MCP_OAUTH_ENABLED:
+        # Fail fast: refuse to start with an incomplete OAuth configuration.
+        # Without these three values the server will 500 on the first Bearer
+        # request, which is harder to diagnose than an explicit startup error.
+        missing = [
+            name
+            for name, val in (
+                ("SUPABASE_AUTH_ISSUER", config.SUPABASE_AUTH_ISSUER),
+                ("MCP_PUBLIC_URL", config.MCP_PUBLIC_URL),
+                ("SUPABASE_DATABASE_URL", os.environ.get("SUPABASE_DATABASE_URL")),
+            )
+            if not val
+        ]
+        if missing:
+            raise RuntimeError(
+                f"MCP_OAUTH_ENABLED=1 but required config missing: {', '.join(missing)}"
+            )
 
         @app.get(oauth_middleware.METADATA_PATH)
         def oauth_protected_resource():
