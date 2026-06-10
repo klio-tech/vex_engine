@@ -102,7 +102,7 @@ def run(database_url: str, *, apply: bool, org_id: Optional[str]) -> None:
                     f"""
                     SELECT id, org_id, content, created_at
                     FROM session_memories
-                    WHERE {' AND '.join(where)}
+                    WHERE {" AND ".join(where)}
                     ORDER BY created_at ASC, id ASC
                     LIMIT :batch
                     """
