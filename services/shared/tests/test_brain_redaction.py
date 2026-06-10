@@ -139,7 +139,6 @@ async def test_dedup_path_receives_masked_content(fake_embed, monkeypatch):
 
     # Patch find_similar_memory so it records what it was called with.
     dedup_embedded: dict = {}
-    original_embed = memory_mod.embed_text
 
     async def _embed_capturing(text_input):
         dedup_embedded["last"] = text_input

@@ -2562,8 +2562,12 @@ Expected: PASS — `tools/list` advertises 8 tools including `forget`; `recall` 
 
 - [ ] **Step 5: Commit any test additions, then walk the rollout checklist (production, in order)**
 
-1. Deploy redaction + prompt hardening (Tasks 1–4). Verify a test write through the live MCP endpoint returns `"redacted": true` for a dummy `sk_test_...` value.
+> **Corrected during final branch review:** the branch ships as ONE image
+> that references `recall_hidden` unconditionally — the migration must run
+> BEFORE the image deploys, not at step 4 as originally drafted.
+
+1. `alembic upgrade head` (migration 026) against production. Additive; the currently-deployed image keeps working.
 2. `python -m scripts.run_redaction_backfill` (dry-run) → review per-org report → `--apply`. Verify the two known leaked keys no longer appear in a recall.
 3. **Rotate the two exposed Stripe test keys** (MoonForge + LoopReel sandbox dashboards).
-4. `alembic upgrade head` (migration 026), deploy Tasks 7–8. Verify a recall no longer returns raw `Used tool ...` observations.
-5. Deploy Tasks 9–12. Configure one client with `X-Vex-Project` and verify cross-project memories stop surfacing; `forget` a junk memory and verify it disappears from recall.
+4. Deploy the branch image (Tasks 1–12 together). Verify: a test write through the live MCP endpoint returns `"redacted": true` for a dummy `sk_test_...` value; a recall no longer returns raw `Used tool ...` observations.
+5. Configure one client with `X-Vex-Project` and verify cross-project memories stop surfacing; `forget` a junk memory and verify it disappears from recall.

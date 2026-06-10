@@ -252,15 +252,28 @@ Per house rules (TDD, ≥ 80% coverage):
 
 ## 9. Rollout order
 
-1. Redaction module + chokepoint integration + prompt hardening (flag on).
+> **Revised after implementation (final branch review):** the feature ships
+> as ONE deployable image whose code references the `recall_hidden` column
+> unconditionally, so the migration MUST run before the image deploys —
+> deploying first would break every write/recall until the migration lands.
+> The migration is additive and backward-compatible, so the old image keeps
+> working against the new column. (Implementation note: the migration is
+> numbered 026, not 023 — the chain was already at 025.)
+
+1. Run migration 026 (`alembic upgrade head`) against production. Additive;
+   the currently-deployed image is unaffected.
 2. Backfill dry-run on production → review report → apply, all orgs.
    Rotate the exposed Stripe keys.
-3. Migration 023 + recall-hidden capture behavior + TTL.
-4. `X-Vex-Project` scoping + two-tier recall + `relevance`/`limit`.
-5. `forget` tool + curator reconciliation.
+3. Deploy the branch image (redaction + chokepoint + prompt hardening +
+   recall-hidden behavior + TTL + `X-Vex-Project` scoping + two-tier recall +
+   `relevance`/`limit` + `forget` + curator reconciliation, together).
+4. Post-deploy verification: a write containing a dummy `sk_test_...` value
+   returns `"redacted": true`; recall no longer returns raw `Used tool ...`
+   observations; a client configured with `X-Vex-Project` stops seeing
+   cross-project memories; `forget` removes a memory from recall.
 
-Each step is independently deployable; all MCP schema changes are additive,
-so existing clients keep working throughout.
+All MCP schema changes are additive, so existing clients keep working
+throughout.
 
 ## Out of scope
 

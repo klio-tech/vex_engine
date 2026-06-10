@@ -265,7 +265,6 @@ async def test_write_files_under_header_project(monkeypatch):
     Monkeypatches resolve_project_from_request on the mcp_app module to return
     "proj-9", then confirms write_scoped_memory is called with project_id="proj-9".
     """
-    import app.mcp_app as mcp_mod
 
     fn = _get_tool_fn("remember")
     seen = {}
