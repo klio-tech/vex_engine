@@ -36,6 +36,15 @@ DEFAULT_LLM_MODEL: str = "claude-haiku-4-5-20251001"
 DEFAULT_LLM_TIMEOUT_S: float = 10.0
 """Default timeout (seconds) for LLM completion calls."""
 
+MAX_EMBED_CHARS: int = 1800
+"""Head-truncation budget for embedding input.
+
+The default embedding model caps input at 512 tokens; at ~4 chars/token a
+1800-char head stays safely under that (≈450 tokens) even for multibyte text.
+Truncation applies ONLY to the vector input — stored ``content`` is never
+modified. This prevents oversized content from returning HTTP 400 and looping
+the embedder (which previously flooded logs at the host's rate limit)."""
+
 # Providers that support response_format via gateway
 _JSON_MODE_PREFIXES = ("openai/", "gpt-")
 
@@ -92,6 +101,14 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
     Returns:
         A list of floats representing the embedding, or ``None`` on error.
     """
+    if text_input and len(text_input) > MAX_EMBED_CHARS:
+        logger.debug(
+            "embed_text: truncating input from %d to %d chars",
+            len(text_input),
+            MAX_EMBED_CHARS,
+        )
+        text_input = text_input[:MAX_EMBED_CHARS]
+
     model = os.environ.get("MEMORY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
     api_base = os.environ.get("LITELLM_API_URL") or os.environ.get("OPENAI_API_BASE")
     api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
