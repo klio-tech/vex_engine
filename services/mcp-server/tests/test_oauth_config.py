@@ -1,6 +1,26 @@
 """Config flags for MCP OAuth (engine side)."""
 
 import importlib
+import os
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _restore_config():
+    """Reload app.config from a clean env after each test.
+
+    The tests reload the module under patched env vars; monkeypatch restores
+    the ENV at teardown but not the already-reloaded MODULE, so without this
+    fixture later test files would observe stale flag values via
+    sys.modules["app.config"].
+    """
+    yield
+    import app.config as config
+
+    for key in ("MCP_OAUTH_ENABLED", "SUPABASE_AUTH_ISSUER", "MCP_PUBLIC_URL"):
+        os.environ.pop(key, None)
+    importlib.reload(config)
 
 
 def _reload_config(monkeypatch, **env):
