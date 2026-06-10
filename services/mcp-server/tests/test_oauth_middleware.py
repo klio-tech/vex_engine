@@ -66,12 +66,18 @@ def test_flag_off_preserves_today(monkeypatch):
 
 def test_metadata_served_when_enabled(monkeypatch):
     client = _client(monkeypatch, enabled=True)
-    resp = client.get("/.well-known/oauth-protected-resource")
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["resource"] == "https://mcp.klio.tech"
-    assert body["authorization_servers"] == ["https://proj.supabase.co/auth/v1"]
-    assert "header" in body["bearer_methods_supported"]
+    # The `resource` identifier is the full MCP endpoint URL the client dials,
+    # not the bare origin — served at both the bare and path-aware locations.
+    for path in (
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/mcp",
+    ):
+        resp = client.get(path)
+        assert resp.status_code == 200, path
+        body = resp.json()
+        assert body["resource"] == "https://mcp.klio.tech/mcp"
+        assert body["authorization_servers"] == ["https://proj.supabase.co/auth/v1"]
+        assert "header" in body["bearer_methods_supported"]
 
 
 def test_unauthenticated_mcp_gets_401_challenge(monkeypatch):
@@ -81,7 +87,8 @@ def test_unauthenticated_mcp_gets_401_challenge(monkeypatch):
     challenge = resp.headers["WWW-Authenticate"]
     assert challenge.startswith("Bearer")
     assert "resource_metadata=" in challenge
-    assert "/.well-known/oauth-protected-resource" in challenge
+    # Challenge points at the path-aware metadata location for the /mcp resource.
+    assert "/.well-known/oauth-protected-resource/mcp" in challenge
 
 
 def test_key_header_passes_through(monkeypatch):

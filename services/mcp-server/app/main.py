@@ -121,10 +121,17 @@ def create_app() -> FastAPI:
                 f"MCP_OAUTH_ENABLED=1 but required config missing: {', '.join(missing)}"
             )
 
-        @app.get(oauth_middleware.METADATA_PATH)
         def oauth_protected_resource():
             """RFC 9728 metadata: points MCP clients at the Supabase AS."""
             return oauth_middleware.protected_resource_metadata()
+
+        # Serve at BOTH the bare well-known path and the RFC 9728 path-aware
+        # location for the ``/mcp`` resource. Clients that follow the
+        # WWW-Authenticate hint use the path-aware URL; others probe the bare
+        # path. Both return identical metadata. Registered before the MCP mount
+        # so the path-aware route is not swallowed by the catch-all transport.
+        app.get(oauth_middleware.METADATA_PATH)(oauth_protected_resource)
+        app.get(oauth_middleware.METADATA_PATH_FOR_RESOURCE)(oauth_protected_resource)
 
     # REST capture layer (passive memory for the thin `klio hook` client).
     # Registered BEFORE the root MCP mount so its ``/capture/*`` routes take

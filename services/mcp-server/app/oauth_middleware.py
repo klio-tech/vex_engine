@@ -35,6 +35,23 @@ logger = logging.getLogger("agentguard.mcp.oauth")
 
 METADATA_PATH = "/.well-known/oauth-protected-resource"
 
+# The MCP transport endpoint path. The OAuth *resource identifier* is the full
+# endpoint URL a client connects to (``<public-url>/mcp``), NOT the bare origin
+# — Anthropic's MCP client validates that the metadata ``resource`` equals the
+# server URL it dialed, so advertising the origin makes it reject discovery
+# before any browser login. Per RFC 9728 the metadata for a resource that has a
+# path is also published at the path-aware well-known location
+# (``/.well-known/oauth-protected-resource/mcp``); we serve and advertise that
+# as the canonical location while keeping the bare path for back-compat.
+MCP_RESOURCE_PATH = "/mcp"
+METADATA_PATH_FOR_RESOURCE = f"{METADATA_PATH}{MCP_RESOURCE_PATH}"
+
+
+def mcp_resource_url() -> str:
+    """Canonical OAuth resource identifier: the full MCP endpoint URL."""
+    return f"{config.MCP_PUBLIC_URL}{MCP_RESOURCE_PATH}"
+
+
 _verifier: Optional[SupabaseTokenVerifier] = None
 _resolver: Optional[GrantResolver] = None
 # Module-level singleton; in-memory, per-replica (matches the key-path limiter).
@@ -81,9 +98,14 @@ def _resolve_grant(identity: OAuthIdentity) -> Optional[OAuthPrincipal]:
 
 
 def protected_resource_metadata() -> dict[str, Any]:
-    """RFC 9728 payload advertising Supabase as the authorization server."""
+    """RFC 9728 payload advertising Supabase as the authorization server.
+
+    ``resource`` is the full MCP endpoint URL (``<public-url>/mcp``) so it
+    matches the URL the client connected to (the value Anthropic's client
+    validates against).
+    """
     return {
-        "resource": config.MCP_PUBLIC_URL,
+        "resource": mcp_resource_url(),
         "authorization_servers": [config.SUPABASE_AUTH_ISSUER],
         "bearer_methods_supported": ["header"],
         "scopes_supported": ["memory"],
@@ -92,8 +114,13 @@ def protected_resource_metadata() -> dict[str, Any]:
 
 
 def _challenge() -> Response:
-    """401 with the WWW-Authenticate challenge that drives client discovery."""
-    metadata_url = f"{config.MCP_PUBLIC_URL}{METADATA_PATH}"
+    """401 with the WWW-Authenticate challenge that drives client discovery.
+
+    Points at the path-aware metadata location (RFC 9728) for the ``/mcp``
+    resource so a client that follows the hint loads metadata whose
+    ``resource`` matches the URL it dialed.
+    """
+    metadata_url = f"{config.MCP_PUBLIC_URL}{METADATA_PATH_FOR_RESOURCE}"
     return Response(
         status_code=401,
         headers={"WWW-Authenticate": (f'Bearer resource_metadata="{metadata_url}"')},
