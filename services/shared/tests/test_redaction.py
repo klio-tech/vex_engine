@@ -4,9 +4,16 @@ False positives are product damage (memories get mangled), so the
 false-positive corpus matters as much as the true-positive corpus.
 """
 
+import re
+
 import pytest
 
-from shared.redaction import Finding, RedactionResult, redact
+from shared.redaction import (
+    _credit_card_guard,
+    _luhn_valid,
+    _shannon_entropy,
+    redact,
+)
 
 # ---- true positives: every kind in the catalog --------------------------
 
@@ -135,3 +142,84 @@ def test_credit_card_fingerprint_normalized_across_formats():
     fp_s = [f for f in spaced.findings if f.kind == "credit_card"][0].fingerprint
     fp_p = [f for f in plain.findings if f.kind == "credit_card"][0].fingerprint
     assert fp_s == fp_p
+
+
+# ---- guard unit tests: branch coverage for internal helpers ----------------
+
+
+def test_shannon_entropy_empty_string_returns_zero():
+    """_shannon_entropy("") must return 0.0 (L161 early-return branch)."""
+    assert _shannon_entropy("") == 0.0
+
+
+def test_luhn_valid_double_minus_nine():
+    """_luhn_valid must correctly subtract 9 when doubled digit > 9 (L177 branch).
+
+    The Mastercard test card 5500000000000004 has a leading 5 in an alternate
+    position that doubles to 10 (> 9), triggering the ``n -= 9`` subtraction.
+    """
+    # 5500000000000004 is the standard Mastercard test card; the leading 5
+    # at the last alternate position doubles to 10, exercising n -= 9 at L177.
+    assert _luhn_valid("5500000000000004") is True
+
+
+def test_mastercard_test_card_is_redacted():
+    """The standard Mastercard test card must be detected through redact() (L177 path)."""
+    result = redact("card 5500 0000 0000 0004")
+    assert result.redacted is True
+    assert "credit_card" in {f.kind for f in result.findings}
+
+
+def test_credit_card_guard_rejects_too_short_digits():
+    """_credit_card_guard must return False for a match with < 13 stripped digits (L190 branch).
+
+    This is a defensive code path: the credit_card regex always produces 13-19 digit
+    matches, so L190 cannot be triggered via redact(). We call _credit_card_guard
+    directly with a synthetic match whose group(0) has < 13 digits.
+    """
+    pattern = re.compile(r"\d+")
+    short_match = pattern.match("411111111")  # 9 digits
+    assert short_match is not None
+    assert _credit_card_guard(short_match) is False
+
+
+def test_credit_card_luhn_invalid_not_redacted():
+    """A 16-digit sequence that fails Luhn must not be masked (L229 branch)."""
+    # 4111111111111112 passes length but fails Luhn (off-by-one on check digit).
+    result = redact("card 4111 1111 1111 1112")
+    assert result.redacted is False
+
+
+def test_credential_assignment_low_entropy_not_redacted():
+    """Low-entropy credential values must not be masked (L232 branch).
+
+    "password=aaaaaaaaaaaa" has near-zero entropy (all same char) and must
+    not trigger the credential_assignment detector.
+    """
+    result = redact("password=aaaaaaaaaaaa")
+    assert result.redacted is False
+
+
+def test_credential_assignment_short_high_entropy_redacted():
+    """Short (8-11 char) but high-entropy credential values must be masked (L203 branch).
+
+    The short-value path requires entropy >= 2.5 bits; "xK8#mP2!" has high
+    character diversity for 8 chars.
+    """
+    result = redact("secret=xK8#mP2!")
+    assert result.redacted is True
+    assert "credential_assignment" in {f.kind for f in result.findings}
+
+
+def test_already_masked_placeholder_not_re_redacted():
+    """A [REDACTED:...] placeholder must not be re-redacted (L226 branch).
+
+    After a first pass the clean_text contains only placeholders; a second
+    pass must return redacted=False (idempotency via the placeholder guard).
+    This also covers the 'continue' skip at L277.
+    """
+    first = redact("password=hunter2secret")
+    assert first.redacted is True
+    second = redact(first.clean_text)
+    assert second.redacted is False
+    assert second.clean_text == first.clean_text
