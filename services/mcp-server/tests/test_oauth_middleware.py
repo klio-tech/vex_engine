@@ -180,6 +180,34 @@ def test_flag_on_missing_config_fails_fast(monkeypatch):
         main.create_app()
 
 
+def test_rate_limited_bearer_gets_429(monkeypatch):
+    """When _rate_limiter.check returns a retry-after value, respond 429."""
+
+    def allow(token):
+        return OAuthIdentity(user_id="u-1", client_id="c-1")
+
+    def grant(identity):
+        return OAuthPrincipal(
+            org_id="org-1",
+            account_slug="acme",
+            user_id="u-1",
+            client_id="c-1",
+            plan="pro",
+            plan_overrides=None,
+        )
+
+    client = _client(monkeypatch, enabled=True, verify=allow, resolve=grant)
+
+    import app.oauth_middleware as om
+
+    monkeypatch.setattr(om._rate_limiter, "check", lambda key, **kw: 7)
+
+    resp = client.post("/mcp", json={}, headers={"Authorization": "Bearer good-token"})
+    assert resp.status_code == 429
+    assert resp.json()["error"] == "rate_limited"
+    assert resp.headers.get("Retry-After") == "7"
+
+
 def test_healthz_and_capture_unaffected(monkeypatch):
     client = _client(monkeypatch, enabled=True)
     assert client.get("/healthz").status_code == 200

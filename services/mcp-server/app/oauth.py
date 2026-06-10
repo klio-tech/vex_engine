@@ -353,3 +353,58 @@ class GrantResolver:
             plan=plan,
             plan_overrides=overrides,
         )
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting for OAuth principals
+# ---------------------------------------------------------------------------
+
+_RATE_WINDOW_S = 60.0
+# Default rpm for OAuth callers when the plan config exposes no explicit
+# value; matches the key path's default per-key rpm.
+DEFAULT_OAUTH_RPM = 1000
+
+
+class OAuthRateLimiter:
+    """Sliding-window request limiter keyed by ``user_id:client_id``.
+
+    Same observable semantics as the API-key limiter (429 + Retry-After):
+    at most ``rpm`` requests per trailing 60-second window per principal.
+    In-memory and per-replica (matches the key limiter's deployment model).
+
+    The ``check`` method is pure CPU/memory work — no I/O — so it is safe
+    to call directly on the async event loop without thread offloading.
+    """
+
+    def __init__(self) -> None:
+        self._hits: dict[str, list[float]] = {}
+        self._lock = threading.Lock()
+
+    def check(
+        self, key: str, *, rpm: int, now: Optional[float] = None
+    ) -> Optional[int]:
+        """Record a hit; return ``None`` if allowed, else seconds to retry after.
+
+        Args:
+            key: Composite principal identifier, e.g. ``"<user_id>:<client_id>"``.
+            rpm: Maximum requests allowed within the trailing ``_RATE_WINDOW_S``
+                window for this key.
+            now: Override the current timestamp (``time.monotonic()``) for
+                deterministic testing.
+
+        Returns:
+            ``None`` when the request is within the rate limit.
+            A positive integer (seconds) when the limit is exceeded; callers
+            should surface this as the ``Retry-After`` response header value.
+        """
+        ts = time.monotonic() if now is None else now
+        cutoff = ts - _RATE_WINDOW_S
+        with self._lock:
+            hits = [h for h in self._hits.get(key, []) if h > cutoff]
+            if len(hits) >= rpm:
+                # Oldest hit in the window determines when the window clears.
+                self._hits[key] = hits
+                return max(1, int(hits[0] + _RATE_WINDOW_S - ts) + 1)
+            hits.append(ts)
+            self._hits[key] = hits
+            return None

@@ -22,9 +22,11 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app import config
 from app.oauth import (
+    DEFAULT_OAUTH_RPM,
     GrantResolver,
     OAuthIdentity,
     OAuthPrincipal,
+    OAuthRateLimiter,
     SupabaseTokenVerifier,
     VerifierUnavailable,
 )
@@ -35,6 +37,8 @@ METADATA_PATH = "/.well-known/oauth-protected-resource"
 
 _verifier: Optional[SupabaseTokenVerifier] = None
 _resolver: Optional[GrantResolver] = None
+# Module-level singleton; in-memory, per-replica (matches the key-path limiter).
+_rate_limiter = OAuthRateLimiter()
 
 
 def _get_verifier() -> SupabaseTokenVerifier:
@@ -147,6 +151,25 @@ class OAuthLadderMiddleware:
                             "https://app.klio.tech/settings/connected-apps"
                         ),
                     },
+                )
+                await response(scope, receive, send)
+                return
+            # Rate-limit check: pure in-memory CPU work — called directly on
+            # the event loop (no thread offload needed).  Placed after the
+            # principal is confirmed valid and before it is attached so a
+            # throttled request never reaches the tool layer.
+            from shared.plan_limits import get_plan_config
+
+            plan_config = get_plan_config(principal.plan, principal.plan_overrides)
+            rpm = getattr(plan_config, "max_rpm", None) or DEFAULT_OAUTH_RPM
+            retry_after = _rate_limiter.check(
+                f"{principal.user_id}:{principal.client_id}", rpm=rpm
+            )
+            if retry_after is not None:
+                response = JSONResponse(
+                    status_code=429,
+                    content={"error": "rate_limited"},
+                    headers={"Retry-After": str(retry_after)},
                 )
                 await response(scope, receive, send)
                 return
