@@ -28,10 +28,16 @@ def upgrade() -> None:
         "memory_usage_counters",
         sa.Column("org_id", sa.String(64), nullable=False),
         sa.Column("period_month", sa.Date(), nullable=False),
-        sa.Column("memories_captured", sa.BigInteger(), server_default="0", nullable=False),
+        sa.Column(
+            "memories_captured", sa.BigInteger(), server_default="0", nullable=False
+        ),
         sa.Column("recalls", sa.BigInteger(), server_default="0", nullable=False),
-        sa.Column("memories_overage", sa.BigInteger(), server_default="0", nullable=False),
-        sa.Column("recalls_overage", sa.BigInteger(), server_default="0", nullable=False),
+        sa.Column(
+            "memories_overage", sa.BigInteger(), server_default="0", nullable=False
+        ),
+        sa.Column(
+            "recalls_overage", sa.BigInteger(), server_default="0", nullable=False
+        ),
         sa.Column(
             "updated_at",
             sa.DateTime(timezone=True),

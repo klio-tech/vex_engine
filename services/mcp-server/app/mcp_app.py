@@ -54,7 +54,11 @@ from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from sqlalchemy import text
 
-from app.auth import resolve_principal, resolve_principal_plan, resolve_project_from_request
+from app.auth import (
+    resolve_principal,
+    resolve_principal_plan,
+    resolve_project_from_request,
+)
 from app.config import (
     MCP_ALLOWED_HOSTS,
     MCP_ALLOWED_ORIGINS,
@@ -541,9 +545,7 @@ async def _perform_recall(
             ).fetchone()
             if row is not None:
                 project_label = {"id": project_id, "name": row.display_name}
-        memories = [
-            _serialize_record(r, project_label=project_label) for r in records
-        ]
+        memories = [_serialize_record(r, project_label=project_label) for r in records]
         return {"memories": memories, "count": len(memories)}
     except Exception:
         logger.exception("brain recall failed (scope=%s)", scope)
@@ -576,7 +578,11 @@ async def _perform_forget(ctx: Context, *, memory_id: str) -> dict[str, Any]:
     request = ctx.request_context.request
     if request is None:
         logger.error("brain forget got no transport request; cannot authenticate")
-        return {"forgotten": False, "error": "unauthorized", "detail": "no request context"}
+        return {
+            "forgotten": False,
+            "error": "unauthorized",
+            "detail": "no request context",
+        }
 
     try:
         org_id, agent_id = resolve_principal(request)

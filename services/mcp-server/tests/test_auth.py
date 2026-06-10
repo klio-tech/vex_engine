@@ -181,8 +181,7 @@ def test_resolve_project_header_resolves_via_find(monkeypatch):
         headers = {"X-Vex-Project": "git@github.com:acme/widgets.git"}
 
     assert (
-        auth_mod.resolve_project_from_request(_Req(), object(), org_id="o")
-        == "proj-1"
+        auth_mod.resolve_project_from_request(_Req(), object(), org_id="o") == "proj-1"
     )
 
 

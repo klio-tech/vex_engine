@@ -81,14 +81,14 @@ def test_placeholder_format_and_fingerprint():
 # ---- false positives: must NOT redact ------------------------------------
 
 FALSE_POSITIVES = [
-    "The migration id is 2d07c2d4-b3c5-4b49-8ff9-08961a737b61",        # UUID
-    "commit c2c3c09 fixed the bug",                                     # short SHA
-    "commit 5bfab80d528255fb2342c9395f2c3bf1e817f145ab90a702",          # long hex sha
-    "ORDER BY embedding <=> :embedding LIMIT 10",                       # SQL
-    "The user wants to connect Stripe to moonforge-prod.",              # prose w/ 'Stripe'
-    "Set MEMORY_EMBEDDING_MODEL to the default model name",             # env var name only
-    "the meeting is at 10:30, room 415",                                # not a phone
-    "version 4.1.1 released",                                           # not a card
+    "The migration id is 2d07c2d4-b3c5-4b49-8ff9-08961a737b61",  # UUID
+    "commit c2c3c09 fixed the bug",  # short SHA
+    "commit 5bfab80d528255fb2342c9395f2c3bf1e817f145ab90a702",  # long hex sha
+    "ORDER BY embedding <=> :embedding LIMIT 10",  # SQL
+    "The user wants to connect Stripe to moonforge-prod.",  # prose w/ 'Stripe'
+    "Set MEMORY_EMBEDDING_MODEL to the default model name",  # env var name only
+    "the meeting is at 10:30, room 415",  # not a phone
+    "version 4.1.1 released",  # not a card
 ]
 
 
@@ -101,6 +101,7 @@ def test_does_not_redact_ordinary_content(content):
 
 
 # ---- idempotency ----------------------------------------------------------
+
 
 def test_redaction_is_idempotent():
     content = "key: sk_test_51TcfsTP4cXbUl5jnQJG2Ou9BUcBChSVqEDNj7d65uQjZXtAVzI1XR2eewh5KDq8GmCfrr1a1xVRNcSdB1c7TtWrU00GsK8y8Je"
@@ -123,6 +124,7 @@ def test_empty_and_none_safe():
 
 # ---- regression: connection-string with email-as-username ----------------
 
+
 def test_connection_string_with_email_username_masks_password():
     result = redact("mongodb://jane.doe@example.com:p4ssw0rdXYZ@host:27017/db")
     assert "p4ssw0rdXYZ" not in result.clean_text
@@ -130,6 +132,7 @@ def test_connection_string_with_email_username_masks_password():
 
 
 # ---- regression: credit-card boundary and fingerprint normalization ------
+
 
 def test_credit_card_mask_preserves_following_space():
     result = redact("card 4111 1111 1111 1111 exp 12/28")

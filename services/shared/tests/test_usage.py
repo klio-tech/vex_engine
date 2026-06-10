@@ -43,7 +43,9 @@ def test_under_cap_allows_no_overage():
 def test_at_cap_free_raises():
     db = _db_with_counters(memories=1_000, recalls=0)
     with pytest.raises(MemoryQuotaExceeded) as exc:
-        check_memory_quota(db, "org-1", get_plan_config("free"), "memory", plan_name="free")
+        check_memory_quota(
+            db, "org-1", get_plan_config("free"), "memory", plan_name="free"
+        )
     assert exc.value.metric == "memory"
     assert exc.value.limit == 1_000
     # The block carries the machine-readable upgrade target one tier up.

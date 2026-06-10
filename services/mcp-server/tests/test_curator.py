@@ -590,10 +590,9 @@ async def test_run_curator_once_closes_session_even_if_tick_raises():
 async def test_distills_each_project_separately_and_tags_scope():
     """A batch spanning two projects (each >= min_inputs) distills per project,
     tagging every write with that partition's project_id/space_id."""
-    rows = (
-        [_row(i, f"a{i}", project_id="proj-A", space_id="sp-A") for i in range(1, 4)]
-        + [_row(i, f"b{i}", project_id="proj-B", space_id="sp-B") for i in range(4, 7)]
-    )
+    rows = [
+        _row(i, f"a{i}", project_id="proj-A", space_id="sp-A") for i in range(1, 4)
+    ] + [_row(i, f"b{i}", project_id="proj-B", space_id="sp-B") for i in range(4, 7)]
     session = _make_session(cursor=None, rows=rows)
     gen, ext, wsm = _patch_curator(summary="s", facts=["f1"])
 
@@ -662,7 +661,9 @@ async def test_input_count_is_per_partition():
         + [_row(i, f"b{i}", project_id="proj-B") for i in range(4, 8)]  # 4
     )
     session = _make_session(cursor=None, rows=rows)
-    gen, ext, wsm = _patch_curator(summary="s", facts=[])  # summary-only keeps it simple
+    gen, ext, wsm = _patch_curator(
+        summary="s", facts=[]
+    )  # summary-only keeps it simple
 
     with gen, ext, wsm as mock_write:
         await curator_tick(session, "org-1", min_inputs=3)
@@ -790,7 +791,9 @@ async def test_reconcile_judge_error_skips_pair(monkeypatch):
         embedding=[0.1],
         max_judgments=5,
     )
-    assert sup_count == 0 and judged == 1  # call attempted, skipped on failure, no raise
+    assert (
+        sup_count == 0 and judged == 1
+    )  # call attempted, skipped on failure, no raise
 
 
 # ---------------------------------------------------------------------------

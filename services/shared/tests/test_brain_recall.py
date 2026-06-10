@@ -486,5 +486,3 @@ async def test_existing_retrieve_memories_unchanged(db_session):
     contents = {r.content for r in results}
     assert "session-scoped fact" in contents
     assert all(r.session_id == session_id for r in results)
-
-

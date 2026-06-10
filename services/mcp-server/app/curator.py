@@ -67,7 +67,13 @@ from typing import Any, Callable, NamedTuple, Optional
 from sqlalchemy import text
 
 from shared.brain import write_scoped_memory
-from shared.memory import call_llm, embed_text, extract_facts, generate_summary, supersede_memory
+from shared.memory import (
+    call_llm,
+    embed_text,
+    extract_facts,
+    generate_summary,
+    supersede_memory,
+)
 
 logger = logging.getLogger("agentguard.mcp.curator")
 
