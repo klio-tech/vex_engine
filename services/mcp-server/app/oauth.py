@@ -154,3 +154,124 @@ class SupabaseTokenVerifier:
             logger.info("oauth: token lacks client identity; rejected")
             return None
         return OAuthIdentity(user_id=str(sub), client_id=str(client_id))
+
+
+# ---------------------------------------------------------------------------
+# Grant resolution: OAuthIdentity -> OAuthPrincipal
+# ---------------------------------------------------------------------------
+
+_GRANT_CACHE_TTL_S = 60.0
+# Negative results are cached briefly too, so a revoked client hammering the
+# endpoint does not hammer Supabase; kept shorter than the positive TTL so a
+# fresh consent becomes usable quickly.
+_GRANT_NEGATIVE_TTL_S = 15.0
+
+
+@dataclass(frozen=True)
+class OAuthPrincipal:
+    """A fully resolved OAuth caller, shaped to match the key path's data."""
+
+    org_id: str
+    account_slug: str
+    user_id: str
+    client_id: str
+    plan: str
+    plan_overrides: Optional[dict]
+
+
+class GrantResolver:
+    """Resolve a validated :class:`OAuthIdentity` to an :class:`OAuthPrincipal`.
+
+    Chain (the same joins the key path already performs):
+        oauth_grants(user_id, client_id, revoked_at IS NULL) -> account_slug
+        organizations(account_slug)                          -> org_id
+        accounts(slug)                                       -> plan, overrides
+
+    Results are cached per (user_id, client_id) for ``_GRANT_CACHE_TTL_S``
+    (60 s — the spec's revocation-lag bound, same TTL as the key cache).
+    All lookup failures return ``None`` — authn fails closed.
+    """
+
+    def __init__(self, *, supabase_engine: Any, tsdb_engine: Any) -> None:
+        self._supabase_engine = supabase_engine
+        self._tsdb_engine = tsdb_engine
+        self._cache: dict[
+            tuple[str, str], tuple[Optional["OAuthPrincipal"], float]
+        ] = {}
+        self._lock = threading.Lock()
+
+    def resolve(self, identity: OAuthIdentity) -> Optional["OAuthPrincipal"]:
+        key = (identity.user_id, identity.client_id)
+        now = time.monotonic()
+        with self._lock:
+            cached = self._cache.get(key)
+            if cached is not None:
+                principal, cached_at = cached
+                ttl = _GRANT_CACHE_TTL_S if principal else _GRANT_NEGATIVE_TTL_S
+                if now - cached_at < ttl:
+                    return principal
+        try:
+            principal = self._lookup(identity)
+        except Exception:
+            logger.warning("oauth: grant lookup failed (fail closed)", exc_info=True)
+            return None
+        with self._lock:
+            self._cache[key] = (principal, now)
+        return principal
+
+    def _lookup(self, identity: OAuthIdentity) -> Optional["OAuthPrincipal"]:
+        from sqlalchemy import text
+
+        with self._supabase_engine.connect() as conn:
+            grant = conn.execute(
+                text(
+                    """
+                    SELECT account_slug FROM oauth_grants
+                    WHERE user_id = :user_id
+                      AND oauth_client_id = :client_id
+                      AND revoked_at IS NULL
+                    LIMIT 1
+                    """
+                ),
+                {"user_id": identity.user_id, "client_id": identity.client_id},
+            ).fetchone()
+        if grant is None:
+            return None
+        account_slug = grant[0]
+
+        with self._tsdb_engine.connect() as conn:
+            org = conn.execute(
+                text(
+                    "SELECT org_id FROM organizations "
+                    "WHERE account_slug = :slug LIMIT 1"
+                ),
+                {"slug": account_slug},
+            ).fetchone()
+        if org is None:
+            # Spec: a grant whose account no longer resolves = revoked.
+            logger.info("oauth: grant account %s has no org; rejected", account_slug)
+            return None
+
+        with self._supabase_engine.connect() as conn:
+            plan_row = conn.execute(
+                text(
+                    "SELECT vex_plan, vex_plan_overrides FROM accounts "
+                    "WHERE slug = :slug LIMIT 1"
+                ),
+                {"slug": account_slug},
+            ).fetchone()
+        plan = plan_row[0] if plan_row and plan_row[0] else "free"
+        overrides = plan_row[1] if plan_row else None
+        if isinstance(overrides, str):
+            import json
+
+            overrides = json.loads(overrides)
+
+        return OAuthPrincipal(
+            org_id=str(org[0]),
+            account_slug=account_slug,
+            user_id=identity.user_id,
+            client_id=identity.client_id,
+            plan=plan,
+            plan_overrides=overrides,
+        )
