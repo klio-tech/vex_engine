@@ -86,7 +86,9 @@ async def test_token_without_client_id_rejected(verifier, rsa_key):
     assert await verifier.verify_token(token) is None
 
 
-async def test_unknown_kid_triggers_refetch_then_rejects(verifier, rsa_key, monkeypatch):
+async def test_unknown_kid_triggers_refetch_then_rejects(
+    verifier, rsa_key, monkeypatch
+):
     calls = {"n": 0}
     real = verifier._fetch_jwks
 
@@ -96,9 +98,16 @@ async def test_unknown_kid_triggers_refetch_then_rejects(verifier, rsa_key, monk
 
     monkeypatch.setattr(verifier, "_fetch_jwks", counting)
     token = pyjwt.encode(
-        {"iss": ISSUER, "sub": "u", "client_id": "c",
-         "iat": int(time.time()), "exp": int(time.time()) + 60},
-        rsa_key, algorithm="RS256", headers={"kid": "unknown-kid"},
+        {
+            "iss": ISSUER,
+            "sub": "u",
+            "client_id": "c",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 60,
+        },
+        rsa_key,
+        algorithm="RS256",
+        headers={"kid": "unknown-kid"},
     )
     assert await verifier.verify_token(token) is None
     assert calls["n"] >= 1  # refreshed on miss
@@ -113,3 +122,54 @@ async def test_jwks_fetch_failure_fails_closed(rsa_key, monkeypatch):
     monkeypatch.setattr(v, "_fetch_jwks", boom)
     token = _mint(rsa_key)
     assert await v.verify_token(token) is None
+
+
+async def test_unknown_kid_flood_is_backoff_limited(verifier, rsa_key, monkeypatch):
+    """A flood of bad-kid tokens must not force a JWKS fetch per request."""
+    calls = {"n": 0}
+    real = verifier._fetch_jwks
+
+    def counting():
+        calls["n"] += 1
+        return real()
+
+    monkeypatch.setattr(verifier, "_fetch_jwks", counting)
+
+    for i in range(20):
+        token = pyjwt.encode(
+            {
+                "iss": ISSUER,
+                "sub": "u",
+                "client_id": "c",
+                "iat": int(time.time()),
+                "exp": int(time.time()) + 60,
+            },
+            rsa_key,
+            algorithm="RS256",
+            headers={"kid": f"bad-{i}"},
+        )
+        assert await verifier.verify_token(token) is None
+
+    # cold load + at most one forced refresh within the backoff window
+    assert calls["n"] <= 2
+
+
+async def test_valid_token_still_verifies_after_backoff_engaged(verifier, rsa_key):
+    """A bad-kid token engaging the backoff must not break subsequent valid tokens."""
+    bad = pyjwt.encode(
+        {
+            "iss": ISSUER,
+            "sub": "u",
+            "client_id": "c",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 60,
+        },
+        rsa_key,
+        algorithm="RS256",
+        headers={"kid": "bad-x"},
+    )
+    assert await verifier.verify_token(bad) is None
+
+    good = _mint(rsa_key)
+    identity = await verifier.verify_token(good)
+    assert identity is not None
