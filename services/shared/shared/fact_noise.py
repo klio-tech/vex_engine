@@ -17,12 +17,16 @@ import re
 # Each pattern targets an unambiguous tool-call / raw-IO shape. Case-insensitive.
 _NOISE_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"^\s*used tool\b", re.IGNORECASE),
-    re.compile(r"\btool\s+[\w./-]+\s+was used\b", re.IGNORECASE),
-    re.compile(r"\bwas used with command\b", re.IGNORECASE),
+    # "Tool <Name> was used …" only when "Tool" is a clause-leading label
+    # (start of string / after sentence break), as the curator emits it.
+    # Anchoring prevents matching the common-noun "tool" mid-sentence in
+    # durable facts like "The migration tool db-migrate was used to …".
+    re.compile(r"(?:^|[.\n]\s*)tool\s+[\w./-]+\s+was used\b", re.IGNORECASE),
+    # Require the literal "command:" colon of a raw tool dump, so durable
+    # facts like "was used with command-line flags" do not match.
+    re.compile(r"\bwas used with command\s*:", re.IGNORECASE),
     re.compile(r"\bused the bash tool\b", re.IGNORECASE),
     re.compile(r"\bexecuted (?:a |the )?bash (?:command|tool)\b", re.IGNORECASE),
-    re.compile(r"\bexecuted bash command\b", re.IGNORECASE),
-    re.compile(r"\btool\s+\w+\s+was used (?:on|to)\b", re.IGNORECASE),
     # Raw tool I/O dumps captured verbatim.
     re.compile(r'input:\s*\{"command"', re.IGNORECASE),
     re.compile(r'response:\s*\{"stdout"', re.IGNORECASE),

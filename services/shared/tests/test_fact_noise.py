@@ -24,6 +24,23 @@ LEGIT = [
     "The user's name is Abhishek and they work on Klio.",
     "The engine validates Supabase tokens via JWKS.",
     "MoonForge uses a Stripe metered billing meter named moonforge_events.",
+    # Adversarial: durable facts that name a tool with the common noun "tool"
+    # mid-sentence followed by "was used". These describe WHAT the team used,
+    # not a captured tool invocation, and must survive.
+    "The migration tool db-migrate was used to roll out the schema change.",
+    "The team's preferred deploy tool flyctl was used for all production releases.",
+    "Our internal tool deploybot was used to ship the release.",
+    "The tool terraform was used to provision the staging cluster.",
+    "The reporting tool metabase was used to build the Q3 dashboard.",
+    "The team's tool eslint was used to lint the frontend.",
+    "The data pipeline tool airflow-cli was used to orchestrate ETL jobs.",
+    "We documented that the tool kubectl was used to debug the outage.",
+    # Adversarial: "was used with command-..." continuations that are not a
+    # raw "command:" tool dump.
+    "A custom tool was used with command-line flags for the import.",
+    "The user noted the tool was used with command palette shortcuts in VS Code.",
+    "The keyboard tool was used with command-key bindings on macOS.",
+    "The new tool was used with command-line arguments only, no GUI.",
 ]
 
 
