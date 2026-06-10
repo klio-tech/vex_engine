@@ -145,6 +145,8 @@ async def _perform_write(
             "detail": "no request context",
         }
 
+    _attach_client_name(ctx, request)
+
     try:
         org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
     except HTTPException as exc:
@@ -207,6 +209,33 @@ async def _perform_write(
 # Sentinel project value meaning "search across all projects" (no project
 # filter). Compared case-insensitively so "any"/"ANY"/"Any" all work.
 _PROJECT_ANY = "any"
+
+
+def _attach_client_name(ctx: Context, request: Any) -> None:
+    """Expose the MCP client's self-reported name for OAuth agent identity.
+
+    Reads the ``clientInfo.name`` from the ``initialize`` handshake
+    (``ctx.session.client_params.clientInfo``) and writes it to
+    ``request.state.mcp_client_name`` so that :func:`app.auth._oauth_agent_id`
+    can derive a stable, human-readable agent id for OAuth principals.
+
+    Best-effort: any exception (SDK shape change, missing session, None
+    client_params) is swallowed silently.  When the attribute is absent the
+    OAuth agent id simply falls back to the raw ``client_id`` — no memory
+    operation is blocked.
+
+    Confirmed SDK attribute path (mcp 1.27.x):
+        ``ctx.session``                          → ``ServerSession``
+        ``ctx.session.client_params``            → ``InitializeRequestParams | None``
+        ``ctx.session.client_params.clientInfo`` → ``Implementation``
+        ``ctx.session.client_params.clientInfo.name`` → ``str``
+    """
+    try:
+        client_info = ctx.session.client_params.clientInfo
+        if client_info and client_info.name:
+            request.state.mcp_client_name = client_info.name
+    except Exception:
+        pass
 
 
 def _serialize_record(
@@ -319,6 +348,8 @@ async def _perform_space(
         # authenticate, so deny rather than guess a principal.
         logger.error("brain space got no transport request; cannot authenticate")
         return {"error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
 
     try:
         org_id, _agent_id = resolve_principal(request)
@@ -443,6 +474,8 @@ async def _perform_recall(
         # authenticate, so deny rather than guess a principal.
         logger.error("brain recall got no transport request; cannot authenticate")
         return {"error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
 
     try:
         org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
@@ -583,6 +616,8 @@ async def _perform_forget(ctx: Context, *, memory_id: str) -> dict[str, Any]:
             "error": "unauthorized",
             "detail": "no request context",
         }
+
+    _attach_client_name(ctx, request)
 
     try:
         org_id, agent_id = resolve_principal(request)

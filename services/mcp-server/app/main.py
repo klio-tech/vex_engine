@@ -6,10 +6,12 @@ factory and a health endpoint. Auth and MCP tools are layered on in
 later tasks.
 """
 
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI
 
+from app import config, oauth_middleware
 from app.auth import shutdown_validator, verify_api_key
 from app.capture import router as capture_router
 from app.mcp_app import build_mcp_server
@@ -100,6 +102,30 @@ def create_app() -> FastAPI:
             "scopes": key_info.scopes,
         }
 
+    # --- MCP OAuth (flag-gated; spec 2026-06-10-mcp-oauth-design.md) -------
+    if config.MCP_OAUTH_ENABLED:
+        # Fail fast: refuse to start with an incomplete OAuth configuration.
+        # Without these three values the server will 500 on the first Bearer
+        # request, which is harder to diagnose than an explicit startup error.
+        missing = [
+            name
+            for name, val in (
+                ("SUPABASE_AUTH_ISSUER", config.SUPABASE_AUTH_ISSUER),
+                ("MCP_PUBLIC_URL", config.MCP_PUBLIC_URL),
+                ("SUPABASE_DATABASE_URL", os.environ.get("SUPABASE_DATABASE_URL")),
+            )
+            if not val
+        ]
+        if missing:
+            raise RuntimeError(
+                f"MCP_OAUTH_ENABLED=1 but required config missing: {', '.join(missing)}"
+            )
+
+        @app.get(oauth_middleware.METADATA_PATH)
+        def oauth_protected_resource():
+            """RFC 9728 metadata: points MCP clients at the Supabase AS."""
+            return oauth_middleware.protected_resource_metadata()
+
     # REST capture layer (passive memory for the thin `klio hook` client).
     # Registered BEFORE the root MCP mount so its ``/capture/*`` routes take
     # precedence over the catch-all mount below.
@@ -109,7 +135,12 @@ def create_app() -> FastAPI:
     # ``/healthz`` / ``/verify`` / ``/capture/*`` are registered above, so they
     # take precedence; all other paths fall through to the mounted MCP app,
     # whose transport serves the endpoint at ``MCP_ENDPOINT_PATH`` ("/mcp").
-    app.mount(MCP_MOUNT_PATH, mcp_server.streamable_http_app())
+    mcp_asgi = mcp_server.streamable_http_app()
+    if config.MCP_OAUTH_ENABLED:
+        mcp_asgi = oauth_middleware.OAuthLadderMiddleware(
+            mcp_asgi, mcp_path=MCP_ENDPOINT_PATH
+        )
+    app.mount(MCP_MOUNT_PATH, mcp_asgi)
 
     return app
 
