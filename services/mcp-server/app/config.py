@@ -79,3 +79,20 @@ CURATOR_ENABLED = _parse_bool(os.environ.get("CURATOR_ENABLED"), default=True)
 CURATOR_INTERVAL_SECONDS = _parse_int(
     os.environ.get("CURATOR_INTERVAL_SECONDS"), default=900, minimum=60
 )
+
+
+# --- MCP OAuth (engine = resource server; Supabase = authorization server) ---
+
+# Master switch. Off (default) preserves today's behavior exactly: Bearer
+# tokens are ignored and unauthenticated MCP requests reach the tools (which
+# return their own unauthorized result dicts).
+MCP_OAUTH_ENABLED: bool = os.environ.get("MCP_OAUTH_ENABLED", "0") == "1"
+
+# The Supabase project's auth issuer, e.g. "https://<ref>.supabase.co/auth/v1".
+# Used as the JWT `iss` check, the JWKS base (<issuer>/.well-known/jwks.json),
+# and the advertised authorization server in RFC 9728 metadata.
+SUPABASE_AUTH_ISSUER: str = os.environ.get("SUPABASE_AUTH_ISSUER", "").rstrip("/")
+
+# This deployment's public base URL, e.g. "https://mcp.klio.tech". Used as the
+# RFC 9728 `resource` identifier and in WWW-Authenticate challenges.
+MCP_PUBLIC_URL: str = os.environ.get("MCP_PUBLIC_URL", "").rstrip("/")
