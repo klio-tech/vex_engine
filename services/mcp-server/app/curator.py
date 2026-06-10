@@ -240,8 +240,11 @@ def _read_new_raw_rows(
     """Read up to ``batch_size`` RAW org memories past the keyset ``cursor``.
 
     Tenant-scoped by ``org_id`` and locked to ``scope='org'`` + RAW types +
-    ``status='active'`` so neither verification's session rows nor the curator's
-    own ``summary``/``fact`` output are ever returned.
+    ``status='active'`` and ``recall_hidden=FALSE`` so neither verification's
+    session rows nor the curator's own ``summary``/``fact`` output are ever
+    returned, and passive hook tool-call captures (stored as ``observation``
+    rows with ``recall_hidden=TRUE`` by migration 026) are NOT distilled into
+    facts — the curator synthesizes only deliberate writes.
 
     Pagination is **keyset** over the composite ``(created_at, id)``: a row is
     new if its ``created_at`` is strictly past the cursor's, OR it shares the
@@ -259,6 +262,7 @@ def _read_new_raw_rows(
             WHERE org_id = :org_id
               AND scope = 'org'
               AND status = 'active'
+              AND recall_hidden = FALSE
               AND memory_type IN ({_RAW_TYPES_SQL})
               AND (
                 :cursor_ts IS NULL

@@ -929,3 +929,31 @@ async def test_synthesize_and_store_reconciles_facts_not_summaries(monkeypatch):
     # max_judgments kwarg must be forwarded (budget enforcement).
     for c in reconcile_calls:
         assert isinstance(c["max_judgments"], int) and c["max_judgments"] > 0
+
+
+# ---------------------------------------------------------------------------
+# recall_hidden exclusion: passive hook captures must not be synthesized
+# ---------------------------------------------------------------------------
+
+
+def test_read_new_raw_rows_excludes_recall_hidden():
+    """The curator must not ingest passive hook tool-call observations
+    (recall_hidden=TRUE); synthesizing those into 'Tool X was used' facts is
+    the noise leak. It synthesizes only from deliberate writes."""
+    import app.curator as curator_mod
+    from app.curator import CursorState
+
+    captured = {}
+
+    class _DB:
+        def execute(self, sql, params=None):
+            captured["sql"] = str(sql)
+
+            class R:
+                def fetchall(self_inner):
+                    return []
+
+            return R()
+
+    curator_mod._read_new_raw_rows(_DB(), "org-1", CursorState(None, None), 50)
+    assert "recall_hidden = FALSE" in captured["sql"]
