@@ -50,6 +50,38 @@ _LEEWAY_S = 30
 # Caps unauthenticated bad-kid floods at ~1 upstream fetch per window.
 _JWKS_REFRESH_BACKOFF_S = 5.0
 
+# Signature algorithms we accept. Supabase signs OAuth-server tokens with
+# ES256 (EC P-256) by default on current projects; RS256 covers projects
+# still on RSA signing keys. The verifier must load the matching key type
+# for whichever the project's JWKS publishes.
+_ALLOWED_ALGS = ["RS256", "ES256"]
+# JWK key types we can build signing keys from (RSA and elliptic-curve).
+_SUPPORTED_KTY = ("RSA", "EC")
+
+
+def _build_key_map(jwks: dict) -> dict:
+    """Map ``kid`` -> public signing key for every supported JWK.
+
+    Handles both RSA (RS256) and EC (ES256) keys via :class:`jwt.PyJWK`, which
+    selects the correct algorithm from each JWK's ``kty``/``alg``/``crv``. A
+    single malformed JWK is skipped (logged) rather than failing the whole set,
+    so one bad key never blocks validation of tokens signed by a good one.
+    """
+    keys: dict = {}
+    for k in jwks.get("keys", []):
+        if k.get("kty") not in _SUPPORTED_KTY:
+            continue
+        try:
+            keys[k.get("kid")] = pyjwt.PyJWK.from_dict(k).key
+        except Exception:
+            logger.warning(
+                "oauth: failed to load JWK (kid=%s kty=%s)",
+                k.get("kid"),
+                k.get("kty"),
+                exc_info=True,
+            )
+    return keys
+
 
 @dataclass(frozen=True)
 class OAuthIdentity:
@@ -132,11 +164,7 @@ class SupabaseTokenVerifier:
                     raise VerifierUnavailable(
                         f"JWKS endpoint unreachable: {self._jwks_url}"
                     ) from exc
-                self._keys = {
-                    k.get("kid"): pyjwt.algorithms.RSAAlgorithm.from_jwk(k)
-                    for k in jwks.get("keys", [])
-                    if k.get("kty") == "RSA"
-                }
+                self._keys = _build_key_map(jwks)
                 self._fetched_at = time.monotonic()
                 self._last_forced_refresh = self._fetched_at
             elif stale or not self._keys:
@@ -147,11 +175,7 @@ class SupabaseTokenVerifier:
                     raise VerifierUnavailable(
                         f"JWKS endpoint unreachable: {self._jwks_url}"
                     ) from exc
-                self._keys = {
-                    k.get("kid"): pyjwt.algorithms.RSAAlgorithm.from_jwk(k)
-                    for k in jwks.get("keys", [])
-                    if k.get("kty") == "RSA"
-                }
+                self._keys = _build_key_map(jwks)
                 self._fetched_at = time.monotonic()
             return self._keys.get(kid)
 
@@ -195,7 +219,7 @@ class SupabaseTokenVerifier:
             claims = pyjwt.decode(
                 token,
                 key=key,
-                algorithms=["RS256"],
+                algorithms=_ALLOWED_ALGS,
                 issuer=self._issuer,
                 leeway=_LEEWAY_S,
                 options={

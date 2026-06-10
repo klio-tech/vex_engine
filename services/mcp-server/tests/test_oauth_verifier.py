@@ -231,3 +231,53 @@ async def test_forced_refresh_jwks_failure_raises_unavailable(rsa_key, monkeypat
     )
     with pytest.raises(VerifierUnavailable):
         await v.verify_token(token)
+
+
+# --- ES256 / EC keys (what Supabase actually publishes) --------------------
+
+
+def test_verifies_es256_ec_token(monkeypatch):
+    """Supabase signs OAuth tokens with ES256 (EC P-256); the verifier must
+    load the EC JWK and accept the ES256 token. Regression for the live
+    'unknown kid after JWKS refresh' → 401 failure."""
+    import time as _time
+
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    from app.oauth import SupabaseTokenVerifier
+
+    ec_key = ec.generate_private_key(ec.SECP256R1())
+    ec_kid = "ec-key-1"
+    public_jwk = pyjwt.algorithms.ECAlgorithm.to_jwk(
+        ec_key.public_key(), as_dict=True
+    )
+    public_jwk["kid"] = ec_kid
+    public_jwk["alg"] = "ES256"
+
+    v = SupabaseTokenVerifier(issuer=ISSUER)
+    monkeypatch.setattr(v, "_fetch_jwks", lambda: {"keys": [public_jwk]})
+
+    now = int(_time.time())
+    token = pyjwt.encode(
+        {
+            "iss": ISSUER,
+            "sub": "ec-user-123",
+            "client_id": "ec-client-abc",
+            "aud": "authenticated",
+            "iat": now,
+            "exp": now + 3600,
+        },
+        ec_key,
+        algorithm="ES256",
+        headers={"kid": ec_kid},
+    )
+
+    import anyio
+
+    async def _run():
+        return await v.verify_token(token)
+
+    identity = anyio.run(_run)
+    assert identity is not None
+    assert identity.user_id == "ec-user-123"
+    assert identity.client_id == "ec-client-abc"
