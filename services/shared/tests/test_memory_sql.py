@@ -178,6 +178,7 @@ def test_no_bind_param_immediately_followed_by_cast():
         os.path.join(here, "..", "shared", "memory.py"),
         os.path.join(here, "..", "shared", "brain.py"),
         os.path.join(here, "..", "..", "scripts", "run_redaction_backfill.py"),
+        os.path.join(here, "..", "..", "scripts", "run_fact_cleanup.py"),
         os.path.join(here, "..", "..", "scripts", "run_retention.py"),
         os.path.join(here, "..", "..", "mcp-server", "app", "capture.py"),
         os.path.join(here, "..", "..", "mcp-server", "app", "curator.py"),
