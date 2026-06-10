@@ -40,8 +40,10 @@ def test_calls_enforce_memory_retention_with_memory_days():
     fake_engine = MagicMock()
     fake_engine.connect.return_value = FakeConn()
 
-    with patch.dict("os.environ", {"DATABASE_URL": "x", "SUPABASE_DATABASE_URL": "y"}), \
-         patch.object(mod, "create_engine", return_value=fake_engine):
+    with (
+        patch.dict("os.environ", {"DATABASE_URL": "x", "SUPABASE_DATABASE_URL": "y"}),
+        patch.object(mod, "create_engine", return_value=fake_engine),
+    ):
         mod.main()
 
     assert any(

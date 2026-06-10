@@ -36,8 +36,10 @@ def _no_metering():
     These tests focus on tool wiring and payload mapping, not metering.
     Patch quota checks to always pass (no-op) so tests stay focused.
     """
-    with patch("app.mcp_app.check_memory_quota", return_value=False), \
-         patch("app.mcp_app.record_usage"):
+    with (
+        patch("app.mcp_app.check_memory_quota", return_value=False),
+        patch("app.mcp_app.record_usage"),
+    ):
         yield
 
 
@@ -98,7 +100,10 @@ async def test_recall_happy_path_serializes_without_embedding():
     session_local = MagicMock(return_value=session)
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", session_local),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
     ):
@@ -142,7 +147,10 @@ async def test_recall_stringifies_uuid_space_and_project_ids():
     retrieve_mock = AsyncMock(return_value=[rec])
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
     ):
@@ -166,7 +174,10 @@ async def test_recall_serializes_null_space_and_project_ids():
     retrieve_mock = AsyncMock(return_value=[rec])
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
     ):
@@ -186,7 +197,10 @@ async def test_recall_serializes_null_created_at():
     retrieve_mock = AsyncMock(return_value=[rec])
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
     ):
@@ -212,7 +226,10 @@ async def test_recall_logs_event():
     session = MagicMock()
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=session)),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
         patch("app.mcp_app.log_recall_event", log_mock),
@@ -244,7 +261,10 @@ async def test_recall_org_isolation_uses_resolved_principal():
     retrieve_mock = AsyncMock(return_value=[])
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-secure", "agent-z", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-secure", "agent-z", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
     ):
@@ -269,7 +289,10 @@ async def test_recall_agent_scope_forwards_agent_id():
     retrieve_mock = AsyncMock(return_value=[])
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
     ):
@@ -292,7 +315,10 @@ async def test_recall_resolves_space_filter():
     retrieve_mock = AsyncMock(return_value=[])
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "find_space_id", return_value="space-42"),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
@@ -309,7 +335,10 @@ async def test_recall_unknown_space_returns_warning_without_retrieve():
     retrieve_mock = AsyncMock(return_value=[])
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "find_space_id", return_value=None),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
@@ -332,7 +361,10 @@ async def test_recall_resolves_project_filter():
     retrieve_mock = AsyncMock(return_value=[])
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "find_project_id", return_value="proj-99"),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
@@ -349,7 +381,10 @@ async def test_recall_unknown_project_returns_warning_without_retrieve():
     retrieve_mock = AsyncMock(return_value=[])
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "find_project_id", return_value=None),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
@@ -372,7 +407,10 @@ async def test_recall_project_any_is_cross_project_no_lookup():
     find_project = MagicMock()
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "find_project_id", find_project),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
@@ -393,7 +431,10 @@ async def test_recall_project_any_case_insensitive():
     find_project = MagicMock()
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "find_project_id", find_project),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
@@ -416,7 +457,10 @@ async def test_recall_no_filters_passes_none():
     retrieve_mock = AsyncMock(return_value=[])
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
     ):

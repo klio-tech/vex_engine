@@ -34,8 +34,10 @@ def _no_metering():
     These tests focus on tool wiring and payload mapping, not metering.
     Patch quota checks to always pass (no-op) so tests stay focused.
     """
-    with patch("app.mcp_app.check_memory_quota", return_value=False), \
-         patch("app.mcp_app.record_usage"):
+    with (
+        patch("app.mcp_app.check_memory_quota", return_value=False),
+        patch("app.mcp_app.record_usage"),
+    ):
         yield
 
 
@@ -122,7 +124,10 @@ async def test_decide_with_rationale_sets_metadata():
     write_mock = AsyncMock(return_value=_canned_result("decision"))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -142,7 +147,10 @@ async def test_decide_without_rationale_omits_rationale_metadata():
     write_mock = AsyncMock(return_value=_canned_result("decision"))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -160,7 +168,10 @@ async def test_session_id_falls_back_to_principal_without_header():
     write_mock = AsyncMock(return_value=_canned_result("memory"))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -228,7 +239,10 @@ async def test_write_tool_scope_agent_forwarded():
     write_mock = AsyncMock(return_value=_canned_result("memory"))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -244,7 +258,10 @@ async def test_write_tool_scope_defaults_to_org():
     write_mock = AsyncMock(return_value=_canned_result("observation"))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -274,7 +291,10 @@ async def test_write_files_under_header_project(monkeypatch):
         return {"stored": True, "deduplicated": False, "id": "x", "scope": "org"}
 
     with (
-        patch("app.mcp_app.resolve_principal_plan", return_value=("org-x", "agent-y", "free", None)),
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch.object(mcp_app.brain, "write_scoped_memory", _fake_write),
         patch("app.mcp_app.resolve_project_from_request", return_value="proj-9"),

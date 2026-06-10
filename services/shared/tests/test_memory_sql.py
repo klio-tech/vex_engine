@@ -129,8 +129,24 @@ async def test_relevance_populated_on_records(monkeypatch):
     # 19 elements: 18 record columns (indices 0-17) + relevance at index 18.
     # No blended_score column — it is only used in the outer ORDER BY.
     fake_row = (
-        uuid.uuid4(), "s", "org-1", "a", None, "fact", "content", None, None,
-        None, "org", "active", None, {}, now, now, None, None,
+        uuid.uuid4(),
+        "s",
+        "org-1",
+        "a",
+        None,
+        "fact",
+        "content",
+        None,
+        None,
+        None,
+        "org",
+        "active",
+        None,
+        {},
+        now,
+        now,
+        None,
+        None,
         0.91,
     )
 

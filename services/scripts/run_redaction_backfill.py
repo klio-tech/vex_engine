@@ -111,9 +111,7 @@ def process_recall_events(db: Any, *, apply: bool, org_id: Optional[str]) -> int
         hits += 1
         if apply:
             db.execute(
-                text(
-                    "UPDATE brain_recall_events SET query_text = :q WHERE id = :id"
-                ),
+                text("UPDATE brain_recall_events SET query_text = :q WHERE id = :id"),
                 {"q": result.clean_text, "id": str(row.id)},
             )
     if apply:
@@ -145,7 +143,7 @@ async def run(database_url: str, *, apply: bool, org_id: Optional[str]) -> None:
                     f"""
                     SELECT id, org_id, content, created_at
                     FROM session_memories
-                    WHERE {' AND '.join(where)}
+                    WHERE {" AND ".join(where)}
                     ORDER BY created_at ASC, id ASC
                     LIMIT :batch
                     """

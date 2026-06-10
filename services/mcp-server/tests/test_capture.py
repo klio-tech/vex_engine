@@ -519,11 +519,12 @@ def test_capture_forget_returns_404_for_unknown_id(client):
     db_patch, _ = _patch_db()
     with (
         db_patch,
-        patch("app.capture.retract_memory", return_value={"forgotten": False, "error": "not_found"}),
+        patch(
+            "app.capture.retract_memory",
+            return_value={"forgotten": False, "error": "not_found"},
+        ),
     ):
-        resp = client.post(
-            "/capture/forget", json={"memory_id": str(uuid.uuid4())}
-        )
+        resp = client.post("/capture/forget", json={"memory_id": str(uuid.uuid4())})
     assert resp.status_code == 404
     assert resp.json()["detail"] == "not_found"
 
@@ -536,7 +537,9 @@ def test_capture_forget_returns_200_on_success(client):
     db_patch, _ = _patch_db()
     with (
         db_patch,
-        patch("app.capture.retract_memory", return_value={"forgotten": True, "id": mem_id}),
+        patch(
+            "app.capture.retract_memory", return_value={"forgotten": True, "id": mem_id}
+        ),
     ):
         resp = client.post("/capture/forget", json={"memory_id": mem_id})
     assert resp.status_code == 200

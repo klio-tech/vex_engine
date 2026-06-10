@@ -103,6 +103,7 @@ def _check_memory_quota_402(
             },
         ) from exc
 
+
 # Memory types a passive capture *event* is allowed to write.  Deliberately
 # EXCLUDES the curator's output types ('summary'/'fact') so a hook can never
 # inject a synthesised type, and excludes arbitrary free strings.  Mirrors the

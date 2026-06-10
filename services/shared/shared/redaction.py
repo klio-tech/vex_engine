@@ -78,7 +78,9 @@ _PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
     #   mongodb://jane.doe@example.com:p4ssw0rdXYZ@host:27017/db
     (
         "connection_string",
-        re.compile(r"(?:\b[a-z][a-z0-9+.\-]*://)(?:[^\s/@]+@)?[^\s:/@]+:([^\s@]+)@[^\s]+"),
+        re.compile(
+            r"(?:\b[a-z][a-z0-9+.\-]*://)(?:[^\s/@]+@)?[^\s:/@]+:([^\s@]+)@[^\s]+"
+        ),
     ),
     # --- HTTP Bearer token ---------------------------------------------------
     # Capture group 1 = the token value.
