@@ -183,6 +183,8 @@ def test_no_bind_param_immediately_followed_by_cast():
         os.path.join(here, "..", "..", "mcp-server", "app", "curator.py"),
         os.path.join(here, "..", "..", "mcp-server", "app", "mcp_app.py"),
         os.path.join(here, "..", "..", "mcp-server", "app", "recall_log.py"),
+        os.path.join(here, "..", "..", "mcp-server", "app", "oauth.py"),
+        os.path.join(here, "..", "..", "mcp-server", "app", "auth.py"),
     ]
     pattern = re.compile(r":[A-Za-z_]\w*::")
     offenders = {}

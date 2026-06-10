@@ -97,3 +97,43 @@ def test_resolution_is_cached_for_ttl(monkeypatch):
     resolver.resolve(identity)
     resolver.resolve(identity)
     assert calls["n"] == 1  # second hit served from cache
+
+
+def test_negative_result_is_cached(monkeypatch):
+    """A no-grant miss is served from cache within the negative TTL."""
+    resolver = _resolver(grant_slug=None)
+    calls = {"n": 0}
+    real = resolver._lookup
+
+    def counting(identity):
+        calls["n"] += 1
+        return real(identity)
+
+    monkeypatch.setattr(resolver, "_lookup", counting)
+    identity = OAuthIdentity(user_id="u-1", client_id="c-1")
+    assert resolver.resolve(identity) is None
+    assert resolver.resolve(identity) is None
+    assert calls["n"] == 1
+
+
+def test_negative_cache_expires_faster_than_positive(monkeypatch):
+    """Negative entries expire after 15s (not 60s) so a fresh consent
+    becomes usable quickly."""
+    import app.oauth as oauth_mod
+
+    resolver = _resolver(grant_slug=None)
+    calls = {"n": 0}
+    real = resolver._lookup
+
+    def counting(identity):
+        calls["n"] += 1
+        return real(identity)
+
+    monkeypatch.setattr(resolver, "_lookup", counting)
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(oauth_mod.time, "monotonic", lambda: clock["now"])
+    identity = OAuthIdentity(user_id="u-1", client_id="c-1")
+    resolver.resolve(identity)
+    clock["now"] += 16.0  # past the 15s negative TTL, well inside 60s
+    resolver.resolve(identity)
+    assert calls["n"] == 2
