@@ -108,7 +108,13 @@ def protected_resource_metadata() -> dict[str, Any]:
         "resource": mcp_resource_url(),
         "authorization_servers": [config.SUPABASE_AUTH_ISSUER],
         "bearer_methods_supported": ["header"],
-        "scopes_supported": ["memory"],
+        # Advertise only scopes the authorization server (Supabase) actually
+        # supports: a client reads these and requests them at the AS, which
+        # rejects any it doesn't recognize (e.g. a product-specific "memory"
+        # scope) with `unsupported scope`, aborting discovery before login.
+        # Memory access is authorized by the oauth_grants row + client_id, NOT
+        # by an OAuth scope string, so `openid` is sufficient here.
+        "scopes_supported": ["openid"],
         "resource_documentation": "https://klio.tech/docs/mcp",
     }
 
