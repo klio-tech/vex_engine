@@ -71,7 +71,7 @@ async def process_memory_batch(
                 SET content = :content,
                     embedding = :embedding,
                     metadata = COALESCE(metadata, '{}'::jsonb)
-                               || :extra_meta::jsonb,
+                               || CAST(:extra_meta AS jsonb),
                     updated_at = NOW()
                 WHERE id = :id
                 """

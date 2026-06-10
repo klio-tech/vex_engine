@@ -658,9 +658,9 @@ def retract_memory(
             SET status = 'retracted',
                 metadata = COALESCE(metadata, '{}'::jsonb)
                            || jsonb_build_object(
-                               'retracted_by', :agent_id::text,
+                               'retracted_by', CAST(:agent_id AS text),
                                'retracted_at', NOW()::text,
-                               'retracted_via', :via::text
+                               'retracted_via', CAST(:via AS text)
                            ),
                 updated_at = NOW()
             WHERE id = :id AND org_id = :org_id

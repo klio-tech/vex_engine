@@ -144,3 +144,39 @@ async def test_relevance_populated_on_records(monkeypatch):
 
     records = await memory_mod.retrieve_memories_scoped(_DB(), "org-1", "q")
     assert records[0].relevance == 0.91
+
+
+def test_no_bind_param_immediately_followed_by_cast():
+    """Ban `:param::type` in raw SQL — SQLAlchemy's text() does not recognize
+    a bind param whose name is immediately followed by `::` (the tokenizer
+    requires a non-word, non-colon character after the name), so the raw
+    `:param` reaches Postgres and fails with a syntax error at runtime.
+    Use `CAST(:param AS type)` instead. This broke the production `forget`
+    tool and would have broken the redaction backfill's --apply mode.
+    """
+    import os
+    import re
+
+    here = os.path.dirname(__file__)
+    sources = [
+        os.path.join(here, "..", "shared", "memory.py"),
+        os.path.join(here, "..", "shared", "brain.py"),
+        os.path.join(here, "..", "..", "scripts", "run_redaction_backfill.py"),
+        os.path.join(here, "..", "..", "scripts", "run_retention.py"),
+        os.path.join(here, "..", "..", "mcp-server", "app", "capture.py"),
+        os.path.join(here, "..", "..", "mcp-server", "app", "curator.py"),
+        os.path.join(here, "..", "..", "mcp-server", "app", "mcp_app.py"),
+        os.path.join(here, "..", "..", "mcp-server", "app", "recall_log.py"),
+    ]
+    pattern = re.compile(r":[A-Za-z_]\w*::")
+    offenders = {}
+    for path in sources:
+        with open(path) as f:
+            hits = [
+                f"line {i}: {line.strip()}"
+                for i, line in enumerate(f, 1)
+                if pattern.search(line)
+            ]
+        if hits:
+            offenders[os.path.basename(path)] = hits
+    assert not offenders, f"bind-then-cast SQL found (use CAST()): {offenders}"
