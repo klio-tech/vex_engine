@@ -14,12 +14,14 @@ never read or return a row belonging to a different org.
 """
 
 import logging
+import os
 import uuid
 from typing import Any, Optional
 
 from sqlalchemy import text
 
 from shared.memory import find_similar_memory, write_memory
+from shared.redaction import redact
 
 logger = logging.getLogger("agentguard.shared.brain")
 
@@ -449,6 +451,7 @@ async def write_scoped_memory(
     metadata: Optional[dict] = None,
     dedup: bool = True,
     scope: str = "org",
+    recall_hidden: bool = False,
 ) -> dict:
     """Write a memory into the Klio brain at org or agent scope (with dedup).
 
@@ -501,19 +504,35 @@ async def write_scoped_memory(
             similar active memory already exists in the dedup window (see Scope).
         scope: ``'org'`` (default) or ``'agent'``. Determines the final scope the
             row is promoted to and the dedup window.
+        recall_hidden: When ``True`` the row is stored but excluded from agent
+            recall results (``retrieve_memories_scoped`` and the recency
+            fallback). Raw ``observation`` rows written by passive hooks should
+            pass ``True``; deliberate types (``note``, ``plan``, ``decision``,
+            ``memory``) should keep the default ``False``.
 
     Returns:
         A result dict describing the outcome (``scope`` echoes the requested
         scope):
 
+        * redaction failure →
+          ``{"stored": False, "error": "redaction_failed"}``
+          The redactor raised an unexpected exception; the unscreened content
+          was rejected (fail-closed). No DB write was attempted.
         * dedup hit →
           ``{"stored": False, "deduplicated": True, "id": ..., "memory_type":
-          ..., "scope": <scope>}``
+          ..., "scope": <scope>, "redacted": <bool>, "redaction_kinds": [...]}``
         * embedding failure →
           ``{"stored": False, "error": "embedding_failed"}``
         * success →
           ``{"stored": True, "deduplicated": False, "id": ..., "memory_type":
-          ..., "scope": <scope>, "space_id": ..., "project_id": ...}``
+          ..., "scope": <scope>, "space_id": ..., "project_id": ...,
+          "redacted": <bool>, "redaction_kinds": [...]}``
+
+        ``redacted`` is ``True`` when at least one secret/PII pattern was
+        detected and masked. ``redaction_kinds`` is a sorted list of the
+        distinct kind strings (e.g. ``["stripe_secret_key"]``); it is empty
+        when no secrets were found.  When ``MEMORY_REDACTION_DISABLED=1``
+        both keys are still present with their no-op values (``False`` / ``[]``).
 
     Raises:
         ValueError: If ``scope`` is neither ``'org'`` nor ``'agent'``.
@@ -522,6 +541,26 @@ async def write_scoped_memory(
         raise ValueError(
             f"unsupported scope: {scope!r} (write_scoped_memory accepts 'org' or 'agent')"
         )
+
+    # --- redaction (fail closed) -----------------------------------------
+    # Mask secrets/PII BEFORE dedup-embedding and storage so neither the
+    # stored text nor any embedding ever contains a detected secret. A
+    # redactor crash rejects the write: unscreened content is never stored.
+    # MEMORY_REDACTION_DISABLED=1 is a self-hosted escape hatch only.
+    redaction_kinds: list[str] = []
+    was_redacted = False
+    if os.environ.get("MEMORY_REDACTION_DISABLED") != "1":
+        try:
+            redaction = redact(content)
+        except Exception:
+            logger.exception("redaction failed; rejecting write (fail closed)")
+            return {"stored": False, "error": "redaction_failed"}
+        if redaction.redacted:
+            content = redaction.clean_text
+            redaction_kinds = sorted({f.kind for f in redaction.findings})
+            was_redacted = True
+            metadata = dict(metadata or {})
+            metadata["redactions"] = redaction_kinds
 
     if dedup:
         existing = await find_similar_memory(
@@ -541,6 +580,8 @@ async def write_scoped_memory(
                 "id": str(existing.id),
                 "memory_type": existing.memory_type,
                 "scope": scope,
+                "redacted": was_redacted,
+                "redaction_kinds": redaction_kinds,
             }
 
     # write_memory's 5th positional arg is execution_id; the column is nullable
@@ -554,6 +595,7 @@ async def write_scoped_memory(
         memory_type,
         content,
         metadata=metadata,
+        recall_hidden=recall_hidden,
     )
     if record is None:
         # write_memory returns None when embedding generation fails.
@@ -591,4 +633,6 @@ async def write_scoped_memory(
         "scope": scope,
         "space_id": space_id,
         "project_id": project_id,
+        "redacted": was_redacted,
+        "redaction_kinds": redaction_kinds,
     }

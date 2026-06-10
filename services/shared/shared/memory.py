@@ -39,6 +39,14 @@ DEFAULT_LLM_TIMEOUT_S: float = 10.0
 # Providers that support response_format via gateway
 _JSON_MODE_PREFIXES = ("openai/", "gpt-")
 
+# Credential-reproduction guard injected into every synthesis prompt so that
+# the LLM is explicitly instructed not to echo secrets even in prose form.
+_NO_CREDENTIALS_RULE = (
+    "Never reproduce credentials, API keys, tokens, passwords, or other "
+    "secrets — not even partially. If the content contains one, refer to it "
+    "generically (e.g. 'a Stripe test key was provided'). "
+)
+
 
 # ---------------------------------------------------------------------------
 # Data class
@@ -67,6 +75,7 @@ class MemoryRecord:
     updated_at: Optional[datetime] = None
     space_id: Optional[str] = None
     project_id: Optional[str] = None
+    relevance: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +218,9 @@ async def generate_summary(
 
     prompt = (
         "Summarize the following agent turn in 1-2 concise sentences. "
-        "Focus on what the agent did and the outcome.\n\n"
+        "Focus on what the agent did and the outcome. "
+        + _NO_CREDENTIALS_RULE
+        + "\n\n"
         + "\n".join(parts)
         + '\n\nRespond with JSON: {"summary": "<your summary>"}'
     )
@@ -239,7 +250,9 @@ async def extract_facts(
 
     prompt = (
         "Extract discrete, verifiable facts from the following agent turn. "
-        "Each fact should be a short, self-contained statement.\n\n"
+        "Each fact should be a short, self-contained statement. "
+        + _NO_CREDENTIALS_RULE
+        + "\n\n"
         + "\n".join(parts)
         + '\n\nRespond with JSON: {"facts": ["fact1", "fact2", ...]}'
     )
@@ -304,8 +317,28 @@ async def write_memory(
     confidence: Optional[float] = None,
     sequence_number: Optional[int] = None,
     metadata: Optional[dict] = None,
+    recall_hidden: bool = False,
 ) -> Optional[MemoryRecord]:
     """Generate an embedding and INSERT a new row into ``session_memories``.
+
+    Args:
+        db_session: A synchronous SQLAlchemy session/connection.
+        session_id: The session this memory belongs to.
+        org_id: Owning org id (tenant scope).
+        agent_id: Authoring agent principal.
+        execution_id: Verification execution id (nullable — pass ``None`` for
+            brain writes that are not tied to a specific execution).
+        memory_type: The memory type string (e.g. ``observation``, ``fact``).
+        content: The memory text to store.
+        confidence: Optional confidence score.
+        sequence_number: Optional ordering sequence within a session.
+        metadata: Optional metadata dict persisted on the row.
+        recall_hidden: When ``True`` the row is stored but excluded from agent
+            recall results (``retrieve_memories_scoped`` and the recency
+            fallback). Raw ``observation`` rows written by passive hooks are
+            stored recall-hidden so they act as curator fuel without polluting
+            the recall surface. Deliberate writes (``note``, ``plan``,
+            ``decision``, ``memory``) keep the default ``False``.
 
     Returns:
         A :class:`MemoryRecord` on success, or ``None`` if embedding
@@ -325,12 +358,12 @@ async def write_memory(
                 id, session_id, org_id, agent_id, execution_id,
                 memory_type, content, embedding, confidence,
                 sequence_number, scope, status, metadata,
-                created_at, updated_at
+                created_at, updated_at, recall_hidden
             ) VALUES (
                 :id, :session_id, :org_id, :agent_id, :execution_id,
                 :memory_type, :content, :embedding, :confidence,
                 :sequence_number, 'session', 'active', :metadata,
-                :created_at, :updated_at
+                :created_at, :updated_at, :recall_hidden
             )
         """),
         {
@@ -347,6 +380,7 @@ async def write_memory(
             "metadata": json.dumps(meta),
             "created_at": now,
             "updated_at": now,
+            "recall_hidden": recall_hidden,
         },
     )
     db_session.commit()
@@ -579,6 +613,65 @@ def supersede_memory(
     db_session.commit()
 
 
+def retract_memory(
+    db_session: Any,
+    *,
+    org_id: str,
+    agent_id: str,
+    memory_id: str,
+    via: str,
+) -> dict:
+    """Explicitly retract a memory (the ``forget`` tool's storage primitive).
+
+    Authorization ladder (org_id always enforced):
+      * unknown / cross-org id → not_found (indistinguishable by design)
+      * scope='agent' row owned by another agent → forbidden
+      * otherwise → status='retracted' + audit metadata; recall never
+        returns non-'active' rows, so the memory disappears immediately.
+
+    Synchronous (inline psycopg2 I/O), matching the house pattern.
+    """
+    try:
+        parsed = uuid.UUID(memory_id)
+    except (ValueError, AttributeError, TypeError):
+        return {"forgotten": False, "error": "invalid_id"}
+
+    row = db_session.execute(
+        text(
+            """
+            SELECT scope, agent_id FROM session_memories
+            WHERE id = :id AND org_id = :org_id AND status = 'active'
+            LIMIT 1
+            """
+        ),
+        {"id": str(parsed), "org_id": org_id},
+    ).fetchone()
+    if row is None:
+        return {"forgotten": False, "error": "not_found"}
+    if row.scope == "agent" and row.agent_id != agent_id:
+        return {"forgotten": False, "error": "forbidden"}
+
+    db_session.execute(
+        text(
+            """
+            UPDATE session_memories
+            SET status = 'retracted',
+                metadata = COALESCE(metadata, '{}'::jsonb)
+                           || jsonb_build_object(
+                               'retracted_by', :agent_id::text,
+                               'retracted_at', NOW()::text,
+                               'retracted_via', :via::text
+                           ),
+                updated_at = NOW()
+            WHERE id = :id AND org_id = :org_id
+            """
+        ),
+        {"id": str(parsed), "org_id": org_id, "agent_id": agent_id, "via": via},
+    )
+    db_session.commit()
+    return {"forgotten": True, "id": str(parsed)}
+
+
 async def retrieve_memories_scoped(
     db_session: Any,
     org_id: str,
@@ -614,29 +707,54 @@ async def retrieve_memories_scoped(
           silently reading org-wide.
         * any other value → raises ``ValueError``.
 
+    NOTE: HNSW candidate-pool trade-off — the inner query fetches
+    ``candidate_pool = limit * 4`` approximate nearest neighbours, then the
+    outer query re-ranks them by the blended score and returns the top
+    ``limit``.  A relevant-but-stale row that falls outside the top-4× ANN
+    candidates will not be rescued by the recency bonus; this is accepted,
+    matching the v1 under-fill acceptance documented below.
+
     NOTE: HNSW is an approximate index; with selective WHERE filters the result
     may under-fill ``limit``. Acceptable for v1.
+
+    Hidden-row contract: rows with ``recall_hidden = TRUE`` are **always**
+    excluded from results regardless of scope or other filters. These rows
+    are raw passive-hook observations stored as curator fuel; only the curator
+    process reads them (it does not filter on ``recall_hidden``).
 
     Args:
         db_session: A synchronous SQLAlchemy connection/session exposing
             ``.execute()`` (same contract as :func:`retrieve_memories`).
         org_id: Tenant whose memories to search. Always enforced — results are
             never returned from another org.
-        query_text: Natural-language query; embedded and ranked by cosine
-            distance against stored memory embeddings.
+        query_text: Natural-language query; embedded and ranked by a blended
+            score (``0.85 * similarity + 0.15 * recency_norm``) over a 30-day
+            recency window (recency_norm clamped to [0, 1]) so that stale
+            near-duplicates are demoted relative to recent relevant memories.
+            Each returned :class:`MemoryRecord` has its ``relevance`` field
+            populated with the raw cosine-similarity score (``1 - cosine
+            distance``).  The inner query is HNSW-accelerated
+            (``ORDER BY embedding <=> :embedding LIMIT :candidate_pool``);
+            the outer re-ranks the bounded candidate pool by blended score.
         scope: One of ``"org"`` or ``"agent"`` (see the visibility ladder
             above). ``"session"`` and any unknown value raise ``ValueError``.
         agent_id: Required when ``scope == "agent"``; ignored otherwise.
         space_id: When given, match rows whose ``space_id`` equals it OR is
             ``NULL`` (unfiled memories surface in every space filter — the safe
             default so nothing is hidden by an over-narrow filter).
-        project_id: When given, match rows whose ``project_id`` equals it OR is
-            ``NULL`` (same NULL-surfacing semantics as ``space_id``).
+        project_id: Two-tier scoping. When given:
+            * **Tier 1** — rows where ``project_id = :project_id`` fill the
+              first ``limit`` slots.
+            * **Tier 2** — unfiled rows (``project_id IS NULL``) fill any
+              remaining slots.
+            * Rows filed under OTHER projects are NEVER surfaced. This replaces
+              the old flat ``(project_id = X OR project_id IS NULL)`` filter.
         limit: Maximum number of records to return.
 
     Returns:
-        A list of :class:`MemoryRecord` ordered by ascending cosine distance
-        (closest first), or an empty list if embedding generation fails.
+        A list of :class:`MemoryRecord` ordered by blended score (descending),
+        or an empty list if embedding generation fails. Each record's
+        ``relevance`` field holds the rounded cosine-similarity score (0–1).
 
     Raises:
         ValueError: If ``scope == "agent"`` but ``agent_id`` is ``None``; if
@@ -666,46 +784,90 @@ async def retrieve_memories_scoped(
     # accepts directly with the cosine-distance operator (<=>).
     embedding_str = str(embedding)
 
-    clauses = [
+    base_clauses = [
         "org_id = :org_id",
         "status = 'active'",
         "superseded_by IS NULL",
+        "recall_hidden = FALSE",
     ]
     params: dict[str, Any] = {
         "org_id": org_id,
         "embedding": embedding_str,
         "limit": limit,
+        "candidate_pool": limit * 4,
     }
 
-    # Scope-column predicate (the visibility ladder). Parenthesized so the OR
-    # in the agent case binds correctly when AND-joined with the base WHERE.
     if scope == "org":
-        clauses.append("scope = 'org'")
+        base_clauses.append("scope = 'org'")
     else:  # scope == "agent" (validated above; agent_id is not None)
-        clauses.append("(scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id))")
+        base_clauses.append(
+            "(scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id))"
+        )
         params["agent_id"] = agent_id
 
     if space_id is not None:
-        clauses.append("(space_id = :space_id OR space_id IS NULL)")
+        base_clauses.append("(space_id = :space_id OR space_id IS NULL)")
         params["space_id"] = space_id
 
-    if project_id is not None:
-        clauses.append("(project_id = :project_id OR project_id IS NULL)")
-        params["project_id"] = project_id
-
-    where_sql = "\n              AND ".join(clauses)
-    sql = text(f"""
-        SELECT id, session_id, org_id, agent_id, execution_id,
-               memory_type, content, embedding, confidence,
-               sequence_number, scope, status, superseded_by,
-               metadata, created_at, updated_at, space_id, project_id
-        FROM session_memories
-        WHERE {where_sql}
-        ORDER BY embedding <=> :embedding
+    # ANN-inner / re-rank-outer shape:
+    #   Inner query — HNSW-accelerated cosine-distance ORDER BY fetches a
+    #     bounded candidate pool (:candidate_pool = limit * 4).
+    #   Outer query — re-ranks the candidates by blended score:
+    #     0.85 * similarity + 0.15 * recency_norm, where recency_norm is the
+    #     fraction of the 30-day window still remaining, clamped to [0, 1].
+    # The outer SELECT * preserves the 18 record columns plus relevance at
+    # index 18.  blended_score is used only in the ORDER BY and is not a
+    # selected column, so each row has exactly 19 elements (indices 0–18).
+    select_sql = """
+        SELECT * FROM (
+            SELECT id, session_id, org_id, agent_id, execution_id,
+                   memory_type, content, embedding, confidence,
+                   sequence_number, scope, status, superseded_by,
+                   metadata, created_at, updated_at, space_id, project_id,
+                   (1 - (embedding <=> :embedding)) AS relevance
+            FROM session_memories
+            WHERE {where}
+            ORDER BY embedding <=> :embedding
+            LIMIT :candidate_pool
+        ) candidates
+        ORDER BY (0.85 * relevance
+                  + 0.15 * LEAST(1, GREATEST(
+                      0, 1 - EXTRACT(EPOCH FROM (NOW() - created_at))
+                             / (30 * 86400)
+                    ))) DESC
         LIMIT :limit
-    """)
+    """
 
-    result = db_session.execute(sql, params)
-    rows = result.fetchall()
+    def _fetch(extra_clause: str, extra_params: dict[str, Any]) -> list:
+        where_sql = "\n              AND ".join(base_clauses + [extra_clause])
+        return db_session.execute(
+            text(select_sql.format(where=where_sql)),
+            {**params, **extra_params},
+        ).fetchall()
 
-    return [_row_to_record(row) for row in rows]
+    if project_id is not None:
+        # Two-tier: same-project rows fill first; remaining slots come from
+        # unfiled (org-level) rows. Rows filed under OTHER projects never
+        # surface.
+        tier1 = _fetch("project_id = :project_id", {"project_id": project_id})
+        remaining = limit - len(tier1)
+        tier2 = []
+        if remaining > 0:
+            # Override both limit and candidate_pool for the tier-2 fill so
+            # the inner ANN pool is proportional to the actual remaining slots.
+            tier2 = _fetch(
+                "project_id IS NULL",
+                {"limit": remaining, "candidate_pool": remaining * 4},
+            )
+        rows = list(tier1) + list(tier2)
+    else:
+        rows = _fetch("TRUE", {})
+
+    records = []
+    for row in rows:
+        # row[:18] = the 18 record columns; row[18] = relevance (cosine sim).
+        # blended_score is not selected as a column — it only drives ORDER BY.
+        record = _row_to_record(row[:18])
+        record.relevance = round(float(row[18]), 3) if row[18] is not None else None
+        records.append(record)
+    return records

@@ -59,3 +59,41 @@ def test_log_recall_event_swallows_errors():
 
     db.rollback.assert_called_once()
     db.commit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Recall-log query redaction (Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_log_recall_event_redacts_query_text():
+    """query_text containing a secret must be redacted before the INSERT params.
+
+    The raw Stripe test key must never appear in the params dict passed to
+    db.execute — it must be replaced by the [REDACTED:…] placeholder.
+    """
+
+    class _Rec:
+        def __init__(self):
+            self.params = None
+
+        def execute(self, sql, params=None):
+            self.params = params
+
+        def commit(self):
+            pass
+
+    db = _Rec()
+    log_recall_event(
+        db,
+        org_id="org-1",
+        agent_id="a",
+        project_id=None,
+        query_text=(
+            "find sk_test_51TcfsTP4cXbUl5jnQJG2Ou9BUcBChSVqEDNj7d65uQjZXtAVzI1XR2"
+            "eewh5KDq8GmCfrr1a1xRNcSdB1c7TtWrU00GsK8y8Je"
+        ),
+        result_count=0,
+        source="mcp",
+    )
+    assert "sk_test_51Tcfs" not in (db.params or {}).get("query_text", "")

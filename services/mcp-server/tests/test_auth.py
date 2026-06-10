@@ -148,3 +148,53 @@ def test_get_validator_uses_memory_scope():
         assert kwargs["required_scope"] == "memory"
     finally:
         auth_module._validator = None
+
+
+# ---------------------------------------------------------------------------
+# X-Vex-Project header resolution (Task 9)
+# ---------------------------------------------------------------------------
+
+
+def test_project_header_constant():
+    from app.auth import PROJECT_HEADER
+
+    assert PROJECT_HEADER == "X-Vex-Project"
+
+
+def test_resolve_project_header_returns_none_without_header():
+    from app.auth import resolve_project_from_request
+
+    class _Req:
+        headers = {}
+
+    assert resolve_project_from_request(_Req(), object(), org_id="o") is None
+
+
+def test_resolve_project_header_resolves_via_find(monkeypatch):
+    import app.auth as auth_mod
+
+    monkeypatch.setattr(
+        auth_mod.brain, "find_project_id", lambda db, *, org_id, identifier: "proj-1"
+    )
+
+    class _Req:
+        headers = {"X-Vex-Project": "git@github.com:acme/widgets.git"}
+
+    assert (
+        auth_mod.resolve_project_from_request(_Req(), object(), org_id="o")
+        == "proj-1"
+    )
+
+
+def test_resolve_project_header_fails_open(monkeypatch):
+    import app.auth as auth_mod
+
+    def _boom(db, *, org_id, identifier):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(auth_mod.brain, "find_project_id", _boom)
+
+    class _Req:
+        headers = {"X-Vex-Project": "anything"}
+
+    assert auth_mod.resolve_project_from_request(_Req(), object(), org_id="o") is None

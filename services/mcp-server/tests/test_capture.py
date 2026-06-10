@@ -398,3 +398,148 @@ def test_event_rejects_unknown_scope(client):
     with db_patch:
         resp = client.post("/capture/event", json={"content": "x", "scope": "session"})
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Pre-LLM redaction (Task 3)
+# ---------------------------------------------------------------------------
+
+SECRET_T3 = (
+    "sk_test_51TcfsTP4cXbUl5jnQJG2Ou9BUcBChSVqEDNj7d65uQjZXtAVzI1XR2"
+    "eewh5KDq8GmCfrr1a1xRNcSdB1c7TtWrU00GsK8y8Je"
+)
+
+
+def test_combine_messages_redacts_before_llm():
+    """_combine_messages must redact secrets before the text is sent to the LLM.
+
+    The raw Stripe test key must be replaced by a [REDACTED:stripe_secret_key:…]
+    placeholder; non-secret content is preserved unchanged.
+    """
+    from app.capture import TranscriptMessage, _combine_messages
+
+    combined = _combine_messages(
+        [
+            TranscriptMessage(role="user", content=f"here is my key {SECRET_T3}"),
+            TranscriptMessage(role="assistant", content="thanks, configuring now"),
+        ]
+    )
+    assert SECRET_T3 not in combined
+    assert "[REDACTED:stripe_secret_key:" in combined
+    assert "configuring now" in combined
+
+
+# ---------------------------------------------------------------------------
+# recall_hidden threading (Task 7)
+# ---------------------------------------------------------------------------
+
+
+def test_capture_event_observation_is_recall_hidden(client, monkeypatch):
+    """Passive hook observations are written recall_hidden=True.
+
+    Observations are raw curator fuel and must not surface in agent recall,
+    so capture_event must pass recall_hidden=True for memory_type='observation'.
+    """
+    import shared.brain as brain_mod
+
+    seen = {}
+
+    async def _fake_write(db, **kwargs):
+        seen.update(kwargs)
+        return {"stored": True, "deduplicated": False, "id": "x", "scope": "org"}
+
+    monkeypatch.setattr(brain_mod, "write_scoped_memory", _fake_write)
+    db_patch, _ = _patch_db()
+    with db_patch:
+        resp = client.post(
+            "/capture/event",
+            json={"content": "Used tool Bash", "memory_type": "observation"},
+        )
+    assert resp.status_code == 200
+    assert seen["recall_hidden"] is True
+
+
+def test_capture_event_note_is_visible(client, monkeypatch):
+    """Deliberate writes (note/plan/decision/memory) are NOT recall-hidden.
+
+    Only raw observations feed the curator as hidden rows; note/plan/decision/
+    memory types must remain visible (recall_hidden=False) so agents can
+    recall them directly.
+    """
+    import shared.brain as brain_mod
+
+    seen = {}
+
+    async def _fake_write(db, **kwargs):
+        seen.update(kwargs)
+        return {"stored": True, "deduplicated": False, "id": "x", "scope": "org"}
+
+    monkeypatch.setattr(brain_mod, "write_scoped_memory", _fake_write)
+    db_patch, _ = _patch_db()
+    with db_patch:
+        resp = client.post(
+            "/capture/event", json={"content": "decision made", "memory_type": "note"}
+        )
+    assert resp.status_code == 200
+    assert seen["recall_hidden"] is False
+
+
+def test_recent_memories_sql_excludes_hidden(client):
+    """_recent_memories must include recall_hidden = FALSE in its WHERE clause.
+
+    The recency fallback (empty-query path) must not surface hidden curator-fuel
+    rows to agents at session start.
+    """
+    captured_sql = {}
+    session = MagicMock()
+
+    def _fake_execute(sql, params=None):
+        captured_sql["sql"] = str(sql)
+        result = MagicMock()
+        result.fetchall.return_value = []
+        return result
+
+    session.execute.side_effect = _fake_execute
+
+    from app.capture import _recent_memories
+
+    _recent_memories(session, org_id="org-1", project_id=None, limit=5)
+    assert "recall_hidden = FALSE" in captured_sql["sql"]
+
+
+# ---------------------------------------------------------------------------
+# /capture/forget
+# ---------------------------------------------------------------------------
+
+
+def test_capture_forget_returns_404_for_unknown_id(client):
+    """forget returns 404 when retract_memory reports not_found."""
+    import uuid
+
+    db_patch, _ = _patch_db()
+    with (
+        db_patch,
+        patch("app.capture.retract_memory", return_value={"forgotten": False, "error": "not_found"}),
+    ):
+        resp = client.post(
+            "/capture/forget", json={"memory_id": str(uuid.uuid4())}
+        )
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "not_found"
+
+
+def test_capture_forget_returns_200_on_success(client):
+    """forget returns 200 with forgotten=True on a valid retraction."""
+    import uuid
+
+    mem_id = str(uuid.uuid4())
+    db_patch, _ = _patch_db()
+    with (
+        db_patch,
+        patch("app.capture.retract_memory", return_value={"forgotten": True, "id": mem_id}),
+    ):
+        resp = client.post("/capture/forget", json={"memory_id": mem_id})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["forgotten"] is True
+    assert body["id"] == mem_id

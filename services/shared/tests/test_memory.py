@@ -490,3 +490,38 @@ async def test_find_similar_memory_agent_scope_filters_agent():
     assert "session_id = :session_id" not in sql
     assert params["agent_id"] == "mf-userA-game1"
     assert "session_id" not in params
+
+
+# ---------------------------------------------------------------------------
+# Prompt hardening: credential reproduction guard
+# ---------------------------------------------------------------------------
+
+
+async def test_extract_facts_prompt_forbids_credentials(monkeypatch):
+    """extract_facts prompt must instruct the LLM never to reproduce credentials."""
+    import shared.memory as memory_mod
+
+    seen: dict = {}
+
+    async def _fake_call_llm(prompt, system=None):
+        seen["prompt"] = prompt
+        return {"facts": []}
+
+    monkeypatch.setattr(memory_mod, "call_llm", _fake_call_llm)
+    await memory_mod.extract_facts("some output")
+    assert "Never reproduce credentials" in seen["prompt"]
+
+
+async def test_generate_summary_prompt_forbids_credentials(monkeypatch):
+    """generate_summary prompt must instruct the LLM never to reproduce credentials."""
+    import shared.memory as memory_mod
+
+    seen: dict = {}
+
+    async def _fake_call_llm(prompt, system=None):
+        seen["prompt"] = prompt
+        return {"summary": "ok"}
+
+    monkeypatch.setattr(memory_mod, "call_llm", _fake_call_llm)
+    await memory_mod.generate_summary("some output")
+    assert "Never reproduce credentials" in seen["prompt"]

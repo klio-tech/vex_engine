@@ -8,18 +8,25 @@ recall for session-start context injection, all over plain REST.  A hook script
 therefore needs only an HTTP ``POST`` — no MCP handshake — which keeps the
 client a dumb forwarder.
 
-Three endpoints, all mounted under ``/capture``:
+Four endpoints, all mounted under ``/capture``:
 
 * ``POST /capture/event`` — store one passive memory (default an
   ``observation``), e.g. from a ``UserPromptSubmit`` hook.
 * ``POST /capture/transcript`` — distil a finished session: extract discrete
   ``fact`` rows and one ``summary`` from the transcript, e.g. from a ``Stop``
   hook.  The transcript is the richest source and only exists at session end,
-  so we mine it then rather than storing the whole thing.
+  so we mine it then rather than storing the whole thing.  Secrets and PII in
+  the transcript are redacted via :func:`shared.redaction.redact` BEFORE the
+  text is sent to the external LLM for fact extraction/summarisation (defense
+  in depth: :func:`shared.brain.write_scoped_memory` re-screens whatever
+  comes back at the storage chokepoint).
 * ``POST /capture/recall`` — read memories for context injection at
   ``SessionStart``.  With a query it does vector recall; with an empty query it
   falls back to recency (most-recent first), so a fresh session always gets
   *something* even before the curator has synthesised anything.
+* ``POST /capture/forget`` — retract one memory by id (hook-client mirror of
+  the MCP ``forget`` tool).  Returns 404 for unknown or cross-org ids, 403
+  for cross-agent scope='agent' rows.
 
 Auth reuses the same ``X-Vex-Key`` (+ optional ``X-Vex-Agent``) bridge as the
 MCP tools, via :func:`app.auth.resolve_principal_dep`, so capture is scoped to
@@ -50,7 +57,13 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from shared import brain
 from shared.auth import KeyInfo
-from shared.memory import extract_facts, generate_summary, retrieve_memories_scoped
+from shared.memory import (
+    extract_facts,
+    generate_summary,
+    retract_memory,
+    retrieve_memories_scoped,
+)
+from shared.redaction import redact
 from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from sqlalchemy import text
@@ -276,11 +289,18 @@ def _find_project_id(
 
 
 def _combine_messages(messages: list[TranscriptMessage]) -> str:
-    """Flatten transcript messages into one text blob, tail-capped.
+    """Flatten transcript messages into one text blob, tail-capped and redacted.
 
     Empty messages are dropped; a role prefix is added when known.  The result
     is truncated to the most-recent :data:`_MAX_TRANSCRIPT_CHARS` characters so
     a very long session does not blow up the LLM call.
+
+    Secrets and PII are redacted via :func:`shared.redaction.redact` BEFORE
+    the text is sent to an external LLM for fact extraction/summarisation —
+    secrets never leave the infrastructure via the mining path.
+    :func:`shared.brain.write_scoped_memory` re-screens whatever comes back
+    (defense in depth), so a redaction failure here can fail open to the
+    chokepoint guarantee.
     """
     parts: list[str] = []
     for m in messages:
@@ -292,6 +312,15 @@ def _combine_messages(messages: list[TranscriptMessage]) -> str:
     combined = "\n".join(parts)
     if len(combined) > _MAX_TRANSCRIPT_CHARS:
         combined = combined[-_MAX_TRANSCRIPT_CHARS:]
+    # Redact BEFORE this text is sent to the external LLM for fact
+    # extraction/summarisation — secrets never leave the infrastructure via
+    # the mining path. write_scoped_memory re-screens whatever comes back
+    # (defense in depth), so a redaction failure here can fail open to the
+    # chokepoint guarantee.
+    try:
+        combined = redact(combined).clean_text
+    except Exception:
+        logger.warning("capture: transcript redaction failed; relying on chokepoint")
     return combined
 
 
@@ -321,6 +350,10 @@ def _recent_memories(
     Used when recall is called with an empty query (session start).  Tenant- and
     brain-scoped (``org_id`` + ``scope='org'`` + ``status='active'``) so neither
     verification's ``scope='session'`` rows nor other orgs' rows are returned.
+    Rows with ``recall_hidden = TRUE`` are excluded: these are raw passive-hook
+    observations stored as curator fuel and must not surface to agents at
+    session start (mirrors the hidden-row contract of
+    :func:`shared.memory.retrieve_memories_scoped`).
     When ``project_id`` is given, rows for that project OR unfiled (``NULL``)
     rows surface — the same NULL-surfacing semantics as
     :func:`shared.memory.retrieve_memories_scoped`.
@@ -333,6 +366,7 @@ def _recent_memories(
             WHERE org_id = :org_id
               AND scope = 'org'
               AND status = 'active'
+              AND recall_hidden = FALSE
               AND (
                 :project_id IS NULL
                 OR project_id = :project_id
@@ -388,6 +422,9 @@ async def capture_event(
                 db, org_id, key_info.plan, "memory", key_info.plan_overrides
             )
         )
+        # Raw tool/prompt observations are curator fuel, not recall
+        # results; deliberate types (note/plan/decision/memory) stay
+        # visible.
         result = await brain.write_scoped_memory(
             db,
             org_id=org_id,
@@ -398,6 +435,7 @@ async def capture_event(
             project_id=project_id,
             metadata=metadata,
             scope=req.scope,
+            recall_hidden=(memory_type == "observation"),
         )
         if result.get("stored"):
             await anyio.to_thread.run_sync(
@@ -589,5 +627,49 @@ async def capture_recall(
     except Exception:
         logger.exception("capture recall failed (scope=%s)", req.scope)
         return {"memories": [], "count": 0, "error": "recall_failed"}
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# /capture/forget
+# ---------------------------------------------------------------------------
+
+
+class ForgetRequest(BaseModel):
+    """Retract one memory by id (hook-client mirror of the MCP forget tool)."""
+
+    memory_id: str = Field(min_length=1, description="Memory id to retract.")
+
+
+@router.post("/forget")
+async def capture_forget(
+    req: ForgetRequest,
+    principal: tuple[str, str] = Depends(resolve_principal_dep),
+) -> dict[str, Any]:
+    """Retract a memory. 404 unknown/cross-org, 403 cross-agent.
+
+    Delegates to :func:`shared.memory.retract_memory` (synchronous DB I/O)
+    which enforces org_id on every query and rejects cross-agent scope='agent'
+    rows.  The route maps the storage-layer error codes to HTTP status codes:
+    ``not_found`` / ``invalid_id`` → 404, ``forbidden`` → 403.
+    """
+    org_id, agent_id = principal
+    db = SessionLocal()
+    try:
+        result = await anyio.to_thread.run_sync(
+            lambda: retract_memory(
+                db,
+                org_id=org_id,
+                agent_id=agent_id,
+                memory_id=req.memory_id,
+                via="hook",
+            )
+        )
+        if result.get("error") in ("not_found", "invalid_id"):
+            raise HTTPException(status_code=404, detail=result["error"])
+        if result.get("error") == "forbidden":
+            raise HTTPException(status_code=403, detail="forbidden")
+        return result
     finally:
         db.close()

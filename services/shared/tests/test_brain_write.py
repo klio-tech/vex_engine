@@ -76,6 +76,8 @@ async def test_write_scoped_memory_dedup_hit_suppresses_write():
         "id": str(existing.id),
         "memory_type": "note",
         "scope": "org",
+        "redacted": False,
+        "redaction_kinds": [],
     }
 
 
@@ -176,6 +178,8 @@ async def test_write_scoped_memory_happy_path_promotes_to_org():
         "scope": "org",
         "space_id": "space-9",
         "project_id": "proj-7",
+        "redacted": False,
+        "redaction_kinds": [],
     }
 
 
@@ -367,6 +371,8 @@ async def test_write_scoped_memory_agent_dedup_hit_returns_agent_scope():
         "id": str(existing.id),
         "memory_type": "observation",
         "scope": "agent",
+        "redacted": False,
+        "redaction_kinds": [],
     }
 
 

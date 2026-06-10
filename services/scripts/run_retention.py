@@ -12,6 +12,10 @@ Usage:
 Environment:
     DATABASE_URL: TimescaleDB connection string
     SUPABASE_DATABASE_URL: Supabase Postgres connection string
+    RAW_OBSERVATION_TTL_DAYS: Days to retain recall_hidden raw observations
+        before they are swept (default: 7). These rows are curator fuel with
+        a short shelf life and are deleted on a fixed TTL independent of
+        per-plan retention settings.
 """
 
 import json
@@ -103,6 +107,25 @@ def main() -> None:
                     org_id,
                     plan,
                 )
+
+            # Hidden raw captures are curator fuel with a short shelf life:
+            # sweep them on a fixed TTL regardless of plan retention.
+            raw_ttl_days = int(os.environ.get("RAW_OBSERVATION_TTL_DAYS", "7"))
+            deleted = tsdb_conn.execute(
+                text(
+                    """
+                    DELETE FROM session_memories
+                    WHERE recall_hidden = TRUE
+                      AND created_at < NOW() - (:days || ' days')::interval
+                    """
+                ),
+                {"days": raw_ttl_days},
+            )
+            logger.info(
+                "Swept hidden raw observations older than %d days (%s rows)",
+                raw_ttl_days,
+                getattr(deleted, "rowcount", "?"),
+            )
 
             tsdb_conn.commit()
 
