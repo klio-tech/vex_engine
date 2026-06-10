@@ -197,3 +197,84 @@ def test_resolve_project_header_fails_open(monkeypatch):
         headers = {"X-Vex-Project": "anything"}
 
     assert auth_mod.resolve_project_from_request(_Req(), object(), org_id="o") is None
+
+
+# ---------------------------------------------------------------------------
+# OAuth principal ladder (Task 5)
+# ---------------------------------------------------------------------------
+
+
+def _oauth_request(principal, headers=None):
+    from app.oauth import OAuthPrincipal  # noqa: F401 — import verifies the type
+
+    class _Req:
+        def __init__(self):
+            self.headers = headers or {}
+            self.state = type("S", (), {})()
+            self.state.oauth_principal = principal
+
+    return _Req()
+
+
+def _principal():
+    from app.oauth import OAuthPrincipal
+
+    return OAuthPrincipal(
+        org_id="org-acme",
+        account_slug="acme",
+        user_id="11111111-2222-3333-4444-555555555555",
+        client_id="client-abc",
+        plan="pro",
+        plan_overrides=None,
+    )
+
+
+def test_resolve_principal_prefers_oauth_state():
+    from app.auth import resolve_principal
+
+    org_id, agent_id = resolve_principal(_oauth_request(_principal()))
+    assert org_id == "org-acme"
+    assert agent_id == "oauth:11111111/client-abc"  # user_short/client_id fallback
+
+
+def test_oauth_agent_uses_client_name_when_provided():
+    from app.auth import resolve_principal
+
+    request = _oauth_request(_principal())
+    request.state.mcp_client_name = "Claude Code"
+    org_id, agent_id = resolve_principal(request)
+    assert agent_id == "oauth:11111111/claude-code"
+
+
+def test_x_vex_agent_header_overrides_oauth_default():
+    from app.auth import resolve_principal
+
+    request = _oauth_request(_principal(), headers={"X-Vex-Agent": "my-bot"})
+    org_id, agent_id = resolve_principal(request)
+    assert agent_id == "my-bot"
+
+
+def test_resolve_principal_plan_carries_oauth_plan():
+    from app.auth import resolve_principal_plan
+
+    org_id, agent_id, plan, overrides = resolve_principal_plan(
+        _oauth_request(_principal())
+    )
+    assert (org_id, plan, overrides) == ("org-acme", "pro", None)
+
+
+def test_no_oauth_state_falls_back_to_key_path(monkeypatch):
+    """Requests without an OAuth principal use the existing key validation."""
+    import app.auth as auth_mod
+
+    class _Req:
+        headers = {"X-Vex-Key": "ag_x", "X-Vex-Agent": "a1"}
+        state = type("S", (), {})()  # no oauth_principal attribute
+
+    class _KeyInfo:
+        org_id = "org-key"
+        plan = "free"
+        plan_overrides = None
+
+    monkeypatch.setattr(auth_mod, "verify_api_key", lambda request: _KeyInfo())
+    assert auth_mod.resolve_principal(_Req()) == ("org-key", "a1")
