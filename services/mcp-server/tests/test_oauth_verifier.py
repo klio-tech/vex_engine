@@ -184,3 +184,50 @@ async def test_valid_token_still_verifies_after_backoff_engaged(verifier, rsa_ke
     good = _mint(rsa_key)
     identity = await verifier.verify_token(good)
     assert identity is not None
+
+
+async def test_forced_refresh_jwks_failure_raises_unavailable(rsa_key, monkeypatch):
+    """When a forced-refresh JWKS fetch fails (outside the backoff window),
+    VerifierUnavailable must be raised — not None (fail-closed, not silent).
+
+    This covers the branch in ``_key_for`` where ``refresh=True`` is requested
+    outside the backoff window but ``_fetch_jwks`` raises.
+    """
+    from app.oauth import VerifierUnavailable
+
+    v = SupabaseTokenVerifier(issuer=ISSUER)
+
+    # Pre-seed the cache with a key so it is NOT stale (stale=False) and NOT
+    # empty, which forces the code to take the forced-refresh branch (not the
+    # TTL-based cold-load branch).
+    public_jwk = pyjwt.algorithms.RSAAlgorithm.to_jwk(
+        rsa_key.public_key(), as_dict=True
+    )
+    public_jwk["kid"] = KID
+    public_jwk["alg"] = "RS256"
+    v._keys = {KID: pyjwt.algorithms.RSAAlgorithm.from_jwk(public_jwk)}
+    v._fetched_at = time.monotonic()  # fresh — not stale
+    # Backoff window has NOT been engaged yet (_last_forced_refresh == 0.0).
+
+    # Now make _fetch_jwks raise so the forced-refresh path (lines 131-132 in
+    # oauth.py) wraps the exception as VerifierUnavailable.
+    def boom():
+        raise RuntimeError("simulated network failure")
+
+    monkeypatch.setattr(v, "_fetch_jwks", boom)
+
+    # Request a token with an unknown kid to trigger the forced-refresh path.
+    token = pyjwt.encode(
+        {
+            "iss": ISSUER,
+            "sub": "u",
+            "client_id": "c",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + 60,
+        },
+        rsa_key,
+        algorithm="RS256",
+        headers={"kid": "kid-not-in-cache"},
+    )
+    with pytest.raises(VerifierUnavailable):
+        await v.verify_token(token)

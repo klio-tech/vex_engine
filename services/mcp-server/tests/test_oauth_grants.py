@@ -137,3 +137,26 @@ def test_negative_cache_expires_faster_than_positive(monkeypatch):
     clock["now"] += 16.0  # past the 15s negative TTL, well inside 60s
     resolver.resolve(identity)
     assert calls["n"] == 2
+
+
+def test_plan_overrides_as_json_string_is_parsed():
+    """When the DB returns plan_overrides as a raw JSON string (not a dict),
+    the resolver must deserialise it so OAuthPrincipal.plan_overrides is a
+    dict, not a str.  Covers the ``json.loads`` branch in ``_lookup``."""
+    import json
+
+    overrides_dict = {"max_rpm": 5000}
+    overrides_str = json.dumps(overrides_dict)
+    # Return (plan, overrides_as_string) from the accounts row.
+    grant_row = ("acme",)
+    org_row = ("org-acme",)
+    resolver = GrantResolver(
+        supabase_engine=FakeEngine(
+            [("oauth_grants", grant_row), ("accounts", ("pro", overrides_str))]
+        ),
+        tsdb_engine=FakeEngine([("organizations", org_row)]),
+    )
+    principal = resolver.resolve(OAuthIdentity(user_id="u-1", client_id="c-1"))
+    assert principal is not None
+    assert isinstance(principal.plan_overrides, dict)
+    assert principal.plan_overrides["max_rpm"] == 5000

@@ -215,3 +215,19 @@ def test_healthz_and_capture_unaffected(monkeypatch):
     resp = client.post("/capture/event", json={"content": "x"})
     assert resp.status_code == 401
     assert "resource_metadata" not in resp.headers.get("WWW-Authenticate", "")
+
+
+def test_agentguard_key_header_passes_through(monkeypatch):
+    """Legacy X-AgentGuard-Key requests bypass Bearer enforcement entirely.
+
+    This is the second key-header variant on the OR branch (line 180 of
+    oauth_middleware.py).  The request must reach the MCP transport, not
+    receive our 401 OAuth challenge.
+    """
+    client = _client(monkeypatch, enabled=True)
+    resp = client.post("/mcp", json={}, headers={"X-AgentGuard-Key": "ag_legacy_key"})
+    # Reaches the MCP transport (which may 400/422 the malformed JSON-RPC body,
+    # but MUST NOT return our OAuth 401 challenge).
+    assert resp.status_code != 401 or "resource_metadata" not in resp.headers.get(
+        "WWW-Authenticate", ""
+    )
