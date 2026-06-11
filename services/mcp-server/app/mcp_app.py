@@ -210,6 +210,18 @@ async def _perform_write(
 # filter). Compared case-insensitively so "any"/"ANY"/"Any" all work.
 _PROJECT_ANY = "any"
 
+# Appended to every recall result as a top-level ``guidance`` field. On hosted
+# clients we cannot force a write, so we remind the agent — at the moment it is
+# already engaged with Klio (each recall), refreshed rather than only at
+# initialize — to persist what matters. Deliberately steers toward DURABLE
+# knowledge and away from tool-call/step noise so it reinforces (not undoes)
+# the signal-quality work.
+RECALL_WRITE_NUDGE = (
+    "If this conversation produced durable facts, decisions, or preferences, "
+    "persist them now with remember / decide / note. Save durable knowledge "
+    "— not tool calls, file reads, or transient steps."
+)
+
 
 def _attach_client_name(ctx: Context, request: Any) -> None:
     """Expose the MCP client's self-reported name for OAuth agent identity.
@@ -473,14 +485,18 @@ async def _perform_recall(
         # (mcp 1.27.x); a transport that does not gives us nothing to
         # authenticate, so deny rather than guess a principal.
         logger.error("brain recall got no transport request; cannot authenticate")
-        return {"error": "unauthorized", "detail": "no request context"}
+        return {
+            "error": "unauthorized",
+            "detail": "no request context",
+            "guidance": RECALL_WRITE_NUDGE,
+        }
 
     _attach_client_name(ctx, request)
 
     try:
         org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
     except HTTPException as exc:
-        return {"error": "unauthorized", "detail": str(exc.detail)}
+        return {"error": "unauthorized", "detail": str(exc.detail), "guidance": RECALL_WRITE_NUDGE}
 
     db = SessionLocal()
     try:
@@ -504,6 +520,7 @@ async def _perform_recall(
                 "error": "quota_exceeded",
                 "detail": exc.message,
                 "suggested_plan": exc.suggested_plan,
+                "guidance": RECALL_WRITE_NUDGE,
             }
 
         # Resolve the optional space-slug filter. An unknown slug is surfaced
@@ -517,6 +534,7 @@ async def _perform_recall(
                     "memories": [],
                     "count": 0,
                     "warning": f"unknown space: {space}",
+                    "guidance": RECALL_WRITE_NUDGE,
                 }
 
         # Resolve the optional project filter. The "any" sentinel means
@@ -529,6 +547,7 @@ async def _perform_recall(
                     "memories": [],
                     "count": 0,
                     "warning": f"unknown project: {project}",
+                    "guidance": RECALL_WRITE_NUDGE,
                 }
 
         # No explicit project arg: fall back to the X-Vex-Project header
@@ -579,10 +598,10 @@ async def _perform_recall(
             if row is not None:
                 project_label = {"id": project_id, "name": row.display_name}
         memories = [_serialize_record(r, project_label=project_label) for r in records]
-        return {"memories": memories, "count": len(memories)}
+        return {"memories": memories, "count": len(memories), "guidance": RECALL_WRITE_NUDGE}
     except Exception:
         logger.exception("brain recall failed (scope=%s)", scope)
-        return {"error": "recall_failed"}
+        return {"error": "recall_failed", "guidance": RECALL_WRITE_NUDGE}
     finally:
         db.close()
 

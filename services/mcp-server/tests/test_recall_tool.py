@@ -345,7 +345,14 @@ async def test_recall_unknown_space_returns_warning_without_retrieve():
     ):
         result = await fn(_fake_ctx(), "q", space="ghost")
 
-    assert result == {"memories": [], "count": 0, "warning": "unknown space: ghost"}
+    from app.mcp_app import RECALL_WRITE_NUDGE
+
+    assert result == {
+        "memories": [],
+        "count": 0,
+        "warning": "unknown space: ghost",
+        "guidance": RECALL_WRITE_NUDGE,
+    }
     retrieve_mock.assert_not_called()
 
 
@@ -391,10 +398,13 @@ async def test_recall_unknown_project_returns_warning_without_retrieve():
     ):
         result = await fn(_fake_ctx(), "q", project="ghost-proj")
 
+    from app.mcp_app import RECALL_WRITE_NUDGE
+
     assert result == {
         "memories": [],
         "count": 0,
         "warning": "unknown project: ghost-proj",
+        "guidance": RECALL_WRITE_NUDGE,
     }
     retrieve_mock.assert_not_called()
 
@@ -574,3 +584,37 @@ async def test_recall_schema_has_limit_field():
     assert "limit" in schema.get("properties", {}), (
         "recall schema missing 'limit' property"
     )
+
+
+# ---------------------------------------------------------------------------
+# Task 1: RECALL_WRITE_NUDGE constant + guidance on every recall return
+# ---------------------------------------------------------------------------
+
+
+def test_recall_write_nudge_constant_steers_durable_not_noise():
+    from app.mcp_app import RECALL_WRITE_NUDGE
+
+    low = RECALL_WRITE_NUDGE.lower()
+    assert "durable" in low
+    # Must explicitly steer AWAY from tool-call/step noise (protects the
+    # signal-quality cleanup we just shipped).
+    assert "tool call" in low or "tool calls" in low
+    assert "remember" in low
+
+
+def test_recall_serializer_unchanged_and_guidance_is_separate():
+    """guidance is a top-level recall-result field, not per-memory."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from app.mcp_app import _serialize_record
+    from shared.memory import MemoryRecord
+
+    out = _serialize_record(
+        MemoryRecord(
+            id=uuid.uuid4(), session_id="s", org_id="o", agent_id="a",
+            memory_type="fact", content="x",
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+    assert "guidance" not in out  # nudge lives on the envelope, not each record
