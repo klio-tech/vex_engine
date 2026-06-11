@@ -612,8 +612,12 @@ def test_recall_serializer_unchanged_and_guidance_is_separate():
 
     out = _serialize_record(
         MemoryRecord(
-            id=uuid.uuid4(), session_id="s", org_id="o", agent_id="a",
-            memory_type="fact", content="x",
+            id=uuid.uuid4(),
+            session_id="s",
+            org_id="o",
+            agent_id="a",
+            memory_type="fact",
+            content="x",
             created_at=datetime.now(timezone.utc),
         )
     )

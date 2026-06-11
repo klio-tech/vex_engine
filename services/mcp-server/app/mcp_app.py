@@ -500,7 +500,11 @@ async def _perform_recall(
     try:
         org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
     except HTTPException as exc:
-        return {"error": "unauthorized", "detail": str(exc.detail), "guidance": RECALL_WRITE_NUDGE}
+        return {
+            "error": "unauthorized",
+            "detail": str(exc.detail),
+            "guidance": RECALL_WRITE_NUDGE,
+        }
 
     db = SessionLocal()
     try:
@@ -602,7 +606,11 @@ async def _perform_recall(
             if row is not None:
                 project_label = {"id": project_id, "name": row.display_name}
         memories = [_serialize_record(r, project_label=project_label) for r in records]
-        return {"memories": memories, "count": len(memories), "guidance": RECALL_WRITE_NUDGE}
+        return {
+            "memories": memories,
+            "count": len(memories),
+            "guidance": RECALL_WRITE_NUDGE,
+        }
     except Exception:
         logger.exception("brain recall failed (scope=%s)", scope)
         return {"error": "recall_failed", "guidance": RECALL_WRITE_NUDGE}
