@@ -153,3 +153,25 @@ async def test_tools_list_over_streamable_http_transport():
                     result = await session.list_tools()
                     names = {tool.name for tool in result.tools}
                     assert names == set(EXPECTED_TOOL_NAMES)
+
+
+def test_server_instructions_state_proactive_write_protocol():
+    """SERVER_INSTRUCTIONS must encode the proactive when-to-write protocol."""
+    from app.mcp_app import SERVER_INSTRUCTIONS
+
+    low = SERVER_INSTRUCTIONS.lower()
+    assert "proactively" in low
+    assert "decision" in low or "decide" in low
+    # Steers away from noise, consistent with the recall nudge + cleanup.
+    assert "not" in low and ("tool call" in low or "tool calls" in low)
+
+
+async def test_remember_description_is_proactive():
+    """The remember tool must instruct proactive writing, not passive storage."""
+    mcp = build_mcp_server()
+    async with create_connected_server_and_client_session(mcp) as session:
+        result = await session.list_tools()
+
+    remember = next(t for t in result.tools if t.name == "remember")
+    desc = remember.description.lower()
+    assert "proactively" in desc or "whenever" in desc

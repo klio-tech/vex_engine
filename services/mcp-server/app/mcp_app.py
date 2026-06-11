@@ -84,17 +84,21 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
 )
 
 # Server-level guidance surfaced to MCP clients during ``initialize``.
-# Reinforces the X-Vex-Agent contract at the protocol level (in addition
-# to the per-tool descriptions).
+# Encodes a proactive when-to-write protocol: agents are told to write
+# durable knowledge without being asked, and steered away from persisting
+# tool calls / transient steps (reinforces the signal-quality cleanup).
+# Also reinforces the X-Vex-Agent contract at the protocol level.
 SERVER_INSTRUCTIONS = (
-    "Klio memory tools for AI agents. Memory is scoped to the org "
-    "resolved from your X-Vex-Key, and to an agent resolved from the "
-    "X-Vex-Agent header. Set the X-Vex-Agent header to a stable "
-    "per-agent identifier; clients that omit it share a single default "
-    "agent and their memories pool together. Use `recall` to retrieve "
-    "context before acting, the write tools (`remember`, `observe`, "
-    "`plan`, `decide`, `note`) to persist what matters, and `forget` "
-    "to retract a memory by id so it never surfaces again."
+    "Klio is the team's shared memory for AI agents. Memory is scoped to the "
+    "org resolved from your X-Vex-Key and to an agent resolved from the "
+    "X-Vex-Agent header; set X-Vex-Agent to a stable per-agent identifier "
+    "(clients that omit it share one default agent). "
+    "Use `recall` to retrieve relevant context before acting. "
+    "PROACTIVELY persist durable knowledge as it arises — without being asked: "
+    "when the user states a durable fact or preference, call `remember`; when a "
+    "decision is made, call `decide`; when a plan is set, call `plan`; for other "
+    "durable context, `note`. Do NOT persist tool calls, file reads, or "
+    "transient steps. Use `forget` to retract a memory by id."
 )
 
 
@@ -747,9 +751,9 @@ def _register_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         name="remember",
         description=(
-            "Store a durable fact/preference for the team. Arg: content. "
-            "Set the X-Vex-Agent header to attribute it to a specific "
-            "agent."
+            "Store a durable fact or preference for the team. Call this PROACTIVELY "
+            "whenever the user reveals one — e.g. 'I'm interviewing at Hive.co for a "
+            "senior PM role' — not only when explicitly asked to remember. Arg: content."
         ),
     )
     async def remember(
@@ -804,7 +808,7 @@ def _register_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         name="plan",
-        description="Record a forward-looking plan. Arg: content.",
+        description="Record a forward-looking plan when one is set. Arg: content.",
     )
     async def plan(
         ctx: Context,
@@ -831,7 +835,7 @@ def _register_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         name="decide",
-        description="Record a decision + rationale. Args: content, optional rationale.",
+        description="Record a decision and its rationale as soon as one is made. Args: content, optional rationale.",
     )
     async def decide(
         ctx: Context,
@@ -863,7 +867,7 @@ def _register_tools(mcp: FastMCP) -> None:
 
     @mcp.tool(
         name="note",
-        description="Free-form note. Arg: content.",
+        description="Free-form note for durable context that isn't a fact, decision, or plan. Arg: content.",
     )
     async def note(
         ctx: Context,
