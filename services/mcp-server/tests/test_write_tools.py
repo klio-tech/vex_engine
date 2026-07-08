@@ -466,3 +466,32 @@ async def test_write_blank_space_treated_as_no_space():
 
     assert write_mock.await_args.kwargs["space_id"] is None
     ensure_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_write_space_slug_is_stripped():
+    """A padded space slug is stripped before the get-or-create, so the space is
+    filed under the trimmed slug (name==slug=="spicy") and a later
+    recall(space="spicy") converges on the same space rather than being unable to
+    find a padded "  spicy  " slug."""
+    fn = _get_tool_fn("remember")
+    write_mock = AsyncMock(return_value=_canned_result("memory"))
+    ensure_mock = MagicMock(return_value="sp-spicy")
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app.brain, "ensure_space", ensure_mock),
+    ):
+        await fn(_fake_ctx({}), "content", space="  spicy  ")
+
+    ensure_mock.assert_called_once()
+    ekw = ensure_mock.call_args.kwargs
+    assert ekw["slug"] == "spicy"
+    assert ekw["name"] == "spicy"
+    assert ekw["org_id"] == "org-x"
+    assert write_mock.await_args.kwargs["space_id"] == "sp-spicy"

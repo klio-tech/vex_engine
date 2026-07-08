@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import litellm
 from litellm import acompletion, aembedding
 from sqlalchemy import text
 
@@ -24,7 +25,30 @@ logger = logging.getLogger("agentguard.shared.memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-DEDUP_THRESHOLD: float = float(os.environ.get("KLIO_DEDUP_THRESHOLD", "0.95"))
+
+def _parse_dedup_threshold() -> float:
+    """Read, validate, and clamp ``KLIO_DEDUP_THRESHOLD`` from the environment.
+
+    A malformed (non-numeric) or out-of-range value must never crash module
+    import — an operator typo in one env var would otherwise take down every
+    process that imports this module. Instead we log a warning and fall back to
+    the ``0.95`` default. The value is also clamped to the valid cosine-similarity
+    range ``[0.0, 1.0]`` (a threshold outside it is meaningless: below 0 collapses
+    everything, above 1 disables dedup entirely).
+    """
+    raw = os.environ.get("KLIO_DEDUP_THRESHOLD", "0.95")
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("invalid KLIO_DEDUP_THRESHOLD=%r; using 0.95", raw)
+        return 0.95
+    if not 0.0 <= value <= 1.0:
+        logger.warning("KLIO_DEDUP_THRESHOLD=%s out of [0,1]; using 0.95", value)
+        return 0.95
+    return value
+
+
+DEDUP_THRESHOLD: float = _parse_dedup_threshold()
 """Cosine similarity threshold above which two memories are treated as duplicates.
 
 Default ``0.95``, overridable at process start via the ``KLIO_DEDUP_THRESHOLD``
@@ -181,22 +205,41 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
     while True:
         try:
             return await _aembedding_call(candidate)
-        except Exception:
+        except (litellm.ContextWindowExceededError, litellm.BadRequestError):
+            # Over-length-shaped rejection: shrinking the vector input can make
+            # the SAME backend accept it, so retry with harder truncation rather
+            # than lose the write.
             current_len = len(candidate) if candidate else 0
             if current_len <= EMBED_MIN_CHARS:
-                # At/below the floor: the backend is genuinely failing, not
-                # merely rejecting oversize input. Preserve the historical
-                # "embedder unavailable → None" contract.
-                logger.warning("Embedding generation failed", exc_info=True)
+                # At/below the floor and still rejected as over-length: the input
+                # cannot be shrunk any further usefully. Preserve the historical
+                # "cannot embed → None" contract rather than loop forever.
+                logger.warning(
+                    "embed_text: over-length even at the %d-char floor; returning None",
+                    current_len,
+                    exc_info=True,
+                )
                 return None
             new_len = max(EMBED_MIN_CHARS, current_len // 2)
             logger.warning(
-                "embed_text: embedding backend failed at %d chars; "
+                "embed_text: over-length at %d chars; "
                 "retrying with harder truncation to %d chars",
                 current_len,
                 new_len,
             )
             candidate = candidate[:new_len]
+        except Exception:
+            # Any non-over-length failure (backend down, timeout, transient
+            # gateway error) is NOT fixed by shrinking: truncating here would
+            # either fan out up to four calls at an already-failing backend or,
+            # worse, silently embed TRUNCATED content once a transient error
+            # cleared. Return None immediately on the original-size attempt,
+            # preserving the "backend error → None" contract.
+            logger.warning(
+                "embed_text: embedding backend error; returning None",
+                exc_info=True,
+            )
+            return None
 
 
 # ---------------------------------------------------------------------------

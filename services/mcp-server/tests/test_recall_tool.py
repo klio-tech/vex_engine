@@ -356,6 +356,57 @@ async def test_recall_unknown_space_returns_warning_without_retrieve():
     retrieve_mock.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_recall_space_slug_is_stripped():
+    """A padded recall space slug is stripped before lookup, so it converges with
+    the write path (which stores the stripped slug): recall(space='  research  ')
+    resolves slug 'research'."""
+    fn = _recall_fn()
+    retrieve_mock = AsyncMock(return_value=[])
+    find_mock = MagicMock(return_value="space-42")
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "find_space_id", find_mock),
+        patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
+    ):
+        await fn(_fake_ctx(), "q", space="  research  ")
+
+    assert find_mock.call_args.kwargs["slug"] == "research"
+    assert retrieve_mock.await_args.kwargs["space_id"] == "space-42"
+
+
+@pytest.mark.asyncio
+async def test_recall_blank_space_resolves_to_org_wide():
+    """A blank / whitespace-only recall space is treated as no filter (org-wide,
+    space_id=None) — mirroring the write side — rather than erroring 'unknown
+    space'. find_space_id is never consulted for an empty slug."""
+    fn = _recall_fn()
+    retrieve_mock = AsyncMock(return_value=[])
+    find_mock = MagicMock()
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "find_space_id", find_mock),
+        patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
+    ):
+        result = await fn(_fake_ctx(), "q", space="   ")
+
+    # No unknown-space short-circuit: retrieval ran org-wide with space_id=None.
+    find_mock.assert_not_called()
+    retrieve_mock.assert_awaited_once()
+    assert retrieve_mock.await_args.kwargs["space_id"] is None
+    assert "warning" not in result
+
+
 # ---------------------------------------------------------------------------
 # Project filter resolution.
 # ---------------------------------------------------------------------------
