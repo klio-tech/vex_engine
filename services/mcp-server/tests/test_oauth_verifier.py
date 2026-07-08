@@ -248,9 +248,7 @@ def test_verifies_es256_ec_token(monkeypatch):
 
     ec_key = ec.generate_private_key(ec.SECP256R1())
     ec_kid = "ec-key-1"
-    public_jwk = pyjwt.algorithms.ECAlgorithm.to_jwk(
-        ec_key.public_key(), as_dict=True
-    )
+    public_jwk = pyjwt.algorithms.ECAlgorithm.to_jwk(ec_key.public_key(), as_dict=True)
     public_jwk["kid"] = ec_kid
     public_jwk["alg"] = "ES256"
 
