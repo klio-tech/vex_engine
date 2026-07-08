@@ -4,10 +4,13 @@ import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import litellm
 import pytest
 from shared.memory import (
     DEDUP_THRESHOLD,
     DEFAULT_EMBEDDING_MODEL,
+    EMBED_MIN_CHARS,
+    MAX_EMBED_CHARS,
     MemoryRecord,
     _row_to_record,
     call_llm,
@@ -88,7 +91,10 @@ async def test_embed_text_calls_litellm():
 
 @pytest.mark.asyncio
 async def test_embed_text_returns_none_on_error():
-    """embed_text should return None when litellm raises an exception."""
+    """embed_text should return None when the backend raises a non-over-length
+    exception (e.g. the service is down): such errors are not fixed by shrinking,
+    so it returns None immediately without retrying.
+    """
     with patch(
         "shared.memory.aembedding",
         new_callable=AsyncMock,
@@ -97,6 +103,131 @@ async def test_embed_text_returns_none_on_error():
         result = await embed_text("hello world")
 
     assert result is None
+
+
+def _overlength_error() -> litellm.ContextWindowExceededError:
+    """Build the litellm over-length error the embedding backend raises when the
+    input exceeds the model's token cap.
+
+    This is the ONLY error shape ``embed_text`` should shrink-and-retry on;
+    every other exception must return ``None`` on the first attempt.
+    """
+    return litellm.ContextWindowExceededError(
+        message="input exceeds model token limit",
+        model="test-embed-model",
+        llm_provider="openai",
+    )
+
+
+def _embedding_backend(success_max: int, call_sizes: list[int]):
+    """Build an aembedding side_effect that records input sizes and raises an
+    over-length error for any input longer than ``success_max`` (simulating the
+    512-token cap that embed_text is expected to shrink under)."""
+
+    def _side_effect(*args, **kwargs):
+        text_in = kwargs["input"][0]
+        size = len(text_in) if text_in else 0
+        call_sizes.append(size)
+        if size > success_max:
+            raise _overlength_error()
+        resp = MagicMock()
+        resp.data = [MagicMock(embedding=SAMPLE_EMBEDDING)]
+        return resp
+
+    return _side_effect
+
+
+@pytest.mark.asyncio
+async def test_embed_text_progressively_truncates_long_input():
+    """A very long/dense input still embeds: embed_text shrinks and retries
+    until the backend accepts the smaller input (the write is never lost)."""
+    success_max = 400
+    call_sizes: list[int] = []
+
+    with patch(
+        "shared.memory.aembedding",
+        new_callable=AsyncMock,
+        side_effect=_embedding_backend(success_max, call_sizes),
+    ):
+        result = await embed_text("x" * 10_000)
+
+    assert result == SAMPLE_EMBEDDING
+    # More than one attempt: the initial head-truncation still exceeded the cap.
+    assert len(call_sizes) > 1
+    # First attempt is the MAX_EMBED_CHARS head-truncation.
+    assert call_sizes[0] == MAX_EMBED_CHARS
+    # Sizes shrink monotonically until one fits under the cap.
+    assert call_sizes[-1] <= success_max
+    assert all(later <= earlier for earlier, later in zip(call_sizes, call_sizes[1:]))
+
+
+@pytest.mark.asyncio
+async def test_embed_text_short_input_single_call():
+    """A normal short input embeds in a single backend call — no needless
+    shrinking when the input already fits."""
+    call_sizes: list[int] = []
+
+    with patch(
+        "shared.memory.aembedding",
+        new_callable=AsyncMock,
+        side_effect=_embedding_backend(success_max=10_000, call_sizes=call_sizes),
+    ):
+        result = await embed_text("a short note")
+
+    assert result == SAMPLE_EMBEDDING
+    assert len(call_sizes) == 1
+
+
+@pytest.mark.asyncio
+async def test_embed_text_returns_none_when_overlength_at_every_size():
+    """embed_text returns None when the input is rejected as over-length even at
+    the floor, and it stops shrinking at EMBED_MIN_CHARS (floor logic)."""
+    call_sizes: list[int] = []
+
+    def _always_overlength(*args, **kwargs):
+        text_in = kwargs["input"][0]
+        call_sizes.append(len(text_in) if text_in else 0)
+        raise _overlength_error()
+
+    with patch(
+        "shared.memory.aembedding",
+        new_callable=AsyncMock,
+        side_effect=_always_overlength,
+    ):
+        result = await embed_text("y" * 10_000)
+
+    assert result is None
+    # Retried down to the floor and no further.
+    assert call_sizes[-1] == EMBED_MIN_CHARS
+    assert all(size >= EMBED_MIN_CHARS for size in call_sizes)
+
+
+@pytest.mark.asyncio
+async def test_embed_text_non_overlength_error_returns_none_single_call():
+    """A non-over-length backend error (service down, timeout, transient gateway
+    error) is NOT retried with truncation: embed_text returns None after exactly
+    ONE call, so it never fans out against a failing backend nor silently embeds
+    truncated content that a plain retry would have accepted at full size."""
+    call_sizes: list[int] = []
+
+    def _transient_failure(*args, **kwargs):
+        text_in = kwargs["input"][0]
+        call_sizes.append(len(text_in) if text_in else 0)
+        raise Exception("embedding service unavailable")
+
+    with patch(
+        "shared.memory.aembedding",
+        new_callable=AsyncMock,
+        side_effect=_transient_failure,
+    ):
+        # A long input would be shrunk IF the error were over-length shaped; a
+        # generic error must still short-circuit after a single attempt.
+        result = await embed_text("y" * 10_000)
+
+    assert result is None
+    assert len(call_sizes) == 1
+    # No shrinking happened: the single attempt was the head-truncated size.
+    assert call_sizes == [MAX_EMBED_CHARS]
 
 
 # ---------------------------------------------------------------------------
@@ -432,8 +563,84 @@ def test_supersede_memory():
 
 def test_constants():
     """Verify module constants are set correctly."""
-    assert DEDUP_THRESHOLD == 0.92
+    assert DEDUP_THRESHOLD == 0.95
     assert DEFAULT_EMBEDDING_MODEL == "intfloat/multilingual-e5-large-instruct"
+
+
+def test_dedup_threshold_env_override(monkeypatch):
+    """KLIO_DEDUP_THRESHOLD overrides the default when the module is reloaded.
+
+    The threshold is read from the environment at import time, so an operator
+    override only takes effect on a fresh import/reload — which is exactly how
+    it is picked up at process start in production.
+    """
+    import importlib
+
+    import shared.memory as memory_mod
+
+    monkeypatch.setenv("KLIO_DEDUP_THRESHOLD", "0.97")
+    try:
+        reloaded = importlib.reload(memory_mod)
+        assert reloaded.DEDUP_THRESHOLD == 0.97
+        # find_similar_memory's default binding tracks the (reloaded) constant.
+        import inspect
+
+        sig = inspect.signature(reloaded.find_similar_memory)
+        assert sig.parameters["threshold"].default == 0.97
+    finally:
+        # Restore module to its default state so later tests see 0.95.
+        monkeypatch.delenv("KLIO_DEDUP_THRESHOLD", raising=False)
+        importlib.reload(memory_mod)
+
+
+def test_dedup_threshold_malformed_falls_back_to_default(monkeypatch):
+    """A non-numeric KLIO_DEDUP_THRESHOLD must NOT crash module import: it falls
+    back to the 0.95 default (with a logged warning)."""
+    import importlib
+
+    import shared.memory as memory_mod
+
+    monkeypatch.setenv("KLIO_DEDUP_THRESHOLD", "not-a-number")
+    try:
+        reloaded = importlib.reload(memory_mod)
+        assert reloaded.DEDUP_THRESHOLD == 0.95
+    finally:
+        monkeypatch.delenv("KLIO_DEDUP_THRESHOLD", raising=False)
+        importlib.reload(memory_mod)
+
+
+@pytest.mark.parametrize("bad_value", ["1.5", "-0.1", "2", "-3.0"])
+def test_dedup_threshold_out_of_range_falls_back_to_default(monkeypatch, bad_value):
+    """A KLIO_DEDUP_THRESHOLD outside [0.0, 1.0] is clamped back to the 0.95
+    default (a similarity threshold outside that range is meaningless)."""
+    import importlib
+
+    import shared.memory as memory_mod
+
+    monkeypatch.setenv("KLIO_DEDUP_THRESHOLD", bad_value)
+    try:
+        reloaded = importlib.reload(memory_mod)
+        assert reloaded.DEDUP_THRESHOLD == 0.95
+    finally:
+        monkeypatch.delenv("KLIO_DEDUP_THRESHOLD", raising=False)
+        importlib.reload(memory_mod)
+
+
+def test_dedup_threshold_boundary_values_accepted(monkeypatch):
+    """The inclusive boundaries 0.0 and 1.0 are valid and preserved (not clamped
+    to the default), so the [0,1] guard does not reject legitimate extremes."""
+    import importlib
+
+    import shared.memory as memory_mod
+
+    for boundary in ("0.0", "1.0"):
+        monkeypatch.setenv("KLIO_DEDUP_THRESHOLD", boundary)
+        try:
+            reloaded = importlib.reload(memory_mod)
+            assert reloaded.DEDUP_THRESHOLD == float(boundary)
+        finally:
+            monkeypatch.delenv("KLIO_DEDUP_THRESHOLD", raising=False)
+            importlib.reload(memory_mod)
 
 
 # ---------------------------------------------------------------------------

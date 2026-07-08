@@ -101,6 +101,18 @@ SERVER_INSTRUCTIONS = (
     "transient steps. Use `forget` to retract a memory by id."
 )
 
+# Shared annotation for the optional ``space`` argument on the five write tools
+# (remember/observe/plan/decide/note). Defined once so the schema description
+# cannot drift between tools; each tool spells it ``space: SpaceParam = None``.
+SpaceParam = Annotated[
+    Optional[str],
+    Field(
+        description=(
+            "Optional space slug to scope this memory to; created if it doesn't exist."
+        )
+    ),
+]
+
 
 async def _perform_write(
     ctx: Context,
@@ -109,6 +121,7 @@ async def _perform_write(
     memory_type: str,
     metadata: Optional[dict] = None,
     scope: str = "org",
+    space: Optional[str] = None,
 ) -> dict[str, Any]:
     """Shared body for the five Klio write tools.
 
@@ -122,6 +135,22 @@ async def _perform_write(
     dict rather than letting the exception leak through the MCP layer (the MCP
     transport has no notion of HTTP status codes for tool errors).
 
+    Space filing (D1): when ``space`` is provided, it is resolved to a
+    ``space_id`` via :func:`shared.brain.ensure_space` (get-or-create, keyed on
+    ``(org_id, slug)``) using the org_id from the resolved principal — NEVER
+    caller input — so the space is inherently tenant-scoped and a write can
+    never target another org's space. The provided string is used verbatim as
+    the slug (mirroring how ``recall`` treats ``space`` as the slug, so a write
+    and a later ``recall(space=...)`` converge on the same row) with
+    ``name == slug``. Resolution is idempotent: a repeat write to the same slug
+    reuses the existing space. Omitting ``space`` (or passing blank/whitespace)
+    leaves ``space_id=None`` — today's org-brain behavior, unchanged.
+
+    ``ensure_space`` is a synchronous DB helper called inline here, matching the
+    established pattern in :func:`_perform_recall` (which resolves its ``space``
+    filter via :func:`shared.brain.find_space_id` inline) and the inline project
+    resolution below.
+
     Args:
         ctx: FastMCP-injected context; ``ctx.request_context.request`` is the
             Starlette request for the Streamable-HTTP transport.
@@ -131,6 +160,9 @@ async def _perform_write(
         scope: ``"org"`` (default) for the shared team brain, or ``"agent"`` to
             write a row private to the caller's resolved ``agent_id`` (only
             ``recall(scope='agent')`` for that same agent sees it).
+        space: Optional space slug to scope this memory to; the space is created
+            (get-or-create) under the caller's org if it does not exist. Omitted
+            or blank means the org-wide brain (``space_id=None``).
 
     Returns:
         The result dict from :func:`shared.brain.write_scoped_memory`, or a
@@ -187,6 +219,23 @@ async def _perform_write(
         # resolve; fail open to unfiled — filing is relevance, not security).
         header_project_id = resolve_project_from_request(request, db, org_id=org_id)
 
+        # Resolve the optional space slug to a space_id (get-or-create, keyed on
+        # (org_id, slug)). The org_id comes from the resolved principal — never
+        # caller input — so the space is inherently tenant-scoped. The slug is
+        # STRIPPED before both the blank-guard and storage so a padded value like
+        # "  x  " files under slug "x" and a later recall(space="x") converges on
+        # the same space (rather than creating an unreachable padded-slug space).
+        # A blank / whitespace-only value is treated as "no space" (space_id stays
+        # None, backward compatible) rather than creating a stray empty-slug space.
+        stripped_space = space.strip() if space is not None else ""
+        space_id: Optional[str] = (
+            brain.ensure_space(
+                db, org_id=org_id, name=stripped_space, slug=stripped_space
+            )
+            if stripped_space
+            else None
+        )
+
         result = await brain.write_scoped_memory(
             db,
             org_id=org_id,
@@ -194,6 +243,7 @@ async def _perform_write(
             content=content,
             memory_type=memory_type,
             session_id=session_id,
+            space_id=space_id,
             project_id=header_project_id,
             metadata=metadata,
             scope=scope,
@@ -531,17 +581,23 @@ async def _perform_recall(
                 "guidance": RECALL_WRITE_NUDGE,
             }
 
-        # Resolve the optional space-slug filter. An unknown slug is surfaced
-        # (not silently dropped) so an over-narrow filter never masquerades as
-        # an org-wide search returning unrelated memories.
+        # Resolve the optional space-slug filter. The slug is STRIPPED so it
+        # converges with the write path (which stores the stripped slug): a
+        # padded recall(space="  x  ") looks up slug "x". A blank / whitespace-
+        # only value is treated as "no space filter" (space_id stays None →
+        # org-wide), mirroring the write side rather than erroring "unknown
+        # space". A genuinely non-blank slug that is not found is still surfaced
+        # (not silently dropped) so an over-narrow filter never masquerades as an
+        # org-wide search returning unrelated memories.
+        stripped_space = space.strip() if space is not None else ""
         space_id: Optional[str] = None
-        if space is not None:
-            space_id = brain.find_space_id(db, org_id=org_id, slug=space)
+        if stripped_space:
+            space_id = brain.find_space_id(db, org_id=org_id, slug=stripped_space)
             if space_id is None:
                 return {
                     "memories": [],
                     "count": 0,
-                    "warning": f"unknown space: {space}",
+                    "warning": f"unknown space: {stripped_space}",
                     "guidance": RECALL_WRITE_NUDGE,
                 }
 
@@ -778,6 +834,7 @@ def _register_tools(mcp: FastMCP) -> None:
                 )
             ),
         ] = "org",
+        space: SpaceParam = None,
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx,
@@ -785,6 +842,7 @@ def _register_tools(mcp: FastMCP) -> None:
             memory_type="memory",
             metadata={"source": "mcp"},
             scope=scope,
+            space=space,
         )
 
     @mcp.tool(
@@ -805,6 +863,7 @@ def _register_tools(mcp: FastMCP) -> None:
                 )
             ),
         ] = "org",
+        space: SpaceParam = None,
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx,
@@ -812,6 +871,7 @@ def _register_tools(mcp: FastMCP) -> None:
             memory_type="observation",
             metadata={"source": "mcp"},
             scope=scope,
+            space=space,
         )
 
     @mcp.tool(
@@ -832,6 +892,7 @@ def _register_tools(mcp: FastMCP) -> None:
                 )
             ),
         ] = "org",
+        space: SpaceParam = None,
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx,
@@ -839,6 +900,7 @@ def _register_tools(mcp: FastMCP) -> None:
             memory_type="plan",
             metadata={"source": "mcp"},
             scope=scope,
+            space=space,
         )
 
     @mcp.tool(
@@ -861,6 +923,7 @@ def _register_tools(mcp: FastMCP) -> None:
                 )
             ),
         ] = "org",
+        space: SpaceParam = None,
     ) -> dict[str, Any]:
         metadata = {"source": "mcp"}
         if rationale is not None:
@@ -871,6 +934,7 @@ def _register_tools(mcp: FastMCP) -> None:
             memory_type="decision",
             metadata=metadata,
             scope=scope,
+            space=space,
         )
 
     @mcp.tool(
@@ -889,6 +953,7 @@ def _register_tools(mcp: FastMCP) -> None:
                 )
             ),
         ] = "org",
+        space: SpaceParam = None,
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx,
@@ -896,6 +961,7 @@ def _register_tools(mcp: FastMCP) -> None:
             memory_type="note",
             metadata={"source": "mcp"},
             scope=scope,
+            space=space,
         )
 
     @mcp.tool(

@@ -305,3 +305,193 @@ async def test_write_files_under_header_project(monkeypatch):
         )
 
     assert seen.get("project_id") == "proj-9"
+
+
+# ---------------------------------------------------------------------------
+# D1 (space-on-write): a caller-supplied space slug is resolved to a space_id
+# via ensure_space (get-or-create, under the caller's org) and threaded into
+# write_scoped_memory. Omitting it keeps today's org-brain behavior.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name,expected_type", list(_TOOL_MEMORY_TYPE.items()))
+async def test_write_with_space_resolves_and_threads_space_id(tool_name, expected_type):
+    """Each write tool resolves space= to a space_id via ensure_space (get-or-
+    create under the caller's org) and threads it into write_scoped_memory; the
+    resolved id is echoed back on the result.
+
+    The shared ``_perform_write`` body implements this once, so the behavior is
+    identical across all five write tools (parametrized here to lock that).
+    """
+    fn = _get_tool_fn(tool_name)
+
+    async def _fake_write(db, **kwargs):
+        # Echo the scope columns like the real write_scoped_memory result so the
+        # assertion on the returned space_id is end-to-end-ish, not mock-only.
+        return {
+            "stored": True,
+            "deduplicated": False,
+            "id": "00000000-0000-0000-0000-000000000001",
+            "memory_type": kwargs.get("memory_type"),
+            "scope": kwargs.get("scope", "org"),
+            "space_id": kwargs.get("space_id"),
+            "project_id": kwargs.get("project_id"),
+        }
+
+    write_mock = AsyncMock(side_effect=_fake_write)
+    ensure_mock = MagicMock(return_value="sp-42")
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app.brain, "ensure_space", ensure_mock),
+    ):
+        result = await fn(_fake_ctx({}), "some content", space="spicychat-platform")
+
+    # Space resolved under the caller's org (never caller-supplied org input).
+    ensure_mock.assert_called_once()
+    ekw = ensure_mock.call_args.kwargs
+    assert ekw["org_id"] == "org-x"
+    # The provided space string is used verbatim as the slug (mirrors recall,
+    # which uses `space` as the slug) with name==slug (no separate name input).
+    assert ekw["slug"] == "spicychat-platform"
+    assert ekw["name"] == "spicychat-platform"
+    # Resolved id threaded into the write and echoed on the result.
+    assert write_mock.await_args.kwargs["space_id"] == "sp-42"
+    assert result["space_id"] == "sp-42"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", ["remember", "note"])
+async def test_write_without_space_leaves_space_id_none(tool_name):
+    """Omitting space keeps today's behavior: space_id is None and ensure_space
+    is never called (backward compatible org-brain write)."""
+    fn = _get_tool_fn(tool_name)
+    write_mock = AsyncMock(return_value=_canned_result("memory"))
+    ensure_mock = MagicMock()
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app.brain, "ensure_space", ensure_mock),
+    ):
+        await fn(_fake_ctx({}), "a durable fact")
+
+    assert write_mock.await_args.kwargs["space_id"] is None
+    ensure_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_write_space_resolved_under_resolved_principal_org():
+    """The org_id reaching ensure_space is the one from resolve_principal_plan —
+    never caller-supplied — so a write can only ever target its own org's space
+    (tenant-safe get-or-create)."""
+    fn = _get_tool_fn("note")
+    write_mock = AsyncMock(return_value=_canned_result("note"))
+    ensure_mock = MagicMock(return_value="sp-secure")
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-secure", "agent-z", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app.brain, "ensure_space", ensure_mock),
+    ):
+        await fn(_fake_ctx({}), "content", space="research")
+
+    assert ensure_mock.call_args.kwargs["org_id"] == "org-secure"
+
+
+@pytest.mark.asyncio
+async def test_write_same_space_slug_is_idempotent_reuses_space():
+    """Two writes with the same space slug both resolve to the SAME space_id
+    (ensure_space is get-or-create), so a second write reuses the space rather
+    than creating a duplicate."""
+    fn = _get_tool_fn("remember")
+    write_mock = AsyncMock(return_value=_canned_result("memory"))
+    # ensure_space returns the same id for a repeat (org, slug) — its ON CONFLICT
+    # get-or-create semantics; the fixed return value models that idempotency.
+    ensure_mock = MagicMock(return_value="sp-shared")
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app.brain, "ensure_space", ensure_mock),
+    ):
+        await fn(_fake_ctx({}), "first fact", space="ledger")
+        first_space_id = write_mock.await_args.kwargs["space_id"]
+        await fn(_fake_ctx({}), "second fact", space="ledger")
+        second_space_id = write_mock.await_args.kwargs["space_id"]
+
+    assert first_space_id == second_space_id == "sp-shared"
+    assert ensure_mock.call_count == 2
+    for call in ensure_mock.call_args_list:
+        assert call.kwargs["slug"] == "ledger"
+        assert call.kwargs["org_id"] == "org-x"
+
+
+@pytest.mark.asyncio
+async def test_write_blank_space_treated_as_no_space():
+    """A blank/whitespace-only space is treated as omitted: space_id stays None
+    and no stray empty-slug space is created."""
+    fn = _get_tool_fn("remember")
+    write_mock = AsyncMock(return_value=_canned_result("memory"))
+    ensure_mock = MagicMock()
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app.brain, "ensure_space", ensure_mock),
+    ):
+        await fn(_fake_ctx({}), "content", space="   ")
+
+    assert write_mock.await_args.kwargs["space_id"] is None
+    ensure_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_write_space_slug_is_stripped():
+    """A padded space slug is stripped before the get-or-create, so the space is
+    filed under the trimmed slug (name==slug=="spicy") and a later
+    recall(space="spicy") converges on the same space rather than being unable to
+    find a padded "  spicy  " slug."""
+    fn = _get_tool_fn("remember")
+    write_mock = AsyncMock(return_value=_canned_result("memory"))
+    ensure_mock = MagicMock(return_value="sp-spicy")
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app.brain, "ensure_space", ensure_mock),
+    ):
+        await fn(_fake_ctx({}), "content", space="  spicy  ")
+
+    ensure_mock.assert_called_once()
+    ekw = ensure_mock.call_args.kwargs
+    assert ekw["slug"] == "spicy"
+    assert ekw["name"] == "spicy"
+    assert ekw["org_id"] == "org-x"
+    assert write_mock.await_args.kwargs["space_id"] == "sp-spicy"
