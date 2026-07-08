@@ -24,8 +24,16 @@ logger = logging.getLogger("agentguard.shared.memory")
 # Constants
 # ---------------------------------------------------------------------------
 
-DEDUP_THRESHOLD: float = 0.92
-"""Cosine similarity threshold above which two memories are duplicates."""
+DEDUP_THRESHOLD: float = float(os.environ.get("KLIO_DEDUP_THRESHOLD", "0.95"))
+"""Cosine similarity threshold above which two memories are treated as duplicates.
+
+Default ``0.95``, overridable at process start via the ``KLIO_DEDUP_THRESHOLD``
+env var. Raised from the historical ``0.92`` because same-topic technical text
+(code, JSON, config, prose on one subject) embeds very tightly: at 0.92
+genuinely distinct notes cleared the bar and were collapsed into a single row
+by :func:`find_similar_memory`. 0.95 keeps near-identical dedup while letting
+distinct same-topic notes coexist. Read from the environment so it can be tuned
+per deployment without a code change."""
 
 DEFAULT_EMBEDDING_MODEL: str = "intfloat/multilingual-e5-large-instruct"
 """Default model used for embedding generation when env var is unset."""
@@ -37,13 +45,28 @@ DEFAULT_LLM_TIMEOUT_S: float = 10.0
 """Default timeout (seconds) for LLM completion calls."""
 
 MAX_EMBED_CHARS: int = 1800
-"""Head-truncation budget for embedding input.
+"""Head-truncation budget for embedding input (first attempt).
 
 The default embedding model caps input at 512 tokens; at ~4 chars/token a
-1800-char head stays safely under that (≈450 tokens) even for multibyte text.
+1800-char head stays under that (≈450 tokens) for typical text. But this is a
+*char* proxy for a *token* cap: dense code/JSON/base64 packs >1 token/char, so
+a 1800-char head can still exceed 512 tokens and make the backend raise. That
+residual risk is handled by :func:`embed_text`'s progressive-truncation retry
+(see :data:`EMBED_MIN_CHARS`), so a long/dense note is never lost.
+
 Truncation applies ONLY to the vector input — stored ``content`` is never
-modified. This prevents oversized content from returning HTTP 400 and looping
-the embedder (which previously flooded logs at the host's rate limit)."""
+modified. This also prevents oversized content from returning HTTP 400 and
+looping the embedder (which previously flooded logs at the host's rate limit)."""
+
+EMBED_MIN_CHARS: int = 256
+"""Smallest truncation floor for :func:`embed_text`'s progressive retry.
+
+When an embedding-backend call fails, :func:`embed_text` halves the input and
+retries, down to this floor. A failure at (or below) the floor is treated as
+the embedding service being genuinely unavailable → ``None``; it is NOT the
+path for "the content was long". Consequently a short input that fails returns
+``None`` on a single attempt (no needless retries), while a long/dense input is
+shrunk repeatedly until it fits under the model's token cap."""
 
 # Providers that support response_format via gateway
 _JSON_MODE_PREFIXES = ("openai/", "gpt-")
@@ -92,23 +115,20 @@ class MemoryRecord:
 # ---------------------------------------------------------------------------
 
 
-async def embed_text(text_input: str) -> Optional[list[float]]:
-    """Generate an embedding vector via ``litellm.aembedding()``.
+async def _aembedding_call(text_input: str) -> list[float]:
+    """Perform a single embedding-backend call via ``litellm.aembedding()``.
 
-    Reads the model name from the ``MEMORY_EMBEDDING_MODEL`` env var,
-    falling back to :data:`DEFAULT_EMBEDDING_MODEL`.
+    Reads the model name from the ``MEMORY_EMBEDDING_MODEL`` env var, falling
+    back to :data:`DEFAULT_EMBEDDING_MODEL`, and optional gateway credentials
+    from the ``LITELLM_*`` / ``OPENAI_*`` env vars.
+
+    Isolated from :func:`embed_text` so the latter can retry it with
+    progressively smaller input without duplicating the litellm wiring. Raises
+    whatever the backend raises (e.g. an over-token-budget HTTP 400).
 
     Returns:
-        A list of floats representing the embedding, or ``None`` on error.
+        The embedding vector as a list of floats.
     """
-    if text_input and len(text_input) > MAX_EMBED_CHARS:
-        logger.debug(
-            "embed_text: truncating input from %d to %d chars",
-            len(text_input),
-            MAX_EMBED_CHARS,
-        )
-        text_input = text_input[:MAX_EMBED_CHARS]
-
     model = os.environ.get("MEMORY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
     api_base = os.environ.get("LITELLM_API_URL") or os.environ.get("OPENAI_API_BASE")
     api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
@@ -120,13 +140,63 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
     if api_key:
         kwargs["api_key"] = api_key
 
-    try:
-        response = await aembedding(**kwargs)
-        item = response.data[0]
-        return item["embedding"] if isinstance(item, dict) else item.embedding
-    except Exception:
-        logger.warning("Embedding generation failed", exc_info=True)
-        return None
+    response = await aembedding(**kwargs)
+    item = response.data[0]
+    return item["embedding"] if isinstance(item, dict) else item.embedding
+
+
+async def embed_text(text_input: str) -> Optional[list[float]]:
+    """Generate an embedding vector via ``litellm.aembedding()``.
+
+    Reads the model name from the ``MEMORY_EMBEDDING_MODEL`` env var, falling
+    back to :data:`DEFAULT_EMBEDDING_MODEL`.
+
+    Robustness — progressive truncation so a long/dense note never fails a
+    write: :data:`MAX_EMBED_CHARS` is only a *char* proxy for the model's 512
+    *token* cap, and dense code/JSON packs >1 token/char, so a char-truncated
+    input can still exceed the cap and make the backend raise. Rather than lose
+    the write, ``embed_text`` retries with the input halved on each backend
+    error, down to the :data:`EMBED_MIN_CHARS` floor. ``None`` is returned ONLY
+    when even the floor-sized attempt fails (the embedding service is genuinely
+    unavailable) — never merely because the content was long.
+
+    Truncation applies ONLY to the vector input; the caller's stored ``content``
+    is never modified by this function.
+
+    Returns:
+        A list of floats representing the embedding, or ``None`` only when the
+        embedding backend fails at every attempted size.
+    """
+    # First attempt: head-truncate to the char budget (unchanged behavior).
+    if text_input and len(text_input) > MAX_EMBED_CHARS:
+        logger.debug(
+            "embed_text: truncating input from %d to %d chars",
+            len(text_input),
+            MAX_EMBED_CHARS,
+        )
+        candidate = text_input[:MAX_EMBED_CHARS]
+    else:
+        candidate = text_input
+
+    while True:
+        try:
+            return await _aembedding_call(candidate)
+        except Exception:
+            current_len = len(candidate) if candidate else 0
+            if current_len <= EMBED_MIN_CHARS:
+                # At/below the floor: the backend is genuinely failing, not
+                # merely rejecting oversize input. Preserve the historical
+                # "embedder unavailable → None" contract.
+                logger.warning("Embedding generation failed", exc_info=True)
+                return None
+            new_len = max(EMBED_MIN_CHARS, current_len // 2)
+            logger.warning(
+                "embed_text: embedding backend failed at %d chars; "
+                "retrying with harder truncation to %d chars",
+                current_len,
+                new_len,
+            )
+            candidate = candidate[:new_len]
 
 
 # ---------------------------------------------------------------------------
