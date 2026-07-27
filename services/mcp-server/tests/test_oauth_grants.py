@@ -4,11 +4,20 @@ from app.oauth import GrantResolver, OAuthIdentity, OAuthPrincipal
 
 
 class FakeConn:
-    def __init__(self, rows):
+    """Match the first needle contained in the statement and serve its row.
+
+    A row that is an ``Exception`` instance is raised instead of returned, so
+    tests can simulate a failing query and assert the fail-closed posture.
+    """
+
+    def __init__(self, rows, recorder=None):
         self._rows = rows
+        self._recorder = recorder
 
     def execute(self, sql, params=None):
         sql_s = str(sql)
+        if self._recorder is not None:
+            self._recorder.append((sql_s, params))
 
         class R:
             def __init__(self, row):
@@ -19,6 +28,8 @@ class FakeConn:
 
         for needle, row in self._rows:
             if needle in sql_s:
+                if isinstance(row, Exception):
+                    raise row
                 return R(row)
         return R(None)
 
@@ -30,18 +41,40 @@ class FakeConn:
 
 
 class FakeEngine:
-    def __init__(self, rows):
+    def __init__(self, rows, recorder=None):
         self._rows = rows
+        self._recorder = recorder
 
     def connect(self):
-        return FakeConn(self._rows)
+        return FakeConn(self._rows, self._recorder)
 
 
-def _resolver(grant_slug="acme", org_id="org-acme", plan=("pro", None)):
+def _supabase_rows(grant_row, membership, plan):
+    """Supabase-side needles, membership BEFORE the bare ``accounts`` needle.
+
+    The membership statement also contains the substring ``accounts``, so it
+    must be matched first or it would be served the plan row.
+    """
+    return [
+        ("oauth_grants", grant_row),
+        ("accounts_memberships", membership),
+        ("accounts", plan),
+    ]
+
+
+def _resolver(
+    grant_slug="acme",
+    org_id="org-acme",
+    plan=("pro", None),
+    membership=(1,),
+    recorder=None,
+):
     grant_row = (grant_slug,) if grant_slug else None
     org_row = (org_id,) if org_id else None
     resolver = GrantResolver(
-        supabase_engine=FakeEngine([("oauth_grants", grant_row), ("accounts", plan)]),
+        supabase_engine=FakeEngine(
+            _supabase_rows(grant_row, membership, plan), recorder=recorder
+        ),
         tsdb_engine=FakeEngine([("organizations", org_row)]),
     )
     return resolver
@@ -60,6 +93,47 @@ def test_active_grant_resolves_principal():
 def test_no_grant_returns_none():
     assert (
         _resolver(grant_slug=None).resolve(
+            OAuthIdentity(user_id="u-1", client_id="c-1")
+        )
+        is None
+    )
+
+
+def test_member_grant_resolves_and_binds_membership_params():
+    """Membership present -> principal resolves, and the membership check is
+    a single parameter-bound query on (grant slug, token user_id)."""
+    recorder: list = []
+    principal = _resolver(recorder=recorder).resolve(
+        OAuthIdentity(user_id="u-1", client_id="c-1")
+    )
+    assert isinstance(principal, OAuthPrincipal)
+    assert principal.org_id == "org-acme"
+    assert principal.plan == "pro"
+
+    membership_calls = [c for c in recorder if "accounts_memberships" in c[0]]
+    assert len(membership_calls) == 1
+    sql, params = membership_calls[0]
+    assert params == {"slug": "acme", "user_id": "u-1"}
+    # Values are bound, never interpolated into the statement text.
+    assert "acme" not in sql
+    assert "u-1" not in sql
+
+
+def test_grant_for_non_member_account_returns_none():
+    """Defense in depth: a grant repointed at an account the user does not
+    belong to must not resolve — otherwise it is cross-tenant access."""
+    assert (
+        _resolver(membership=None).resolve(
+            OAuthIdentity(user_id="u-1", client_id="c-1")
+        )
+        is None
+    )
+
+
+def test_membership_lookup_error_fails_closed():
+    """A failing membership query must never fall through to a principal."""
+    assert (
+        _resolver(membership=RuntimeError("db down")).resolve(
             OAuthIdentity(user_id="u-1", client_id="c-1")
         )
         is None
@@ -152,7 +226,7 @@ def test_plan_overrides_as_json_string_is_parsed():
     org_row = ("org-acme",)
     resolver = GrantResolver(
         supabase_engine=FakeEngine(
-            [("oauth_grants", grant_row), ("accounts", ("pro", overrides_str))]
+            _supabase_rows(grant_row, (1,), ("pro", overrides_str))
         ),
         tsdb_engine=FakeEngine([("organizations", org_row)]),
     )
