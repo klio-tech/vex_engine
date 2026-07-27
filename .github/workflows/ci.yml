@@ -16,7 +16,12 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install ruff
-        run: pip install ruff
+        # Pinned deliberately. An unpinned install picks up whatever ruff was
+        # released that morning, so a new version's rules turn CI red on code
+        # nobody touched — 0.16.0 did exactly that (403 errors across the repo,
+        # blocking unrelated PRs). Bump this on purpose, with the resulting
+        # fixes in the same commit.
+        run: pip install ruff==0.15.4
       - name: Ruff lint check
         run: ruff check services/
       - name: Ruff format check
