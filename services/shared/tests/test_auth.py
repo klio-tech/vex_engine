@@ -880,3 +880,104 @@ class TestPlanLookupJoin:
             "free",
             None,
         )
+
+
+# ---------------------------------------------------------------------------
+# Tests: memory scope is decoupled from the reliability executions table
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryQuotaDecoupling:
+    """Memory availability must not ride on the reliability hypertable.
+
+    Memory usage is metered by ``shared.usage`` (``memory_usage_counters``)
+    at the MCP/capture layer, so a memory-scoped validation has no business
+    running -- let alone failing closed on -- a COUNT over ``executions``.
+    """
+
+    MEMORY_SCOPES = ["memory"]
+    BOTH_SCOPES = ["ingest", "verify", "read", "memory"]
+
+    def _validate_with(self, *, required_scope, key_scopes, **route_kwargs):
+        entry, raw_key, _ = _make_key_entry(scopes=key_scopes)
+        validator, engine = _build_validator(required_scope=required_scope)
+        executed = _route_main_engine(
+            engine, key_row=_make_db_row([entry]), **route_kwargs
+        )
+        validator._query_plan_from_supabase = MagicMock(return_value=("free", None))
+        return validator, raw_key, executed
+
+    def test_memory_scope_does_not_count_executions(self):
+        validator, raw_key, executed = self._validate_with(
+            required_scope="memory",
+            key_scopes=self.MEMORY_SCOPES,
+        )
+
+        result = validator.validate(raw_key)
+
+        assert result.org_id == "test-org"
+        assert not any("FROM executions" in sql for sql in executed)
+
+    def test_memory_scope_survives_broken_executions_table(self):
+        """A sick reliability hypertable must not 503 a memory request."""
+        validator, raw_key, executed = self._validate_with(
+            required_scope="memory",
+            key_scopes=self.MEMORY_SCOPES,
+            usage_error=True,
+        )
+
+        result = validator.validate(raw_key)
+
+        assert result.org_id == "test-org"
+        assert not any("FROM executions" in sql for sql in executed)
+
+    def test_memory_scope_not_blocked_by_reliability_overage(self):
+        """Reliability usage far past the free cap must not gate memory."""
+        validator, raw_key, _ = self._validate_with(
+            required_scope="memory",
+            key_scopes=self.MEMORY_SCOPES,
+            usage_count=10_000_000,
+        )
+
+        assert validator.validate(raw_key).org_id == "test-org"
+
+    def test_dual_scope_key_still_metered_on_reliability_surface(self):
+        """A key with both scopes is unchanged on the ingest surface."""
+        validator, raw_key, executed = self._validate_with(
+            required_scope="ingest",
+            key_scopes=self.BOTH_SCOPES,
+            usage_count=1000,  # free plan observations cap
+        )
+
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+
+        assert exc_info.value.status_code == 429
+        assert any("FROM executions" in sql for sql in executed)
+
+    @pytest.mark.parametrize("scope", ["ingest", "verify", "read"])
+    def test_reliability_scopes_still_count_executions(self, scope):
+        validator, raw_key, executed = self._validate_with(
+            required_scope=scope,
+            key_scopes=self.BOTH_SCOPES,
+            usage_count=1,
+        )
+
+        validator.validate(raw_key)
+
+        assert any("FROM executions" in sql for sql in executed)
+
+    @pytest.mark.parametrize("scope", ["ingest", "verify", "read"])
+    def test_reliability_scopes_still_fail_closed(self, scope):
+        """Regression guard: the 503 fail-closed path is untouched."""
+        validator, raw_key, _ = self._validate_with(
+            required_scope=scope,
+            key_scopes=self.BOTH_SCOPES,
+            usage_error=True,
+        )
+
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.retry_after_seconds == 30

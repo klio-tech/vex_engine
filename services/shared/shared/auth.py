@@ -34,6 +34,13 @@ logger = logging.getLogger("agentguard.auth")
 
 VALID_SCOPES = frozenset({"ingest", "verify", "read", "memory"})
 
+# Scopes whose monthly usage is metered by the reliability ``executions``
+# hypertable.  The memory product meters itself through
+# ``shared.usage`` (``memory_usage_counters``, enforced at the MCP/capture
+# layer), so memory-scoped requests must neither pay for nor fail closed on a
+# COUNT over a reliability table their tenant may never write to.
+RELIABILITY_SCOPES = frozenset({"ingest", "verify", "read"})
+
 
 def _is_uuid(value: str | None) -> bool:
     """Return True when ``value`` is a well-formed UUID string.
@@ -460,17 +467,27 @@ class KeyValidator:
             )
 
     def _check_quota(self, entry: _CachedKey) -> None:
-        """Enforce monthly quota based on organization plan.
+        """Enforce the monthly reliability quota for this validator's scope.
 
         Uses direct queries against the ``executions`` hypertable,
         filtered by scope:
         - ``verify`` scope → counts rows where ``confidence IS NOT NULL``
-        - ``ingest``/``memory`` scope → counts all rows
+        - ``ingest``/``read`` scope → counts all rows
           (observations + verifications)
+
+        ``memory`` is exempt: each service builds its own ``KeyValidator``
+        with a fixed ``required_scope``, so a memory-scoped validator only
+        ever serves memory traffic (the MCP server) and that traffic is
+        metered by ``shared.usage``.  A key that also carries ``ingest`` /
+        ``verify`` / ``read`` is still fully metered here whenever it is used
+        against a reliability service, whose validator carries that scope.
 
         Fail-closed: if the query errors, the request is denied with 503.
         Results are cached per-org for 30 s to reduce DB pressure.
         """
+        if self._required_scope not in RELIABILITY_SCOPES:
+            return
+
         plan_config = get_plan_config(entry.plan, entry.plan_overrides)
 
         if self._required_scope == "verify":
