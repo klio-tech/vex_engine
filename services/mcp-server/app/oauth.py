@@ -286,11 +286,18 @@ class GrantResolver:
 
     Chain (the same joins the key path already performs):
         oauth_grants(user_id, client_id, revoked_at IS NULL) -> account_slug
+        accounts_memberships(account_slug, user_id)          -> membership gate
         organizations(account_slug)                          -> org_id
         accounts(slug)                                       -> plan, overrides
 
+    The membership gate is deliberately redundant with the ``oauth_grants``
+    RLS policies: the grant row is treated as a claim, not as proof, so a row
+    whose ``account_slug`` points at a workspace the user does not belong to
+    resolves to no principal instead of another tenant's memory.
+
     Results are cached per (user_id, client_id) for ``_GRANT_CACHE_TTL_S``
-    (60 s — the spec's revocation-lag bound, same TTL as the key cache).
+    (60 s — the spec's revocation-lag bound, same TTL as the key cache), which
+    also bounds how long a removed membership stays usable.
     All lookup failures return ``None`` — authn fails closed.
     """
 
@@ -340,6 +347,32 @@ class GrantResolver:
         if grant is None:
             return None
         account_slug = grant[0]
+
+        # Defense in depth: never trust the grant row's account_slug on its
+        # own.  Re-verify server-side that the token's user really is a
+        # member of that account, so a grant repointed at someone else's
+        # workspace cannot buy cross-tenant access to its memory.
+        with self._supabase_engine.connect() as conn:
+            membership = conn.execute(
+                text(
+                    """
+                    SELECT 1
+                    FROM public.accounts_memberships m
+                    JOIN public.accounts a ON a.id = m.account_id
+                    WHERE a.slug = :slug
+                      AND m.user_id = :user_id
+                    LIMIT 1
+                    """
+                ),
+                {"slug": account_slug, "user_id": identity.user_id},
+            ).fetchone()
+        if membership is None:
+            logger.warning(
+                "oauth: user %s is not a member of grant account %s; rejected",
+                identity.user_id,
+                account_slug,
+            )
+            return None
 
         with self._tsdb_engine.connect() as conn:
             org = conn.execute(
