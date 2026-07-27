@@ -629,3 +629,355 @@ class TestQuotaEnforcement:
         assert len(calls) >= 2
         quota_query = str(calls[1][0][0])
         assert "confidence IS NOT NULL" in quota_query
+
+
+# ---------------------------------------------------------------------------
+# Helpers: engine routers that record the SQL a validator actually issues
+# ---------------------------------------------------------------------------
+
+ACCOUNT_UUID = "3f2a9b1c-7d64-4c18-9a55-1e0b6d2f8c43"
+
+
+def _build_validator_with_supabase(required_scope="verify", cache_ttl_s=60.0):
+    """Build a KeyValidator with mocked primary *and* Supabase engines."""
+    main_engine = MagicMock()
+    supabase_engine = MagicMock()
+    with patch("shared.auth.create_engine") as mock_create:
+        mock_create.side_effect = [main_engine, supabase_engine]
+        validator = KeyValidator(
+            database_url="postgresql://test:test@localhost/test",
+            required_scope=required_scope,
+            supabase_database_url="postgresql://test:test@localhost/supabase",
+            cache_ttl_s=cache_ttl_s,
+        )
+    return validator, main_engine, supabase_engine
+
+
+def _route_main_engine(engine, *, key_row, usage_count=0, usage_error=False):
+    """Route primary-engine queries by statement and record every SQL string.
+
+    Returns the recording list so a test can assert *which* queries ran --
+    notably whether the reliability ``executions`` COUNT was issued at all.
+    """
+    executed: list[str] = []
+    mock_conn = MagicMock()
+
+    def _execute(statement, params=None, *args, **kwargs):
+        sql = str(statement)
+        executed.append(sql)
+        result = MagicMock()
+        if "FROM organizations" in sql:
+            result.fetchone.return_value = key_row
+            return result
+        if "FROM executions" in sql:
+            if usage_error:
+                raise Exception("executions hypertable unavailable")
+            result.scalar.return_value = usage_count
+            return result
+        result.fetchone.return_value = None
+        result.scalar.return_value = 0
+        return result
+
+    mock_conn.execute.side_effect = _execute
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    engine.connect.return_value = mock_conn
+    return executed
+
+
+def _route_supabase_engine(engine, *, by_id=None, by_slug=None, error=False):
+    """Route Supabase plan lookups and record ``(sql, params)`` per call.
+
+    ``by_id`` is the row returned for the immutable account-UUID join and
+    ``by_slug`` the row for the legacy mutable-slug join (``None`` = no row).
+    """
+    executed: list[tuple[str, dict]] = []
+    mock_conn = MagicMock()
+
+    def _execute(statement, params=None, *args, **kwargs):
+        bound = params or {}
+        executed.append((str(statement), bound))
+        if error:
+            raise Exception("supabase unavailable")
+        result = MagicMock()
+        if "account_id" in bound:
+            result.fetchone.return_value = by_id
+        else:
+            result.fetchone.return_value = by_slug
+        return result
+
+    mock_conn.execute.side_effect = _execute
+    mock_conn.__enter__ = MagicMock(return_value=mock_conn)
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    engine.connect.return_value = mock_conn
+    return executed
+
+
+# ---------------------------------------------------------------------------
+# Tests: plan lookup joins Supabase on the immutable account UUID
+# ---------------------------------------------------------------------------
+
+
+class TestPlanLookupJoin:
+    """The plan join must survive a workspace rename.
+
+    ``organizations.account_slug`` mirrors a user-editable Supabase slug, so
+    it goes stale the moment somebody renames their workspace. Joining on the
+    immutable ``accounts.id`` keeps paid tenants on their paid plan instead of
+    silently downgrading every API key to ``free``.
+    """
+
+    def test_stale_slug_still_resolves_paid_plan_via_account_uuid(self):
+        """Renamed workspace: stale slug misses, UUID join still finds 'pro'."""
+        entry, raw_key, _ = _make_key_entry()
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(
+            main_engine,
+            key_row=_make_db_row(
+                [entry], org_id=ACCOUNT_UUID, account_slug="old-workspace-name"
+            ),
+            usage_count=10,
+        )
+        _route_supabase_engine(
+            supabase_engine,
+            by_id=("pro", None),
+            by_slug=None,  # slug was renamed -> legacy lookup misses
+        )
+
+        result = validator.validate(raw_key)
+
+        assert result.plan == "pro"
+        assert result.org_id == ACCOUNT_UUID
+
+    def test_uuid_join_binds_org_id_and_skips_slug_query(self):
+        """A UUID hit short-circuits: no second query on the mutable slug."""
+        entry, raw_key, _ = _make_key_entry()
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(
+            main_engine,
+            key_row=_make_db_row(
+                [entry], org_id=ACCOUNT_UUID, account_slug="old-workspace-name"
+            ),
+        )
+        supabase_calls = _route_supabase_engine(
+            supabase_engine,
+            by_id=("team", {"observations_per_month": 999}),
+            by_slug=("free", None),
+        )
+
+        result = validator.validate(raw_key)
+
+        assert result.plan == "team"
+        assert result.plan_overrides == {"observations_per_month": 999}
+        assert len(supabase_calls) == 1
+        sql, params = supabase_calls[0]
+        assert params == {"account_id": ACCOUNT_UUID}
+        assert ACCOUNT_UUID not in sql  # bound, never interpolated
+
+    def test_overrides_json_string_is_parsed(self):
+        """Drivers that hand back JSONB as text still yield a dict."""
+        entry, raw_key, _ = _make_key_entry()
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(
+            main_engine,
+            key_row=_make_db_row([entry], org_id=ACCOUNT_UUID, account_slug="acme"),
+        )
+        _route_supabase_engine(
+            supabase_engine, by_id=("enterprise", '{"max_agents": 42}')
+        )
+
+        result = validator.validate(raw_key)
+
+        assert result.plan == "enterprise"
+        assert result.plan_overrides == {"max_agents": 42}
+
+    def test_legacy_non_uuid_org_id_falls_back_to_slug_lookup(self):
+        """Legacy orgs (org_id='vex') keep working via the slug join."""
+        entry, raw_key, _ = _make_key_entry()
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(
+            main_engine,
+            key_row=_make_db_row([entry], org_id="vex", account_slug="vex"),
+        )
+        supabase_calls = _route_supabase_engine(
+            supabase_engine, by_id=None, by_slug=("pro", None)
+        )
+
+        result = validator.validate(raw_key)
+
+        assert result.plan == "pro"
+        # A non-UUID org_id must not be sent to a uuid-typed column at all.
+        assert len(supabase_calls) == 1
+        assert supabase_calls[0][1] == {"slug": "vex"}
+
+    def test_uuid_org_without_account_row_falls_back_to_slug(self):
+        """UUID miss still tries the slug before giving up."""
+        entry, raw_key, _ = _make_key_entry()
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(
+            main_engine,
+            key_row=_make_db_row([entry], org_id=ACCOUNT_UUID, account_slug="acme"),
+        )
+        supabase_calls = _route_supabase_engine(
+            supabase_engine, by_id=None, by_slug=("starter", None)
+        )
+
+        result = validator.validate(raw_key)
+
+        assert result.plan == "starter"
+        assert len(supabase_calls) == 2
+        assert supabase_calls[0][1] == {"account_id": ACCOUNT_UUID}
+        assert supabase_calls[1][1] == {"slug": "acme"}
+
+    def test_unknown_org_falls_back_to_free(self):
+        """Neither join matches -> safe ('free', None) fallback."""
+        entry, raw_key, _ = _make_key_entry()
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(
+            main_engine,
+            key_row=_make_db_row([entry], org_id=ACCOUNT_UUID, account_slug="ghost"),
+        )
+        _route_supabase_engine(supabase_engine, by_id=None, by_slug=None)
+
+        result = validator.validate(raw_key)
+
+        assert result.plan == "free"
+        assert result.plan_overrides is None
+
+    def test_supabase_error_falls_back_to_free(self):
+        """A genuine Supabase failure keeps the existing 'free' posture."""
+        entry, raw_key, _ = _make_key_entry()
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(
+            main_engine,
+            key_row=_make_db_row([entry], org_id=ACCOUNT_UUID, account_slug="acme"),
+        )
+        _route_supabase_engine(supabase_engine, error=True)
+
+        result = validator.validate(raw_key)
+
+        assert result.plan == "free"
+        assert result.plan_overrides is None
+
+    def test_no_supabase_engine_returns_free(self):
+        """Unconfigured Supabase engine short-circuits to the free plan."""
+        validator, _ = _build_validator(required_scope="verify")
+        assert validator._query_plan_from_supabase("acme", ACCOUNT_UUID) == (
+            "free",
+            None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tests: memory scope is decoupled from the reliability executions table
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryQuotaDecoupling:
+    """Memory availability must not ride on the reliability hypertable.
+
+    Memory usage is metered by ``shared.usage`` (``memory_usage_counters``)
+    at the MCP/capture layer, so a memory-scoped validation has no business
+    running -- let alone failing closed on -- a COUNT over ``executions``.
+    """
+
+    MEMORY_SCOPES = ["memory"]
+    BOTH_SCOPES = ["ingest", "verify", "read", "memory"]
+
+    def _validate_with(self, *, required_scope, key_scopes, **route_kwargs):
+        entry, raw_key, _ = _make_key_entry(scopes=key_scopes)
+        validator, engine = _build_validator(required_scope=required_scope)
+        executed = _route_main_engine(
+            engine, key_row=_make_db_row([entry]), **route_kwargs
+        )
+        validator._query_plan_from_supabase = MagicMock(return_value=("free", None))
+        return validator, raw_key, executed
+
+    def test_memory_scope_does_not_count_executions(self):
+        validator, raw_key, executed = self._validate_with(
+            required_scope="memory",
+            key_scopes=self.MEMORY_SCOPES,
+        )
+
+        result = validator.validate(raw_key)
+
+        assert result.org_id == "test-org"
+        assert not any("FROM executions" in sql for sql in executed)
+
+    def test_memory_scope_survives_broken_executions_table(self):
+        """A sick reliability hypertable must not 503 a memory request."""
+        validator, raw_key, executed = self._validate_with(
+            required_scope="memory",
+            key_scopes=self.MEMORY_SCOPES,
+            usage_error=True,
+        )
+
+        result = validator.validate(raw_key)
+
+        assert result.org_id == "test-org"
+        assert not any("FROM executions" in sql for sql in executed)
+
+    def test_memory_scope_not_blocked_by_reliability_overage(self):
+        """Reliability usage far past the free cap must not gate memory."""
+        validator, raw_key, _ = self._validate_with(
+            required_scope="memory",
+            key_scopes=self.MEMORY_SCOPES,
+            usage_count=10_000_000,
+        )
+
+        assert validator.validate(raw_key).org_id == "test-org"
+
+    def test_dual_scope_key_still_metered_on_reliability_surface(self):
+        """A key with both scopes is unchanged on the ingest surface."""
+        validator, raw_key, executed = self._validate_with(
+            required_scope="ingest",
+            key_scopes=self.BOTH_SCOPES,
+            usage_count=1000,  # free plan observations cap
+        )
+
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+
+        assert exc_info.value.status_code == 429
+        assert any("FROM executions" in sql for sql in executed)
+
+    @pytest.mark.parametrize("scope", ["ingest", "verify", "read"])
+    def test_reliability_scopes_still_count_executions(self, scope):
+        validator, raw_key, executed = self._validate_with(
+            required_scope=scope,
+            key_scopes=self.BOTH_SCOPES,
+            usage_count=1,
+        )
+
+        validator.validate(raw_key)
+
+        assert any("FROM executions" in sql for sql in executed)
+
+    @pytest.mark.parametrize("scope", ["ingest", "verify", "read"])
+    def test_reliability_scopes_still_fail_closed(self, scope):
+        """Regression guard: the 503 fail-closed path is untouched."""
+        validator, raw_key, _ = self._validate_with(
+            required_scope=scope,
+            key_scopes=self.BOTH_SCOPES,
+            usage_error=True,
+        )
+
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.retry_after_seconds == 30

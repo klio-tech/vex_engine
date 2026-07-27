@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -32,6 +33,29 @@ from shared.plan_limits import PlanConfig, get_plan_config
 logger = logging.getLogger("agentguard.auth")
 
 VALID_SCOPES = frozenset({"ingest", "verify", "read", "memory"})
+
+# Scopes whose monthly usage is metered by the reliability ``executions``
+# hypertable.  The memory product meters itself through
+# ``shared.usage`` (``memory_usage_counters``, enforced at the MCP/capture
+# layer), so memory-scoped requests must neither pay for nor fail closed on a
+# COUNT over a reliability table their tenant may never write to.
+RELIABILITY_SCOPES = frozenset({"ingest", "verify", "read"})
+
+
+def _is_uuid(value: str | None) -> bool:
+    """Return True when ``value`` is a well-formed UUID string.
+
+    Guards the ``accounts.id`` join: ``org_id`` is a free-form ``varchar(64)``
+    and legacy rows hold slug-like values, which Postgres would reject when
+    compared against a ``uuid`` column.
+    """
+    if not value:
+        return False
+    try:
+        uuid.UUID(str(value))
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
 
 
 @dataclass
@@ -259,25 +283,52 @@ class KeyValidator:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _query_plan_from_supabase(self, account_slug: str) -> tuple:
-        """Query plan data from Supabase accounts table.
+    def _query_plan_from_supabase(
+        self,
+        account_slug: str,
+        org_id: str | None = None,
+    ) -> tuple:
+        """Query plan data from the Supabase ``accounts`` table.
+
+        The join prefers the **immutable** account UUID (``accounts.id``),
+        which the dashboard writes into ``organizations.org_id`` when it
+        provisions an org.  Account slugs are user-editable: renaming a
+        workspace leaves the engine's cached ``organizations.account_slug``
+        stale, and a slug-only join would then miss and silently downgrade a
+        paying tenant to ``free`` until a dashboard page load re-heals the row.
+
+        Legacy orgs predate that convention and carry a non-UUID ``org_id``
+        (migration 003 backfilled ``account_slug = org_id`` for them), so the
+        mutable-slug join is retained as a fallback.
 
         Returns a ``(plan, plan_overrides)`` tuple.  Falls back to
-        ``("free", None)`` if the Supabase engine is not configured,
-        the slug is not found, or any error occurs.
+        ``("free", None)`` if the Supabase engine is not configured, neither
+        join matches, or any error occurs.
         """
         if self._supabase_engine is None:
             return ("free", None)
         try:
             with self._supabase_engine.connect() as conn:
-                result = conn.execute(
-                    text(
-                        "SELECT vex_plan, vex_plan_overrides FROM accounts "
-                        "WHERE slug = :slug AND is_personal_account = false LIMIT 1"
-                    ),
-                    {"slug": account_slug},
-                )
-                row = result.fetchone()
+                row = None
+                if _is_uuid(org_id):
+                    row = conn.execute(
+                        text(
+                            "SELECT vex_plan, vex_plan_overrides FROM accounts "
+                            "WHERE id = CAST(:account_id AS uuid) "
+                            "AND is_personal_account = false LIMIT 1"
+                        ),
+                        {"account_id": org_id},
+                    ).fetchone()
+
+                if row is None:
+                    row = conn.execute(
+                        text(
+                            "SELECT vex_plan, vex_plan_overrides FROM accounts "
+                            "WHERE slug = :slug AND is_personal_account = false LIMIT 1"
+                        ),
+                        {"slug": account_slug},
+                    ).fetchone()
+
                 if row is None:
                     return ("free", None)
                 plan = row[0] or "free"
@@ -333,7 +384,9 @@ class KeyValidator:
         org_id = row[0]
         api_keys = row[1] if isinstance(row[1], list) else json.loads(row[1])
         account_slug = row[2] if row[2] else org_id
-        plan_val, plan_overrides_val = self._query_plan_from_supabase(account_slug)
+        plan_val, plan_overrides_val = self._query_plan_from_supabase(
+            account_slug, org_id
+        )
         plan_config = get_plan_config(plan_val, plan_overrides_val)
 
         # Find the matching key entry in the JSONB array
@@ -414,17 +467,27 @@ class KeyValidator:
             )
 
     def _check_quota(self, entry: _CachedKey) -> None:
-        """Enforce monthly quota based on organization plan.
+        """Enforce the monthly reliability quota for this validator's scope.
 
         Uses direct queries against the ``executions`` hypertable,
         filtered by scope:
         - ``verify`` scope → counts rows where ``confidence IS NOT NULL``
-        - ``ingest``/``memory`` scope → counts all rows
+        - ``ingest``/``read`` scope → counts all rows
           (observations + verifications)
+
+        ``memory`` is exempt: each service builds its own ``KeyValidator``
+        with a fixed ``required_scope``, so a memory-scoped validator only
+        ever serves memory traffic (the MCP server) and that traffic is
+        metered by ``shared.usage``.  A key that also carries ``ingest`` /
+        ``verify`` / ``read`` is still fully metered here whenever it is used
+        against a reliability service, whose validator carries that scope.
 
         Fail-closed: if the query errors, the request is denied with 503.
         Results are cached per-org for 30 s to reduce DB pressure.
         """
+        if self._required_scope not in RELIABILITY_SCOPES:
+            return
+
         plan_config = get_plan_config(entry.plan, entry.plan_overrides)
 
         if self._required_scope == "verify":
