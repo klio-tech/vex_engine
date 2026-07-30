@@ -5,8 +5,6 @@ row payloads, so these tests assert on tenancy predicates and on the TS-side
 transformation without a live database.
 """
 
-
-
 from shared import artifacts as af
 
 
@@ -164,9 +162,7 @@ def test_collect_purgeable_selects_retracted_and_superseded_rows():
 
     rows = af.collect_purgeable(db, older_than_hours=af.PURGE_GRACE_HOURS)
 
-    assert rows == [
-        {"id": "a1", "org_id": "acme", "version": 1, "status": "retracted"}
-    ]
+    assert rows == [{"id": "a1", "org_id": "acme", "version": 1, "status": "retracted"}]
     sql, params = db.calls[0]
     assert "'retracted'" in sql
     assert "'superseded'" in sql

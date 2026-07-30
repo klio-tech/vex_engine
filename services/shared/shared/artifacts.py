@@ -344,9 +344,7 @@ def collect_abandoned(db: Any, *, older_than_hours: int = PENDING_TTL_HOURS) -> 
         ),
         {"hours": older_than_hours},
     ).fetchall()
-    return [
-        {"id": str(r[0]), "org_id": r[1], "version": int(r[2])} for r in rows
-    ]
+    return [{"id": str(r[0]), "org_id": r[1], "version": int(r[2])} for r in rows]
 
 
 def collect_purgeable(db: Any, *, older_than_hours: int = PURGE_GRACE_HOURS) -> list:

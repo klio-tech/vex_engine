@@ -102,7 +102,9 @@ def upgrade() -> None:
         """
     )
     # The GC pass sweeps pending rows by age.
-    op.create_index("ix_artifacts_status_created", "artifacts", ["status", "created_at"])
+    op.create_index(
+        "ix_artifacts_status_created", "artifacts", ["status", "created_at"]
+    )
 
 
 def downgrade() -> None:

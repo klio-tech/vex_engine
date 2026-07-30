@@ -301,9 +301,7 @@ async def test_purge_deletes_the_object_even_for_an_inline_artifact(gc_seams):
 async def test_both_passes_run_in_one_sweep(gc_seams):
     af, st = gc_seams
     db = MagicMock()
-    af.collect_abandoned.return_value = [
-        {"id": "p1", "org_id": "acme", "version": 1}
-    ]
+    af.collect_abandoned.return_value = [{"id": "p1", "org_id": "acme", "version": 1}]
     af.collect_purgeable.return_value = [
         {"id": "r1", "org_id": "acme", "version": 1, "status": "retracted"}
     ]

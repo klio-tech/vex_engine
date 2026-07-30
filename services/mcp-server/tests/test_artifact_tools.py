@@ -483,7 +483,9 @@ async def test_confirm_card_write_failure_retracts_the_artifact(storage):
         "space_id": "space-1",
         "project_id": "project-1",
     }
-    storage.brain.write_scoped_memory.side_effect = RuntimeError("embedding service down")
+    storage.brain.write_scoped_memory.side_effect = RuntimeError(
+        "embedding service down"
+    )
 
     result = await _tool("artifact_put")(
         _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
@@ -502,9 +504,15 @@ async def test_confirm_card_write_failure_retracts_the_artifact(storage):
 async def test_get_returns_inline_text(storage):
     storage.artifacts.TEXT_PAGE_CHARS = 51_200
     storage.artifacts.get_artifact.return_value = {
-        "id": "a1", "status": "active", "title": "t", "kind": "document",
-        "mime_type": "text/markdown", "inline_text": "hello", "storage_uri": None,
-        "version": 1, "size_bytes": 5,
+        "id": "a1",
+        "status": "active",
+        "title": "t",
+        "kind": "document",
+        "mime_type": "text/markdown",
+        "inline_text": "hello",
+        "storage_uri": None,
+        "version": 1,
+        "size_bytes": 5,
     }
 
     result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
@@ -517,9 +525,15 @@ async def test_get_returns_inline_text(storage):
 async def test_get_pages_long_text_and_reports_more(storage):
     storage.artifacts.TEXT_PAGE_CHARS = 10
     storage.artifacts.get_artifact.return_value = {
-        "id": "a1", "status": "active", "title": "t", "kind": "document",
-        "mime_type": "text/plain", "inline_text": "abcdefghijKLMNO",
-        "storage_uri": None, "version": 1, "size_bytes": 15,
+        "id": "a1",
+        "status": "active",
+        "title": "t",
+        "kind": "document",
+        "mime_type": "text/plain",
+        "inline_text": "abcdefghijKLMNO",
+        "storage_uri": None,
+        "version": 1,
+        "size_bytes": 15,
     }
 
     first = await _tool("artifact_get")(_ctx(), artifact_id="a1")
@@ -534,9 +548,14 @@ async def test_get_pages_long_text_and_reports_more(storage):
 @pytest.mark.asyncio
 async def test_get_text_on_a_binary_points_at_url_mode(storage):
     storage.artifacts.get_artifact.return_value = {
-        "id": "a1", "status": "active", "title": "t", "kind": "file",
-        "mime_type": "application/pdf", "inline_text": None,
-        "storage_uri": "s3://klio-artifacts/acme/a1/v1", "version": 1,
+        "id": "a1",
+        "status": "active",
+        "title": "t",
+        "kind": "file",
+        "mime_type": "application/pdf",
+        "inline_text": None,
+        "storage_uri": "s3://klio-artifacts/acme/a1/v1",
+        "version": 1,
         "size_bytes": 2048,
     }
 
@@ -551,9 +570,14 @@ async def test_get_text_on_a_binary_points_at_url_mode(storage):
 async def test_get_url_returns_a_short_lived_signed_url(storage):
     storage.storage.presign_get.return_value = "https://example/download"
     storage.artifacts.get_artifact.return_value = {
-        "id": "a1", "status": "active", "title": "t", "kind": "file",
-        "mime_type": "application/pdf", "inline_text": None,
-        "storage_uri": "s3://klio-artifacts/acme/a1/v1", "version": 1,
+        "id": "a1",
+        "status": "active",
+        "title": "t",
+        "kind": "file",
+        "mime_type": "application/pdf",
+        "inline_text": None,
+        "storage_uri": "s3://klio-artifacts/acme/a1/v1",
+        "version": 1,
         "size_bytes": 2048,
     }
 
@@ -573,9 +597,15 @@ async def test_get_on_another_orgs_artifact_reads_as_not_found(storage):
 @pytest.mark.asyncio
 async def test_get_on_a_retracted_artifact_reads_as_not_found(storage):
     storage.artifacts.get_artifact.return_value = {
-        "id": "a1", "status": "retracted", "title": "t", "kind": "document",
-        "mime_type": "text/plain", "inline_text": "gone", "storage_uri": None,
-        "version": 1, "size_bytes": 4,
+        "id": "a1",
+        "status": "retracted",
+        "title": "t",
+        "kind": "document",
+        "mime_type": "text/plain",
+        "inline_text": "gone",
+        "storage_uri": None,
+        "version": 1,
+        "size_bytes": 4,
     }
     result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
     assert result["error"] == "not_found"
@@ -605,9 +635,14 @@ def test_is_text_mime_still_rejects_binary_types():
 
 def _s3_text_row(**overrides):
     row = {
-        "id": "a1", "status": "active", "title": "t", "kind": "record",
-        "mime_type": "application/json", "inline_text": None,
-        "storage_uri": "s3://klio-artifacts/acme/a1/v1", "version": 1,
+        "id": "a1",
+        "status": "active",
+        "title": "t",
+        "kind": "record",
+        "mime_type": "application/json",
+        "inline_text": None,
+        "storage_uri": "s3://klio-artifacts/acme/a1/v1",
+        "version": 1,
         "size_bytes": 13,
     }
     row.update(overrides)
@@ -705,9 +740,15 @@ async def test_get_url_runs_its_s3_calls_off_the_event_loop(storage):
     local, but they are still blocking network calls and belong off the loop
     for the same reason as the read above."""
     storage.artifacts.get_artifact.return_value = {
-        "id": "a1", "status": "active", "title": "t", "kind": "document",
-        "mime_type": "text/markdown", "inline_text": "hello", "storage_uri": None,
-        "version": 1, "size_bytes": 5,
+        "id": "a1",
+        "status": "active",
+        "title": "t",
+        "kind": "document",
+        "mime_type": "text/markdown",
+        "inline_text": "hello",
+        "storage_uri": None,
+        "version": 1,
+        "size_bytes": 5,
     }
     threads = []
 
@@ -715,6 +756,7 @@ async def test_get_url_runs_its_s3_calls_off_the_event_loop(storage):
         def _inner(*_a, **_k):
             threads.append(threading.current_thread())
             return result
+
         return _inner
 
     storage.storage.put_text.side_effect = _record({"size_bytes": 5, "checksum": "c"})
@@ -730,9 +772,14 @@ async def test_get_url_runs_its_s3_calls_off_the_event_loop(storage):
 @pytest.mark.asyncio
 async def test_get_text_on_s3_read_failure_returns_internal_error_not_a_crash(storage):
     storage.artifacts.get_artifact.return_value = {
-        "id": "a1", "status": "active", "title": "t", "kind": "document",
-        "mime_type": "text/plain", "inline_text": None,
-        "storage_uri": "s3://klio-artifacts/acme/a1/v1", "version": 1,
+        "id": "a1",
+        "status": "active",
+        "title": "t",
+        "kind": "document",
+        "mime_type": "text/plain",
+        "inline_text": None,
+        "storage_uri": "s3://klio-artifacts/acme/a1/v1",
+        "version": 1,
         "size_bytes": 100,
     }
     storage.storage.get_text_page.side_effect = RuntimeError("s3 unavailable")

@@ -16,7 +16,12 @@ from app.auth import shutdown_validator, verify_api_key
 from app.capture import router as capture_router
 from app.db import SessionLocal
 from app.mcp_app import build_mcp_server
-from app.scheduler import start_artifact_gc, start_curator, stop_artifact_gc, stop_curator
+from app.scheduler import (
+    start_artifact_gc,
+    start_curator,
+    stop_artifact_gc,
+    stop_curator,
+)
 from shared.auth import KeyInfo
 
 # The MCP Streamable-HTTP ASGI app is mounted at the application root.
