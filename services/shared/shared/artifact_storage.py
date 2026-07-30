@@ -90,11 +90,18 @@ def head(s3: Any, key: str) -> Optional[dict]:
     Returns ``None`` when the object does not exist, which is how an
     unconfirmed upload is detected. The body is read to compute the checksum:
     a client-supplied one could not be trusted, and dedup depends on it.
+
+    Raises ClientError if the error is not a missing-object (404/NoSuchKey):
+    transient failures (AccessDenied, throttling, internal errors) must surface
+    as real failures, not silently tell users their upload failed.
     """
     try:
         s3.head_object(Bucket=ARTIFACT_BUCKET, Key=key)
-    except ClientError:
-        return None
+    except ClientError as e:
+        error_code = e.response.get("Error", {}).get("Code") if e.response else None
+        if error_code in ("404", "NoSuchKey"):
+            return None
+        raise
 
     body = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=key)["Body"].read()
     return _measure(body)

@@ -48,6 +48,19 @@ def test_presign_get_uses_the_short_ttl():
     assert s3.generate_presigned_url.call_args.kwargs["ExpiresIn"] == 900
 
 
+def test_presign_get_includes_response_content_headers():
+    """Security test: presigned GET must force attachment disposition and octet-stream type."""
+    s3 = _fake_s3()
+    s3.generate_presigned_url.return_value = "https://example/get"
+
+    st.presign_get(s3, "acme/a/v1")
+
+    kwargs = s3.generate_presigned_url.call_args.kwargs
+    params = kwargs["Params"]
+    assert params["ResponseContentDisposition"] == "attachment"
+    assert params["ResponseContentType"] == "application/octet-stream"
+
+
 def test_head_returns_measured_size_and_checksum():
     body = b"hello world"
     s3 = _fake_s3()
@@ -69,6 +82,17 @@ def test_head_returns_none_when_the_object_is_absent():
     )
 
     assert st.head(s3, "acme/a/v1") is None
+
+
+def test_head_raises_non_404_errors():
+    """Transient S3 failures must surface as real failures, not silent upload-absent."""
+    s3 = _fake_s3()
+    s3.head_object.side_effect = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "Access Denied"}}, "HeadObject"
+    )
+
+    with pytest.raises(ClientError):
+        st.head(s3, "acme/a/v1")
 
 
 def test_put_text_stores_and_returns_measured_metadata():
