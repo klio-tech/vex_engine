@@ -227,7 +227,17 @@ def mark_superseded(db: Any, *, org_id: str, artifact_id: str) -> None:
 
 
 def collect_abandoned(db: Any, *, older_than_hours: int = PENDING_TTL_HOURS) -> list:
-    """Pending artifacts whose upload never arrived. Caller deletes the bytes."""
+    """Pending artifacts whose upload never arrived. Caller deletes the bytes.
+
+    Intentionally cross-org: this is the background maintenance sweep, not a
+    request-scoped query, so it has no ``org_id`` predicate and returns stale
+    rows across every tenant. That is correct here, but it is the one place in
+    this module that breaks the "every artifact query is org-scoped" invariant
+    the rest of the feature relies on. Do not "fix" this into a tenant-scoped
+    function, and do not copy this as a template for a request-handling query.
+    Any caller doing follow-up work per row (e.g. deleting its S3 object) MUST
+    scope that work using the ``org_id`` each row returns.
+    """
     rows = db.execute(
         text(
             """

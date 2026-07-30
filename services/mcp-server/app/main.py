@@ -14,8 +14,9 @@ from fastapi import Depends, FastAPI
 from app import config, oauth_middleware
 from app.auth import shutdown_validator, verify_api_key
 from app.capture import router as capture_router
+from app.db import SessionLocal
 from app.mcp_app import build_mcp_server
-from app.scheduler import start_curator, stop_curator
+from app.scheduler import start_artifact_gc, start_curator, stop_artifact_gc, stop_curator
 from shared.auth import KeyInfo
 
 # The MCP Streamable-HTTP ASGI app is mounted at the application root.
@@ -43,19 +44,22 @@ async def lifespan(app: FastAPI):
     instance, which is exactly why each app owns its own server rather
     than sharing a module-level singleton.
 
-    On shutdown we cancel the background curator loop and flush/dispose the
-    auth ``KeyValidator`` so its DB engine is released cleanly.
+    On shutdown we cancel the background curator loop and the artifact GC
+    loop, and flush/dispose the auth ``KeyValidator`` so its DB engine is
+    released cleanly.
 
-    The curator scheduler (``app.scheduler``) is started here so the
-    single-service deployment needs no external cron; it sleeps before its first
-    pass, so entering and promptly exiting this context never triggers a
-    curation pass.
+    The curator scheduler and the artifact GC sweep (both in
+    ``app.scheduler``) are started here so the single-service deployment
+    needs no external cron; each sleeps before its first pass, so entering
+    and promptly exiting this context never triggers a real pass.
     """
     start_curator(app)
+    start_artifact_gc(app, SessionLocal)
     try:
         async with app.state.mcp_server.session_manager.run():
             yield
     finally:
+        await stop_artifact_gc(app)
         await stop_curator(app)
         shutdown_validator()
 
