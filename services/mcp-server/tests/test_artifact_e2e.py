@@ -18,21 +18,37 @@ bucket.
 The one patched seam is ``shared.memory.embed_text``: this dev environment has
 no live embedding-provider credentials (no ``TOGETHER_API_KEY`` /
 ``LITELLM_API_URL`` — see ``.env.example``), and the embedding backend is an
-external paid API this test suite must not depend on to run. This mirrors the
-*existing* precedent in ``tests/test_e2e.py`` (its module docstring: "Embeddings
-... FIXED 1024-element vector ... All of write_memory / find_similar_memory /
-retrieve_memories_scoped call embed_text"). Patching it does not weaken this
-test: the fixed vector still flows through a REAL pgvector column, a REAL
-cosine-distance ORDER BY, and a REAL org-scoped WHERE clause — the exact
-mechanics of discovery this task exists to prove. Only the external LLM call
-itself is stubbed.
+external paid API this test suite must not depend on to run.
+
+**Deterministic, input-dependent fake embedding (not a single fixed vector).**
+An earlier version of this module patched ``embed_text`` to always return the
+SAME vector (mirroring ``tests/test_e2e.py``'s precedent). Code review
+correctly flagged that this made the central "agent B discovers agent A's
+artifact through recall" assertion unfalsifiable in principle: with only 1-2
+rows in a fresh throwaway org and every vector identical, `assert cards` would
+pass even if the ``ORDER BY embedding <=> :embedding`` were removed, reversed,
+or the blended-score re-rank were completely broken — there was nothing to
+discriminate against. ``_hash_embedding`` below fixes this: it derives a
+deterministic vector from a SHA-256 hash of the input text (same text -> same
+vector, always; different text -> a different, effectively uncorrelated
+vector). It is NOT a semantic embedding — two rows about the same topic in
+different words land at unrelated vectors — so the tests below route around
+that by making a query's text an EXACT match for the target row's own stored
+content, while distractor rows carry deliberately different, unrelated text.
+That is what makes the ``ORDER BY`` genuinely decide the outcome: the target's
+distance is exactly 0, every distractor's is not.
 
 Everything else in this module is genuinely live:
 
 * ``test_agent_b_recalls_an_artifact_agent_a_wrote`` — the brief's core
-  scenario: agent A stores, agent B (a DIFFERENT agent, never told the
-  artifact exists) discovers it via semantic recall, reads its text, and gets
-  a presigned download URL.
+  scenario: several unrelated memories are planted in the org first (so the
+  candidate pool recall must rank against is real, not "the only 1-2 rows
+  that exist"), agent A then stores an artifact, and agent B (a DIFFERENT
+  agent, never told the artifact exists) must retrieve it under a `limit`
+  below the total row count — i.e. it must be SELECTED, not merely
+  INCLUDED — reads its text, and gets a presigned download URL. A negative
+  assertion confirms no unrelated distractor makes it into the small,
+  competitive result set.
 * ``test_gc_guarded_delete_against_real_postgres`` — exercises the per-row
   ``WHERE id = :id AND status = 'pending' RETURNING id`` guarded DELETE (a new
   idiom with no other precedent in this codebase) against real Postgres: one
@@ -48,11 +64,19 @@ Everything else in this module is genuinely live:
   the real ``enforce_memory_retention()`` SQL function, and asserts the plain
   memory row is swept while the artifact card survives (migrations 028/029) —
   proving the exclusion actually fires, not merely that nothing old enough to
-  test was ever created.
+  test was ever created — then re-confirms the card is still recall-reachable
+  by an exact-content-match query.
+
+See ``.superpowers/sdd/2026-07-30-klio-artifacts/task-11-report.md`` for the
+verification that this recall assertion can now actually fail: a control run
+with the ranking deliberately reversed, shown failing, then restored and shown
+passing.
 """
 
 import hashlib
+import math
 import os
+import random
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -67,10 +91,30 @@ pytestmark = pytest.mark.skipif(
     not os.environ.get("KLIO_E2E"), reason="set KLIO_E2E=1 with a live stack"
 )
 
-# A fixed embedding vector of the exact column dimension (vector(1024)). See
-# the module docstring: this is the same seam test_e2e.py patches, for the
-# same reason (no live embedding-provider credentials in this dev environment).
-_FIXED_EMBEDDING = [0.1] * 1024
+# pgvector column is vector(1024) (see migration 017).
+_EMBED_DIM = 1024
+
+
+def _hash_embedding(text_input: str) -> list[float]:
+    """Deterministic, input-dependent stand-in for a real embedding.
+
+    Same text -> same vector, always (repeatable, so a query re-run behaves
+    identically). Different text -> a different vector with overwhelming
+    probability (1024 floats seeded from a 256-bit hash; a collision between
+    two distinct texts is astronomically unlikely). This is what gives the
+    ``ORDER BY embedding <=> :embedding`` something real to discriminate on —
+    see the module docstring for why a single fixed vector (the prior version
+    of this module) made the central recall assertion unfalsifiable.
+
+    Deliberately NOT semantic: this has no notion of "similar meaning",
+    only "identical text". The tests route around that by querying with text
+    that exactly matches the target row's stored content.
+    """
+    seed = hashlib.sha256(text_input.encode("utf-8")).digest()
+    rng = random.Random(seed)
+    vector = [rng.uniform(-1.0, 1.0) for _ in range(_EMBED_DIM)]
+    norm = math.sqrt(sum(v * v for v in vector)) or 1.0
+    return [v / norm for v in vector]
 
 
 # ---------------------------------------------------------------------------
@@ -203,10 +247,11 @@ def _e2e_org():
 def _patched_embeddings():
     """Patch the one non-deterministic, credential-gated seam.
 
-    See the module docstring for why this mirrors ``tests/test_e2e.py``'s
-    established pattern rather than weakening the test.
+    See the module docstring: this now uses a deterministic, input-dependent
+    fake embedding (``_hash_embedding``), not a single fixed vector, so
+    ranking has something real to discriminate on.
     """
-    embed_mock = AsyncMock(return_value=list(_FIXED_EMBEDDING))
+    embed_mock = AsyncMock(side_effect=lambda text_input: _hash_embedding(text_input))
     with patch("shared.memory.embed_text", embed_mock):
         yield
 
@@ -237,38 +282,86 @@ def _ctx(agent: str):
 
 
 # ---------------------------------------------------------------------------
-# 1. The brief's core scenario.
+# 1. The brief's core scenario, made genuinely competitive.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
 async def test_agent_b_recalls_an_artifact_agent_a_wrote(_e2e_org):
     from app.mcp_app import build_mcp_server
+    from shared.artifacts import card_content
 
     server = build_mcp_server()
     put = server._tool_manager.get_tool("artifact_put").fn
     get = server._tool_manager.get_tool("artifact_get").fn
     recall = server._tool_manager.get_tool("recall").fn
+    remember = server._tool_manager.get_tool("remember").fn
 
     marker = uuid.uuid4().hex[:8]
 
+    # Plant distractors in the SAME org BEFORE the target artifact exists, so
+    # the candidate pool recall ranks against is real (6 rows), not "the only
+    # 1-2 rows in a fresh throwaway org". Each is deliberately unrelated in
+    # content to the target, so its hash-derived vector lands far from the
+    # query's.
+    distractor_marker = uuid.uuid4().hex[:8]
+    distractor_facts = [
+        f"The office coffee machine is being replaced next week {distractor_marker}",
+        f"Q3 offsite is in Denver this year {distractor_marker}",
+        f"The design system's primary typeface is Inter {distractor_marker}",
+        f"Marketing's campaign tracker lives in Airtable {distractor_marker}",
+        f"Intern onboarding has twelve steps {distractor_marker}",
+    ]
+    for fact in distractor_facts:
+        r = await remember(_ctx("agent-distractor"), content=fact)
+        assert r["stored"] is True, r
+
+    title = f"Rate limiter design {marker}"
+    summary = f"Token bucket at the edge, decision {marker}"
+    kind = "document"
+    content = "# Rate limiting\n\nToken bucket, 100 rps per key."
+
     stored = await put(
-        _ctx("agent-a"),
-        title=f"Rate limiter design {marker}",
-        summary=f"Token bucket at the edge, decision {marker}",
-        kind="document",
-        content="# Rate limiting\n\nToken bucket, 100 rps per key.",
+        _ctx("agent-a"), title=title, summary=summary, kind=kind, content=content
     )
     assert stored["stored"] is True, stored
 
-    # Agent B has never seen this artifact and searches semantically.
-    found = await recall(_ctx("agent-b"), query="how do we rate limit", limit=25)
+    # The query text is an EXACT match for the card row's own stored content
+    # (see ``shared.artifacts.card_content`` — this is exactly what
+    # ``_write_artifact_card`` writes). With a hash-derived, non-semantic
+    # embedding this is what guarantees the target's vector distance is
+    # exactly 0 while every distractor's unrelated text lands elsewhere —
+    # what actually makes the ORDER BY decide the outcome, rather than
+    # everything in a tiny org just happening to fit under `limit`.
+    query = card_content(title, summary, kind, len(content.encode("utf-8")))
+
+    # limit=1 against a 6-row org (1 target + 5 distractors): only the single
+    # best-ranked row can come back at all, so the target must be SELECTED
+    # under maximum competition, not merely INCLUDED because the result set
+    # happened to cover every row. A random distractor's hash-derived vector
+    # has expected cosine similarity ~0 against the query (observed ~0.05 in
+    # practice); the target's is exactly 1.0 (identical text) — nowhere near
+    # a coin flip, so this is not relying on luck to exclude the distractors.
+    found = await recall(_ctx("agent-b"), query=query, limit=1)
+    memories = found.get("memories", [])
+    assert len(memories) <= 1, found
+
     cards = [
         m
-        for m in found.get("memories", [])
+        for m in memories
         if m.get("memory_type") == "artifact" and marker in m.get("content", "")
     ]
     assert cards, f"agent B could not discover agent A's artifact through recall: {found!r}"
+
+    # Negative assertion: an unrelated distractor must NOT be in the small,
+    # competitive result set. Without this, a ranking that returns
+    # "everything" (or an arbitrary subset with no real ordering) could still
+    # satisfy the assertion above by coincidence.
+    returned_contents = " ".join(m.get("content", "") for m in memories)
+    assert distractor_marker not in returned_contents, (
+        "an unrelated distractor made it into a small, competitive recall "
+        f"result — ranking is not actually discriminating: {found!r}"
+    )
 
     artifact_id = cards[0]["metadata"]["artifact_id"]
     body = await get(_ctx("agent-b"), artifact_id=artifact_id)
@@ -477,6 +570,7 @@ async def test_retention_excludes_active_artifact_card(_e2e_org):
     from app.db import SessionLocal
     from app.mcp_app import build_mcp_server
     from shared import artifacts
+    from shared.artifacts import card_content
 
     org_id = _e2e_org
     db = SessionLocal()
@@ -488,26 +582,26 @@ async def test_retention_excludes_active_artifact_card(_e2e_org):
         remember = server._tool_manager.get_tool("remember").fn
 
         marker = uuid.uuid4().hex[:8]
+        title = f"Retention-survivor {marker}"
+        summary = "Must outlive a 1-day retention window while active"
+        kind = "document"
+        content = f"content {marker}"
+
         stored = await put(
-            _ctx("agent-a"),
-            title=f"Retention-survivor {marker}",
-            summary="Must outlive a 1-day retention window while active",
-            kind="document",
-            content=f"content {marker}",
+            _ctx("agent-a"), title=title, summary=summary, kind=kind, content=content
         )
         assert stored["stored"] is True, stored
         artifact_id = stored["artifact_id"]
 
-        # A different agent than the artifact_put call above: brain_session_id
-        # derives the session from (org_id, agent_id) when no mcp-session-id
-        # header is sent, and the fixed-embedding seam (module docstring) makes
-        # every write's vector cosine-identical. Reusing "agent-a"'s session
-        # here would make `remember`'s dedup check find the just-written
-        # artifact card as a "similar" existing memory and skip the write
-        # entirely — a collision that is an artifact of the patched embedding,
-        # not something a real embedding backend would do (mirrors test_e2e.py's
-        # documented dedup caveat).
-        remembered = await remember(_ctx("agent-c"), content=f"plain fact {marker}")
+        # Now that embed_text is input-dependent (not a single fixed vector —
+        # see the module docstring), this plain memory's distinct text no
+        # longer collides with the artifact card's under dedup
+        # (``find_similar_memory``, session+org scoped, threshold 0.95): two
+        # different texts hash to uncorrelated vectors, so cosine similarity
+        # is not above threshold. Using the SAME agent as the artifact_put
+        # call above (previously required a different agent/session to dodge
+        # a fixed-embedding dedup collision) is therefore safe again.
+        remembered = await remember(_ctx("agent-a"), content=f"plain fact {marker}")
         assert remembered["stored"] is True, remembered
         plain_memory_id = remembered["id"]
 
@@ -552,16 +646,18 @@ async def test_retention_excludes_active_artifact_card(_e2e_org):
             "artifact-card exclusion actually fired"
         )
 
-        # And the card must still be genuinely discoverable through recall,
-        # not merely present as a row.
+        # And the card must still be genuinely reachable through recall, not
+        # merely present as a row — exact-content-match query, same technique
+        # as the headline discovery test above.
         recall = server._tool_manager.get_tool("recall").fn
-        found = await recall(_ctx("agent-b"), query="retention survivor", limit=25)
+        query = card_content(title, summary, kind, len(content.encode("utf-8")))
+        found = await recall(_ctx("agent-b"), query=query, limit=5)
         cards = [
             m
             for m in found.get("memories", [])
             if m.get("memory_type") == "artifact" and marker in m.get("content", "")
         ]
-        assert cards, f"card survived the DB sweep but is not recall-discoverable: {found!r}"
+        assert cards, f"card survived the DB sweep but is not recall-reachable: {found!r}"
 
         artifacts.retract(db, org_id=org_id, artifact_id=artifact_id)
     finally:
