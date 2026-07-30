@@ -37,7 +37,7 @@ def seams():
             return_value=("acme", "agent-1", "free", None),
         ),
         patch("app.mcp_app.get_plan_config", return_value=plan),
-        patch("app.mcp_app.SessionLocal", MagicMock()),
+        patch("app.mcp_app.SessionLocal", MagicMock()) as session_local,
         patch("app.mcp_app.artifacts") as af,
         patch("app.mcp_app.brain") as brain,
         patch("app.mcp_app.resolve_project_from_request", return_value=None),
@@ -55,7 +55,10 @@ def seams():
         }
         brain.write_scoped_memory = AsyncMock(return_value={"stored": True})
         brain.ensure_space.return_value = None
-        yield SimpleNamespace(artifacts=af, brain=brain)
+        # ``SessionLocal()`` (called once per tool invocation) always yields
+        # this same fake session, so tests can inspect raw ``db.execute`` calls
+        # (e.g. the supersede/hide-card path) without a real DB.
+        yield SimpleNamespace(artifacts=af, brain=brain, db=session_local.return_value)
 
 
 @pytest.mark.asyncio
@@ -141,3 +144,65 @@ async def test_auth_failure_returns_a_clean_error_not_an_exception():
 
     assert result["stored"] is False
     assert result["error"] == "unauthorized"
+
+
+@pytest.mark.asyncio
+async def test_supersedes_marks_old_artifact_superseded_and_hides_its_card(seams):
+    result = await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="document",
+        content="hey",
+        supersedes="old-id",
+    )
+
+    # The new artifact is still created and carded normally in this call.
+    assert result["stored"] is True
+    assert result["artifact_id"] == "new-artifact-id"
+    seams.brain.write_scoped_memory.assert_awaited_once()
+
+    # The old artifact is superseded using the resolved org_id — never a
+    # caller-supplied one.
+    seams.artifacts.mark_superseded.assert_called_once()
+    supersede_kwargs = seams.artifacts.mark_superseded.call_args.kwargs
+    assert supersede_kwargs["org_id"] == "acme"
+    assert supersede_kwargs["artifact_id"] == "old-id"
+
+    # Its card is hidden from recall (raw UPDATE against session_memories,
+    # since there is no shared.artifacts helper for hiding a card).
+    hide_call = next(
+        call
+        for call in seams.db.execute.call_args_list
+        if "recall_hidden" in str(call.args[0])
+    )
+    params = hide_call.args[1]
+    assert params["org_id"] == "acme"
+    assert params["artifact_id"] == "old-id"
+
+
+@pytest.mark.asyncio
+async def test_card_write_failure_retracts_the_artifact_and_returns_an_error(seams):
+    """A card-write failure must not leave a paid-for, invisible artifact.
+
+    ``artifacts.create_pending`` / ``activate`` each commit independently and
+    only then does the card get written, so a failure here (e.g. an embedding
+    service hiccup) would otherwise leave the artifact ``status='active'`` with
+    no discovery card: billed, listed by any future artifacts UI, and
+    permanently invisible to recall. The fix compensates by retracting the
+    just-activated artifact and surfacing an error rather than a false
+    success.
+    """
+    seams.brain.write_scoped_memory.side_effect = RuntimeError("embedding service down")
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="document", content="hey"
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "card_write_failed"
+
+    seams.artifacts.retract.assert_called_once()
+    retract_kwargs = seams.artifacts.retract.call_args.kwargs
+    assert retract_kwargs["org_id"] == "acme"
+    assert retract_kwargs["artifact_id"] == "new-artifact-id"

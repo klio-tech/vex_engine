@@ -389,19 +389,51 @@ async def _perform_artifact_put(
                 storage_uri=None,
             )
 
-            await _write_artifact_card(
-                db,
-                org_id=org_id,
-                agent_id=agent_id,
-                session_id=session_id,
-                artifact_id=new_id,
-                title=title,
-                summary=summary,
-                kind=kind,
-                size_bytes=len(body),
-                space_id=space_id,
-                project_id=project_id,
-            )
+            try:
+                await _write_artifact_card(
+                    db,
+                    org_id=org_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    artifact_id=new_id,
+                    title=title,
+                    summary=summary,
+                    kind=kind,
+                    size_bytes=len(body),
+                    space_id=space_id,
+                    project_id=project_id,
+                )
+            except Exception:
+                # The card is the ONLY discovery mechanism (see module docstring
+                # above _write_artifact_card): without it the artifact is active,
+                # counted against the org's storage pool, and permanently
+                # invisible to recall. artifacts.create_pending/activate each
+                # commit independently of this write (write_scoped_memory commits
+                # internally and is shared with the verification path, so it
+                # cannot be folded into one transaction), so a card-write failure
+                # here would otherwise leave a paid-for, invisible row behind.
+                # Compensate by retracting the artifact we just activated so it
+                # stops counting against the pool and the caller can retry
+                # cleanly. Log with the artifact id FIRST, before attempting the
+                # compensating retract, so the original failure is never lost if
+                # the retract itself also fails.
+                logger.exception(
+                    "artifact card write failed after activate; retracting "
+                    "artifact_id=%s to avoid an invisible, paid-for row",
+                    new_id,
+                )
+                try:
+                    artifacts.retract(db, org_id=org_id, artifact_id=new_id)
+                except Exception:
+                    # Guarded: a failure here must never mask the original
+                    # card-write exception. Any row that slips through past
+                    # this point is findable in logs by artifact_id above.
+                    logger.exception(
+                        "compensating retract also failed for artifact_id=%s; "
+                        "row may still be active with no card",
+                        new_id,
+                    )
+                return {"stored": False, "error": "card_write_failed"}
 
             if supersedes:
                 artifacts.mark_superseded(db, org_id=org_id, artifact_id=supersedes)
