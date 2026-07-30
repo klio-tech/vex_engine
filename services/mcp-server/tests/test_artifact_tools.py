@@ -250,6 +250,8 @@ async def test_confirm_measures_the_object_and_writes_the_card(storage):
         "summary": "s",
         "kind": "file",
         "version": 1,
+        "space_id": "space-1",
+        "project_id": "project-1",
     }
 
     result = await _tool("artifact_put")(
@@ -261,6 +263,13 @@ async def test_confirm_measures_the_object_and_writes_the_card(storage):
     # The measured size wins, not anything the client declared.
     assert storage.artifacts.activate.call_args.kwargs["size_bytes"] == 2048
     storage.brain.write_scoped_memory.assert_awaited_once()
+    # The card must be filed into the same space/project the pending row was
+    # created with (Task 5) — not left unscoped. Using non-None values here
+    # means a regression back to `row.get(...)` returning None would fail
+    # this assertion.
+    card_kwargs = storage.brain.write_scoped_memory.await_args.kwargs
+    assert card_kwargs["space_id"] == "space-1"
+    assert card_kwargs["project_id"] == "project-1"
 
 
 @pytest.mark.asyncio
@@ -273,6 +282,8 @@ async def test_confirm_rejects_bytes_that_exceed_the_per_file_limit(storage):
         "summary": "s",
         "kind": "file",
         "version": 1,
+        "space_id": "space-1",
+        "project_id": "project-1",
     }
 
     # Declared 1KB, actually uploaded 50MB against a 10MB plan limit.
@@ -296,6 +307,8 @@ async def test_confirm_without_uploaded_bytes_is_rejected(storage):
         "summary": "s",
         "kind": "file",
         "version": 1,
+        "space_id": "space-1",
+        "project_id": "project-1",
     }
 
     result = await _tool("artifact_put")(
@@ -331,6 +344,8 @@ async def test_confirm_card_write_failure_retracts_the_artifact(storage):
         "summary": "s",
         "kind": "file",
         "version": 1,
+        "space_id": "space-1",
+        "project_id": "project-1",
     }
     storage.brain.write_scoped_memory.side_effect = RuntimeError("embedding service down")
 

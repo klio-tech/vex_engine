@@ -512,8 +512,8 @@ async def _perform_artifact_put(
                     summary=row["summary"],
                     kind=row["kind"],
                     size_bytes=measured["size_bytes"],
-                    space_id=row.get("space_id"),
-                    project_id=row.get("project_id"),
+                    space_id=row["space_id"],
+                    project_id=row["project_id"],
                 )
             except Exception:
                 # Same compensating-retract pattern as the inline path above:
