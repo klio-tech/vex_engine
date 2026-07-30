@@ -49,7 +49,7 @@ from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
-from shared import artifacts, brain
+from shared import artifact_storage, artifacts, brain
 from shared.memory import MemoryRecord, retract_memory, retrieve_memories_scoped
 from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
@@ -281,7 +281,7 @@ async def _perform_artifact_put(
     Mirrors :func:`_perform_write`'s auth and session handling exactly. Three
     behaviours select on the arguments present: inline (``content`` given),
     presigned request (neither ``content`` nor ``artifact_id``), and confirm
-    (``artifact_id`` given). Only inline is implemented here.
+    (``artifact_id`` given).
 
     The pool check runs before any write work so an over-quota org never
     reserves an id or uploads bytes.
@@ -446,11 +446,176 @@ async def _perform_artifact_put(
                 "status": "active",
             }
 
-        # Presigned request and confirm branches land here in Task 7.
+        # ── Confirm: the client says the bytes are uploaded ──────────────
+        if artifact_id is not None:
+            row = artifacts.get_artifact(db, org_id=org_id, artifact_id=artifact_id)
+            if row is None or row["status"] != "pending":
+                # A cross-org id reads as not-found, never as a permission error.
+                return {"stored": False, "error": "not_found"}
+
+            s3 = artifact_storage.get_artifact_s3_client()
+            key = artifact_storage.object_key(org_id, artifact_id, row["version"])
+            measured = artifact_storage.head(s3, key)
+            if measured is None:
+                return {
+                    "stored": False,
+                    "error": "no_bytes_uploaded",
+                    "detail": "No object found at the upload URL. Upload, then confirm.",
+                }
+
+            # The declared size only chose a strategy; the quota is charged on
+            # what was actually stored.
+            if measured["size_bytes"] > cfg.artifact_max_file_bytes:
+                return {
+                    "stored": False,
+                    "error": "file_too_large",
+                    "detail": (
+                        f"{measured['size_bytes']} bytes exceeds the "
+                        f"{cfg.artifact_max_file_bytes}-byte per-file limit on the "
+                        f"{plan} plan."
+                    ),
+                    "suggested_plan": "max",
+                }
+
+            used = artifacts.org_storage_bytes(db, org_id=org_id)
+            if used + measured["size_bytes"] > cfg.artifact_storage_bytes:
+                return {
+                    "stored": False,
+                    "error": "storage_quota_exceeded",
+                    "detail": (
+                        f"{used} of {cfg.artifact_storage_bytes} bytes used on the "
+                        f"{plan} plan."
+                    ),
+                    "suggested_plan": "max",
+                }
+
+            artifacts.activate(
+                db,
+                org_id=org_id,
+                artifact_id=artifact_id,
+                size_bytes=measured["size_bytes"],
+                checksum=measured["checksum"],
+                inline_text=None,
+                storage_uri=artifact_storage.storage_uri(
+                    org_id, artifact_id, row["version"]
+                ),
+            )
+
+            try:
+                await _write_artifact_card(
+                    db,
+                    org_id=org_id,
+                    agent_id=agent_id,
+                    session_id=session_id,
+                    artifact_id=artifact_id,
+                    title=row["title"],
+                    summary=row["summary"],
+                    kind=row["kind"],
+                    size_bytes=measured["size_bytes"],
+                    space_id=row.get("space_id"),
+                    project_id=row.get("project_id"),
+                )
+            except Exception:
+                # Same compensating-retract pattern as the inline path above:
+                # activate() already committed, so a card-write failure here
+                # would otherwise leave a paid-for, invisible artifact. Log
+                # with the artifact id FIRST, before attempting the
+                # compensating retract, so the original failure is never lost
+                # if the retract itself also fails.
+                logger.exception(
+                    "artifact card write failed after confirm/activate; "
+                    "retracting artifact_id=%s to avoid an invisible, "
+                    "paid-for row",
+                    artifact_id,
+                )
+                try:
+                    artifacts.retract(db, org_id=org_id, artifact_id=artifact_id)
+                except Exception:
+                    # Guarded: a failure here must never mask the original
+                    # card-write exception. Any row that slips through past
+                    # this point is findable in logs by artifact_id above.
+                    logger.exception(
+                        "compensating retract also failed for artifact_id=%s; "
+                        "row may still be active with no card",
+                        artifact_id,
+                    )
+                return {"stored": False, "error": "card_write_failed"}
+
+            if supersedes:
+                artifacts.mark_superseded(db, org_id=org_id, artifact_id=supersedes)
+                _hide_card_for_artifact(db, org_id=org_id, artifact_id=supersedes)
+
+            return {
+                "stored": True,
+                "artifact_id": artifact_id,
+                "version": row["version"],
+                "status": "active",
+            }
+
+        # ── Request: reserve an id and hand back an upload URL ───────────
+        if not mime_type:
+            return {
+                "stored": False,
+                "error": "mime_type_required",
+                "detail": "Provide `mime_type` when omitting `content`.",
+            }
+
+        declared = size_bytes or 0
+        if declared > cfg.artifact_max_file_bytes:
+            return {
+                "stored": False,
+                "error": "file_too_large",
+                "detail": (
+                    f"{declared} bytes exceeds the {cfg.artifact_max_file_bytes}-byte "
+                    f"per-file limit on the {plan} plan."
+                ),
+                "suggested_plan": "max",
+            }
+
+        stripped_space = space.strip() if space is not None else ""
+        space_id = (
+            brain.ensure_space(
+                db, org_id=org_id, name=stripped_space, slug=stripped_space
+            )
+            if stripped_space
+            else None
+        )
+
+        new_id = artifacts.create_pending(
+            db,
+            org_id=org_id,
+            agent_id=agent_id,
+            title=title,
+            summary=summary,
+            kind=kind,
+            mime_type=mime_type,
+            space_id=space_id,
+            project_id=resolve_project_from_request(request, db, org_id=org_id),
+            supersedes=supersedes,
+        )
+
+        s3 = artifact_storage.get_artifact_s3_client()
+        key = artifact_storage.object_key(org_id, new_id, 1)
+
+        if declared > artifact_storage.MULTIPART_THRESHOLD_BYTES:
+            return {
+                "stored": False,
+                "artifact_id": new_id,
+                "multipart": True,
+                "detail": (
+                    "Over 100MB. Use the Klio CLI, which performs the multipart "
+                    "upload, then confirm with this artifact_id."
+                ),
+                "expires_in": artifact_storage.PRESIGN_TTL_SECONDS,
+            }
+
         return {
             "stored": False,
-            "error": "not_implemented",
-            "detail": "Provide `content` for an inline artifact.",
+            "artifact_id": new_id,
+            "upload_url": artifact_storage.presign_put(s3, key),
+            "method": "PUT",
+            "expires_in": artifact_storage.PRESIGN_TTL_SECONDS,
+            "detail": "Upload the bytes, then call artifact_put again with this artifact_id.",
         }
     except Exception:
         logger.exception("artifact_put failed")

@@ -206,3 +206,142 @@ async def test_card_write_failure_retracts_the_artifact_and_returns_an_error(sea
     retract_kwargs = seams.artifacts.retract.call_args.kwargs
     assert retract_kwargs["org_id"] == "acme"
     assert retract_kwargs["artifact_id"] == "new-artifact-id"
+
+
+@pytest.fixture
+def storage(seams):
+    """Add a patched artifact_storage to the existing seams."""
+    with patch("app.mcp_app.artifact_storage") as st:
+        st.MULTIPART_THRESHOLD_BYTES = 100 * MB
+        st.PRESIGN_TTL_SECONDS = 900
+        st.object_key.return_value = "acme/new-artifact-id/v1"
+        st.storage_uri.return_value = "s3://klio-artifacts/acme/new-artifact-id/v1"
+        st.presign_put.return_value = "https://example/upload"
+        st.head.return_value = {"size_bytes": 2048, "checksum": "abc"}
+        st.get_artifact_s3_client.return_value = MagicMock()
+        yield SimpleNamespace(storage=st, artifacts=seams.artifacts, brain=seams.brain)
+
+
+@pytest.mark.asyncio
+async def test_request_returns_an_upload_url_and_writes_no_card(storage):
+    result = await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="file",
+        mime_type="application/pdf",
+        size_bytes=2048,
+    )
+
+    assert result["artifact_id"] == "new-artifact-id"
+    assert result["upload_url"] == "https://example/upload"
+    assert result["expires_in"] == 900
+    # No card until the bytes actually exist — an abandoned upload must never
+    # appear in recall.
+    storage.brain.write_scoped_memory.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_measures_the_object_and_writes_the_card(storage):
+    storage.artifacts.get_artifact.return_value = {
+        "id": "new-artifact-id",
+        "status": "pending",
+        "title": "t",
+        "summary": "s",
+        "kind": "file",
+        "version": 1,
+    }
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["stored"] is True
+    assert result["status"] == "active"
+    # The measured size wins, not anything the client declared.
+    assert storage.artifacts.activate.call_args.kwargs["size_bytes"] == 2048
+    storage.brain.write_scoped_memory.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_confirm_rejects_bytes_that_exceed_the_per_file_limit(storage):
+    storage.storage.head.return_value = {"size_bytes": 50 * MB, "checksum": "abc"}
+    storage.artifacts.get_artifact.return_value = {
+        "id": "new-artifact-id",
+        "status": "pending",
+        "title": "t",
+        "summary": "s",
+        "kind": "file",
+        "version": 1,
+    }
+
+    # Declared 1KB, actually uploaded 50MB against a 10MB plan limit.
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "file_too_large"
+    storage.artifacts.activate.assert_not_called()
+    storage.brain.write_scoped_memory.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_confirm_without_uploaded_bytes_is_rejected(storage):
+    storage.storage.head.return_value = None
+    storage.artifacts.get_artifact.return_value = {
+        "id": "new-artifact-id",
+        "status": "pending",
+        "title": "t",
+        "summary": "s",
+        "kind": "file",
+        "version": 1,
+    }
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "no_bytes_uploaded"
+
+
+@pytest.mark.asyncio
+async def test_confirming_another_orgs_artifact_reads_as_not_found(storage):
+    storage.artifacts.get_artifact.return_value = None
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="someone-elses"
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_confirm_card_write_failure_retracts_the_artifact(storage):
+    """Same compensating-retract pattern as the inline path (Task 6 review):
+    a card-write failure on confirm must not leave a paid-for, invisible
+    artifact billed against the org's storage pool.
+    """
+    storage.artifacts.get_artifact.return_value = {
+        "id": "new-artifact-id",
+        "status": "pending",
+        "title": "t",
+        "summary": "s",
+        "kind": "file",
+        "version": 1,
+    }
+    storage.brain.write_scoped_memory.side_effect = RuntimeError("embedding service down")
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "card_write_failed"
+
+    storage.artifacts.retract.assert_called_once()
+    retract_kwargs = storage.artifacts.retract.call_args.kwargs
+    assert retract_kwargs["org_id"] == "acme"
+    assert retract_kwargs["artifact_id"] == "new-artifact-id"
