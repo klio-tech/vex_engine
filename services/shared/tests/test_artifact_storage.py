@@ -459,6 +459,4 @@ def test_unbounded_whole_object_text_read_is_not_available_at_all():
 def test_delete_is_scoped_to_the_bucket():
     s3 = _fake_s3()
     st.delete(s3, "acme/a/v1")
-    s3.delete_object.assert_called_once_with(
-        Bucket="klio-artifacts", Key="acme/a/v1"
-    )
+    s3.delete_object.assert_called_once_with(Bucket="klio-artifacts", Key="acme/a/v1")

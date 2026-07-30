@@ -967,9 +967,7 @@ async def _perform_artifact_get(
                     row["inline_text"],
                     row["mime_type"],
                 )
-            url = await anyio.to_thread.run_sync(
-                artifact_storage.presign_get, s3, key
-            )
+            url = await anyio.to_thread.run_sync(artifact_storage.presign_get, s3, key)
             return {
                 **head,
                 # Never logged: a presigned URL is a bearer credential.
@@ -1879,7 +1877,9 @@ def _register_tools(mcp: FastMCP) -> None:
     )
     async def artifact_get(
         ctx: Context,
-        artifact_id: Annotated[str, Field(description="From a recall result's metadata.")],
+        artifact_id: Annotated[
+            str, Field(description="From a recall result's metadata.")
+        ],
         mode: Annotated[
             Literal["text", "url"],
             Field(description="'text' (default) or 'url' for a download link."),

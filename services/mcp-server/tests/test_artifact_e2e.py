@@ -360,7 +360,9 @@ async def test_agent_b_recalls_an_artifact_agent_a_wrote(_e2e_org):
         for m in memories
         if m.get("memory_type") == "artifact" and marker in m.get("content", "")
     ]
-    assert cards, f"agent B could not discover agent A's artifact through recall: {found!r}"
+    assert cards, (
+        f"agent B could not discover agent A's artifact through recall: {found!r}"
+    )
 
     # Negative assertion: an unrelated distractor must NOT be in the small,
     # competitive result set. Without this, a ranking that returns
@@ -472,9 +474,9 @@ async def test_gc_guarded_delete_against_real_postgres(_e2e_org):
             {"id": abandoned_id},
         ).fetchone()
         assert remaining is None, "abandoned pending row must be deleted"
-        assert (
-            artifact_storage.head(s3, abandoned_key) is None
-        ), "abandoned row's object must be deleted"
+        assert artifact_storage.head(s3, abandoned_key) is None, (
+            "abandoned row's object must be deleted"
+        )
 
         # Row 2: survives, status still 'active', object untouched.
         surviving = db.execute(
@@ -483,9 +485,9 @@ async def test_gc_guarded_delete_against_real_postgres(_e2e_org):
         ).fetchone()
         assert surviving is not None, "row confirmed mid-sweep must survive"
         assert surviving[0] == "active"
-        assert (
-            artifact_storage.head(s3, confirmed_key) is not None
-        ), "confirmed row's object must NOT be deleted by the sweep"
+        assert artifact_storage.head(s3, confirmed_key) is not None, (
+            "confirmed row's object must NOT be deleted by the sweep"
+        )
     finally:
         for key in (abandoned_key, confirmed_key):
             try:
@@ -913,7 +915,9 @@ async def test_retention_excludes_active_artifact_card(_e2e_org):
             for m in found.get("memories", [])
             if m.get("memory_type") == "artifact" and marker in m.get("content", "")
         ]
-        assert cards, f"card survived the DB sweep but is not recall-reachable: {found!r}"
+        assert cards, (
+            f"card survived the DB sweep but is not recall-reachable: {found!r}"
+        )
 
         artifacts.retract(db, org_id=org_id, artifact_id=artifact_id)
     finally:
@@ -1208,17 +1212,17 @@ async def test_large_s3_text_artifact_pages_without_buffering_it(_e2e_org):
 
         assert first["text"] == body[: artifacts.TEXT_PAGE_CHARS]
         assert first["has_more"] is True
-        assert second["text"] == body[
-            artifacts.TEXT_PAGE_CHARS : 2 * artifacts.TEXT_PAGE_CHARS
-        ]
+        assert (
+            second["text"]
+            == body[artifacts.TEXT_PAGE_CHARS : 2 * artifacts.TEXT_PAGE_CHARS]
+        )
 
         assert ranges and all(r is not None for r in ranges), (
             f"a page read went out without a Range header: {ranges!r} — the "
             "whole object was requested to serve one page"
         )
-        ceiling = (
-            artifact_storage.UTF8_MAX_BYTES_PER_CHAR
-            * (2 * artifacts.TEXT_PAGE_CHARS + 1)
+        ceiling = artifact_storage.UTF8_MAX_BYTES_PER_CHAR * (
+            2 * artifacts.TEXT_PAGE_CHARS + 1
         )
         for header in ranges:
             end = int(header.split("-")[1])

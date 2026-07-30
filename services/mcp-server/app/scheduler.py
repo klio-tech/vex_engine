@@ -280,9 +280,7 @@ async def collect_artifacts_once(db_factory: Callable[[], Any]) -> int:
                 # Confirmed between collect_abandoned's SELECT and this
                 # DELETE: the row is no longer pending, so it was NOT removed
                 # above. Its object must be left alone.
-                logger.info(
-                    "artifact GC: skipping %s, no longer pending", row["id"]
-                )
+                logger.info("artifact GC: skipping %s, no longer pending", row["id"])
                 continue
 
             key = artifact_storage.object_key(row["org_id"], row["id"], row["version"])
@@ -304,7 +302,9 @@ async def collect_artifacts_once(db_factory: Callable[[], Any]) -> int:
         db.close()
 
 
-async def _artifact_gc_loop(db_factory: Callable[[], Any], interval_seconds: float) -> None:
+async def _artifact_gc_loop(
+    db_factory: Callable[[], Any], interval_seconds: float
+) -> None:
     """Sleep ``interval_seconds``, run one sweep, repeat until cancelled.
 
     Mirrors :func:`_curator_loop`: sleeps before the first tick so a
