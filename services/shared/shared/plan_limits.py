@@ -111,6 +111,14 @@ class PlanConfig:
     memory_retention_days: int = 30
     memory_sync_enabled: bool = False
 
+    # Artifacts (Klio) — durable files, documents and records. Capacity is the
+    # paid axis; the feature is available on every plan, because handing work
+    # between agents is the wedge (same reason max_agents is -1 everywhere).
+    # 0 disables artifacts entirely. Mirror at
+    # Dashboard/apps/landing/lib/pricing.ts (keep in sync).
+    artifact_max_file_bytes: int = 10 * 1024 * 1024
+    artifact_storage_bytes: int = 100 * 1024 * 1024
+
 
 PLAN_LIMITS: dict[str, PlanConfig] = {
     "free": PlanConfig(
@@ -131,6 +139,8 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         recalls_per_month=10_000,
         memory_retention_days=1,
         memory_sync_enabled=False,
+        artifact_max_file_bytes=10 * 1024 * 1024,
+        artifact_storage_bytes=100 * 1024 * 1024,
     ),
     "starter": PlanConfig(
         observations_per_month=25_000,
@@ -150,6 +160,8 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         recalls_per_month=100_000,
         memory_retention_days=7,
         memory_sync_enabled=True,
+        artifact_max_file_bytes=50 * 1024 * 1024,
+        artifact_storage_bytes=5 * 1024 * 1024 * 1024,
     ),
     "pro": PlanConfig(
         observations_per_month=150_000,
@@ -169,6 +181,8 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         recalls_per_month=1_000_000,
         memory_retention_days=30,
         memory_sync_enabled=True,
+        artifact_max_file_bytes=50 * 1024 * 1024,
+        artifact_storage_bytes=5 * 1024 * 1024 * 1024,
     ),
     "team": PlanConfig(
         observations_per_month=1_500_000,
@@ -188,6 +202,29 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         recalls_per_month=10_000_000,
         memory_retention_days=90,
         memory_sync_enabled=True,
+        artifact_max_file_bytes=50 * 1024 * 1024,
+        artifact_storage_bytes=5 * 1024 * 1024 * 1024,
+    ),
+    "max": PlanConfig(
+        observations_per_month=1_500_000,
+        verifications_per_month=150_000,
+        corrections_per_month=-1,
+        max_rpm=5_000,
+        max_agents=-1,
+        corrections_enabled=True,
+        webhook_alerts=True,
+        slack_alerts=True,
+        retention_days=90,
+        overage_allowed=True,
+        max_experiments=-1,
+        max_datasets=-1,
+        max_dataset_items=-1,
+        memories_per_month=1_500_000,
+        recalls_per_month=10_000_000,
+        memory_retention_days=90,
+        memory_sync_enabled=True,
+        artifact_max_file_bytes=1024 * 1024 * 1024,
+        artifact_storage_bytes=1024 * 1024 * 1024 * 1024,
     ),
     "enterprise": PlanConfig(
         observations_per_month=10_000_000,
@@ -207,6 +244,8 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         recalls_per_month=-1,
         memory_retention_days=365,
         memory_sync_enabled=True,
+        artifact_max_file_bytes=1024 * 1024 * 1024,
+        artifact_storage_bytes=1024 * 1024 * 1024 * 1024,
     ),
 }
 
