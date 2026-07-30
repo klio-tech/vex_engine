@@ -34,7 +34,7 @@ from typing import Any, Callable, Optional
 
 from sqlalchemy import text as sa_text
 
-from app.config import CURATOR_ENABLED, CURATOR_INTERVAL_SECONDS
+from app.config import ARTIFACT_GC_ENABLED, CURATOR_ENABLED, CURATOR_INTERVAL_SECONDS
 from app.curator import run_curator_once
 from app.db import SessionLocal
 from shared import artifact_storage, artifacts
@@ -121,6 +121,19 @@ async def collect_artifacts_once(db_factory: Callable[[], Any]) -> int:
     is intentionally cross-org (see its docstring); the ``org_id`` used to build
     each object's key comes from the row itself, never from any other source.
 
+    **TOCTOU guard.** ``collect_abandoned`` SELECTs rows that were ``pending``
+    as of that query, but a late ``activate()`` call can flip a row to
+    ``active`` in the (however small) window between that SELECT and this
+    function's DELETE. Deleting unconditionally would destroy a live,
+    just-confirmed artifact and the bytes a customer just uploaded — permanent
+    data loss on a timer. So each row is deleted with its own conditional,
+    atomic ``DELETE ... WHERE id = :id AND status = 'pending' RETURNING id``:
+    the DELETE only removes the row if it is *still* pending at that instant.
+    The S3 object for a row is deleted **only after** that DELETE confirms the
+    row was actually removed — never before, and never for a row whose DELETE
+    returned nothing. This ordering is the invariant: the sweep must never
+    destroy bytes belonging to a row it did not also delete.
+
     Object deletion is best-effort and never blocks row cleanup: the common
     case for an abandoned upload is that no object was ever put to S3 at all,
     so a missing-object failure here is expected, not exceptional, and must
@@ -133,20 +146,36 @@ async def collect_artifacts_once(db_factory: Callable[[], Any]) -> int:
             return 0
 
         s3 = artifact_storage.get_artifact_s3_client()
+        collected = 0
         for row in stale:
+            deleted = db.execute(
+                sa_text(
+                    "DELETE FROM artifacts WHERE id = :id AND status = 'pending' "
+                    "RETURNING id"
+                ),
+                {"id": row["id"]},
+            ).fetchone()
+            db.commit()
+
+            if not deleted:
+                # Confirmed between collect_abandoned's SELECT and this
+                # DELETE: the row is no longer pending, so it was NOT removed
+                # above. Its object must be left alone.
+                logger.info(
+                    "artifact GC: skipping %s, no longer pending", row["id"]
+                )
+                continue
+
             key = artifact_storage.object_key(row["org_id"], row["id"], row["version"])
             try:
                 artifact_storage.delete(s3, key)
             except Exception:
                 logger.debug("artifact GC: no object at %s", key)
+            collected += 1
 
-        db.execute(
-            sa_text("DELETE FROM artifacts WHERE id = ANY(:ids)"),
-            {"ids": [row["id"] for row in stale]},
-        )
-        db.commit()
-        logger.info("artifact GC: collected %d abandoned uploads", len(stale))
-        return len(stale)
+        if collected:
+            logger.info("artifact GC: collected %d abandoned uploads", collected)
+        return collected
     finally:
         db.close()
 
@@ -173,14 +202,30 @@ async def _artifact_gc_loop(db_factory: Callable[[], Any], interval_seconds: flo
 
 
 def start_artifact_gc(
-    app: Any, db_factory: Callable[[], Any], interval_seconds: float = 3600
-) -> asyncio.Task:
+    app: Any,
+    db_factory: Callable[[], Any],
+    interval_seconds: float = 3600,
+    *,
+    enabled: Optional[bool] = None,
+) -> Optional[asyncio.Task]:
     """Start the hourly abandoned-upload sweep and stash the task on ``app.state``.
 
-    Mirrors :func:`start_curator`'s shape (sleep-before-tick loop, task stored
-    on ``app.state``), but the artifact sweep is not gated behind an enabled
-    flag — it is cheap, idempotent, and safe to run in every environment.
+    Mirrors :func:`start_curator`'s shape exactly: same sleep-before-tick
+    loop, same task-on-``app.state`` storage, and — since this sweep deletes
+    DB rows and S3 objects — the same kill-switch convention
+    (``ARTIFACT_GC_ENABLED``, read here exactly like ``CURATOR_ENABLED`` is
+    read in :func:`start_curator`) so on-call can disable it with an env var
+    instead of a code change and redeploy.
+
+    Returns the created :class:`asyncio.Task`, or ``None`` when disabled (in
+    which case ``app.state.artifact_gc_task`` is also set to ``None``).
     """
+    enabled = ARTIFACT_GC_ENABLED if enabled is None else enabled
+    if not enabled:
+        logger.info("artifact GC scheduler disabled")
+        app.state.artifact_gc_task = None
+        return None
+
     task = asyncio.create_task(_artifact_gc_loop(db_factory, interval_seconds))
     app.state.artifact_gc_task = task
     logger.info("artifact GC scheduler started (interval=%ss)", interval_seconds)
