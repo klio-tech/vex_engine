@@ -1095,7 +1095,7 @@ def get_artifact(db: Any, *, org_id: str, artifact_id: str) -> Optional[dict]:
             """
             SELECT id, org_id, agent_id, title, summary, kind, mime_type,
                    size_bytes, checksum, inline_text, storage_uri,
-                   version, status
+                   version, status, space_id, project_id
             FROM artifacts
             WHERE org_id = :org_id AND id = :artifact_id
             """
@@ -1118,6 +1118,11 @@ def get_artifact(db: Any, *, org_id: str, artifact_id: str) -> Optional[dict]:
         "storage_uri": row[10],
         "version": int(row[11]),
         "status": row[12],
+        # Carried so the confirm path can file the card into the same space
+        # the pending row was created with — otherwise a presigned artifact's
+        # card silently lands unfiled.
+        "space_id": row[13],
+        "project_id": row[14],
     }
 
 
@@ -1857,8 +1862,8 @@ In `_perform_artifact_put`, replace the `# Presigned request and confirm branche
                 summary=row["summary"],
                 kind=row["kind"],
                 size_bytes=measured["size_bytes"],
-                space_id=None,
-                project_id=None,
+                space_id=row["space_id"],
+                project_id=row["project_id"],
             )
 
             if supersedes:
@@ -2223,6 +2228,20 @@ async def test_forget_retracts_the_artifact_and_hides_its_card(storage):
 
 
 @pytest.mark.asyncio
+async def test_forget_with_a_non_uuid_id_rolls_back_and_tries_memory(storage):
+    # Memory ids are not always UUIDs. The ::uuid cast raises, and without a
+    # rollback Postgres leaves the transaction aborted — breaking the memory
+    # path that should have handled this id.
+    storage.artifacts.retract.side_effect = Exception("invalid input for uuid")
+    db = mcp_app.SessionLocal.return_value
+
+    result = await _tool("forget")(_ctx(), memory_id="not-a-uuid")
+
+    db.rollback.assert_called_once()
+    assert result.get("kind") != "artifact"
+
+
+@pytest.mark.asyncio
 async def test_recall_description_tells_agents_about_artifact_get():
     tool = build_mcp_server()._tool_manager.get_tool("recall")
     # Without this, an agent receives an artifact card and has no idea a
@@ -2248,15 +2267,32 @@ In the existing `forget` tool body in `services/mcp-server/app/mcp_app.py`, befo
             return {"forgotten": True, "kind": "artifact", "id": memory_id}
 ```
 
-If `retract` raises because the id is not a valid UUID, catch and fall through to the memory path:
+A memory id and an artifact id are both opaque strings here, so `forget` must
+tolerate being handed either. Two hazards make the naive version wrong:
+
+- `artifacts.retract` casts the id to `uuid` in SQL. A non-UUID string raises,
+  and Postgres then leaves the transaction **aborted** — every later statement
+  in the same session fails with `current transaction is aborted`, so the
+  memory path that should have handled this id fails too.
+- Rolling back is therefore mandatory, not defensive.
+
+Use exactly this:
 
 ```python
+        # An id may name an artifact or a memory. Try the artifact first: a hit
+        # must retract the bytes AND hide the card, or recall keeps surfacing a
+        # card pointing at something that is gone.
+        #
+        # A non-UUID id (memory ids are not always UUIDs) makes the ::uuid cast
+        # raise and leaves the transaction aborted, which would break the memory
+        # path below. Roll back before falling through.
         try:
             if artifacts.retract(db, org_id=org_id, artifact_id=memory_id):
                 _hide_card_for_artifact(db, org_id=org_id, artifact_id=memory_id)
                 return {"forgotten": True, "kind": "artifact", "id": memory_id}
         except Exception:
-            logger.debug("forget: id %s is not an artifact, trying memory", memory_id)
+            db.rollback()
+            logger.debug("forget: %s is not an artifact id, trying memory", memory_id)
 ```
 
 - [ ] **Step 4: Update `recall`'s description**
@@ -2271,7 +2307,7 @@ In the `@mcp.tool(name="recall", ...)` decorator, append this sentence to the ex
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run from `services/mcp-server`: `pytest tests/test_artifact_tools.py -v`
-Expected: 19 passed.
+Expected: 20 passed.
 
 - [ ] **Step 6: Commit**
 
