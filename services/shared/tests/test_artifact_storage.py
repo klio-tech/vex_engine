@@ -460,3 +460,101 @@ def test_delete_is_scoped_to_the_bucket():
     s3 = _fake_s3()
     st.delete(s3, "acme/a/v1")
     s3.delete_object.assert_called_once_with(Bucket="klio-artifacts", Key="acme/a/v1")
+
+
+# ---------------------------------------------------------------------------
+# Credential resolution
+#
+# Artifacts and Vex traces live in different buckets with different blast
+# radii. storage-worker reads the shared S3_* names for traces, so the artifact
+# client must be able to take a DIFFERENT credential — otherwise the two share
+# one key by construction and bucket-scoping the tokens buys nothing.
+# ---------------------------------------------------------------------------
+
+_S3_VARS = (
+    "KLIO_ARTIFACT_S3_ENDPOINT",
+    "KLIO_ARTIFACT_S3_ACCESS_KEY",
+    "KLIO_ARTIFACT_S3_SECRET_KEY",
+    "KLIO_ARTIFACT_S3_REGION",
+    "S3_ENDPOINT",
+    "S3_ACCESS_KEY",
+    "S3_SECRET_KEY",
+    "S3_REGION",
+)
+
+
+@pytest.fixture
+def clean_s3_env(monkeypatch):
+    """Remove every S3 variable so each test states its own environment."""
+    for var in _S3_VARS:
+        monkeypatch.delenv(var, raising=False)
+    return monkeypatch
+
+
+def _client_settings(client):
+    return {
+        "endpoint": client.meta.endpoint_url,
+        "region": client.meta.region_name,
+    }
+
+
+def test_artifact_vars_win_over_the_shared_ones(clean_s3_env):
+    """A dedicated artifact credential must not be shadowed by the traces one."""
+    clean_s3_env.setenv("S3_ENDPOINT", "https://traces.example")
+    clean_s3_env.setenv("S3_ACCESS_KEY", "traces-key")
+    clean_s3_env.setenv("S3_SECRET_KEY", "traces-secret")
+    clean_s3_env.setenv("KLIO_ARTIFACT_S3_ENDPOINT", "https://artifacts.example")
+    clean_s3_env.setenv("KLIO_ARTIFACT_S3_ACCESS_KEY", "artifact-key")
+    clean_s3_env.setenv("KLIO_ARTIFACT_S3_SECRET_KEY", "artifact-secret")
+
+    assert (
+        st._artifact_s3_setting("ENDPOINT", "fallback") == "https://artifacts.example"
+    )
+    assert st._artifact_s3_setting("ACCESS_KEY", "fallback") == "artifact-key"
+    assert st._artifact_s3_setting("SECRET_KEY", "fallback") == "artifact-secret"
+
+    client = st.get_artifact_s3_client()
+    assert _client_settings(client)["endpoint"] == "https://artifacts.example"
+
+
+def test_falls_back_to_the_shared_vars_when_no_artifact_var_is_set(clean_s3_env):
+    """Existing single-bucket deployments must keep working with no new config."""
+    clean_s3_env.setenv("S3_ENDPOINT", "https://shared.example")
+    clean_s3_env.setenv("S3_ACCESS_KEY", "shared-key")
+    clean_s3_env.setenv("S3_SECRET_KEY", "shared-secret")
+
+    assert st._artifact_s3_setting("ENDPOINT", "fallback") == "https://shared.example"
+    assert st._artifact_s3_setting("ACCESS_KEY", "fallback") == "shared-key"
+    assert st.get_artifact_s3_client().meta.endpoint_url == "https://shared.example"
+
+
+def test_falls_back_to_the_local_dev_defaults_when_nothing_is_set(clean_s3_env):
+    """docker-compose MinIO keeps working with an empty environment."""
+    assert st._artifact_s3_setting("ENDPOINT", "http://localhost:9000") == (
+        "http://localhost:9000"
+    )
+    assert st.get_artifact_s3_client().meta.endpoint_url == "http://localhost:9000"
+
+
+def test_an_empty_artifact_var_does_not_shadow_the_shared_one(clean_s3_env):
+    """An unset-but-present variable is a deploy footgun; treat blank as absent."""
+    clean_s3_env.setenv("KLIO_ARTIFACT_S3_ENDPOINT", "")
+    clean_s3_env.setenv("S3_ENDPOINT", "https://shared.example")
+
+    assert st._artifact_s3_setting("ENDPOINT", "fallback") == "https://shared.example"
+
+
+def test_region_prefers_the_artifact_var(clean_s3_env):
+    """R2 needs region 'auto'; AWS-shaped default must be overridable per client."""
+    import importlib
+
+    clean_s3_env.setenv("S3_REGION", "us-east-1")
+    clean_s3_env.setenv("KLIO_ARTIFACT_S3_REGION", "auto")
+    reloaded = importlib.reload(st)
+    try:
+        assert reloaded.ARTIFACT_S3_REGION == "auto"
+        assert reloaded.get_artifact_s3_client().meta.region_name == "auto"
+    finally:
+        for var in _S3_VARS:
+            clean_s3_env.delenv(var, raising=False)
+        importlib.reload(st)
