@@ -630,7 +630,12 @@ _TEXT_MIME_EXACT = {"application/json", "application/xml", "application/yaml"}
 
 
 def _is_text_mime(mime_type: str) -> bool:
-    return mime_type.startswith(_TEXT_MIME_PREFIXES) or mime_type in _TEXT_MIME_EXACT
+    # MIME types commonly carry a parameter (e.g. "application/json;
+    # charset=utf-8"); match against the normalized type/subtype only, not
+    # the raw header value, or a genuinely-text record gets misclassified as
+    # binary.
+    normalized = mime_type.split(";", 1)[0].strip().lower()
+    return normalized.startswith(_TEXT_MIME_PREFIXES) or normalized in _TEXT_MIME_EXACT
 
 
 async def _perform_artifact_get(
@@ -701,7 +706,7 @@ async def _perform_artifact_get(
                 ),
             }
 
-        page = full[offset : offset + artifacts.TEXT_PAGE_BYTES]
+        page = full[offset : offset + artifacts.TEXT_PAGE_CHARS]
         return {
             **head,
             "text": page,

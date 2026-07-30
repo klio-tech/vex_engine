@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.mcp_app import build_mcp_server
+from app.mcp_app import _is_text_mime, build_mcp_server
 
 MB = 1024 * 1024
 
@@ -364,7 +364,7 @@ async def test_confirm_card_write_failure_retracts_the_artifact(storage):
 
 @pytest.mark.asyncio
 async def test_get_returns_inline_text(storage):
-    storage.artifacts.TEXT_PAGE_BYTES = 51_200
+    storage.artifacts.TEXT_PAGE_CHARS = 51_200
     storage.artifacts.get_artifact.return_value = {
         "id": "a1", "status": "active", "title": "t", "kind": "document",
         "mime_type": "text/markdown", "inline_text": "hello", "storage_uri": None,
@@ -379,7 +379,7 @@ async def test_get_returns_inline_text(storage):
 
 @pytest.mark.asyncio
 async def test_get_pages_long_text_and_reports_more(storage):
-    storage.artifacts.TEXT_PAGE_BYTES = 10
+    storage.artifacts.TEXT_PAGE_CHARS = 10
     storage.artifacts.get_artifact.return_value = {
         "id": "a1", "status": "active", "title": "t", "kind": "document",
         "mime_type": "text/plain", "inline_text": "abcdefghijKLMNO",
@@ -443,3 +443,62 @@ async def test_get_on_a_retracted_artifact_reads_as_not_found(storage):
     }
     result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
     assert result["error"] == "not_found"
+
+
+# --- _is_text_mime: parameterized / cased MIME types (code-review finding) ---
+
+
+def test_is_text_mime_accepts_json_with_charset_parameter():
+    # "application/json" alone hits the exact-match set, but a real-world
+    # Content-Type nearly always carries a "; charset=..." parameter — the
+    # non-text/* exact-match types are exactly where structured `record`
+    # artifacts live, so this must not be misclassified as binary.
+    assert _is_text_mime("application/json; charset=utf-8") is True
+
+
+def test_is_text_mime_is_case_insensitive():
+    assert _is_text_mime("TEXT/PLAIN") is True
+
+
+def test_is_text_mime_still_rejects_binary_types():
+    assert _is_text_mime("application/pdf") is False
+
+
+# --- mode='text' reading a non-inline (S3-backed) text artifact ---
+
+
+@pytest.mark.asyncio
+async def test_get_text_reads_a_text_artifact_stored_in_s3(storage):
+    storage.artifacts.TEXT_PAGE_CHARS = 51_200
+    storage.artifacts.get_artifact.return_value = {
+        "id": "a1", "status": "active", "title": "t", "kind": "record",
+        "mime_type": "application/json", "inline_text": None,
+        "storage_uri": "s3://klio-artifacts/acme/a1/v1", "version": 1,
+        "size_bytes": 13,
+    }
+    storage.storage.get_text.return_value = '{"ok": true}'
+
+    result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
+
+    storage.storage.object_key.assert_called_with("acme", "a1", 1)
+    storage.storage.get_text.assert_called_once_with(
+        storage.storage.get_artifact_s3_client.return_value,
+        storage.storage.object_key.return_value,
+    )
+    assert result["text"] == '{"ok": true}'
+    assert result["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_text_on_s3_read_failure_returns_internal_error_not_a_crash(storage):
+    storage.artifacts.get_artifact.return_value = {
+        "id": "a1", "status": "active", "title": "t", "kind": "document",
+        "mime_type": "text/plain", "inline_text": None,
+        "storage_uri": "s3://klio-artifacts/acme/a1/v1", "version": 1,
+        "size_bytes": 100,
+    }
+    storage.storage.get_text.side_effect = RuntimeError("s3 unavailable")
+
+    result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
+
+    assert result == {"error": "internal_error"}

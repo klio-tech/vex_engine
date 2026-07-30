@@ -20,9 +20,15 @@ from sqlalchemy import text
 # touches object storage. Covers essentially every spec, record and code file.
 INLINE_MAX_BYTES = 65_536
 
-# One artifact_get(mode='text') call returns at most this much, with an offset
-# for paging. A context window is the real constraint here, not the transport.
-TEXT_PAGE_BYTES = 51_200
+# One artifact_get(mode='text') call returns at most this many *characters*
+# (not bytes) of a Python str, with an offset for paging. Characters, not
+# bytes, are the right unit: the thing being protected is an agent's context
+# window, which is measured in tokens, and characters track token count far
+# more closely than UTF-8 byte length does — a single CJK or emoji character
+# can be 3-4 bytes but is still roughly one token. Slicing by byte count would
+# also risk splitting a multi-byte character mid-codepoint and would make
+# ``offset`` meaningless across pages.
+TEXT_PAGE_CHARS = 51_200
 
 # An upload that is requested and never confirmed is collected after this long.
 PENDING_TTL_HOURS = 24
