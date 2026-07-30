@@ -13,12 +13,17 @@ ENV PYTHONPATH="/app/lib/shared"
 # pydantic/sqlalchemy/psycopg2. Keep this list in sync with
 # services/shared/pyproject.toml [dependencies]. Specifiers are quoted so the
 # shell does not interpret '>=' as an output redirection.
+#
+# boto3 is required because shared.artifact_storage imports it at module
+# scope and mcp_app imports artifact_storage at module scope — so a missing
+# boto3 is not a lazy failure, it is a crash loop on container start.
 RUN pip install --no-cache-dir \
     "pydantic>=2.0.0" \
     "sqlalchemy>=2.0.0" \
     "psycopg2-binary>=2.9.0" \
     "pgvector>=0.3.0" \
-    "litellm>=1.0.0"
+    "litellm>=1.0.0" \
+    "boto3>=1.29.0"
 
 # Install the MCP server service.
 COPY services/mcp-server/pyproject.toml /app/
