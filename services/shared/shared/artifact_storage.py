@@ -37,7 +37,13 @@ ARTIFACT_BUCKET = os.environ.get("KLIO_ARTIFACT_BUCKET", "klio-artifacts")
 #
 # Region is likewise pinned: presigning needs one, and inheriting it from the
 # ambient AWS profile makes the signature depend on the operator's shell.
-ARTIFACT_S3_REGION = os.environ.get("S3_REGION", "us-east-1")
+#
+# Cloudflare R2 requires the literal region ``auto``; getting this wrong makes
+# every presigned URL fail signature validation, so it is set deliberately per
+# deployment rather than left on the AWS-shaped default.
+ARTIFACT_S3_REGION = os.environ.get("KLIO_ARTIFACT_S3_REGION") or os.environ.get(
+    "S3_REGION", "us-east-1"
+)
 
 # Presigned URLs are bearer credentials: anyone holding one can read or write
 # that single object. Short TTL is the mitigation. Never log them.
@@ -48,13 +54,35 @@ PRESIGN_TTL_SECONDS = 900
 MULTIPART_THRESHOLD_BYTES = 100 * 1024 * 1024
 
 
+def _artifact_s3_setting(name: str, fallback: str) -> str:
+    """Resolve one S3 setting, preferring the artifact-specific variable.
+
+    Artifacts and Vex trace payloads live in DIFFERENT buckets with different
+    retention and a very different blast radius — traces are internal
+    telemetry, artifacts are customer documents. Keeping them on one credential
+    means a leaked artifact key also reads every trace, and vice versa.
+
+    ``storage-worker`` reads the shared ``S3_*`` variables for traces. Reading
+    the same names here would make credential separation impossible to express
+    in config, so the artifact client prefers ``KLIO_ARTIFACT_S3_*`` and falls
+    back to the shared names.
+
+    The fallback is what keeps docker-compose, the E2E suite and any existing
+    single-bucket deployment working untouched: set nothing and behaviour is
+    exactly as before.
+    """
+    return os.environ.get(f"KLIO_ARTIFACT_S3_{name}") or os.environ.get(
+        f"S3_{name}", fallback
+    )
+
+
 def get_artifact_s3_client() -> Any:
     """Return a boto3 S3 client configured for the artifact bucket."""
     return boto3.client(
         "s3",
-        endpoint_url=os.environ.get("S3_ENDPOINT", "http://localhost:9000"),
-        aws_access_key_id=os.environ.get("S3_ACCESS_KEY", "agentguard"),
-        aws_secret_access_key=os.environ.get("S3_SECRET_KEY", "agentguard_dev"),
+        endpoint_url=_artifact_s3_setting("ENDPOINT", "http://localhost:9000"),
+        aws_access_key_id=_artifact_s3_setting("ACCESS_KEY", "agentguard"),
+        aws_secret_access_key=_artifact_s3_setting("SECRET_KEY", "agentguard_dev"),
         region_name=ARTIFACT_S3_REGION,
         config=Config(
             signature_version="s3v4",
