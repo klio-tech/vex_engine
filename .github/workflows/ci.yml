@@ -54,3 +54,63 @@ jobs:
         run: pip install -e "services/${{ matrix.service }}[dev]"
       - name: Run tests
         run: pytest services/${{ matrix.service }}/tests/ -v --tb=short
+
+  container-import:
+    name: Container Import (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    needs: [lint]
+    # Builds each service image and imports its entrypoint module.
+    #
+    # This exists because `service-tests` cannot catch a missing runtime
+    # dependency. Those tests run under `pip install -e services/<svc>[dev]`
+    # in a venv that already has every transitive package, while the images
+    # hand-maintain their own dependency lists — see the pip block in
+    # services/mcp-server/Dockerfile.
+    #
+    # On 2026-07-30 that gap took mcp.klio.tech down for ~35 minutes: boto3
+    # was added to services/shared/pyproject.toml but not to the mcp-server
+    # Dockerfile's copy of shared's deps. `mcp_app` imports artifact_storage
+    # at module scope, which imports boto3 at module scope, so the container
+    # crash-looped on start. All 282 tests were green throughout.
+    #
+    # Importing the entrypoint is what makes this bite: a module-scope import
+    # error is exactly the failure that reaches production as a crash loop
+    # rather than as a handled error at first use.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: mcp-server
+            import: app.main
+          - service: ingestion-api
+            import: app.main
+          - service: dashboard-api
+            import: app.main
+          - service: sync-gateway
+            import: app.main
+          - service: storage-worker
+            import: app.main
+          - service: async-worker
+            import: app.main
+          - service: alert-service
+            import: app.main
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.service }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          tags: klio-${{ matrix.service }}:ci
+          load: true
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+      - name: Import ${{ matrix.import }} inside the image
+        # No database, broker or network is available here, so this asserts
+        # only that every module-scope import resolves. That is the whole
+        # point: anything needing a live dependency belongs behind a function
+        # call, not at import time.
+        run: |
+          docker run --rm --network none klio-${{ matrix.service }}:ci \
+            python -c "import ${{ matrix.import }}; print('import OK: ${{ matrix.import }}')"
