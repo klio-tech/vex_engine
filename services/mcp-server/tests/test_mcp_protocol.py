@@ -30,6 +30,7 @@ _REQUIRED_SCHEMA_FIELD = {
     "decide": "content",
     "note": "content",
     "artifact_put": "title",
+    "artifact_get": "artifact_id",
     "space": "action",
     "forget": "memory_id",
 }

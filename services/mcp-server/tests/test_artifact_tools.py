@@ -360,3 +360,86 @@ async def test_confirm_card_write_failure_retracts_the_artifact(storage):
     retract_kwargs = storage.artifacts.retract.call_args.kwargs
     assert retract_kwargs["org_id"] == "acme"
     assert retract_kwargs["artifact_id"] == "new-artifact-id"
+
+
+@pytest.mark.asyncio
+async def test_get_returns_inline_text(storage):
+    storage.artifacts.TEXT_PAGE_BYTES = 51_200
+    storage.artifacts.get_artifact.return_value = {
+        "id": "a1", "status": "active", "title": "t", "kind": "document",
+        "mime_type": "text/markdown", "inline_text": "hello", "storage_uri": None,
+        "version": 1, "size_bytes": 5,
+    }
+
+    result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
+
+    assert result["text"] == "hello"
+    assert result["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_pages_long_text_and_reports_more(storage):
+    storage.artifacts.TEXT_PAGE_BYTES = 10
+    storage.artifacts.get_artifact.return_value = {
+        "id": "a1", "status": "active", "title": "t", "kind": "document",
+        "mime_type": "text/plain", "inline_text": "abcdefghijKLMNO",
+        "storage_uri": None, "version": 1, "size_bytes": 15,
+    }
+
+    first = await _tool("artifact_get")(_ctx(), artifact_id="a1")
+    assert first["text"] == "abcdefghij"
+    assert first["has_more"] is True
+
+    second = await _tool("artifact_get")(_ctx(), artifact_id="a1", offset=10)
+    assert second["text"] == "KLMNO"
+    assert second["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_text_on_a_binary_points_at_url_mode(storage):
+    storage.artifacts.get_artifact.return_value = {
+        "id": "a1", "status": "active", "title": "t", "kind": "file",
+        "mime_type": "application/pdf", "inline_text": None,
+        "storage_uri": "s3://klio-artifacts/acme/a1/v1", "version": 1,
+        "size_bytes": 2048,
+    }
+
+    result = await _tool("artifact_get")(_ctx(), artifact_id="a1", mode="text")
+
+    # v1 does no extraction; saying so beats returning mojibake.
+    assert result["error"] == "not_text"
+    assert "url" in result["detail"]
+
+
+@pytest.mark.asyncio
+async def test_get_url_returns_a_short_lived_signed_url(storage):
+    storage.storage.presign_get.return_value = "https://example/download"
+    storage.artifacts.get_artifact.return_value = {
+        "id": "a1", "status": "active", "title": "t", "kind": "file",
+        "mime_type": "application/pdf", "inline_text": None,
+        "storage_uri": "s3://klio-artifacts/acme/a1/v1", "version": 1,
+        "size_bytes": 2048,
+    }
+
+    result = await _tool("artifact_get")(_ctx(), artifact_id="a1", mode="url")
+
+    assert result["url"] == "https://example/download"
+    assert result["expires_in"] == 900
+
+
+@pytest.mark.asyncio
+async def test_get_on_another_orgs_artifact_reads_as_not_found(storage):
+    storage.artifacts.get_artifact.return_value = None
+    result = await _tool("artifact_get")(_ctx(), artifact_id="someone-elses")
+    assert result["error"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_get_on_a_retracted_artifact_reads_as_not_found(storage):
+    storage.artifacts.get_artifact.return_value = {
+        "id": "a1", "status": "retracted", "title": "t", "kind": "document",
+        "mime_type": "text/plain", "inline_text": "gone", "storage_uri": None,
+        "version": 1, "size_bytes": 4,
+    }
+    result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
+    assert result["error"] == "not_found"

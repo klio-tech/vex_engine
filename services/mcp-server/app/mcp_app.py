@@ -81,6 +81,7 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "decide",
     "note",
     "artifact_put",
+    "artifact_get",
     "space",
     "forget",
 )
@@ -620,6 +621,96 @@ async def _perform_artifact_put(
     except Exception:
         logger.exception("artifact_put failed")
         return {"stored": False, "error": "internal_error"}
+    finally:
+        db.close()
+
+
+_TEXT_MIME_PREFIXES = ("text/",)
+_TEXT_MIME_EXACT = {"application/json", "application/xml", "application/yaml"}
+
+
+def _is_text_mime(mime_type: str) -> bool:
+    return mime_type.startswith(_TEXT_MIME_PREFIXES) or mime_type in _TEXT_MIME_EXACT
+
+
+async def _perform_artifact_get(
+    ctx: Context,
+    *,
+    artifact_id: str,
+    mode: str = "text",
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Shared body for ``artifact_get``.
+
+    Text is returned one bounded page at a time: a recall result can point at a
+    multi-megabyte artifact, and a context window is the real constraint.
+    Binary artifacts are never guessed at — v1 does no extraction, so the caller
+    is told to use ``mode='url'``.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        return {"error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, _agent_id, _plan, _overrides = resolve_principal_plan(request)
+    except HTTPException as exc:
+        return {"error": "unauthorized", "detail": str(exc.detail)}
+
+    db = SessionLocal()
+    try:
+        row = artifacts.get_artifact(db, org_id=org_id, artifact_id=artifact_id)
+        if row is None or row["status"] not in ("active", "superseded"):
+            return {"error": "not_found"}
+
+        head = {
+            "artifact_id": row["id"],
+            "title": row["title"],
+            "kind": row["kind"],
+        }
+
+        if mode == "url":
+            s3 = artifact_storage.get_artifact_s3_client()
+            key = artifact_storage.object_key(org_id, row["id"], row["version"])
+            if row["inline_text"] is not None:
+                # Inline artifacts have no object yet; materialise one so the
+                # URL contract holds for every kind.
+                artifact_storage.put_text(
+                    s3, key, row["inline_text"], row["mime_type"]
+                )
+            return {
+                **head,
+                "url": artifact_storage.presign_get(s3, key),
+                "expires_in": artifact_storage.PRESIGN_TTL_SECONDS,
+            }
+
+        if row["inline_text"] is not None:
+            full = row["inline_text"]
+        elif _is_text_mime(row["mime_type"]):
+            s3 = artifact_storage.get_artifact_s3_client()
+            key = artifact_storage.object_key(org_id, row["id"], row["version"])
+            full = artifact_storage.get_text(s3, key)
+        else:
+            return {
+                **head,
+                "error": "not_text",
+                "detail": (
+                    f"{row['mime_type']} is not text. Call artifact_get with "
+                    "mode='url' to download it."
+                ),
+            }
+
+        page = full[offset : offset + artifacts.TEXT_PAGE_BYTES]
+        return {
+            **head,
+            "text": page,
+            "offset": offset,
+            "has_more": (offset + len(page)) < len(full),
+        }
+    except Exception:
+        logger.exception("artifact_get failed")
+        return {"error": "internal_error"}
     finally:
         db.close()
 
@@ -1440,6 +1531,29 @@ def _register_tools(mcp: FastMCP) -> None:
             project=project,
             supersedes=supersedes,
             artifact_id=artifact_id,
+        )
+
+    @mcp.tool(
+        name="artifact_get",
+        description=(
+            "Fetch an artifact surfaced by recall. mode='text' returns its "
+            "contents one page at a time (use `offset` to continue); mode='url' "
+            "returns a short-lived download link for binary content."
+        ),
+    )
+    async def artifact_get(
+        ctx: Context,
+        artifact_id: Annotated[str, Field(description="From a recall result's metadata.")],
+        mode: Annotated[
+            Literal["text", "url"],
+            Field(description="'text' (default) or 'url' for a download link."),
+        ] = "text",
+        offset: Annotated[
+            int, Field(description="Character offset for paging text.", ge=0)
+        ] = 0,
+    ) -> dict[str, Any]:
+        return await _perform_artifact_get(
+            ctx, artifact_id=artifact_id, mode=mode, offset=offset
         )
 
     @mcp.tool(

@@ -73,4 +73,4 @@ def test_forget_is_registered_as_eighth_tool():
     from app.mcp_app import EXPECTED_TOOL_NAMES
 
     assert "forget" in EXPECTED_TOOL_NAMES
-    assert len(EXPECTED_TOOL_NAMES) == 9
+    assert len(EXPECTED_TOOL_NAMES) == 10
