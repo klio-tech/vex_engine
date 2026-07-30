@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app import mcp_app
 from app.mcp_app import _is_text_mime, build_mcp_server
 
 MB = 1024 * 1024
@@ -36,6 +37,11 @@ def seams():
             "app.mcp_app.resolve_principal_plan",
             return_value=("acme", "agent-1", "free", None),
         ),
+        # ``forget`` resolves the principal via the plain ``resolve_principal``
+        # (shared with the older single-memory path), not ``resolve_principal_plan``
+        # used by the rest of the artifact tools — patch both so ``_ctx()``
+        # (which carries no ``X-Vex-Key``) authenticates for every tool.
+        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-1")),
         patch("app.mcp_app.get_plan_config", return_value=plan),
         patch("app.mcp_app.SessionLocal", MagicMock()) as session_local,
         patch("app.mcp_app.artifacts") as af,
@@ -502,3 +508,39 @@ async def test_get_text_on_s3_read_failure_returns_internal_error_not_a_crash(st
     result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
 
     assert result == {"error": "internal_error"}
+
+
+# --- forget: retract an artifact (bytes + card) by id ---
+
+
+@pytest.mark.asyncio
+async def test_forget_retracts_the_artifact_and_hides_its_card(storage):
+    storage.artifacts.retract.return_value = True
+
+    result = await _tool("forget")(_ctx(), memory_id="a1")
+
+    assert result["forgotten"] is True
+    storage.artifacts.retract.assert_called_once()
+    assert storage.artifacts.retract.call_args.kwargs["org_id"] == "acme"
+
+
+@pytest.mark.asyncio
+async def test_forget_with_a_non_uuid_id_rolls_back_and_tries_memory(storage):
+    # Memory ids are not always UUIDs. The ::uuid cast raises, and without a
+    # rollback Postgres leaves the transaction aborted — breaking the memory
+    # path that should have handled this id.
+    storage.artifacts.retract.side_effect = Exception("invalid input for uuid")
+    db = mcp_app.SessionLocal.return_value
+
+    result = await _tool("forget")(_ctx(), memory_id="not-a-uuid")
+
+    db.rollback.assert_called_once()
+    assert result.get("kind") != "artifact"
+
+
+@pytest.mark.asyncio
+async def test_recall_description_tells_agents_about_artifact_get():
+    tool = build_mcp_server()._tool_manager.get_tool("recall")
+    # Without this, an agent receives an artifact card and has no idea a
+    # follow-up tool exists.
+    assert "artifact_get" in tool.description

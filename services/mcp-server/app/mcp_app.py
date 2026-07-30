@@ -1221,6 +1221,21 @@ async def _perform_forget(ctx: Context, *, memory_id: str) -> dict[str, Any]:
 
     db = SessionLocal()
     try:
+        # An id may name an artifact or a memory. Try the artifact first: a hit
+        # must retract the bytes AND hide the card, or recall keeps surfacing a
+        # card pointing at something that is gone.
+        #
+        # A non-UUID id (memory ids are not always UUIDs) makes the ::uuid cast
+        # raise and leaves the transaction aborted, which would break the memory
+        # path below. Roll back before falling through.
+        try:
+            if artifacts.retract(db, org_id=org_id, artifact_id=memory_id):
+                _hide_card_for_artifact(db, org_id=org_id, artifact_id=memory_id)
+                return {"forgotten": True, "kind": "artifact", "id": memory_id}
+        except Exception:
+            db.rollback()
+            logger.debug("forget: %s is not an artifact id, trying memory", memory_id)
+
         return retract_memory(
             db, org_id=org_id, agent_id=agent_id, memory_id=memory_id, via="mcp"
         )
@@ -1287,7 +1302,9 @@ def _register_tools(mcp: FastMCP) -> None:
             "Retrieve relevant memories for the current org/team. "
             "Args: query (required); optional scope ('org' default | "
             "'agent'), space, project, limit. Set the X-Vex-Agent header to "
-            "scope by agent."
+            "scope by agent. "
+            "Results with memory_type 'artifact' are stored files or documents: "
+            "call artifact_get with the metadata's artifact_id to read them."
         ),
     )
     async def recall(
