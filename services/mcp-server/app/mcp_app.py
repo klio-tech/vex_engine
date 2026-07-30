@@ -41,6 +41,7 @@ memories pool under one agent_id.  The server instructions and the
 to scope memory to a distinct agent.
 """
 
+import functools
 import hashlib
 import logging
 from typing import Annotated, Any, Literal, Optional
@@ -386,10 +387,14 @@ async def _perform_artifact_put(
     * **inline** — the bytes are in hand, so the per-file limit and the storage
       pool are both checked against their real size before any row is created.
     * **request** — nothing exists yet, so the checks run against the CLIENT'S
-      DECLARED size, which is unverifiable. That is why this branch also caps
-      how many ``pending`` reservations an org may hold at once
-      (``artifacts.MAX_PENDING_PER_ORG``): the declared size gates the
-      strategy, the cap bounds the damage when it lies.
+      DECLARED size. That size is mandatory here and is SIGNED into the upload
+      URL (``presign_put``'s ``ContentLength``), so it is not merely a hint the
+      client may ignore: an upload of any other size fails signature
+      verification at the storage layer. The declared size therefore both gates
+      the strategy and caps the URL, and ``artifacts.MAX_PENDING_PER_ORG``
+      bounds how many such capped reservations an org may hold at once.
+      Server-measured values still win at confirm time; the declared size is
+      never persisted.
     * **confirm** — the only branch with a server-measured number. The size is
       read via ``HEAD`` (no transfer) and checked against both limits BEFORE
       the object is streamed to compute its checksum, so rejecting an
@@ -470,6 +475,18 @@ async def _perform_artifact_put(
                     "deduplicated": True,
                 }
 
+            # Project resolution FIRST: it is the only one of the two that can
+            # reject the write, and ``ensure_space`` CREATES a row. Running
+            # ensure_space first left an orphan space behind on every
+            # ``unknown_project`` rejection — a typo'd project name retried in a
+            # loop silently fills the org's space list with junk it never asked
+            # for. Resolve what can fail before creating anything durable.
+            project_id, project_error = _resolve_artifact_project(
+                request, db, org_id=org_id, project=project
+            )
+            if project_error is not None:
+                return project_error
+
             stripped_space = space.strip() if space is not None else ""
             space_id = (
                 brain.ensure_space(
@@ -478,11 +495,6 @@ async def _perform_artifact_put(
                 if stripped_space
                 else None
             )
-            project_id, project_error = _resolve_artifact_project(
-                request, db, org_id=org_id, project=project
-            )
-            if project_error is not None:
-                return project_error
 
             new_id = artifacts.create_pending(
                 db,
@@ -734,7 +746,25 @@ async def _perform_artifact_put(
                 "detail": "Provide `mime_type` when omitting `content`.",
             }
 
-        declared = size_bytes or 0
+        # A declared size is mandatory on this branch, because it is what gets
+        # SIGNED into the upload URL (``presign_put``'s ``ContentLength``). No
+        # declared size means no cap to sign, i.e. a URL through which an
+        # object of any size can be uploaded — the exact hole that made
+        # ``MAX_PENDING_PER_ORG``'s bound false. The previous
+        # ``size_bytes or 0`` also sailed through the pool check below, since
+        # zero always fits.
+        declared = size_bytes if size_bytes is not None else 0
+        if declared <= 0:
+            return {
+                "stored": False,
+                "error": "size_bytes_required",
+                "detail": (
+                    "Provide a positive `size_bytes` when omitting `content`: "
+                    "the upload URL is signed for exactly that many bytes, so "
+                    "an upload of any other size is rejected."
+                ),
+            }
+
         if declared > cfg.artifact_max_file_bytes:
             return {
                 "stored": False,
@@ -779,6 +809,15 @@ async def _perform_artifact_put(
                 ),
             }
 
+        # Project first, then space — same ordering and same reason as the
+        # inline branch above: never create a space row for a write that is
+        # about to be rejected.
+        project_id, project_error = _resolve_artifact_project(
+            request, db, org_id=org_id, project=project
+        )
+        if project_error is not None:
+            return project_error
+
         stripped_space = space.strip() if space is not None else ""
         space_id = (
             brain.ensure_space(
@@ -787,11 +826,6 @@ async def _perform_artifact_put(
             if stripped_space
             else None
         )
-        project_id, project_error = _resolve_artifact_project(
-            request, db, org_id=org_id, project=project
-        )
-        if project_error is not None:
-            return project_error
 
         new_id = artifacts.create_pending(
             db,
@@ -824,7 +858,12 @@ async def _perform_artifact_put(
         return {
             "stored": False,
             "artifact_id": new_id,
-            "upload_url": artifact_storage.presign_put(s3, key),
+            # Signed for exactly ``declared`` bytes: an upload of any other
+            # size fails signature verification at the storage layer, so this
+            # URL is genuinely capped and not merely advertised as capped.
+            "upload_url": artifact_storage.presign_put(
+                s3, key, content_length=declared
+            ),
             "method": "PUT",
             "expires_in": artifact_storage.PRESIGN_TTL_SECONDS,
             "detail": "Upload the bytes, then call artifact_put again with this artifact_id.",
@@ -862,6 +901,23 @@ async def _perform_artifact_get(
     multi-megabyte artifact, and a context window is the real constraint.
     Binary artifacts are never guessed at — v1 does no extraction, so the caller
     is told to use ``mode='url'``.
+
+    **Every blocking S3 call here runs through ``anyio.to_thread.run_sync``**,
+    for the same reason the confirm path in :func:`_perform_artifact_put` does:
+    boto3 is synchronous, and a network round trip taken inline stalls every
+    other MCP request sharing this replica's event loop.
+
+    **The page is bounded at the storage layer, not sliced after the fact.**
+    This used to call ``artifact_storage.get_text``, which did
+    ``get_object(...)["Body"].read().decode("utf-8")`` — an unbounded
+    whole-object read with no size gate at all. Plans allow up to 1GB per file,
+    so returning 51,200 characters of a 900MB ``text/plain`` artifact meant
+    buffering 900MB plus a UTF-8 decode into RAM, on the loop: an authenticated
+    caller could stall the replica by reading page one. ``get_text_page`` takes
+    the character window and issues a byte ``Range`` sized from it, so the
+    transfer is proportional to the page rather than the object. See that
+    function for why a character-addressed page must still be anchored at
+    byte 0 and how it stays bounded regardless.
     """
     request = ctx.request_context.request
     if request is None:
@@ -904,21 +960,51 @@ async def _perform_artifact_get(
                 # recorded, the GC purge pass finds it without consulting
                 # ``storage_uri`` (see ``scheduler._purge_dead_artifacts``), so
                 # it is destroyed with the artifact rather than outliving it.
-                artifact_storage.put_text(
-                    s3, key, row["inline_text"], row["mime_type"]
+                await anyio.to_thread.run_sync(
+                    artifact_storage.put_text,
+                    s3,
+                    key,
+                    row["inline_text"],
+                    row["mime_type"],
                 )
+            url = await anyio.to_thread.run_sync(
+                artifact_storage.presign_get, s3, key
+            )
             return {
                 **head,
-                "url": artifact_storage.presign_get(s3, key),
+                # Never logged: a presigned URL is a bearer credential.
+                "url": url,
                 "expires_in": artifact_storage.PRESIGN_TTL_SECONDS,
             }
 
         if row["inline_text"] is not None:
+            # Already in memory and capped at INLINE_MAX_BYTES (64KB), so
+            # slicing it is bounded by construction.
             full = row["inline_text"]
+            page = full[offset : offset + artifacts.TEXT_PAGE_CHARS]
+            has_more = (offset + len(page)) < len(full)
         elif _is_text_mime(row["mime_type"]):
+            # A character is at least one byte in UTF-8, so an offset at or
+            # beyond the object's SERVER-MEASURED size is certainly past its
+            # last character. Answering that from the row costs nothing and
+            # keeps a caller from asking S3 to range over the whole object with
+            # an out-of-range offset — the one input on this path that scales
+            # the transfer, since the range is otherwise sized from it.
+            size_bytes = row["size_bytes"] or 0
+            if offset >= size_bytes:
+                return {**head, "text": "", "offset": offset, "has_more": False}
+
             s3 = artifact_storage.get_artifact_s3_client()
             key = artifact_storage.object_key(org_id, row["id"], row["version"])
-            full = artifact_storage.get_text(s3, key)
+            page, has_more = await anyio.to_thread.run_sync(
+                functools.partial(
+                    artifact_storage.get_text_page,
+                    s3,
+                    key,
+                    offset=offset,
+                    limit=artifacts.TEXT_PAGE_CHARS,
+                )
+            )
         else:
             return {
                 **head,
@@ -929,12 +1015,11 @@ async def _perform_artifact_get(
                 ),
             }
 
-        page = full[offset : offset + artifacts.TEXT_PAGE_CHARS]
         return {
             **head,
             "text": page,
             "offset": offset,
-            "has_more": (offset + len(page)) < len(full),
+            "has_more": has_more,
         }
     except Exception:
         logger.exception("artifact_get failed")
@@ -1751,7 +1836,13 @@ def _register_tools(mcp: FastMCP) -> None:
         ] = None,
         size_bytes: Annotated[
             Optional[int],
-            Field(description="Declared size; selects the upload strategy."),
+            Field(
+                description=(
+                    "Byte size of the upload. Required when content is "
+                    "omitted: the upload URL is signed for exactly this many "
+                    "bytes, so an upload of any other size is rejected."
+                )
+            ),
         ] = None,
         space: SpaceParam = None,
         project: Annotated[

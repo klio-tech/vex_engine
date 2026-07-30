@@ -5,6 +5,7 @@ brain.write_scoped_memory are patched at the app.mcp_app boundary, so no DB,
 no embeddings and no S3 are touched.
 """
 
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -276,6 +277,107 @@ async def test_request_returns_an_upload_url_and_writes_no_card(storage):
 
 
 @pytest.mark.asyncio
+async def test_the_upload_url_is_signed_with_the_declared_size(storage):
+    """``MAX_PENDING_PER_ORG``'s bound is only real if each URL is capped.
+
+    ``presign_put`` signed ``Bucket`` and ``Key`` only, so every outstanding
+    reservation accepted an object of unbounded size: the cap bounded the
+    number of concurrent objects and not one byte. Binding the declared size
+    into the signature is what turns 32 reservations into a real ceiling of
+    32 x the plan's per-file limit.
+    """
+    await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="file",
+        mime_type="application/pdf",
+        size_bytes=2048,
+    )
+
+    assert storage.storage.presign_put.call_args.kwargs["content_length"] == 2048
+
+
+@pytest.mark.asyncio
+async def test_a_request_without_a_declared_size_is_refused(storage):
+    """No declared size means no cap to sign, i.e. an unbounded URL.
+
+    The old ``declared = size_bytes or 0`` also let this bypass the pool check
+    entirely: zero always fits.
+    """
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", mime_type="application/pdf"
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "size_bytes_required"
+    storage.storage.presign_put.assert_not_called()
+    storage.artifacts.create_pending.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [0, -1])
+async def test_a_request_with_a_non_positive_declared_size_is_refused(storage, bad):
+    result = await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="file",
+        mime_type="application/pdf",
+        size_bytes=bad,
+    )
+
+    assert result["error"] == "size_bytes_required"
+    storage.storage.presign_put.assert_not_called()
+
+
+# --- an unknown project must not leave an orphan space behind -------------
+
+
+@pytest.mark.asyncio
+async def test_unknown_project_on_the_inline_path_creates_no_space(seams):
+    """``ensure_space`` CREATES a space row. Running it before the project is
+    resolved means a rejected write still mints tenant rows: retry a typo'd
+    project name in a loop and the org's space list fills with junk it never
+    asked for and cannot see the origin of.
+    """
+    seams.brain.find_project_id.return_value = None
+
+    result = await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="document",
+        content="hey",
+        space="new-space",
+        project="does-not-exist",
+    )
+
+    assert result["error"] == "unknown_project"
+    seams.brain.ensure_space.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unknown_project_on_the_request_path_creates_no_space(storage):
+    storage.brain.find_project_id.return_value = None
+
+    result = await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="file",
+        mime_type="application/pdf",
+        size_bytes=2048,
+        space="new-space",
+        project="does-not-exist",
+    )
+
+    assert result["error"] == "unknown_project"
+    storage.brain.ensure_space.assert_not_called()
+    storage.artifacts.create_pending.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_confirm_measures_the_object_and_writes_the_card(storage):
     storage.artifacts.get_artifact.return_value = {
         "id": "new-artifact-id",
@@ -501,26 +603,128 @@ def test_is_text_mime_still_rejects_binary_types():
 # --- mode='text' reading a non-inline (S3-backed) text artifact ---
 
 
-@pytest.mark.asyncio
-async def test_get_text_reads_a_text_artifact_stored_in_s3(storage):
-    storage.artifacts.TEXT_PAGE_CHARS = 51_200
-    storage.artifacts.get_artifact.return_value = {
+def _s3_text_row(**overrides):
+    row = {
         "id": "a1", "status": "active", "title": "t", "kind": "record",
         "mime_type": "application/json", "inline_text": None,
         "storage_uri": "s3://klio-artifacts/acme/a1/v1", "version": 1,
         "size_bytes": 13,
     }
-    storage.storage.get_text.return_value = '{"ok": true}'
+    row.update(overrides)
+    return row
+
+
+@pytest.mark.asyncio
+async def test_get_text_reads_a_text_artifact_stored_in_s3(storage):
+    storage.artifacts.TEXT_PAGE_CHARS = 51_200
+    storage.artifacts.get_artifact.return_value = _s3_text_row()
+    storage.storage.get_text_page.return_value = ('{"ok": true}', False)
 
     result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
 
     storage.storage.object_key.assert_called_with("acme", "a1", 1)
-    storage.storage.get_text.assert_called_once_with(
+    call = storage.storage.get_text_page.call_args
+    assert call.args == (
         storage.storage.get_artifact_s3_client.return_value,
         storage.storage.object_key.return_value,
     )
     assert result["text"] == '{"ok": true}'
     assert result["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_get_text_asks_s3_for_only_one_page(storage):
+    """The Critical finding: reading a page must not read the object.
+
+    ``get_text(s3, key)`` was ``get_object(...)["Body"].read().decode("utf-8")``
+    — unbounded, synchronous, and with no size gate anywhere on this path. On a
+    plan allowing 1GB files, serving 51,200 characters of a 900MB
+    ``text/plain`` artifact buffered all 900MB plus its decode into RAM. The
+    page window must be pushed down into the storage call so the transfer is
+    bounded by what is returned.
+    """
+    storage.artifacts.TEXT_PAGE_CHARS = 51_200
+    storage.artifacts.get_artifact.return_value = _s3_text_row(size_bytes=900 * MB)
+    storage.storage.get_text_page.return_value = ("x" * 51_200, True)
+
+    result = await _tool("artifact_get")(_ctx(), artifact_id="a1", offset=51_200)
+
+    kwargs = storage.storage.get_text_page.call_args.kwargs
+    assert kwargs["offset"] == 51_200
+    assert kwargs["limit"] == 51_200
+    assert result["offset"] == 51_200
+    assert result["has_more"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_text_past_the_end_answers_without_touching_s3(storage):
+    """``offset`` is the one client input that scales the ranged read.
+
+    A character is at least one byte, so an offset at or beyond the object's
+    server-measured size is certainly past its last character — answerable from
+    the row, with no request to S3 at all.
+    """
+    storage.artifacts.TEXT_PAGE_CHARS = 51_200
+    storage.artifacts.get_artifact.return_value = _s3_text_row(size_bytes=13)
+
+    result = await _tool("artifact_get")(_ctx(), artifact_id="a1", offset=999_999_999)
+
+    assert result["text"] == ""
+    assert result["has_more"] is False
+    storage.storage.get_text_page.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_text_from_s3_runs_off_the_event_loop(storage):
+    """Blocking boto3 I/O on the loop stalls every other MCP request.
+
+    Even bounded, a page read is a network round trip. The confirm path already
+    runs its S3 calls through ``anyio.to_thread.run_sync``; the read path was
+    left calling boto3 inline. Asserting on the *thread the call actually runs
+    on* is what makes this falsifiable — a mock-call assertion would pass
+    either way.
+    """
+    storage.artifacts.TEXT_PAGE_CHARS = 51_200
+    storage.artifacts.get_artifact.return_value = _s3_text_row()
+    threads = []
+
+    def _record(*_a, **_k):
+        threads.append(threading.current_thread())
+        return ("body", False)
+
+    storage.storage.get_text_page.side_effect = _record
+
+    await _tool("artifact_get")(_ctx(), artifact_id="a1")
+
+    assert threads and threading.main_thread() not in threads
+
+
+@pytest.mark.asyncio
+async def test_get_url_runs_its_s3_calls_off_the_event_loop(storage):
+    """``put_text`` (inline materialisation) and ``presign_get`` are bounded or
+    local, but they are still blocking network calls and belong off the loop
+    for the same reason as the read above."""
+    storage.artifacts.get_artifact.return_value = {
+        "id": "a1", "status": "active", "title": "t", "kind": "document",
+        "mime_type": "text/markdown", "inline_text": "hello", "storage_uri": None,
+        "version": 1, "size_bytes": 5,
+    }
+    threads = []
+
+    def _record(result):
+        def _inner(*_a, **_k):
+            threads.append(threading.current_thread())
+            return result
+        return _inner
+
+    storage.storage.put_text.side_effect = _record({"size_bytes": 5, "checksum": "c"})
+    storage.storage.presign_get.side_effect = _record("https://example/download")
+
+    result = await _tool("artifact_get")(_ctx(), artifact_id="a1", mode="url")
+
+    assert result["url"] == "https://example/download"
+    assert len(threads) == 2
+    assert threading.main_thread() not in threads
 
 
 @pytest.mark.asyncio
@@ -531,7 +735,7 @@ async def test_get_text_on_s3_read_failure_returns_internal_error_not_a_crash(st
         "storage_uri": "s3://klio-artifacts/acme/a1/v1", "version": 1,
         "size_bytes": 100,
     }
-    storage.storage.get_text.side_effect = RuntimeError("s3 unavailable")
+    storage.storage.get_text_page.side_effect = RuntimeError("s3 unavailable")
 
     result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
 

@@ -176,6 +176,48 @@ def test_collect_purgeable_selects_retracted_and_superseded_rows():
     assert params["hours"] == af.PURGE_GRACE_HOURS
 
 
+# --- the grace window must run from DEATH, not from birth ------------------
+
+
+def test_collect_purgeable_ages_rows_from_when_they_died():
+    """``PURGE_GRACE_HOURS`` is only real if it is measured from retraction.
+
+    Keyed off ``created_at``, the window protected only content younger than
+    itself: an artifact created eight days ago and retracted one minute ago was
+    already past ``created_at < NOW() - 7 days`` and therefore purgeable on the
+    very next sweep tick — zero grace, for exactly the mature documents an
+    accidental ``forget`` is most costly on.
+    """
+    db = FakeSession(FakeResult([]))
+
+    af.collect_purgeable(db)
+
+    sql, _params = db.calls[0]
+    assert "COALESCE(retracted_at, created_at)" in sql
+    # The bare created_at comparison is what made the window a no-op.
+    assert "created_at < NOW()" not in sql
+
+
+def test_retract_stamps_the_death_time():
+    """Without this the row is dead with no death time and falls back to
+    ``created_at`` — i.e. straight back to zero grace."""
+    db = FakeSession(FakeResult([("a1",)]))
+
+    assert af.retract(db, org_id="acme", artifact_id="a1") is True
+
+    sql, _ = db.calls[0]
+    assert "retracted_at = NOW()" in sql
+
+
+def test_mark_superseded_stamps_the_death_time():
+    db = FakeSession(FakeResult([]))
+
+    af.mark_superseded(db, org_id="acme", artifact_id="a1")
+
+    sql, _ = db.calls[0]
+    assert "retracted_at = NOW()" in sql
+
+
 def test_purge_grace_window_is_a_named_nonzero_constant():
     """A grace window is what keeps a future undelete possible."""
     assert isinstance(af.PURGE_GRACE_HOURS, int)

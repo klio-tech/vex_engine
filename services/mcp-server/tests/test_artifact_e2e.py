@@ -593,8 +593,15 @@ async def test_forget_then_sweep_actually_removes_the_bytes_from_minio(_e2e_org)
         assert artifact_storage.head_size(s3, forgotten_key) is not None
 
         # Both dead rows are past the grace window; the survivor is untouched.
+        # ``retracted_at`` is backdated alongside ``created_at`` because the
+        # window now runs from DEATH, not from birth (migration 030) — ageing
+        # only ``created_at`` no longer makes a freshly-retracted row purgeable,
+        # which is the entire point of that change.
         db.execute(
-            text("UPDATE artifacts SET created_at = :ts WHERE id IN (:a, :b, :c)"),
+            text(
+                "UPDATE artifacts SET created_at = :ts, retracted_at = :ts "
+                "WHERE id IN (:a, :b, :c)"
+            ),
             {
                 "ts": datetime.now(timezone.utc)
                 - timedelta(hours=artifacts.PURGE_GRACE_HOURS + 1),
@@ -708,7 +715,10 @@ async def test_purge_collects_an_inline_artifacts_materialised_object(_e2e_org):
 
         assert (await forget(_ctx("agent-a"), memory_id=artifact_id))["forgotten"]
         db.execute(
-            text("UPDATE artifacts SET created_at = :ts WHERE id = :id"),
+            text(
+                "UPDATE artifacts SET created_at = :ts, retracted_at = :ts "
+                "WHERE id = :id"
+            ),
             {
                 "ts": datetime.now(timezone.utc)
                 - timedelta(hours=artifacts.PURGE_GRACE_HOURS + 1),
@@ -907,6 +917,323 @@ async def test_retention_excludes_active_artifact_card(_e2e_org):
 
         artifacts.retract(db, org_id=org_id, artifact_id=artifact_id)
     finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# The presigned PUT must be capped server-side, against real object storage.
+# ---------------------------------------------------------------------------
+
+
+def _raw_put(url: str, body: bytes) -> int:
+    """PUT ``body`` at ``url`` with a real HTTP client; return the status code.
+
+    Deliberately not boto3: the point is to behave like the arbitrary client
+    that holds the presigned URL, which is exactly the party the cap has to
+    constrain. Never logs ``url`` — a presigned URL is a bearer credential.
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(url, data=body, method="PUT")
+    request.add_header("Content-Length", str(len(body)))
+    try:
+        with urllib.request.urlopen(request) as response:
+            return response.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+@pytest.mark.asyncio
+async def test_presigned_put_is_capped_at_the_declared_size(_e2e_org):
+    """``MAX_PENDING_PER_ORG``'s bound has to be real, not asserted.
+
+    The cap claims to limit an org's un-billed exposure to
+    ``MAX_PENDING_PER_ORG x the plan's per-file limit``. Signing only
+    ``Bucket`` and ``Key`` capped nothing: each of the 32 outstanding URLs
+    accepted an object of ANY size, so the true bound was 32 concurrent
+    objects of unbounded size, recycled every ``PENDING_TTL_HOURS``.
+
+    Binding ``ContentLength`` into the signature is only a fix if the storage
+    layer actually enforces it, and that is not something a mock can answer:
+    a unit test with a fake ``generate_presigned_url`` proves the parameter was
+    passed, never that an oversized PUT is refused. This asks real MinIO.
+
+    Three probes, because only the three together distinguish "the cap works"
+    from "the URL is broken and rejects everything":
+
+    * the declared size is ACCEPTED (the URL is usable at all);
+    * a larger body is REJECTED (the cap bites);
+    * a smaller body is REJECTED (the length is signed, not a ceiling the
+      client may reinterpret).
+    """
+    from app.mcp_app import build_mcp_server
+    from shared import artifact_storage
+
+    org_id = _e2e_org
+    declared = 64
+    s3 = artifact_storage.get_artifact_s3_client()
+
+    artifact_id = None
+    try:
+        put = build_mcp_server()._tool_manager.get_tool("artifact_put").fn
+        reserved = await put(
+            _ctx("agent-a"),
+            title="Capped upload",
+            summary="live-stack presign cap fixture",
+            kind="file",
+            mime_type="application/octet-stream",
+            size_bytes=declared,
+        )
+        artifact_id = reserved["artifact_id"]
+        url = reserved["upload_url"]
+        key = artifact_storage.object_key(org_id, artifact_id, 1)
+
+        # Oversized first, so a pass cannot be an artefact of the object
+        # already existing from the accepted probe below.
+        assert _raw_put(url, b"x" * (declared * 100)) == 403, (
+            "an oversized PUT was accepted through the presigned URL — the "
+            "declared size is not being enforced by the storage layer"
+        )
+        assert artifact_storage.head_size(s3, key) is None, (
+            "the rejected oversized PUT still stored an object"
+        )
+
+        assert _raw_put(url, b"y" * (declared // 2)) == 403, (
+            "an undersized PUT was accepted — the length is signed, so any "
+            "length other than the declared one must fail verification"
+        )
+
+        assert _raw_put(url, b"z" * declared) == 200, (
+            "the declared size was rejected — the URL is unusable, which is "
+            "not a cap, it is a break"
+        )
+        assert artifact_storage.head_size(s3, key) == declared
+    finally:
+        if artifact_id is not None:
+            try:
+                artifact_storage.delete(
+                    s3, artifact_storage.object_key(org_id, artifact_id, 1)
+                )
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# The purge grace window must run from death, not from birth.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_grace_window_runs_from_retraction_not_creation(_e2e_org):
+    """``PURGE_GRACE_HOURS`` exists so an accidental ``forget`` is recoverable.
+
+    Keyed off ``created_at`` it delivered that only for content YOUNGER than
+    the window. An artifact created eight days ago and retracted one minute ago
+    was already past ``created_at < NOW() - 7 days``, so the sweep destroyed
+    its bytes on the very next tick — zero grace, silently, for exactly the
+    mature documents where a wrong ``forget`` costs the most.
+
+    The row here is deliberately far older than the window and retracted just
+    now. Against the pre-030 selector its object is gone after one sweep;
+    against ``COALESCE(retracted_at, created_at)`` the bytes survive, which is
+    what makes an undelete buildable rather than impossible.
+    """
+    from app.db import SessionLocal
+    from app.scheduler import collect_artifacts_once
+    from shared import artifact_storage, artifacts
+
+    org_id = _e2e_org
+    db = SessionLocal()
+    s3 = artifact_storage.get_artifact_s3_client()
+    artifact_id = None
+
+    try:
+        artifact_id = artifacts.create_pending(
+            db,
+            org_id=org_id,
+            agent_id="agent-a",
+            title="Long-lived spec",
+            summary="created long ago, retracted just now",
+            kind="file",
+            mime_type="text/plain",
+        )
+        key = artifact_storage.object_key(org_id, artifact_id, 1)
+        measured = artifact_storage.put_text(s3, key, "irreplaceable", "text/plain")
+        assert artifacts.activate(
+            db,
+            org_id=org_id,
+            artifact_id=artifact_id,
+            size_bytes=measured["size_bytes"],
+            checksum=measured["checksum"],
+            inline_text=None,
+            storage_uri=artifact_storage.storage_uri(org_id, artifact_id, 1),
+        )
+
+        # Old content: created well beyond the grace window.
+        db.execute(
+            text("UPDATE artifacts SET created_at = :ts WHERE id = :id"),
+            {
+                "ts": datetime.now(timezone.utc)
+                - timedelta(hours=artifacts.PURGE_GRACE_HOURS * 4),
+                "id": artifact_id,
+            },
+        )
+        db.commit()
+
+        # Retracted right now, through the real helper.
+        assert artifacts.retract(db, org_id=org_id, artifact_id=artifact_id) is True
+
+        await collect_artifacts_once(lambda: SessionLocal())
+
+        assert artifact_storage.head_size(s3, key) is not None, (
+            "an artifact retracted one moment ago lost its bytes on the very "
+            "next sweep because the grace window was measured from creation — "
+            "there was no grace period at all for content older than the window"
+        )
+        row = artifacts.get_artifact(db, org_id=org_id, artifact_id=artifact_id)
+        assert row is not None and row["status"] == "retracted"
+
+        # ...and once the death itself ages past the window, it IS collected —
+        # otherwise this test would also pass on a sweep that purges nothing.
+        db.execute(
+            text("UPDATE artifacts SET retracted_at = :ts WHERE id = :id"),
+            {
+                "ts": datetime.now(timezone.utc)
+                - timedelta(hours=artifacts.PURGE_GRACE_HOURS + 1),
+                "id": artifact_id,
+            },
+        )
+        db.commit()
+
+        await collect_artifacts_once(lambda: SessionLocal())
+
+        assert artifact_storage.head_size(s3, key) is None, (
+            "the window is not a reprieve, it is a delay: once the retraction "
+            "itself is older than PURGE_GRACE_HOURS the bytes must go"
+        )
+    finally:
+        if artifact_id is not None:
+            try:
+                artifact_storage.delete(
+                    s3, artifact_storage.object_key(org_id, artifact_id, 1)
+                )
+            except Exception:
+                pass
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# mode='text' must page a large S3-backed artifact without buffering it.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_large_s3_text_artifact_pages_without_buffering_it(_e2e_org):
+    """The Critical finding, against real object storage.
+
+    ``get_text`` read the whole object and decoded it to serve one page, so a
+    900MB ``text/plain`` artifact cost 900MB of RAM per reader. The object here
+    is 4MB — small enough for CI, large enough that a whole-object read is
+    unmistakable — and deliberately multi-byte, so a byte-indexed page would
+    return the wrong window rather than merely a ragged one.
+
+    The bound is asserted on what MinIO was actually asked for: the ``Range``
+    header on the wire, captured through a botocore event hook.
+    """
+    from app.db import SessionLocal
+    from app.mcp_app import build_mcp_server
+    from shared import artifact_storage, artifacts
+
+    org_id = _e2e_org
+    db = SessionLocal()
+    s3 = artifact_storage.get_artifact_s3_client()
+    artifact_id = None
+
+    try:
+        unit = "日本語テキスト abcdefg ☕ "
+        body = unit * (4 * 1024 * 1024 // len(unit.encode("utf-8")))
+        encoded = body.encode("utf-8")
+        assert len(encoded) > 3 * 1024 * 1024
+
+        artifact_id = artifacts.create_pending(
+            db,
+            org_id=org_id,
+            agent_id="agent-a",
+            title="Big log",
+            summary="multi-megabyte multi-byte text artifact",
+            kind="document",
+            mime_type="text/plain",
+        )
+        key = artifact_storage.object_key(org_id, artifact_id, 1)
+        measured = artifact_storage.put_text(s3, key, body, "text/plain")
+        assert artifacts.activate(
+            db,
+            org_id=org_id,
+            artifact_id=artifact_id,
+            size_bytes=measured["size_bytes"],
+            checksum=measured["checksum"],
+            inline_text=None,
+            storage_uri=artifact_storage.storage_uri(org_id, artifact_id, 1),
+        )
+
+        ranges: list = []
+
+        def _capture(request, **_kwargs):
+            header = request.headers.get("Range")
+            # botocore hands headers back as bytes on the wire-level hook.
+            if isinstance(header, (bytes, bytearray)):
+                header = header.decode("ascii")
+            ranges.append(header)
+
+        get = build_mcp_server()._tool_manager.get_tool("artifact_get").fn
+
+        import app.mcp_app as mcp_app_mod
+
+        with patch.object(
+            mcp_app_mod.artifact_storage,
+            "get_artifact_s3_client",
+            lambda: s3,
+        ):
+            s3.meta.events.register("before-send.s3.GetObject", _capture)
+            try:
+                first = await get(_ctx("agent-a"), artifact_id=artifact_id)
+                second = await get(
+                    _ctx("agent-a"),
+                    artifact_id=artifact_id,
+                    offset=len(first["text"]),
+                )
+            finally:
+                s3.meta.events.unregister("before-send.s3.GetObject", _capture)
+
+        assert first["text"] == body[: artifacts.TEXT_PAGE_CHARS]
+        assert first["has_more"] is True
+        assert second["text"] == body[
+            artifacts.TEXT_PAGE_CHARS : 2 * artifacts.TEXT_PAGE_CHARS
+        ]
+
+        assert ranges and all(r is not None for r in ranges), (
+            f"a page read went out without a Range header: {ranges!r} — the "
+            "whole object was requested to serve one page"
+        )
+        ceiling = (
+            artifact_storage.UTF8_MAX_BYTES_PER_CHAR
+            * (2 * artifacts.TEXT_PAGE_CHARS + 1)
+        )
+        for header in ranges:
+            end = int(header.split("-")[1])
+            assert end < ceiling, f"range {header} is not bounded by the page"
+            assert end < len(encoded), (
+                f"range {header} spans the whole {len(encoded)}-byte object"
+            )
+    finally:
+        if artifact_id is not None:
+            try:
+                artifact_storage.delete(
+                    s3, artifact_storage.object_key(org_id, artifact_id, 1)
+                )
+            except Exception:
+                pass
         db.close()
 
 

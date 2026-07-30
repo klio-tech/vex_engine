@@ -87,6 +87,31 @@ async def test_nothing_to_collect_is_not_an_error():
 
 
 @pytest.mark.asyncio
+async def test_an_idle_tick_never_touches_s3():
+    """An empty sweep must be a quiet no-op, including when S3 is misconfigured.
+
+    ``get_artifact_s3_client`` reads endpoint and credentials from the
+    environment, so a bad or missing S3 config makes it raise. Building the
+    client unconditionally turns every hourly tick of an otherwise idle
+    deployment into a logged exception — noise that trains on-call to ignore
+    this sweep's alerts, on a job whose real failures delete data. Nothing to
+    collect means nothing to connect to.
+    """
+    db = MagicMock()
+    with (
+        patch("app.scheduler.artifacts") as af,
+        patch("app.scheduler.artifact_storage") as st,
+    ):
+        af.collect_abandoned.return_value = []
+        af.collect_purgeable.return_value = []
+        st.get_artifact_s3_client.side_effect = RuntimeError("S3_ENDPOINT unset")
+
+        assert await collect_artifacts_once(lambda: db) == 0
+
+    st.get_artifact_s3_client.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_a_row_confirmed_before_delete_keeps_its_object():
     """TOCTOU: activate() can flip a row from 'pending' to 'active' in the
     window between collect_abandoned's SELECT and this sweep's DELETE. The

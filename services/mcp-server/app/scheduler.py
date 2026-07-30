@@ -122,7 +122,7 @@ async def stop_curator(app: Any) -> None:
         app.state.curator_task = None
 
 
-def _purge_dead_artifacts(db: Any, s3: Any) -> int:
+def _purge_dead_artifacts(db: Any, s3: Any, dead: list) -> int:
     """Second sweep pass: destroy the bytes of retracted/superseded artifacts.
 
     ``forget`` (``artifacts.retract``) and supersede only flip ``status``.
@@ -169,8 +169,12 @@ def _purge_dead_artifacts(db: Any, s3: Any) -> int:
 
     Object deletion is best-effort per row: one failure logs and moves on so a
     single unreachable object cannot strand the rest of the batch.
+
+    ``dead`` is passed in rather than selected here: the caller already has to
+    know whether there is any work at all before it decides to build an S3
+    client, and re-running ``collect_purgeable`` would be a second scan whose
+    result could differ from the one that decision was made on.
     """
-    dead = artifacts.collect_purgeable(db)
     if not dead:
         return 0
 
@@ -249,8 +253,18 @@ async def collect_artifacts_once(db_factory: Callable[[], Any]) -> int:
     """
     db = db_factory()
     try:
-        s3 = artifact_storage.get_artifact_s3_client()
         stale = artifacts.collect_abandoned(db)
+        dead = artifacts.collect_purgeable(db)
+        if not stale and not dead:
+            # Nothing to collect means nothing to connect to. Building the
+            # client reads endpoint and credentials from the environment and
+            # raises when they are missing or wrong, so doing it
+            # unconditionally turns every tick of an idle deployment into a
+            # logged exception — noise that trains on-call to ignore this
+            # sweep's alerts, on a job whose real failures delete data.
+            return 0
+
+        s3 = artifact_storage.get_artifact_s3_client()
         collected = 0
         for row in stale:
             deleted = db.execute(
@@ -284,7 +298,7 @@ async def collect_artifacts_once(db_factory: Callable[[], Any]) -> int:
         # Second pass: destroy the bytes of artifacts that are dead but whose
         # objects nothing else in the system would ever remove. See
         # ``_purge_dead_artifacts``.
-        collected += _purge_dead_artifacts(db, s3)
+        collected += _purge_dead_artifacts(db, s3, dead)
         return collected
     finally:
         db.close()

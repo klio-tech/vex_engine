@@ -33,25 +33,49 @@ TEXT_PAGE_CHARS = 51_200
 # An upload that is requested and never confirmed is collected after this long.
 PENDING_TTL_HOURS = 24
 
-# A retracted or superseded artifact keeps its bytes this long before the sweep
-# destroys them. The window exists so an undelete remains POSSIBLE: `forget` is
-# a single tool call an agent can make by mistake on customer document content,
-# and once the object is gone there is nothing to restore from. Seven days is
-# the same order as a consumer trash bin — long enough that a human notices a
-# wrong `forget` and asks, short enough that a genuine deletion request is
-# still honoured promptly. Nothing today exposes an undelete; this constant is
-# what keeps building one a product decision rather than an impossible one.
+# A retracted or superseded artifact keeps its bytes this long AFTER IT DIES,
+# before the sweep destroys them. The window exists so an undelete remains
+# POSSIBLE: `forget` is a single tool call an agent can make by mistake on
+# customer document content, and once the object is gone there is nothing to
+# restore from. Seven days is the same order as a consumer trash bin — long
+# enough that a human notices a wrong `forget` and asks, short enough that a
+# genuine deletion request is still honoured promptly. Nothing today exposes an
+# undelete; this constant is what keeps building one a product decision rather
+# than an impossible one.
+#
+# The age this is measured against is ``COALESCE(retracted_at, created_at)``
+# (migration 030), i.e. when the row actually became dead. It used to be
+# ``created_at`` alone, which gave the full window only to content younger than
+# the window and ZERO grace to anything older — a document created eight days
+# ago and retracted one minute ago was purgeable on the next tick, so for most
+# real content the protection this constant advertises did not exist. The one
+# residual gap is rows that were already dead when 030 ran: they have no
+# ``retracted_at`` and still fall back to ``created_at``.
 PURGE_GRACE_HOURS = 24 * 7
 
 # The most `pending` rows one org may hold at once. Each pending row is a live
 # presigned PUT that nothing counts against the storage pool until it is
 # confirmed, so uncapped they are a way to park unbilled bytes: mint a thousand
-# reservations, upload through every one, wait for GC, repeat. The cap bounds
-# that exposure to MAX_PENDING_PER_ORG x the plan's per-file limit (320MB on
-# Free) instead of leaving it unbounded. 32 is well above any legitimate
-# concurrency — a client uploading a batch in parallel opens a handful of
-# connections, not dozens — and a caller that hits it only has to confirm or
-# abandon what it already started.
+# reservations, upload through every one, wait for GC, repeat.
+#
+# The cap bounds that exposure to MAX_PENDING_PER_ORG x the DECLARED size of
+# each reservation, because ``artifact_storage.presign_put`` signs
+# ``ContentLength`` — a PUT of any other size fails signature verification at
+# the storage layer, so the URL is genuinely capped and not merely advertised
+# as capped. The declared size is separately checked against the plan's
+# per-file limit before the URL is issued, so the true ceiling is
+# MAX_PENDING_PER_ORG x that limit (320MB on Free), recycled every
+# PENDING_TTL_HOURS.
+#
+# Before ``ContentLength`` was signed, this bound was FALSE as written: each
+# presigned PUT accepted an object of unbounded size, so the cap bounded the
+# number of concurrent objects and not one byte of storage. Both halves are
+# load-bearing — remove the signed length and the number below stops meaning
+# anything.
+#
+# 32 is well above any legitimate concurrency — a client uploading a batch in
+# parallel opens a handful of connections, not dozens — and a caller that hits
+# it only has to confirm or abandon what it already started.
 MAX_PENDING_PER_ORG = 32
 
 
@@ -262,10 +286,16 @@ def get_artifact(db: Any, *, org_id: str, artifact_id: str) -> Optional[dict]:
 
 
 def retract(db: Any, *, org_id: str, artifact_id: str) -> bool:
-    """Retract an artifact. Returns False when the org does not own it."""
+    """Retract an artifact. Returns False when the org does not own it.
+
+    Stamps ``retracted_at`` in the same statement that flips the status, so the
+    grace window in :func:`collect_purgeable` starts now rather than at
+    creation. Both must move together: a row marked dead without a death time
+    silently falls back to ``created_at`` and gets no grace at all.
+    """
     row = db.execute(
         text(
-            "UPDATE artifacts SET status = 'retracted' "
+            "UPDATE artifacts SET status = 'retracted', retracted_at = NOW() "
             "WHERE org_id = :org_id AND id = :artifact_id AND status = 'active' "
             "RETURNING id"
         ),
@@ -276,9 +306,15 @@ def retract(db: Any, *, org_id: str, artifact_id: str) -> bool:
 
 
 def mark_superseded(db: Any, *, org_id: str, artifact_id: str) -> None:
+    """Retire a version that a newer artifact replaces.
+
+    Stamps ``retracted_at`` for the same reason :func:`retract` does: a
+    superseded version is dead, and its grace window has to run from the moment
+    it was replaced.
+    """
     db.execute(
         text(
-            "UPDATE artifacts SET status = 'superseded' "
+            "UPDATE artifacts SET status = 'superseded', retracted_at = NOW() "
             "WHERE org_id = :org_id AND id = :artifact_id AND status = 'active'"
         ),
         {"org_id": org_id, "artifact_id": artifact_id},
@@ -324,11 +360,14 @@ def collect_purgeable(db: Any, *, older_than_hours: int = PURGE_GRACE_HOURS) -> 
     unhonourable deletion request over customer document content and a pool
     that under-counts what the bucket actually holds.
 
-    ``created_at`` — not a retraction timestamp — is the age used, because the
-    table has no ``retracted_at`` column; combined with
-    :data:`PURGE_GRACE_HOURS` this means a row must be both dead AND old.
-    An artifact retracted the day it was created therefore keeps its bytes for
-    the remainder of the window, which is the conservative direction to err in.
+    The age is measured from ``COALESCE(retracted_at, created_at)`` — when the
+    row DIED, not when it was born (migration 030). Keying off ``created_at``
+    alone gave the full :data:`PURGE_GRACE_HOURS` only to content younger than
+    the window and no grace at all to anything older: a document created eight
+    days ago and retracted one minute ago was purgeable on the very next sweep
+    tick. The ``COALESCE`` fallback applies only to rows that were already dead
+    when migration 030 ran, which is a finite, shrinking set; every row
+    retracted since carries a real ``retracted_at``.
 
     Same cross-org contract and the same warning as
     :func:`collect_abandoned`: this is the background maintenance sweep, so it
@@ -341,7 +380,8 @@ def collect_purgeable(db: Any, *, older_than_hours: int = PURGE_GRACE_HOURS) -> 
             """
             SELECT id, org_id, version, status FROM artifacts
             WHERE status IN ('retracted', 'superseded')
-              AND created_at < NOW() - (:hours || ' hours')::interval
+              AND COALESCE(retracted_at, created_at)
+                  < NOW() - (:hours || ' hours')::interval
             """
         ),
         {"hours": older_than_hours},
