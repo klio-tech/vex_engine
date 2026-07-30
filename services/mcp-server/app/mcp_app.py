@@ -45,6 +45,7 @@ import hashlib
 import logging
 from typing import Annotated, Any, Literal, Optional
 
+import anyio
 from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -54,6 +55,7 @@ from shared.memory import MemoryRecord, retract_memory, retrieve_memories_scoped
 from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from app.auth import (
     resolve_principal,
@@ -263,6 +265,100 @@ async def _perform_write(
         db.close()
 
 
+def _dedup_confirm(
+    db: Any,
+    s3: Any,
+    key: str,
+    *,
+    org_id: str,
+    pending_id: str,
+    existing: dict,
+) -> dict[str, Any]:
+    """Finalise a confirm whose bytes turned out to duplicate an active artifact.
+
+    The org already holds these exact bytes, so the caller is pointed at the
+    existing artifact — same contract as the inline path's dedup — and the
+    redundant upload is cleaned up rather than left to rot:
+
+    * the uploaded object is deleted (best-effort: a failure here must not turn
+      a successful dedup into an error; the sweep is not a factor because the
+      object belongs to a row that is about to stop existing, so a failed
+      delete is logged and left for an operator);
+    * the ``pending`` row is deleted, freeing one of the org's reservation
+      slots instead of parking a GC candidate for 24 hours.
+
+    No card is written: the existing artifact already has one, and a second
+    card pointing at the same artifact would be a duplicate recall result.
+    """
+    try:
+        artifact_storage.delete(s3, key)
+    except Exception:
+        logger.warning(
+            "artifact confirm dedup: could not delete the redundant object for "
+            "artifact_id=%s; the row is gone, the object may need manual cleanup",
+            pending_id,
+            exc_info=True,
+        )
+    try:
+        artifacts.delete_pending(db, org_id=org_id, artifact_id=pending_id)
+    except Exception:
+        # The abandoned-upload sweep collects it within PENDING_TTL_HOURS, so
+        # this is untidy rather than harmful. Never fail the dedup over it.
+        logger.warning(
+            "artifact confirm dedup: could not delete pending row %s; the GC "
+            "sweep will collect it",
+            pending_id,
+            exc_info=True,
+        )
+    return {
+        "stored": True,
+        "artifact_id": existing["id"],
+        "version": existing["version"],
+        "status": "active",
+        "deduplicated": True,
+    }
+
+
+def _resolve_artifact_project(
+    request: Any, db: Any, *, org_id: str, project: Optional[str]
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Resolve where an artifact should be filed. Returns ``(project_id, error)``.
+
+    Precedence follows ``recall``'s existing rule rather than inventing a new
+    one: an explicit ``project`` argument wins, and only when it is absent does
+    the ``X-Vex-Project`` header decide. Before this existed, ``artifact_put``
+    advertised a ``project`` argument in its schema and then overwrote it with
+    the header unconditionally — an agent passing ``project="apollo"`` with no
+    header got ``project_id = None``, and a later ``recall(project="apollo")``
+    never surfaced the card, with no error anywhere to explain it.
+
+    Also as in ``recall``: an explicit identifier that resolves to nothing is
+    SURFACED, not silently widened. On the write side that means refusing the
+    write — filing the artifact org-wide when the caller named a project is a
+    silent misfile, and the artifact is immutable so it cannot be corrected in
+    place. The header path keeps failing open (unfiled), matching every other
+    write tool.
+
+    ``brain.find_project_id`` is read-only and org-scoped; it never creates a
+    project, so a caller cannot mint tenant rows through this argument.
+    """
+    stripped = project.strip() if project is not None else ""
+    if not stripped:
+        return resolve_project_from_request(request, db, org_id=org_id), None
+
+    project_id = brain.find_project_id(db, org_id=org_id, identifier=stripped)
+    if project_id is None:
+        return None, {
+            "stored": False,
+            "error": "unknown_project",
+            "detail": (
+                f"unknown project: {stripped}. Omit `project` to file this "
+                "artifact org-wide, or create the project first."
+            ),
+        }
+    return project_id, None
+
+
 async def _perform_artifact_put(
     ctx: Context,
     *,
@@ -284,8 +380,24 @@ async def _perform_artifact_put(
     presigned request (neither ``content`` nor ``artifact_id``), and confirm
     (``artifact_id`` given).
 
-    The pool check runs before any write work so an over-quota org never
-    reserves an id or uploads bytes.
+    Quota is enforced on each branch before that branch does anything durable,
+    but *what* it can be enforced against differs, and the difference matters:
+
+    * **inline** — the bytes are in hand, so the per-file limit and the storage
+      pool are both checked against their real size before any row is created.
+    * **request** — nothing exists yet, so the checks run against the CLIENT'S
+      DECLARED size, which is unverifiable. That is why this branch also caps
+      how many ``pending`` reservations an org may hold at once
+      (``artifacts.MAX_PENDING_PER_ORG``): the declared size gates the
+      strategy, the cap bounds the damage when it lies.
+    * **confirm** — the only branch with a server-measured number. The size is
+      read via ``HEAD`` (no transfer) and checked against both limits BEFORE
+      the object is streamed to compute its checksum, so rejecting an
+      over-limit upload never costs a full download.
+
+    Blocking boto3 calls in this coroutine run through
+    ``anyio.to_thread.run_sync``: hashing a multi-GB object inline would stall
+    the event loop for the entire transfer.
     """
     request = ctx.request_context.request
     if request is None:
@@ -366,7 +478,11 @@ async def _perform_artifact_put(
                 if stripped_space
                 else None
             )
-            project_id = resolve_project_from_request(request, db, org_id=org_id)
+            project_id, project_error = _resolve_artifact_project(
+                request, db, org_id=org_id, project=project
+            )
+            if project_error is not None:
+                return project_error
 
             new_id = artifacts.create_pending(
                 db,
@@ -456,8 +572,18 @@ async def _perform_artifact_put(
 
             s3 = artifact_storage.get_artifact_s3_client()
             key = artifact_storage.object_key(org_id, artifact_id, row["version"])
-            measured = artifact_storage.head(s3, key)
-            if measured is None:
+
+            # ── Step 1: size, from HEAD alone. No bytes move. ─────────────
+            # The presigned PUT is uncapped server-side, so whatever the client
+            # declared, the object here may be arbitrarily large. Both limits
+            # are enforced against ContentLength BEFORE anything reads the
+            # body: measuring by downloading would make the REJECTION path the
+            # expensive one, which is an authenticated remote DoS available to
+            # the cheapest plan and unstoppable by quota.
+            measured_size = await anyio.to_thread.run_sync(
+                artifact_storage.head_size, s3, key
+            )
+            if measured_size is None:
                 return {
                     "stored": False,
                     "error": "no_bytes_uploaded",
@@ -466,12 +592,12 @@ async def _perform_artifact_put(
 
             # The declared size only chose a strategy; the quota is charged on
             # what was actually stored.
-            if measured["size_bytes"] > cfg.artifact_max_file_bytes:
+            if measured_size > cfg.artifact_max_file_bytes:
                 return {
                     "stored": False,
                     "error": "file_too_large",
                     "detail": (
-                        f"{measured['size_bytes']} bytes exceeds the "
+                        f"{measured_size} bytes exceeds the "
                         f"{cfg.artifact_max_file_bytes}-byte per-file limit on the "
                         f"{plan} plan."
                     ),
@@ -479,7 +605,7 @@ async def _perform_artifact_put(
                 }
 
             used = artifacts.org_storage_bytes(db, org_id=org_id)
-            if used + measured["size_bytes"] > cfg.artifact_storage_bytes:
+            if used + measured_size > cfg.artifact_storage_bytes:
                 return {
                     "stored": False,
                     "error": "storage_quota_exceeded",
@@ -490,17 +616,64 @@ async def _perform_artifact_put(
                     "suggested_plan": "max",
                 }
 
-            artifacts.activate(
-                db,
-                org_id=org_id,
-                artifact_id=artifact_id,
-                size_bytes=measured["size_bytes"],
-                checksum=measured["checksum"],
-                inline_text=None,
-                storage_uri=artifact_storage.storage_uri(
-                    org_id, artifact_id, row["version"]
-                ),
+            # ── Step 2: checksum, streamed. Only now are the bytes read. ──
+            # Off the event loop for the same reason: this is the one call here
+            # whose cost scales with object size.
+            measured_checksum = await anyio.to_thread.run_sync(
+                artifact_storage.checksum, s3, key
             )
+
+            # Dedup on the MEASURED checksum, exactly as the inline path does.
+            # Without this, identical bytes make ``activate``'s UPDATE violate
+            # ``ux_artifacts_org_checksum_active``; the IntegrityError becomes a
+            # generic ``internal_error`` and the pending row is stuck forever,
+            # unconfirmable and indistinguishable from a server bug.
+            existing = artifacts.find_active_by_checksum(
+                db, org_id=org_id, checksum=measured_checksum
+            )
+            if existing is not None and existing["id"] != artifact_id:
+                return _dedup_confirm(
+                    db,
+                    s3,
+                    key,
+                    org_id=org_id,
+                    pending_id=artifact_id,
+                    existing=existing,
+                )
+
+            try:
+                artifacts.activate(
+                    db,
+                    org_id=org_id,
+                    artifact_id=artifact_id,
+                    size_bytes=measured_size,
+                    checksum=measured_checksum,
+                    inline_text=None,
+                    storage_uri=artifact_storage.storage_uri(
+                        org_id, artifact_id, row["version"]
+                    ),
+                )
+            except IntegrityError:
+                # The concurrent-confirm race: two callers confirm identical
+                # bytes at once, both pass the dedup lookup above, and the
+                # partial unique index picks a winner. The loser lands here and
+                # must resolve to the winning artifact, not ``internal_error``.
+                db.rollback()
+                winner = artifacts.find_active_by_checksum(
+                    db, org_id=org_id, checksum=measured_checksum
+                )
+                if winner is None:
+                    # Not a dedup collision — some other constraint. Do not
+                    # dress a real failure up as a success.
+                    logger.exception(
+                        "artifact confirm hit a non-dedup IntegrityError for "
+                        "artifact_id=%s",
+                        artifact_id,
+                    )
+                    return {"stored": False, "error": "internal_error"}
+                return _dedup_confirm(
+                    db, s3, key, org_id=org_id, pending_id=artifact_id, existing=winner
+                )
 
             try:
                 await _write_artifact_card(
@@ -512,7 +685,7 @@ async def _perform_artifact_put(
                     title=row["title"],
                     summary=row["summary"],
                     kind=row["kind"],
-                    size_bytes=measured["size_bytes"],
+                    size_bytes=measured_size,
                     space_id=row["space_id"],
                     project_id=row["project_id"],
                 )
@@ -573,6 +746,39 @@ async def _perform_artifact_put(
                 "suggested_plan": "max",
             }
 
+        # The pool, against the DECLARED size. Weaker than the confirm-time
+        # check (nothing verifies this number), but its absence was a complete
+        # bypass: an org could loop this branch, collect presigned PUTs, and
+        # upload unbounded bytes through them with nothing counting or
+        # rejecting anything until GC ran 24 hours later.
+        used = artifacts.org_storage_bytes(db, org_id=org_id)
+        if used + declared > cfg.artifact_storage_bytes:
+            return {
+                "stored": False,
+                "error": "storage_quota_exceeded",
+                "detail": (
+                    f"{used} of {cfg.artifact_storage_bytes} bytes used on the "
+                    f"{plan} plan. Reads still work; forget an artifact or upgrade."
+                ),
+                "suggested_plan": "max",
+            }
+
+        # The declared size is unverifiable, so bound the blast radius by
+        # capping live reservations too: without this, `size_bytes=1` a
+        # thousand times yields a thousand uncounted upload URLs. See
+        # ``artifacts.MAX_PENDING_PER_ORG`` for the number and its reasoning.
+        pending = artifacts.pending_count(db, org_id=org_id)
+        if pending >= artifacts.MAX_PENDING_PER_ORG:
+            return {
+                "stored": False,
+                "error": "too_many_pending_uploads",
+                "detail": (
+                    f"{pending} uploads are already awaiting confirmation "
+                    f"(limit {artifacts.MAX_PENDING_PER_ORG}). Confirm or "
+                    "abandon them before starting more."
+                ),
+            }
+
         stripped_space = space.strip() if space is not None else ""
         space_id = (
             brain.ensure_space(
@@ -581,6 +787,11 @@ async def _perform_artifact_put(
             if stripped_space
             else None
         )
+        project_id, project_error = _resolve_artifact_project(
+            request, db, org_id=org_id, project=project
+        )
+        if project_error is not None:
+            return project_error
 
         new_id = artifacts.create_pending(
             db,
@@ -591,7 +802,7 @@ async def _perform_artifact_put(
             kind=kind,
             mime_type=mime_type,
             space_id=space_id,
-            project_id=resolve_project_from_request(request, db, org_id=org_id),
+            project_id=project_id,
             supersedes=supersedes,
         )
 
@@ -680,7 +891,19 @@ async def _perform_artifact_get(
             key = artifact_storage.object_key(org_id, row["id"], row["version"])
             if row["inline_text"] is not None:
                 # Inline artifacts have no object yet; materialise one so the
-                # URL contract holds for every kind.
+                # URL contract holds for every kind. The row deliberately stays
+                # inline (``storage_uri`` NULL) — Postgres remains the body of
+                # record, and the quota is charged once, not twice.
+                #
+                # The materialised object is deterministic and idempotent: the
+                # key is ``object_key(org_id, id, version)`` and artifacts are
+                # immutable, so every call re-puts identical bytes at the
+                # identical key. A stale copy is therefore harmless — it can
+                # only ever be overwritten with itself, never orphaned under a
+                # second identity. And because the key is derived rather than
+                # recorded, the GC purge pass finds it without consulting
+                # ``storage_uri`` (see ``scheduler._purge_dead_artifacts``), so
+                # it is destroyed with the artifact rather than outliving it.
                 artifact_storage.put_text(
                     s3, key, row["inline_text"], row["mime_type"]
                 )

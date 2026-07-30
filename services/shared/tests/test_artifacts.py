@@ -5,9 +5,7 @@ row payloads, so these tests assert on tenancy predicates and on the TS-side
 transformation without a live database.
 """
 
-from unittest.mock import MagicMock
 
-import pytest
 
 from shared import artifacts as af
 
@@ -148,3 +146,82 @@ def test_collect_abandoned_selects_only_stale_pending_rows():
     sql, params = db.calls[0]
     assert "'pending'" in sql
     assert params["hours"] == 24
+
+
+# --- C2: retracted / superseded rows must become collectable -------------
+
+
+def test_collect_purgeable_selects_retracted_and_superseded_rows():
+    """``forget`` and supersede leave bytes behind unless something sweeps them.
+
+    Without this selector there is no code path anywhere that will ever delete
+    a retracted artifact's object: the row reads as gone from every API, stops
+    counting against the pool, and the bytes stay in the bucket forever. A
+    deletion request cannot be honoured and storage grows monotonically while
+    quota under-counts it.
+    """
+    db = FakeSession(FakeResult([("a1", "acme", 1, "retracted")]))
+
+    rows = af.collect_purgeable(db, older_than_hours=af.PURGE_GRACE_HOURS)
+
+    assert rows == [
+        {"id": "a1", "org_id": "acme", "version": 1, "status": "retracted"}
+    ]
+    sql, params = db.calls[0]
+    assert "'retracted'" in sql
+    assert "'superseded'" in sql
+    # Pending rows belong to the other sweep; mixing them would delete an
+    # in-flight upload with no grace period of its own.
+    assert "'pending'" not in sql
+    assert params["hours"] == af.PURGE_GRACE_HOURS
+
+
+def test_purge_grace_window_is_a_named_nonzero_constant():
+    """A grace window is what keeps a future undelete possible."""
+    assert isinstance(af.PURGE_GRACE_HOURS, int)
+    assert af.PURGE_GRACE_HOURS > 0
+
+
+# --- I1: a confirm that duplicates existing bytes must finalise cleanly ---
+
+
+def test_delete_pending_is_org_scoped_and_status_guarded():
+    """Used when a confirm dedups: the redundant pending row must not linger
+    for 24h as a GC candidate, but it must never delete an active row.
+    """
+    db = FakeSession(FakeResult([("a1",)]))
+
+    assert af.delete_pending(db, org_id="acme", artifact_id="a1") is True
+
+    sql, params = db.calls[0]
+    assert "DELETE FROM artifacts" in sql
+    assert "org_id = :org_id" in sql
+    assert "status = 'pending'" in sql
+    assert params["org_id"] == "acme"
+
+
+def test_delete_pending_reports_a_miss_for_another_org():
+    db = FakeSession(FakeResult([]))
+    assert af.delete_pending(db, org_id="other-org", artifact_id="a1") is False
+
+
+# --- I3: pending rows are an unbilled, unbounded reservation -------------
+
+
+def test_pending_count_is_org_scoped_to_pending_rows():
+    """Each pending row is a presigned PUT nobody counts. Uncapped, an org can
+    mint a thousand of them and upload through every one.
+    """
+    db = FakeSession(FakeResult([(7,)]))
+
+    assert af.pending_count(db, org_id="acme") == 7
+
+    sql, params = db.calls[0]
+    assert "org_id = :org_id" in sql
+    assert "status = 'pending'" in sql
+    assert params["org_id"] == "acme"
+
+
+def test_max_pending_per_org_is_a_named_positive_constant():
+    assert isinstance(af.MAX_PENDING_PER_ORG, int)
+    assert af.MAX_PENDING_PER_ORG > 0

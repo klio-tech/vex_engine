@@ -52,6 +52,10 @@ def seams():
         af.human_size.return_value = "3 B"
         af.card_content.return_value = "[artifact] t — s (document, 3 B)"
         af.org_storage_bytes.return_value = 0
+        # I3: the request path now consults both of these before handing out a
+        # presigned PUT.
+        af.MAX_PENDING_PER_ORG = 32
+        af.pending_count.return_value = 0
         af.find_active_by_checksum.return_value = None
         af.create_pending.return_value = "new-artifact-id"
         af.activate.return_value = {
@@ -224,8 +228,32 @@ def storage(seams):
         st.storage_uri.return_value = "s3://klio-artifacts/acme/new-artifact-id/v1"
         st.presign_put.return_value = "https://example/upload"
         st.head.return_value = {"size_bytes": 2048, "checksum": "abc"}
+        # C1: size and checksum are now measured in two separate steps so the
+        # limit can be enforced before the bytes are streamed.
+        st.head_size.return_value = 2048
+        st.checksum.return_value = "abc"
         st.get_artifact_s3_client.return_value = MagicMock()
-        yield SimpleNamespace(storage=st, artifacts=seams.artifacts, brain=seams.brain)
+        yield SimpleNamespace(
+            storage=st,
+            artifacts=seams.artifacts,
+            brain=seams.brain,
+            db=seams.db,
+        )
+
+
+def _pending_row(**overrides):
+    row = {
+        "id": "new-artifact-id",
+        "status": "pending",
+        "title": "t",
+        "summary": "s",
+        "kind": "file",
+        "version": 1,
+        "space_id": "space-1",
+        "project_id": "project-1",
+    }
+    row.update(overrides)
+    return row
 
 
 @pytest.mark.asyncio
@@ -280,7 +308,7 @@ async def test_confirm_measures_the_object_and_writes_the_card(storage):
 
 @pytest.mark.asyncio
 async def test_confirm_rejects_bytes_that_exceed_the_per_file_limit(storage):
-    storage.storage.head.return_value = {"size_bytes": 50 * MB, "checksum": "abc"}
+    storage.storage.head_size.return_value = 50 * MB
     storage.artifacts.get_artifact.return_value = {
         "id": "new-artifact-id",
         "status": "pending",
@@ -305,7 +333,7 @@ async def test_confirm_rejects_bytes_that_exceed_the_per_file_limit(storage):
 
 @pytest.mark.asyncio
 async def test_confirm_without_uploaded_bytes_is_rejected(storage):
-    storage.storage.head.return_value = None
+    storage.storage.head_size.return_value = None
     storage.artifacts.get_artifact.return_value = {
         "id": "new-artifact-id",
         "status": "pending",
@@ -536,6 +564,381 @@ async def test_forget_with_a_non_uuid_id_rolls_back_and_tries_memory(storage):
 
     db.rollback.assert_called_once()
     assert result.get("kind") != "artifact"
+
+
+# ---------------------------------------------------------------------------
+# C1: the confirm path must size-check before it moves any bytes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_confirm_rejects_an_oversized_object_without_hashing_it(storage):
+    """An over-limit upload must be rejected on the strength of HEAD alone.
+
+    Free plan, 10MB limit, 5GB uploaded through the presigned PUT. If the
+    server computes a checksum before checking the size, it streams all 5GB on
+    the *rejection* path — an authenticated remote DoS from the cheapest tier
+    that quota cannot stop, because the request is being refused anyway.
+    """
+    storage.storage.head_size.return_value = 5 * 1024**3
+    storage.artifacts.get_artifact.return_value = _pending_row()
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "file_too_large"
+    storage.storage.checksum.assert_not_called()
+    # And the whole-object read must not be reachable from this path at all.
+    storage.storage.head.assert_not_called()
+    storage.artifacts.activate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_confirm_rejects_an_over_pool_object_without_hashing_it(storage):
+    """The pool check is the other pre-transfer gate."""
+    storage.storage.head_size.return_value = 5 * MB
+    storage.artifacts.org_storage_bytes.return_value = 98 * MB
+    storage.artifacts.get_artifact.return_value = _pending_row()
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "storage_quota_exceeded"
+    storage.storage.checksum.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_confirm_absent_object_is_detected_by_size_alone(storage):
+    storage.storage.head_size.return_value = None
+    storage.artifacts.get_artifact.return_value = _pending_row()
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["error"] == "no_bytes_uploaded"
+    storage.storage.checksum.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_confirm_runs_blocking_s3_work_off_the_event_loop(storage):
+    """boto3 is blocking and ``_perform_artifact_put`` is a coroutine.
+
+    Hashing a multi-GB object inline would stall the event loop for the whole
+    transfer, starving every other MCP request on the replica. The S3 calls
+    must go through the codebase's ``anyio.to_thread.run_sync`` seam.
+    """
+    storage.artifacts.get_artifact.return_value = _pending_row()
+
+    with patch(
+        "app.mcp_app.anyio.to_thread.run_sync", wraps=mcp_app.anyio.to_thread.run_sync
+    ) as run_sync:
+        result = await _tool("artifact_put")(
+            _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+        )
+
+    assert result["stored"] is True, result
+    offloaded = {call.args[0] for call in run_sync.call_args_list}
+    assert storage.storage.head_size in offloaded
+    assert storage.storage.checksum in offloaded
+
+
+# ---------------------------------------------------------------------------
+# I1: duplicate bytes on the presigned path must not wedge the upload.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_confirm_of_duplicate_bytes_returns_the_existing_artifact(storage):
+    """Without dedup here, ``activate``'s UPDATE violates
+    ``ux_artifacts_org_checksum_active`` and the generic handler reports
+    ``internal_error``. The row stays pending forever and the agent cannot
+    distinguish that from a server bug.
+    """
+    storage.artifacts.get_artifact.return_value = _pending_row()
+    storage.artifacts.find_active_by_checksum.return_value = {
+        "id": "already-here",
+        "version": 2,
+    }
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["stored"] is True
+    assert result["artifact_id"] == "already-here"
+    assert result["version"] == 2
+    assert result["deduplicated"] is True
+    storage.artifacts.activate.assert_not_called()
+    # The redundant upload's bytes and its pending reservation are cleaned up.
+    storage.storage.delete.assert_called_once()
+    storage.artifacts.delete_pending.assert_called_once()
+    assert (
+        storage.artifacts.delete_pending.call_args.kwargs["artifact_id"]
+        == "new-artifact-id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirm_dedup_lookup_uses_the_measured_checksum(storage):
+    storage.artifacts.get_artifact.return_value = _pending_row()
+    storage.storage.checksum.return_value = "measured-sha"
+
+    await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert (
+        storage.artifacts.find_active_by_checksum.call_args.kwargs["checksum"]
+        == "measured-sha"
+    )
+
+
+@pytest.mark.asyncio
+async def test_confirm_integrity_error_falls_back_to_dedup(storage):
+    """The concurrent-race case: two confirms of identical bytes at once.
+
+    One wins the partial unique index; the loser's UPDATE raises
+    IntegrityError. That must resolve to the winning artifact, not
+    ``internal_error``.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    storage.artifacts.get_artifact.return_value = _pending_row()
+    storage.artifacts.activate.side_effect = IntegrityError(
+        "UPDATE artifacts", {}, Exception("ux_artifacts_org_checksum_active")
+    )
+    # Nothing on the first (pre-activate) lookup; the winner is visible on the
+    # retry after the constraint fires.
+    storage.artifacts.find_active_by_checksum.side_effect = [
+        None,
+        {"id": "winner", "version": 1},
+    ]
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["stored"] is True
+    assert result["artifact_id"] == "winner"
+    assert result["deduplicated"] is True
+
+
+@pytest.mark.asyncio
+async def test_confirm_integrity_error_with_no_winner_is_not_a_false_success(storage):
+    """An IntegrityError that is NOT a dedup collision must still be an error."""
+    from sqlalchemy.exc import IntegrityError
+
+    storage.artifacts.get_artifact.return_value = _pending_row()
+    storage.artifacts.activate.side_effect = IntegrityError(
+        "UPDATE artifacts", {}, Exception("some other constraint")
+    )
+    storage.artifacts.find_active_by_checksum.side_effect = [None, None]
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "internal_error"
+
+
+# ---------------------------------------------------------------------------
+# I2: the advertised `project` argument must actually file the artifact.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inline_put_honours_an_explicit_project_argument(seams):
+    """``project`` is in the tool schema and was silently discarded.
+
+    An agent that passes project="apollo" with no X-Vex-Project header got
+    project_id=None, so a later recall(project="apollo") never returned the
+    card — with no error anywhere.
+    """
+    seams.brain.find_project_id.return_value = "project-apollo"
+
+    result = await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="document",
+        content="hey",
+        project="apollo",
+    )
+
+    assert result["stored"] is True
+    assert seams.artifacts.create_pending.call_args.kwargs["project_id"] == (
+        "project-apollo"
+    )
+    assert seams.brain.write_scoped_memory.await_args.kwargs["project_id"] == (
+        "project-apollo"
+    )
+    assert seams.brain.find_project_id.call_args.kwargs["org_id"] == "acme"
+    assert seams.brain.find_project_id.call_args.kwargs["identifier"] == "apollo"
+
+
+@pytest.mark.asyncio
+async def test_explicit_project_wins_over_the_header(seams):
+    """Same precedence rule ``recall`` already uses: explicit arg beats header."""
+    seams.brain.find_project_id.return_value = "project-apollo"
+
+    with patch(
+        "app.mcp_app.resolve_project_from_request", return_value="project-from-header"
+    ) as header_resolve:
+        await _tool("artifact_put")(
+            _ctx(),
+            title="t",
+            summary="s",
+            kind="document",
+            content="hey",
+            project="apollo",
+        )
+
+    assert seams.artifacts.create_pending.call_args.kwargs["project_id"] == (
+        "project-apollo"
+    )
+    header_resolve.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_no_project_argument_still_falls_back_to_the_header(seams):
+    with patch(
+        "app.mcp_app.resolve_project_from_request", return_value="project-from-header"
+    ):
+        await _tool("artifact_put")(
+            _ctx(), title="t", summary="s", kind="document", content="hey"
+        )
+
+    assert seams.artifacts.create_pending.call_args.kwargs["project_id"] == (
+        "project-from-header"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_project_argument_is_surfaced_not_swallowed(seams):
+    """``recall`` warns rather than silently widening; a write must not file the
+    artifact somewhere the caller did not ask for either.
+    """
+    seams.brain.find_project_id.return_value = None
+
+    result = await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="document",
+        content="hey",
+        project="nope",
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "unknown_project"
+    seams.artifacts.create_pending.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_request_path_honours_an_explicit_project_argument(storage):
+    storage.brain.find_project_id.return_value = "project-apollo"
+
+    await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="file",
+        mime_type="application/pdf",
+        size_bytes=2048,
+        project="apollo",
+    )
+
+    assert storage.artifacts.create_pending.call_args.kwargs["project_id"] == (
+        "project-apollo"
+    )
+
+
+# ---------------------------------------------------------------------------
+# I3: the presigned-request path must not bypass the pool.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_request_path_checks_the_declared_size_against_the_pool(storage):
+    """A Free org with 95MB of a 100MB pool used cannot reserve another 9MB.
+
+    Before this check the request branch looked only at the per-file limit, so
+    an org could loop presigned PUTs and upload unbounded unbilled bytes.
+    """
+    storage.artifacts.org_storage_bytes.return_value = 95 * MB
+
+    result = await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="file",
+        mime_type="application/pdf",
+        size_bytes=9 * MB,
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "storage_quota_exceeded"
+    storage.artifacts.create_pending.assert_not_called()
+    storage.storage.presign_put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_request_path_caps_concurrent_pending_reservations(storage):
+    """``size_bytes=1`` a thousand times is a thousand uncounted upload URLs."""
+    from shared import artifacts as real_artifacts
+
+    storage.artifacts.MAX_PENDING_PER_ORG = real_artifacts.MAX_PENDING_PER_ORG
+    storage.artifacts.pending_count.return_value = real_artifacts.MAX_PENDING_PER_ORG
+
+    result = await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="file",
+        mime_type="application/pdf",
+        size_bytes=1,
+    )
+
+    assert result["stored"] is False
+    assert result["error"] == "too_many_pending_uploads"
+    storage.artifacts.create_pending.assert_not_called()
+    storage.storage.presign_put.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_request_path_still_succeeds_under_both_limits(storage):
+    from shared import artifacts as real_artifacts
+
+    storage.artifacts.MAX_PENDING_PER_ORG = real_artifacts.MAX_PENDING_PER_ORG
+    storage.artifacts.pending_count.return_value = 1
+    storage.artifacts.org_storage_bytes.return_value = 1 * MB
+
+    result = await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="file",
+        mime_type="application/pdf",
+        size_bytes=2048,
+    )
+
+    assert result["upload_url"] == "https://example/upload"
+
+
+def test_perform_artifact_put_docstring_does_not_overclaim_the_pool_check():
+    """The docstring asserted the pool check runs before ANY write work.
+
+    That was false for the request branch, and a false invariant in a
+    docstring is worse than none — the next reader trusts it.
+    """
+    doc = mcp_app._perform_artifact_put.__doc__ or ""
+    assert "pool check runs before any write work" not in doc.lower()
 
 
 @pytest.mark.asyncio

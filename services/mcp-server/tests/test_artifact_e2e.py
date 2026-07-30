@@ -55,6 +55,15 @@ Everything else in this module is genuinely live:
   abandoned upload is collected (row + object both gone), one that was
   confirmed in the same instant the sweep ran survives untouched (row AND
   object both still there).
+* ``test_forget_then_sweep_actually_removes_the_bytes_from_minio`` — the one
+  assertion that makes "forget really deletes" real rather than claimed. A
+  retracted artifact's and a superseded version's objects must be absent from
+  the real MinIO bucket after the purge pass, while an ``active`` artifact of
+  the same age keeps its bytes. Mocked S3 cannot prove this: it would report a
+  delete that never left the process.
+* ``test_purge_collects_an_inline_artifacts_materialised_object`` — the M1
+  case: ``artifact_get(mode='url')`` on an inline artifact writes an object the
+  row never references, and the purge pass must still collect it.
 * ``test_check_constraint_rejects_invalid_body`` — proves
   ``ck_artifacts_one_body`` is actually enforced by Postgres, not just present
   in a migration file: activating a row with both bodies, or neither, is
@@ -483,6 +492,243 @@ async def test_gc_guarded_delete_against_real_postgres(_e2e_org):
                 artifact_storage.delete(s3, key)
             except Exception:
                 pass
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# 2b. forget really deletes: the object is GONE from MinIO after the sweep.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_forget_then_sweep_actually_removes_the_bytes_from_minio(_e2e_org):
+    """The assertion that makes "forget really deletes" real rather than claimed.
+
+    ``forget`` only sets ``status='retracted'``. Every observable surface then
+    says the artifact is gone — the card is hidden, ``artifact_get`` returns
+    not_found, ``org_storage_bytes`` stops counting it — while the object it
+    points at stays in the bucket. The purge pass is what closes that gap, and
+    nothing short of asking real object storage whether the bytes are still
+    there can prove it: a mocked S3 would happily report a delete that never
+    reached MinIO.
+
+    Both the retracted and the superseded case are covered, plus the negative
+    control: an artifact that is still ``active`` must NOT lose its bytes to
+    the same sweep.
+    """
+    from app.db import SessionLocal
+    from app.mcp_app import build_mcp_server
+    from app.scheduler import collect_artifacts_once
+    from shared import artifact_storage, artifacts
+
+    org_id = _e2e_org
+    db = SessionLocal()
+    s3 = artifact_storage.get_artifact_s3_client()
+    keys = []
+
+    try:
+        server = build_mcp_server()
+        forget = server._tool_manager.get_tool("forget").fn
+        get = server._tool_manager.get_tool("artifact_get").fn
+
+        def _upload(title: str, body: str) -> tuple[str, str]:
+            """Create a real active, S3-backed artifact and return (id, key)."""
+            artifact_id = artifacts.create_pending(
+                db,
+                org_id=org_id,
+                agent_id="agent-a",
+                title=title,
+                summary=f"{title} — live-stack purge fixture",
+                kind="file",
+                mime_type="text/plain",
+            )
+            key = artifact_storage.object_key(org_id, artifact_id, 1)
+            keys.append(key)
+            measured = artifact_storage.put_text(s3, key, body, "text/plain")
+            activated = artifacts.activate(
+                db,
+                org_id=org_id,
+                artifact_id=artifact_id,
+                size_bytes=measured["size_bytes"],
+                checksum=measured["checksum"],
+                inline_text=None,
+                storage_uri=artifact_storage.storage_uri(org_id, artifact_id, 1),
+            )
+            assert activated is not None
+            # A card, so the "card must not resurface" assertion has something
+            # real to check.
+            db.execute(
+                text(
+                    """
+                    INSERT INTO session_memories
+                        (org_id, agent_id, session_id, content, memory_type,
+                         metadata, scope)
+                    VALUES
+                        (:org_id, 'agent-a', :session_id, :content, 'artifact',
+                         CAST(:metadata AS jsonb), 'org')
+                    """
+                ),
+                {
+                    "org_id": org_id,
+                    "session_id": f"purge-{artifact_id}",
+                    "content": f"[artifact] {title}",
+                    "metadata": '{"artifact_id": "%s", "source": "mcp"}' % artifact_id,
+                },
+            )
+            db.commit()
+            return artifact_id, key
+
+        forgotten_id, forgotten_key = _upload("Forgotten PDF", "customer bytes")
+        superseded_id, superseded_key = _upload("Old version", "stale bytes")
+        survivor_id, survivor_key = _upload("Still wanted", "keep me")
+
+        # Real ``forget`` through the real tool: retracts the row, hides the card.
+        result = await forget(_ctx("agent-a"), memory_id=forgotten_id)
+        assert result["forgotten"] is True, result
+        assert result["kind"] == "artifact"
+
+        artifacts.mark_superseded(db, org_id=org_id, artifact_id=superseded_id)
+
+        # Right now the bytes are still there — that is the bug this test pins.
+        assert artifact_storage.head_size(s3, forgotten_key) is not None
+
+        # Both dead rows are past the grace window; the survivor is untouched.
+        db.execute(
+            text("UPDATE artifacts SET created_at = :ts WHERE id IN (:a, :b, :c)"),
+            {
+                "ts": datetime.now(timezone.utc)
+                - timedelta(hours=artifacts.PURGE_GRACE_HOURS + 1),
+                "a": forgotten_id,
+                "b": superseded_id,
+                "c": survivor_id,
+            },
+        )
+        db.commit()
+
+        await collect_artifacts_once(lambda: SessionLocal())
+
+        # THE assertion: the bytes are gone from real object storage.
+        assert artifact_storage.head_size(s3, forgotten_key) is None, (
+            "forget reported success and the sweep ran, but the object is "
+            "still in MinIO — the deletion request was not honoured"
+        )
+        assert artifact_storage.head_size(s3, superseded_key) is None, (
+            "a superseded version's bytes must be destroyed too"
+        )
+
+        # Negative control: an active artifact of the same age keeps its bytes.
+        assert artifact_storage.head_size(s3, survivor_key) is not None, (
+            "the purge pass destroyed an ACTIVE artifact's bytes"
+        )
+        assert (await get(_ctx("agent-a"), artifact_id=survivor_id, mode="url"))[
+            "url"
+        ].startswith("http")
+
+        # Rows and cards for the purged artifacts are gone; the survivor's stay.
+        for dead_id in (forgotten_id, superseded_id):
+            assert (
+                db.execute(
+                    text("SELECT 1 FROM artifacts WHERE id = :id"), {"id": dead_id}
+                ).fetchone()
+                is None
+            ), f"{dead_id} row must be removed by the purge"
+            assert (
+                db.execute(
+                    text(
+                        "SELECT 1 FROM session_memories WHERE org_id = :org_id "
+                        "AND memory_type = 'artifact' "
+                        "AND metadata->>'artifact_id' = :id"
+                    ),
+                    {"org_id": org_id, "id": dead_id},
+                ).fetchone()
+                is None
+            ), f"{dead_id} card must not survive its artifact"
+
+        assert (
+            db.execute(
+                text("SELECT status FROM artifacts WHERE id = :id"),
+                {"id": survivor_id},
+            ).fetchone()[0]
+            == "active"
+        )
+    finally:
+        for key in keys:
+            try:
+                artifact_storage.delete(s3, key)
+            except Exception:
+                pass
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_purge_collects_an_inline_artifacts_materialised_object(_e2e_org):
+    """M1, live: ``mode='url'`` on an INLINE artifact writes a real object that
+    the row never references (``storage_uri`` stays NULL). Because the purge
+    pass derives the key instead of reading that column, the object is still
+    collected when the artifact is forgotten.
+    """
+    from app.db import SessionLocal
+    from app.mcp_app import build_mcp_server
+    from app.scheduler import collect_artifacts_once
+    from shared import artifact_storage, artifacts
+
+    org_id = _e2e_org
+    db = SessionLocal()
+    s3 = artifact_storage.get_artifact_s3_client()
+
+    try:
+        server = build_mcp_server()
+        put = server._tool_manager.get_tool("artifact_put").fn
+        get = server._tool_manager.get_tool("artifact_get").fn
+        forget = server._tool_manager.get_tool("forget").fn
+
+        marker = uuid.uuid4().hex[:8]
+        stored = await put(
+            _ctx("agent-a"),
+            title=f"Inline doc {marker}",
+            summary="Materialises an object when downloaded",
+            kind="document",
+            content=f"inline body {marker}",
+        )
+        assert stored["stored"] is True, stored
+        artifact_id = stored["artifact_id"]
+
+        link = await get(_ctx("agent-a"), artifact_id=artifact_id, mode="url")
+        assert link["url"].startswith("http"), link
+
+        key = artifact_storage.object_key(org_id, artifact_id, 1)
+        assert artifact_storage.head_size(s3, key) is not None, (
+            "mode='url' should have materialised an object"
+        )
+        # The row really is still inline — this is what made the object
+        # uncollectable before the purge derived its key.
+        row = artifacts.get_artifact(db, org_id=org_id, artifact_id=artifact_id)
+        assert row["inline_text"] is not None
+        assert row["storage_uri"] is None
+
+        assert (await forget(_ctx("agent-a"), memory_id=artifact_id))["forgotten"]
+        db.execute(
+            text("UPDATE artifacts SET created_at = :ts WHERE id = :id"),
+            {
+                "ts": datetime.now(timezone.utc)
+                - timedelta(hours=artifacts.PURGE_GRACE_HOURS + 1),
+                "id": artifact_id,
+            },
+        )
+        db.commit()
+
+        await collect_artifacts_once(lambda: SessionLocal())
+
+        assert artifact_storage.head_size(s3, key) is None, (
+            "an inline artifact's materialised object outlived the artifact"
+        )
+    finally:
+        try:
+            artifact_storage.delete(
+                s3, artifact_storage.object_key(org_id, artifact_id, 1)
+            )
+        except Exception:
+            pass
         db.close()
 
 

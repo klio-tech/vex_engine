@@ -61,15 +61,100 @@ def test_presign_get_includes_response_content_headers():
     assert params["ResponseContentType"] == "application/octet-stream"
 
 
+def _streaming_body(body: bytes, chunk_size: int = 4):
+    """A stand-in for botocore's StreamingBody.
+
+    ``read`` is deliberately made to blow up: any code path that pulls a whole
+    object into RAM is a remote DoS (see ``head_size``'s docstring), so the
+    fake refuses to serve one rather than quietly letting a regression pass.
+    """
+
+    def _no_read(*_args, **_kwargs):
+        raise AssertionError(
+            "the whole object was read into memory; stream it in chunks instead"
+        )
+
+    return MagicMock(
+        read=_no_read,
+        iter_chunks=lambda chunk_size=chunk_size: (
+            body[i : i + chunk_size] for i in range(0, len(body), chunk_size)
+        ),
+    )
+
+
 def test_head_returns_measured_size_and_checksum():
     body = b"hello world"
     s3 = _fake_s3()
     s3.head_object.return_value = {"ContentLength": len(body)}
-    s3.get_object.return_value = {"Body": MagicMock(read=lambda: body)}
+    s3.get_object.return_value = {"Body": _streaming_body(body)}
 
     meta = st.head(s3, "acme/a/v1")
 
     assert meta == {
+        "size_bytes": len(body),
+        "checksum": hashlib.sha256(body).hexdigest(),
+    }
+
+
+# --- C1: size must be knowable WITHOUT downloading the object -------------
+
+
+def test_head_size_never_fetches_the_body():
+    """The per-file limit has to be enforceable before any transfer.
+
+    A Free-plan org can request a presigned PUT, upload 5GB, and then confirm.
+    If measuring the object requires downloading it, the server pulls all 5GB
+    into memory *on the rejection path* — an authenticated remote DoS from the
+    cheapest tier that quota cannot stop. ``head_size`` must answer from
+    ``ContentLength`` alone.
+    """
+    s3 = _fake_s3()
+    s3.head_object.return_value = {"ContentLength": 5 * 1024**3}
+
+    assert st.head_size(s3, "acme/a/v1") == 5 * 1024**3
+    s3.get_object.assert_not_called()
+
+
+def test_head_size_returns_none_when_the_object_is_absent():
+    s3 = _fake_s3()
+    s3.head_object.side_effect = ClientError(
+        {"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject"
+    )
+
+    assert st.head_size(s3, "acme/a/v1") is None
+
+
+def test_head_size_raises_non_404_errors():
+    s3 = _fake_s3()
+    s3.head_object.side_effect = ClientError(
+        {"Error": {"Code": "AccessDenied", "Message": "Access Denied"}}, "HeadObject"
+    )
+
+    with pytest.raises(ClientError):
+        st.head_size(s3, "acme/a/v1")
+
+
+def test_checksum_streams_the_body_in_chunks():
+    """The checksum is computed incrementally, never over a buffered body."""
+    body = b"hello world, streamed in pieces"
+    s3 = _fake_s3()
+    s3.get_object.return_value = {"Body": _streaming_body(body, chunk_size=3)}
+
+    assert st.checksum(s3, "acme/a/v1") == hashlib.sha256(body).hexdigest()
+
+
+def test_head_uses_the_streaming_checksum_path():
+    """``head`` keeps its size+checksum contract, but must not buffer either.
+
+    The fake's ``read`` raises, so this fails if ``head`` regresses to
+    ``get_object(...)["Body"].read()``.
+    """
+    body = b"x" * 1024
+    s3 = _fake_s3()
+    s3.head_object.return_value = {"ContentLength": len(body)}
+    s3.get_object.return_value = {"Body": _streaming_body(body, chunk_size=7)}
+
+    assert st.head(s3, "acme/a/v1") == {
         "size_bytes": len(body),
         "checksum": hashlib.sha256(body).hexdigest(),
     }

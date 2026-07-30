@@ -84,27 +84,75 @@ def _measure(body: bytes) -> dict:
     return {"size_bytes": len(body), "checksum": hashlib.sha256(body).hexdigest()}
 
 
-def head(s3: Any, key: str) -> Optional[dict]:
-    """Server-side measurement of a stored object.
+# Bytes pulled per iteration when hashing an object. Large enough that a
+# multi-GB object does not cost a million round trips through the generator,
+# small enough that peak resident memory per concurrent confirm stays flat
+# regardless of object size.
+CHECKSUM_CHUNK_BYTES = 1024 * 1024
+
+
+def head_size(s3: Any, key: str) -> Optional[int]:
+    """Object size from ``ContentLength`` alone — no body transfer.
+
+    This is the size-only half of :func:`head`, and it exists so a caller can
+    enforce a size limit BEFORE paying to move the bytes. The confirm path
+    hands out a presigned PUT with no server-side cap on what is actually
+    uploaded, so a Free-plan org (10MB limit) can upload 5GB and then confirm.
+    Measuring that by downloading it would mean the *rejection* path is the
+    expensive one — an authenticated remote DoS from the cheapest tier, which
+    quota by definition cannot stop. ``HEAD`` answers in one round trip and
+    constant memory.
 
     Returns ``None`` when the object does not exist, which is how an
-    unconfirmed upload is detected. The body is read to compute the checksum:
-    a client-supplied one could not be trusted, and dedup depends on it.
+    unconfirmed upload is detected.
 
     Raises ClientError if the error is not a missing-object (404/NoSuchKey):
     transient failures (AccessDenied, throttling, internal errors) must surface
     as real failures, not silently tell users their upload failed.
     """
     try:
-        s3.head_object(Bucket=ARTIFACT_BUCKET, Key=key)
+        response = s3.head_object(Bucket=ARTIFACT_BUCKET, Key=key)
     except ClientError as e:
         error_code = e.response.get("Error", {}).get("Code") if e.response else None
         if error_code in ("404", "NoSuchKey"):
             return None
         raise
+    return int(response["ContentLength"])
 
-    body = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=key)["Body"].read()
-    return _measure(body)
+
+def checksum(s3: Any, key: str, *, chunk_bytes: int = CHECKSUM_CHUNK_BYTES) -> str:
+    """SHA-256 of a stored object, computed by streaming it in chunks.
+
+    A client-supplied checksum could not be trusted and dedup depends on this
+    one, so the bytes really do have to move — but they are hashed as they
+    arrive and never accumulated. ``StreamingBody.iter_chunks`` is botocore's
+    incremental reader; ``.read()`` would buffer the whole object and is the
+    thing this function exists to avoid.
+    """
+    digest = hashlib.sha256()
+    body = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=key)["Body"]
+    for chunk in body.iter_chunks(chunk_size=chunk_bytes):
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def head(s3: Any, key: str) -> Optional[dict]:
+    """Server-side measurement of a stored object: size AND checksum.
+
+    Kept for callers that want both in one go. It is now composed from
+    :func:`head_size` and :func:`checksum`, so it never buffers the object
+    either. Callers that must enforce a size limit should call the two
+    separately and check the limit in between — paying for a full stream of an
+    object that is about to be rejected is exactly the failure mode
+    ``head_size`` exists to prevent.
+
+    Returns ``None`` when the object does not exist. Raises ClientError for any
+    non-404 failure, same contract as before.
+    """
+    size = head_size(s3, key)
+    if size is None:
+        return None
+    return {"size_bytes": size, "checksum": checksum(s3, key)}
 
 
 def put_text(s3: Any, key: str, text: str, mime_type: str) -> dict:

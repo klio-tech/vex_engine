@@ -188,6 +188,17 @@ the quota is charged against.
 **Garbage collection:** `pending` artifacts older than 24 hours are deleted along with
 any uploaded object, by the existing scheduler in `services/mcp-server/app/scheduler.py`.
 
+**Reservation cap.** A `pending` row is a live presigned PUT that nothing counts against
+the pool until it is confirmed, so the request path also checks the declared size against
+the pool and caps concurrent reservations per org (`artifacts.MAX_PENDING_PER_ORG`).
+Without both, an org could loop `size_bytes=1`, collect unlimited upload URLs, and push
+unbounded unbilled bytes through them until GC ran a day later.
+
+**Measurement order at confirm.** The size comes from `HEAD` (`ContentLength`) and both
+limits are enforced against it *before* the object is streamed to compute its checksum.
+Measuring by downloading would make the rejection path the expensive one — an
+authenticated remote DoS available on the cheapest plan, which quota cannot stop.
+
 Inline is not a convenience — it is the only write path available to ChatGPT connectors
 and Claude.ai custom connectors, which can make MCP tool calls but cannot issue an
 arbitrary HTTP PUT. Without it those clients could read artifacts but never create one.
@@ -213,6 +224,18 @@ artifact_get(
 Extended to accept an artifact id. Sets the artifact to `retracted` and its card to
 `recall_hidden = true` in one transaction — one lifecycle, no orphaned cards. Bytes are
 deleted from object storage by the same scheduler pass that collects abandoned uploads.
+
+That pass has a second sweep for exactly this: `retracted` and `superseded` rows older
+than `artifacts.PURGE_GRACE_HOURS` have their object deleted and their row and card
+hard-deleted. The grace window exists so a future undelete stays possible — `forget` is
+one tool call over customer document content, and once the object is gone there is
+nothing to restore from. Each row is removed with the same guarded
+`DELETE … RETURNING id` the pending sweep uses, and the object is deleted only after the
+row's removal is confirmed, so bytes are never destroyed for a row the sweep did not also
+finalise. The object key is derived from `(org_id, id, version)` rather than read from
+`storage_uri`, because `artifact_get(mode='url')` materialises an object for an *inline*
+artifact while leaving `storage_uri` NULL — keying off that column would leave those
+objects uncollected forever.
 
 ### `recall`
 

@@ -7,10 +7,19 @@ lifespan (:mod:`app.main`), so the single-service Railway deployment needs no
 external cron.
 
 The same module also drives the artifact GC sweep
-(:func:`collect_artifacts_once`), which deletes ``pending`` artifact rows
-whose upload was never confirmed — and their S3 objects, best-effort — after
-``shared.artifacts.PENDING_TTL_HOURS``.  See :func:`_artifact_gc_loop` /
-:func:`start_artifact_gc`, which mirror the curator loop's shape.
+(:func:`collect_artifacts_once`), which has two passes:
+
+1. ``pending`` artifact rows whose upload was never confirmed are deleted —
+   with their S3 objects, best-effort — after
+   ``shared.artifacts.PENDING_TTL_HOURS``.
+2. ``retracted`` / ``superseded`` rows older than
+   ``shared.artifacts.PURGE_GRACE_HOURS`` have their bytes destroyed and their
+   rows and cards removed (:func:`_purge_dead_artifacts`).  This is what makes
+   ``forget`` a real deletion rather than a status change: nothing else in the
+   system ever removes an artifact's object.
+
+See :func:`_artifact_gc_loop` / :func:`start_artifact_gc`, which mirror the
+curator loop's shape.
 
 Design notes:
 
@@ -113,6 +122,105 @@ async def stop_curator(app: Any) -> None:
         app.state.curator_task = None
 
 
+def _purge_dead_artifacts(db: Any, s3: Any) -> int:
+    """Second sweep pass: destroy the bytes of retracted/superseded artifacts.
+
+    ``forget`` (``artifacts.retract``) and supersede only flip ``status``.
+    Nothing else in the system ever deletes an object or clears
+    ``inline_text``, so before this pass existed a forgotten artifact read as
+    gone from every API — card hidden, ``artifact_get`` not_found, excluded
+    from ``org_storage_bytes`` — while its object stayed in the bucket
+    permanently. That is a deletion request over customer document content
+    that could not be honoured, and a storage pool that under-counts what is
+    actually stored.
+
+    **Hard delete, deliberately.** The row is removed outright rather than
+    given a terminal status with its bodies nulled. Two reasons, and this is
+    the explicit choice the alternative was weighed against: ``artifacts``
+    carries a CHECK constraint enumerating the four legal statuses (migration
+    027), so a ``'purged'`` state would need its own migration for no
+    behavioural gain; and the row itself holds customer-authored ``title`` and
+    ``summary``, which a genuine deletion should not leave behind. The card is
+    deleted in the same transaction for exactly that second reason — it is a
+    copy of the same customer text — and deleting it is also what guarantees
+    it can never become discoverable again, independent of whether its
+    ``recall_hidden`` flag was ever set.
+
+    **Ordering discipline, mirroring the pending sweep.** ``collect_purgeable``
+    SELECTs rows dead as of that query, but the grace window exists precisely
+    so a row could be restored to ``'active'`` before the sweep reaches it.
+    Each row is therefore deleted with its own guarded, atomic
+    ``DELETE ... WHERE id = :id AND status IN ('retracted','superseded')
+    RETURNING id``, and the S3 object is deleted **only after** that DELETE
+    confirms the row was actually removed. The sweep must never destroy bytes
+    belonging to a row it did not also delete.
+
+    **The key is derived, not read from ``storage_uri``.** ``artifact_get``
+    with ``mode='url'`` on an INLINE artifact materialises an object at
+    ``object_key(org_id, id, version)`` and leaves the row inline
+    (``storage_uri`` NULL) — so a NULL ``storage_uri`` does not mean "no object
+    exists". Keying the purge off that column would leave every such
+    materialised object uncollected forever. Deleting at the derived key
+    instead covers both cases and is harmless when nothing is there. That same
+    determinism is what makes a materialised object safe while the artifact is
+    alive: every ``mode='url'`` call re-puts identical bytes at the identical
+    key, so a stale one is an idempotent overwrite, never an orphan with a
+    second identity.
+
+    Object deletion is best-effort per row: one failure logs and moves on so a
+    single unreachable object cannot strand the rest of the batch.
+    """
+    dead = artifacts.collect_purgeable(db)
+    if not dead:
+        return 0
+
+    purged = 0
+    for row in dead:
+        deleted = db.execute(
+            sa_text(
+                "DELETE FROM artifacts WHERE id = :id "
+                "AND status IN ('retracted', 'superseded') "
+                "RETURNING id"
+            ),
+            {"id": row["id"]},
+        ).fetchone()
+
+        if not deleted:
+            # Restored (or already purged) between the SELECT and this DELETE.
+            # The row was NOT removed, so its object must be left alone.
+            db.commit()
+            logger.info("artifact purge: skipping %s, no longer dead", row["id"])
+            continue
+
+        # Same transaction as the row delete: the card is a copy of the
+        # customer's title and summary and must not outlive the artifact.
+        # ``org_id`` comes from the row itself — this sweep is cross-org.
+        db.execute(
+            sa_text(
+                "DELETE FROM session_memories "
+                "WHERE org_id = :org_id AND memory_type = 'artifact' "
+                "AND metadata->>'artifact_id' = :artifact_id"
+            ),
+            {"org_id": row["org_id"], "artifact_id": row["id"]},
+        )
+        db.commit()
+
+        key = artifact_storage.object_key(row["org_id"], row["id"], row["version"])
+        try:
+            artifact_storage.delete(s3, key)
+        except Exception:
+            logger.warning(
+                "artifact purge: object delete failed for %s; row already removed",
+                key,
+                exc_info=True,
+            )
+        purged += 1
+
+    if purged:
+        logger.info("artifact purge: destroyed bytes for %d dead artifacts", purged)
+    return purged
+
+
 async def collect_artifacts_once(db_factory: Callable[[], Any]) -> int:
     """Delete pending artifacts whose upload never arrived, and their bytes.
 
@@ -141,11 +249,8 @@ async def collect_artifacts_once(db_factory: Callable[[], Any]) -> int:
     """
     db = db_factory()
     try:
-        stale = artifacts.collect_abandoned(db)
-        if not stale:
-            return 0
-
         s3 = artifact_storage.get_artifact_s3_client()
+        stale = artifacts.collect_abandoned(db)
         collected = 0
         for row in stale:
             deleted = db.execute(
@@ -175,6 +280,11 @@ async def collect_artifacts_once(db_factory: Callable[[], Any]) -> int:
 
         if collected:
             logger.info("artifact GC: collected %d abandoned uploads", collected)
+
+        # Second pass: destroy the bytes of artifacts that are dead but whose
+        # objects nothing else in the system would ever remove. See
+        # ``_purge_dead_artifacts``.
+        collected += _purge_dead_artifacts(db, s3)
         return collected
     finally:
         db.close()
