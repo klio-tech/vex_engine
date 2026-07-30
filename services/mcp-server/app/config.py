@@ -81,6 +81,18 @@ CURATOR_INTERVAL_SECONDS = _parse_int(
 )
 
 
+# --- Artifact GC scheduler --------------------------------------------
+#
+# The abandoned-upload sweep (``app.scheduler.collect_artifacts_once``)
+# deletes ``pending`` artifact rows whose upload was never confirmed, and
+# their S3 objects, hourly in every environment. It is destructive (DB rows
+# and S3 objects), so — mirroring ``CURATOR_ENABLED`` above — it has its own
+# kill switch: if it ever misbehaves, on-call can disable it with an env var
+# instead of a code change and redeploy. Defaults to enabled so behaviour is
+# unchanged out of the box.
+ARTIFACT_GC_ENABLED = _parse_bool(os.environ.get("ARTIFACT_GC_ENABLED"), default=True)
+
+
 # --- MCP OAuth (engine = resource server; Supabase = authorization server) ---
 
 # Master switch. Off (default) preserves today's behavior exactly: Bearer
