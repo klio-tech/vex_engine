@@ -1171,7 +1171,7 @@ def collect_abandoned(db: Any, *, older_than_hours: int = PENDING_TTL_HOURS) -> 
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run from `services/shared`: `pytest tests/test_artifacts.py -v`
-Expected: 11 passed.
+Expected: 10 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -1947,7 +1947,7 @@ In `_perform_artifact_put`, replace the `# Presigned request and confirm branche
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run from `services/mcp-server`: `pytest tests/test_artifact_tools.py -v`
-Expected: 11 passed.
+Expected: 10 passed.
 
 - [ ] **Step 5: Commit**
 
