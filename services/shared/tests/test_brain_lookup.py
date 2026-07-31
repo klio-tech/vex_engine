@@ -163,3 +163,87 @@ def test_find_project_id_uuid_miss_then_name_miss_returns_none():
     assert result is None
     assert db_session.execute.call_count == 2
     db_session.commit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# find_project_id — path resolution and deterministic ranking
+#
+# ensure_project dedups on git_remote when present and repo_root_path
+# otherwise, so a project created outside a git repo is keyed by its
+# directory. The read path used to match only git_remote/display_name, which
+# made those projects unresolvable — the caller silently fell back to org-wide
+# recall. In production two thirds of projects are path-only.
+#
+# display_name is the last path segment, so one org holds several projects
+# called "web" or "app". The old query ended in a bare LIMIT 1 with no
+# ORDER BY, so the winner was arbitrary and could change between calls —
+# resolving to the WRONG project, which is worse than not resolving.
+# ---------------------------------------------------------------------------
+
+
+def test_find_project_id_matches_repo_root_path():
+    """A non-git project must be resolvable by the directory it was keyed on."""
+    proj_id = uuid.uuid4()
+    db_session = MagicMock()
+    db_session.execute.return_value = _result_with_row((proj_id,))
+
+    result = find_project_id(
+        db_session, org_id="org-1", identifier="/Users/dev/Me/Agent Memory"
+    )
+
+    assert result == str(proj_id)
+    sql = _executed_sql(db_session)
+    assert "repo_root_path = :ident" in sql
+    params = _executed_params(db_session)
+    assert params == {"org_id": "org-1", "ident": "/Users/dev/Me/Agent Memory"}
+    db_session.commit.assert_not_called()
+
+
+def test_find_project_id_ranks_exact_keys_above_display_name():
+    """git_remote and repo_root_path are unique per org; display_name is not.
+
+    A display_name collision must never outrank an exact key match, so the
+    ordering is by specificity first.
+    """
+    db_session = MagicMock()
+    db_session.execute.return_value = _result_with_row((uuid.uuid4(),))
+
+    find_project_id(db_session, org_id="org-1", identifier="web")
+
+    sql = _executed_sql(db_session)
+    remote_rank = sql.index("WHEN git_remote = :ident THEN 0")
+    path_rank = sql.index("WHEN repo_root_path = :ident THEN 1")
+    assert remote_rank < path_rank, "git_remote must rank above repo_root_path"
+    assert "ELSE 2" in sql, "display_name must rank last"
+
+
+def test_find_project_id_is_deterministic_under_display_name_collision():
+    """Ties must break on a stable, total ordering — never planner order.
+
+    Without this the same identifier can resolve to a different project
+    between two calls, so memories file and recall against whichever row the
+    planner happened to return.
+    """
+    db_session = MagicMock()
+    db_session.execute.return_value = _result_with_row((uuid.uuid4(),))
+
+    find_project_id(db_session, org_id="org-1", identifier="web")
+
+    sql = _executed_sql(db_session)
+    assert "ORDER BY" in sql, "a bare LIMIT 1 is non-deterministic"
+    order_clause = sql[sql.index("ORDER BY") :]
+    assert "last_seen_at DESC" in order_clause
+    # id is the final tie-break: two projects can share a last_seen_at.
+    assert "id ASC" in order_clause
+    assert order_clause.index("last_seen_at DESC") < order_clause.index("id ASC")
+
+
+def test_find_project_id_still_returns_none_for_unknown_identifier():
+    """Fail-open behaviour is unchanged: unknown resolves to None, not a guess."""
+    db_session = MagicMock()
+    db_session.execute.return_value = _result_with_row(None)
+
+    assert (
+        find_project_id(db_session, org_id="org-1", identifier="/no/such/dir") is None
+    )
+    db_session.commit.assert_not_called()

@@ -271,11 +271,29 @@ def find_project_id(db_session: Any, *, org_id: str, identifier: str) -> Optiona
     Read-only counterpart to :func:`ensure_project`: it resolves a user-facing
     identifier to its id on the recall (read) path and NEVER creates a row.
 
-    Resolution order (all tenant-scoped by ``org_id``):
+    Resolution order (all tenant-scoped by ``org_id``), most specific first:
 
-        1. If ``identifier`` parses as a UUID, look up by ``id`` first.
-        2. Otherwise (or if the id lookup misses), match by ``git_remote`` OR
-           ``display_name``.
+        1. If ``identifier`` parses as a UUID, look up by ``id``.
+        2. ``git_remote`` — unique per org via ``ix_projects_org_remote``.
+        3. ``repo_root_path`` — unique per org for non-git projects via
+           ``ix_projects_org_path``.
+        4. ``display_name`` — NOT unique; see the ambiguity note below.
+
+    Why ``repo_root_path`` is here: :func:`ensure_project` dedups on
+    ``git_remote`` when present and ``repo_root_path`` otherwise, so a project
+    created outside a git repo is keyed by its directory. Omitting the path from
+    this read path made those projects unresolvable — the caller fell back to
+    org-wide recall — even though the writer had filed memories under them. In
+    production two thirds of projects are path-only, so this was the common case,
+    not an edge case.
+
+    Ambiguity: ``display_name`` is the last path segment, so one org routinely
+    holds several projects named ``web`` or ``app``. The previous query ended in
+    a bare ``LIMIT 1`` with no ``ORDER BY``, making the winner arbitrary and
+    unstable between calls — silently resolving to the WRONG project, which is
+    worse than not resolving at all. Matches are now ranked by specificity, and
+    ties within ``display_name`` break by most-recently-seen then by id, so the
+    result is deterministic and the likeliest intent wins.
 
     Returns ``None`` when nothing matches so the caller can surface "unknown
     project" rather than silently widening the search.
@@ -290,7 +308,8 @@ def find_project_id(db_session: Any, *, org_id: str, identifier: str) -> Optiona
         db_session: A synchronous SQLAlchemy session/connection exposing
             ``.execute()``.
         org_id: Owning org id (tenant scope).
-        identifier: A project id (UUID), git remote URL, or display name.
+        identifier: A project id (UUID), git remote URL, repository root path,
+            or display name.
 
     Returns:
         The project id as a string, or ``None`` if no matching project exists.
@@ -319,12 +338,27 @@ def find_project_id(db_session: Any, *, org_id: str, identifier: str) -> Optiona
         # Fall through: a UUID-shaped identifier that is not a known id may
         # still legitimately match a git_remote / display_name.
 
+    # Ranked by specificity so an exact git_remote or repo_root_path always
+    # beats a display_name collision, and ordered fully so the winner is
+    # deterministic across calls rather than whatever the planner returned first.
     row = db_session.execute(
         text(
             """
             SELECT id FROM projects
             WHERE org_id = :org_id
-              AND (git_remote = :ident OR display_name = :ident)
+              AND (
+                git_remote = :ident
+                OR repo_root_path = :ident
+                OR display_name = :ident
+              )
+            ORDER BY
+              CASE
+                WHEN git_remote = :ident THEN 0
+                WHEN repo_root_path = :ident THEN 1
+                ELSE 2
+              END,
+              last_seen_at DESC NULLS LAST,
+              id ASC
             LIMIT 1
             """
         ),
