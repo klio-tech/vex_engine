@@ -1198,3 +1198,47 @@ async def test_recall_description_tells_agents_about_artifact_get():
     # Without this, an agent receives an artifact card and has no idea a
     # follow-up tool exists.
     assert "artifact_get" in tool.description
+
+
+@pytest.mark.asyncio
+async def test_request_path_refuses_oversized_without_reserving_anything(storage):
+    """Multipart is not implemented, so refuse before creating a pending row.
+
+    This branch used to sit AFTER create_pending and told the caller to "use
+    the Klio CLI, which performs the multipart upload". No such command
+    exists, so the caller received an artifact_id it could never fulfil — and
+    the reservation it burned counted against MAX_PENDING_PER_ORG until GC
+    collected it 24 hours later.
+    """
+    storage.artifacts.MAX_PENDING_PER_ORG = 32
+    storage.artifacts.pending_count.return_value = 0
+    storage.artifacts.org_storage_bytes.return_value = 0
+    storage.storage.MULTIPART_THRESHOLD_BYTES = 100 * MB
+
+    # Only reachable on a plan whose per-file limit exceeds the multipart
+    # threshold — i.e. Max (1GB per file). Every smaller plan is stopped by
+    # file_too_large first, so this dead end only ever reached the customers
+    # paying the most.
+    max_plan = SimpleNamespace(
+        artifact_max_file_bytes=1024 * MB,
+        artifact_storage_bytes=1024 * 1024 * MB,
+    )
+
+    with patch("app.mcp_app.get_plan_config", return_value=max_plan):
+        result = await _tool("artifact_put")(
+            _ctx(),
+            title="t",
+            summary="s",
+            kind="file",
+            mime_type="application/octet-stream",
+            size_bytes=200 * MB,
+        )
+
+    assert result["stored"] is False
+    assert result["error"] == "too_large_for_single_upload"
+    # The old copy pointed at a CLI command that does not exist.
+    assert "CLI" not in result["detail"]
+    # Nothing may be reserved, signed, or filed for a request we refuse.
+    storage.artifacts.create_pending.assert_not_called()
+    storage.storage.presign_put.assert_not_called()
+    storage.brain.ensure_space.assert_not_called()

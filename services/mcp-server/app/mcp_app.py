@@ -776,6 +776,27 @@ async def _perform_artifact_put(
                 "suggested_plan": "max",
             }
 
+        # Multipart is not implemented, so refuse here rather than further down.
+        #
+        # This branch used to sit AFTER create_pending and told the caller to
+        # "use the Klio CLI, which performs the multipart upload". No such
+        # command exists, so the caller was handed an artifact_id it could
+        # never fulfil — and the reservation it burned counted against
+        # MAX_PENDING_PER_ORG until GC collected it 24 hours later. Refusing
+        # before any row is created costs the caller nothing and says something
+        # true.
+        if declared > artifact_storage.MULTIPART_THRESHOLD_BYTES:
+            return {
+                "stored": False,
+                "error": "too_large_for_single_upload",
+                "detail": (
+                    f"{declared} bytes exceeds the "
+                    f"{artifact_storage.MULTIPART_THRESHOLD_BYTES}-byte limit for a "
+                    "single upload. Multipart upload is not available yet, so an "
+                    "artifact this large cannot be stored in this release."
+                ),
+            }
+
         # The pool, against the DECLARED size. Weaker than the confirm-time
         # check (nothing verifies this number), but its absence was a complete
         # bypass: an org could loop this branch, collect presigned PUTs, and
@@ -842,18 +863,6 @@ async def _perform_artifact_put(
 
         s3 = artifact_storage.get_artifact_s3_client()
         key = artifact_storage.object_key(org_id, new_id, 1)
-
-        if declared > artifact_storage.MULTIPART_THRESHOLD_BYTES:
-            return {
-                "stored": False,
-                "artifact_id": new_id,
-                "multipart": True,
-                "detail": (
-                    "Over 100MB. Use the Klio CLI, which performs the multipart "
-                    "upload, then confirm with this artifact_id."
-                ),
-                "expires_in": artifact_storage.PRESIGN_TTL_SECONDS,
-            }
 
         return {
             "stored": False,
