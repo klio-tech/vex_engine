@@ -83,4 +83,4 @@ def test_forget_is_registered():
         "project_members",
         "project_grant",
     } <= set(EXPECTED_TOOL_NAMES)
-    assert len(EXPECTED_TOOL_NAMES) == 15
+    assert len(EXPECTED_TOOL_NAMES) == 16
