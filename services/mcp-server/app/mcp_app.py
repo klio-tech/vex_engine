@@ -51,9 +51,10 @@ from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
-from shared import artifact_storage, artifacts, brain
+from shared import artifact_storage, artifacts, brain, projects
 from shared.memory import MemoryRecord, retract_memory, retrieve_memories_scoped
 from shared.plan_limits import get_plan_config
+from shared.promotion import promote_memory
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -69,6 +70,8 @@ from app.config import (
     MCP_DNS_REBINDING_PROTECTION,
 )
 from app.db import SessionLocal
+from app.directory import resolve_org_member_by_email
+from app.identity import resolve_request_user_id
 from app.recall_log import log_recall_event
 from app.session import brain_session_id
 
@@ -87,6 +90,11 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "artifact_get",
     "space",
     "forget",
+    "share",
+    "project_create",
+    "project_list",
+    "project_members",
+    "project_grant",
 )
 
 # Server-level guidance surfaced to MCP clients during ``initialize``.
@@ -118,6 +126,45 @@ SpaceParam = Annotated[
         )
     ),
 ]
+
+
+def _explicit_write_scope(
+    db: Any,
+    *,
+    requested_scope: str,
+    org_id: str,
+    user_id: Optional[str],
+    project_id: Optional[str],
+) -> str:
+    """Decide the scope for an EXPLICIT write (``remember``/``decide``/…).
+
+    Calling one of these tools IS the act of sharing, so unlike a hook capture
+    the result is never ``private``. The only question is *how* shared::
+
+        project  — when a project resolved AND the author is a member of it
+        org      — otherwise (and always, for the deprecated 'agent' request)
+
+    Why membership is required before writing ``scope='project'``: that scope is
+    a boundary, and a write into it by a non-member is wrong in both directions
+    at once. The author could not read back their own memory (they are not a
+    member), and a non-member would have injected content into a space they
+    have no standing in — a way to write across a boundary you cannot read
+    across. Falling back to ``org`` is the conservative answer and is exactly
+    today's behaviour for the 106 auto-created projects that have no members:
+    the row is still FILED under the project (``project_id`` is set, ranking it
+    first on that project's recall) but it is not FENCED by it.
+
+    ``requested_scope='agent'`` is honoured as-is for backward compatibility;
+    it is deprecated in favour of ``private``, which explicit tools do not
+    write.
+    """
+    if requested_scope == "agent":
+        return "agent"
+    if project_id and projects.is_member(
+        db, org_id=org_id, project_id=project_id, user_id=user_id
+    ):
+        return "project"
+    return "org"
 
 
 async def _perform_write(
@@ -163,9 +210,11 @@ async def _perform_write(
         content: The memory text to store.
         memory_type: The brain memory type for this tool.
         metadata: Optional metadata persisted on the row.
-        scope: ``"org"`` (default) for the shared team brain, or ``"agent"`` to
-            write a row private to the caller's resolved ``agent_id`` (only
-            ``recall(scope='agent')`` for that same agent sees it).
+        scope: The scope the caller ASKED for — ``"org"`` (default) or the
+            deprecated ``"agent"``. The scope actually written is decided by
+            :func:`_explicit_write_scope`, which may narrow ``org`` to
+            ``project``. Explicit tools never write ``private``: calling one is
+            the act of sharing.
         space: Optional space slug to scope this memory to; the space is created
             (get-or-create) under the caller's org if it does not exist. Omitted
             or blank means the org-wide brain (``space_id=None``).
@@ -193,6 +242,11 @@ async def _perform_write(
         org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
     except HTTPException as exc:
         return {"stored": False, "error": "unauthorized", "detail": str(exc.detail)}
+
+    # Authorship, not visibility: an explicit write is shared either way, and
+    # this records who taught the team it. ``None`` is legal and simply means
+    # the row has no author.
+    user_id = resolve_request_user_id(request)
 
     session_id = brain_session_id(request, org_id, agent_id)
 
@@ -242,6 +296,14 @@ async def _perform_write(
             else None
         )
 
+        effective_scope = _explicit_write_scope(
+            db,
+            requested_scope=scope,
+            org_id=org_id,
+            user_id=user_id,
+            project_id=header_project_id,
+        )
+
         result = await brain.write_scoped_memory(
             db,
             org_id=org_id,
@@ -252,7 +314,8 @@ async def _perform_write(
             space_id=space_id,
             project_id=header_project_id,
             metadata=metadata,
-            scope=scope,
+            scope=effective_scope,
+            user_id=user_id,
         )
         # Only meter an actual insert: a deduplicated write stores no new row, so
         # it must not consume the org's monthly memory allowance.
@@ -1153,6 +1216,11 @@ def _serialize_record(
         "content": record.content,
         "scope": record.scope,
         "confidence": record.confidence,
+        # EXTRACTED (stated or done) vs INFERRED (an LLM deduced it) vs
+        # AMBIGUOUS. Returned so a caller can WEIGH a memory rather than
+        # treating a model's deduction as something the user said. Distinct
+        # from ``confidence`` above, which is a float and always has been.
+        "provenance": record.provenance,
         "relevance": record.relevance,
         # space_id/project_id are ``sa.UUID()`` columns, so a raw ``text()``
         # SELECT yields ``uuid.UUID`` objects (not strings). Stringify them —
@@ -1338,9 +1406,12 @@ async def _perform_recall(
         ctx: FastMCP-injected context; ``ctx.request_context.request`` is the
             Starlette request for the Streamable-HTTP transport.
         query: Natural-language search query.
-        scope: ``"org"`` (default) or ``"agent"`` (the schema restricts it to
-            these two, so :func:`retrieve_memories_scoped` never raises
-            ``ValueError`` for a valid call).
+        scope: ``"org"`` (default — the visibility ladder: the team brain plus
+            the caller's own private and project memories), ``"private"``
+            (theirs alone), or the deprecated ``"agent"``. The schema restricts
+            it to these three, so :func:`retrieve_memories_scoped` never raises
+            ``ValueError`` for a valid call — except for ``private`` without a
+            resolvable user, which is caught before the call.
         space: Optional space slug; resolved to a ``space_id`` filter.
         project: Optional project identifier; resolved to a ``project_id``
             filter. The sentinel ``"any"`` (case-insensitive) means
@@ -1376,6 +1447,23 @@ async def _perform_recall(
         return {
             "error": "unauthorized",
             "detail": str(exc.detail),
+            "guidance": RECALL_WRITE_NUDGE,
+        }
+
+    # The read half of the visibility ladder. Forwarded on every scope, not
+    # just 'private': at the default scope it is what unions in the caller's
+    # own private captures and their project memberships.
+    user_id = resolve_request_user_id(request)
+    if scope == "private" and not user_id:
+        return {
+            "memories": [],
+            "count": 0,
+            "error": "unattributed_caller",
+            "detail": (
+                "scope='private' needs a caller we can attribute to a person. "
+                "This request resolved to no user, so there are no memories "
+                "that could be yours."
+            ),
             "guidance": RECALL_WRITE_NUDGE,
         }
 
@@ -1451,6 +1539,7 @@ async def _perform_recall(
             query,
             scope=scope,
             agent_id=agent_id,
+            user_id=user_id,
             space_id=space_id,
             project_id=project_id,
             limit=min(max(limit, 1), 50),
@@ -1551,12 +1640,458 @@ async def _perform_forget(ctx: Context, *, memory_id: str) -> dict[str, Any]:
             db.rollback()
             logger.debug("forget: %s is not an artifact id, trying memory", memory_id)
 
+        # user_id gates private rows: without it every private row in the org
+        # looks unowned and a teammate could retract memories they cannot read.
         return retract_memory(
-            db, org_id=org_id, agent_id=agent_id, memory_id=memory_id, via="mcp"
+            db,
+            org_id=org_id,
+            agent_id=agent_id,
+            memory_id=memory_id,
+            via="mcp",
+            user_id=resolve_request_user_id(request),
         )
     except Exception:
         logger.exception("brain forget failed")
         return {"forgotten": False, "error": "forget_failed"}
+    finally:
+        db.close()
+
+
+async def _perform_share(ctx: Context, *, memory_id: str, to: str) -> dict[str, Any]:
+    """Shared body for the ``share`` tool: promote one of MY private memories.
+
+    Authorization lives entirely in :func:`shared.promotion.promote_memory`,
+    whose SELECT carries ``user_id = :user_id`` so a row belonging to someone
+    else is never fetched, let alone modified. This layer's job is to resolve
+    the caller and to refuse cleanly when it cannot.
+
+    Sharing to ``'project'`` additionally requires membership of the project
+    the memory is filed under. Without that check a user could push a private
+    memory into a project boundary they have no standing in — writing across a
+    line they cannot read across.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        logger.error("brain share got no transport request; cannot authenticate")
+        return {
+            "shared": False,
+            "error": "unauthorized",
+            "detail": "no request context",
+        }
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, _agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"shared": False, "error": "unauthorized", "detail": str(exc.detail)}
+
+    user_id = resolve_request_user_id(request)
+    if not user_id:
+        return {
+            "shared": False,
+            "error": "unattributed_caller",
+            "detail": (
+                "Sharing requires a caller we can attribute to a person. This "
+                "request resolved to no user, so it owns no private memories."
+            ),
+        }
+
+    db = SessionLocal()
+    try:
+        if to == "project":
+            row = db.execute(
+                text(
+                    """
+                    SELECT project_id FROM session_memories
+                    WHERE id = :id AND org_id = :org_id AND user_id = :user_id
+                      AND status = 'active'
+                    LIMIT 1
+                    """
+                ),
+                {"id": memory_id, "org_id": org_id, "user_id": user_id},
+            ).fetchone()
+            if row is None or row.project_id is None:
+                # Same answer for "not yours", "does not exist" and "not filed
+                # under a project" — see promote_memory on why not_found.
+                return {"shared": False, "error": "not_found"}
+            if not projects.is_member(
+                db, org_id=org_id, project_id=str(row.project_id), user_id=user_id
+            ):
+                return {
+                    "shared": False,
+                    "error": "not_a_member",
+                    "detail": (
+                        "You are not a member of the project this memory is "
+                        "filed under, so you cannot share it there."
+                    ),
+                }
+
+        return promote_memory(
+            db, org_id=org_id, memory_id=memory_id, user_id=user_id, to=to, via="mcp"
+        )
+    except Exception:
+        logger.exception("brain share failed (to=%s)", to)
+        return {"shared": False, "error": "share_failed"}
+    finally:
+        db.close()
+
+
+def _serialize_project(p: dict[str, Any]) -> dict[str, Any]:
+    """JSON-safe projection of a :func:`shared.projects.list_projects` row."""
+    return {
+        "id": p["id"],
+        "name": p["display_name"],
+        "git_remote": p["git_remote"],
+        "repo_root_path": p["repo_root_path"],
+        "member_count": p["member_count"],
+        "last_seen_at": (
+            p["last_seen_at"].isoformat() if p.get("last_seen_at") else None
+        ),
+        "created_at": p["created_at"].isoformat() if p.get("created_at") else None,
+    }
+
+
+async def _perform_project_create(
+    ctx: Context,
+    *,
+    name: str,
+    git_remote: Optional[str],
+    repo_root_path: Optional[str],
+) -> dict[str, Any]:
+    """Create (or adopt) a project and make the caller its administrator.
+
+    ``ensure_project`` already auto-creates a project on any write that carries
+    a git remote or repo root — that is how 106 of them exist. So this tool is
+    for NAMING and ORGANISING ahead of use, and for one thing auto-creation
+    cannot do: establishing who administers it.
+
+    Adoption rule for a project that already exists:
+
+    * the caller is already a member → their role is raised to ``admin``;
+    * the project has NO members at all → the caller becomes its first admin.
+      Auto-created projects are all in this state, and claiming one grants
+      nothing retroactively: a project with no members has no readable
+      ``scope='project'`` rows, because nothing could have been written into a
+      boundary nobody was inside;
+    * someone else already administers it → ``forbidden``. This is the case
+      that must not fall through to a silent claim.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        return {
+            "created": False,
+            "error": "unauthorized",
+            "detail": "no request context",
+        }
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, _agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"created": False, "error": "unauthorized", "detail": str(exc.detail)}
+
+    user_id = resolve_request_user_id(request)
+    if not user_id:
+        return {
+            "created": False,
+            "error": "unattributed_caller",
+            "detail": (
+                "Creating a project makes you its administrator, which needs a "
+                "caller we can attribute to a person."
+            ),
+        }
+
+    stripped = (name or "").strip()
+    if not stripped:
+        return {"created": False, "error": "name is required"}
+    if not git_remote and not repo_root_path:
+        # Mirrors ck_projects_has_identity: a project with neither is
+        # unrepresentable and, worse, unresolvable by every later lookup.
+        return {
+            "created": False,
+            "error": "identity_required",
+            "detail": (
+                "Provide git_remote or repo_root_path. A project is keyed by "
+                "one of them, and without either nothing can resolve it later."
+            ),
+        }
+
+    db = SessionLocal()
+    try:
+        project_id = brain.ensure_project(
+            db,
+            org_id=org_id,
+            display_name=stripped,
+            git_remote=git_remote,
+            repo_root_path=repo_root_path,
+        )
+        existing = projects.member_count(db, org_id=org_id, project_id=project_id)
+        already_member = projects.is_member(
+            db, org_id=org_id, project_id=project_id, user_id=user_id
+        )
+        if existing and not already_member:
+            return {
+                "created": False,
+                "id": project_id,
+                "error": "forbidden",
+                "detail": (
+                    "This project already exists and is administered by someone "
+                    "else. Ask one of its admins for access."
+                ),
+            }
+
+        projects.add_member(
+            db,
+            org_id=org_id,
+            project_id=project_id,
+            user_id=user_id,
+            role=projects.ROLE_ADMIN,
+            granted_by=user_id,
+        )
+        projects.record_grant_audit(
+            db,
+            org_id=org_id,
+            project_id=project_id,
+            granted_to=user_id,
+            granted_to_email=None,
+            granted_by=user_id,
+            role=projects.ROLE_ADMIN,
+            surface=projects.SURFACE_MCP,
+        )
+        return {
+            "created": True,
+            "id": project_id,
+            "name": stripped,
+            "role": projects.ROLE_ADMIN,
+            # 0 means this call established the project's first administrator —
+            # either a brand-new project or an adopted auto-created one.
+            "members_before": existing,
+        }
+    except ValueError as exc:
+        return {"created": False, "error": "invalid_project", "detail": str(exc)}
+    except Exception:
+        logger.exception("project_create failed")
+        return {"created": False, "error": "project_create_failed"}
+    finally:
+        db.close()
+
+
+async def _perform_project_list(ctx: Context) -> dict[str, Any]:
+    """List the org's projects. Names and member COUNTS only — never contents."""
+    request = ctx.request_context.request
+    if request is None:
+        return {"error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, _agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"error": "unauthorized", "detail": str(exc.detail)}
+
+    db = SessionLocal()
+    try:
+        rows = projects.list_projects(db, org_id=org_id)
+        return {
+            "projects": [_serialize_project(p) for p in rows],
+            "count": len(rows),
+        }
+    except Exception:
+        logger.exception("project_list failed")
+        return {"error": "project_list_failed"}
+    finally:
+        db.close()
+
+
+async def _perform_project_members(ctx: Context, *, project: str) -> dict[str, Any]:
+    """List a project's members.
+
+    Readable by any member of the project. A non-member gets ``not_found``
+    rather than a member list: who has access to a project is itself part of
+    what the boundary protects, and confirming a project exists to someone
+    outside it is a needless disclosure.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        return {"error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, _agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"error": "unauthorized", "detail": str(exc.detail)}
+
+    user_id = resolve_request_user_id(request)
+
+    db = SessionLocal()
+    try:
+        project_id = brain.find_project_id(db, org_id=org_id, identifier=project)
+        if project_id is None:
+            return {"error": "not_found", "detail": f"unknown project: {project}"}
+        if not projects.is_member(
+            db, org_id=org_id, project_id=project_id, user_id=user_id
+        ):
+            return {"error": "not_found", "detail": f"unknown project: {project}"}
+        members = projects.list_members(db, org_id=org_id, project_id=project_id) or []
+        return {
+            "project": {"id": project_id},
+            "members": [
+                {
+                    "user_id": m["user_id"],
+                    "role": m["role"],
+                    "granted_by": m["granted_by"],
+                    "granted_at": (
+                        m["granted_at"].isoformat() if m.get("granted_at") else None
+                    ),
+                }
+                for m in members
+            ],
+            "count": len(members),
+        }
+    except Exception:
+        logger.exception("project_members failed")
+        return {"error": "project_members_failed"}
+    finally:
+        db.close()
+
+
+async def _perform_project_grant(
+    ctx: Context, *, project: str, user: str, role: str
+) -> dict[str, Any]:
+    """Grant a teammate access to a project they are not yet in.
+
+    This is the tool that converts a prompt injection into real data access, so
+    it is the most constrained one in the file. Four gates, in order, each of
+    which fails closed:
+
+    1. The caller must resolve to a person. An unattributable request grants
+       nothing.
+    2. The project must resolve within the caller's own org.
+    3. The caller must ADMINISTER that project — not merely belong to it, and
+       certainly not merely belong to the org. This is what holds the blast
+       radius at "a project you already control".
+    4. The grantee is named by EMAIL and must already be a member of the
+       caller's org, resolved against the org's own membership records
+       (:mod:`app.directory`). A raw user id is refused outright: accepting one
+       would let injected text name a principal directly, and an agent has no
+       legitimate way to know a UUID anyway.
+
+    Then, and only then, the grant is written and audited.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        return {
+            "granted": False,
+            "error": "unauthorized",
+            "detail": "no request context",
+        }
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, _agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"granted": False, "error": "unauthorized", "detail": str(exc.detail)}
+
+    caller = resolve_request_user_id(request)
+    if not caller:
+        return {
+            "granted": False,
+            "error": "unattributed_caller",
+            "detail": (
+                "Granting project access requires a caller we can attribute to "
+                "a person."
+            ),
+        }
+
+    email = (user or "").strip()
+    if "@" not in email:
+        return {
+            "granted": False,
+            "error": "email_required",
+            "detail": (
+                "`user` must be a teammate's email address. User ids are not "
+                "accepted here."
+            ),
+        }
+    if role not in (projects.ROLE_MEMBER, projects.ROLE_ADMIN):
+        return {"granted": False, "error": "invalid_role"}
+
+    db = SessionLocal()
+    try:
+        project_id = brain.find_project_id(db, org_id=org_id, identifier=project)
+        if project_id is None:
+            return {
+                "granted": False,
+                "error": "not_found",
+                "detail": f"unknown project: {project}",
+            }
+
+        if not projects.is_admin(
+            db, org_id=org_id, project_id=project_id, user_id=caller
+        ):
+            return {
+                "granted": False,
+                "error": "forbidden",
+                "detail": (
+                    "You may only grant access to projects you administer. "
+                    "Create the project, or ask one of its admins."
+                ),
+            }
+
+        grantee = resolve_org_member_by_email(org_id, email)
+        if not grantee:
+            return {
+                "granted": False,
+                "error": "not_in_org",
+                "detail": (
+                    f"{email} is not a member of this organisation, so they "
+                    "cannot be granted access to its projects."
+                ),
+            }
+
+        ok = projects.add_member(
+            db,
+            org_id=org_id,
+            project_id=project_id,
+            user_id=grantee,
+            role=role,
+            granted_by=caller,
+        )
+        if not ok:
+            return {"granted": False, "error": "not_found"}
+
+        projects.record_grant_audit(
+            db,
+            org_id=org_id,
+            project_id=project_id,
+            granted_to=grantee,
+            granted_to_email=email,
+            granted_by=caller,
+            role=role,
+            surface=projects.SURFACE_MCP,
+        )
+        logger.info(
+            "project_grant: %s granted %s (%s) role=%s on project %s via mcp",
+            caller,
+            grantee,
+            email,
+            role,
+            project_id,
+        )
+        return {
+            "granted": True,
+            "project_id": project_id,
+            "user_id": grantee,
+            "email": email,
+            "role": role,
+        }
+    except Exception:
+        logger.exception("project_grant failed")
+        return {"granted": False, "error": "project_grant_failed"}
     finally:
         db.close()
 
@@ -1628,8 +2163,15 @@ def _register_tools(mcp: FastMCP) -> None:
             str, Field(description="What to search the team's memory for.")
         ],
         scope: Annotated[
-            Literal["org", "agent"],
-            Field(description="Memory scope: 'org' (default) or 'agent'."),
+            Literal["org", "agent", "private"],
+            Field(
+                description=(
+                    "'org' (default) returns the team's shared brain PLUS your "
+                    "own private memories and any project you belong to. "
+                    "'private' narrows to your own memories alone. 'agent' is "
+                    "deprecated."
+                )
+            ),
         ] = "org",
         space: Annotated[
             Optional[str],
@@ -1938,3 +2480,115 @@ def _register_tools(mcp: FastMCP) -> None:
         ],
     ) -> dict[str, Any]:
         return await _perform_forget(ctx, memory_id=memory_id)
+
+    @mcp.tool(
+        name="share",
+        description=(
+            "Promote one of YOUR OWN private memories to the team, or to the "
+            "project it is filed under. Passive session capture is private by "
+            "default; this is how something becomes shared. You can only share "
+            "memories you wrote. Args: memory_id, to ('org' default | "
+            "'project')."
+        ),
+    )
+    async def share(
+        ctx: Context,
+        memory_id: Annotated[
+            str, Field(description="Id of your private memory, from a recall result.")
+        ],
+        to: Annotated[
+            Literal["org", "project"],
+            Field(
+                description=(
+                    "'org' (default) shares with everyone in the org; "
+                    "'project' shares with members of the project this memory "
+                    "is filed under."
+                )
+            ),
+        ] = "org",
+    ) -> dict[str, Any]:
+        return await _perform_share(ctx, memory_id=memory_id, to=to)
+
+    @mcp.tool(
+        name="project_create",
+        description=(
+            "Name a project and become its administrator. NOTE: projects are "
+            "already created automatically the first time a memory is written "
+            "from a repo, so you do NOT need to call this before writing — use "
+            "it to give a project a proper name ahead of time, and to become "
+            "the admin who can grant teammates access to it. Args: name, "
+            "optional git_remote, optional repo_root_path (one of the two is "
+            "required)."
+        ),
+    )
+    async def project_create(
+        ctx: Context,
+        name: Annotated[str, Field(description="Human-readable project name.")],
+        git_remote: Annotated[
+            Optional[str],
+            Field(description="Canonical git remote URL; the preferred identity."),
+        ] = None,
+        repo_root_path: Annotated[
+            Optional[str],
+            Field(description="Repository root path, for projects with no remote."),
+        ] = None,
+    ) -> dict[str, Any]:
+        return await _perform_project_create(
+            ctx, name=name, git_remote=git_remote, repo_root_path=repo_root_path
+        )
+
+    @mcp.tool(
+        name="project_list",
+        description=(
+            "List the projects in this org, with how many members each has. "
+            "No arguments."
+        ),
+    )
+    async def project_list(ctx: Context) -> dict[str, Any]:
+        return await _perform_project_list(ctx)
+
+    @mcp.tool(
+        name="project_members",
+        description=(
+            "List who has access to a project. You must be a member of it. "
+            "Arg: project (name, git remote, path, or id)."
+        ),
+    )
+    async def project_members(
+        ctx: Context,
+        project: Annotated[
+            str, Field(description="Project name, git remote, repo path, or id.")
+        ],
+    ) -> dict[str, Any]:
+        return await _perform_project_members(ctx, project=project)
+
+    @mcp.tool(
+        name="project_grant",
+        description=(
+            "Give a teammate access to a project you administer. `user` is "
+            "their EMAIL ADDRESS — they must already be in this org. You can "
+            "only grant on projects you administer, and every grant is "
+            "audit-logged. Args: project, user (email), optional role "
+            "('member' default | 'admin')."
+        ),
+    )
+    async def project_grant(
+        ctx: Context,
+        project: Annotated[
+            str, Field(description="Project name, git remote, repo path, or id.")
+        ],
+        user: Annotated[
+            str,
+            Field(
+                description=(
+                    "The teammate's EMAIL address, e.g. 'priya@oppla.ai'. Not "
+                    "a user id."
+                )
+            ),
+        ],
+        role: Annotated[
+            Literal["member", "admin"],
+            Field(description="'member' (default) can read; 'admin' can also grant."),
+        ] = "member",
+    ) -> dict[str, Any]:
+        return await _perform_project_grant(ctx, project=project, user=user, role=role)

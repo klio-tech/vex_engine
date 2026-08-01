@@ -123,6 +123,9 @@ async def test_recall_happy_path_serializes_without_embedding():
             "content",
             "scope",
             "confidence",
+            # Added in phase 2: EXTRACTED / INFERRED / AMBIGUOUS, so a caller
+            # can tell what the user said from what a model deduced.
+            "provenance",
             "relevance",
             "space_id",
             "project_id",

@@ -89,34 +89,48 @@ def test_a_non_principal_object_on_state_is_ignored():
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 is a no-op at the boundary.
+# Phase 2 turns the routing on.
 #
-# The spec's promise is: "Phase 1 leaves the product behaving exactly as it
-# does now, so it is a safe place to stop if phase 2 needs rethinking." These
-# assert that promise mechanically so a later edit cannot quietly break it.
+# The two tests below replace phase 1's no-op guards, which asserted the exact
+# opposite: that NOTHING called resolve_user_id and that capture.py contained
+# no private scope. Those guards existed to prove phase 1 was schema-only and
+# therefore a safe place to stop. Phase 2 is the phase they were waiting for,
+# so they are inverted rather than deleted — the file still mechanically
+# asserts where identity is and is not wired, it now asserts the other state.
 # ---------------------------------------------------------------------------
 
 
-def test_no_write_path_calls_resolve_user_id_yet():
-    """Phase 2 wires identity into writes. If this fails, a routing change
-    landed in a phase that is supposed to be schema-only."""
+def test_identity_is_wired_into_the_write_and_read_paths():
+    """The inverse of phase 1's guard: routing now depends on identity.
+
+    Named explicitly rather than asserted as "non-empty" so that a module
+    silently LOSING its identity call is a failure. capture.py routing to
+    private without consulting resolve_user_id would be an owner-less private
+    row; curator.py without it would read across users.
+    """
     import pathlib
 
     app_dir = pathlib.Path(__file__).resolve().parents[1] / "app"
-    callers = [
+    callers = {
         p.name
         for p in app_dir.glob("*.py")
-        if p.name not in {"identity.py"} and "resolve_user_id" in p.read_text()
-    ]
-    assert callers == [], f"Phase 1 must not wire identity into: {callers}"
+        if p.name != "identity.py"
+        and (
+            "resolve_user_id" in p.read_text()
+            or "resolve_request_user_id" in p.read_text()
+        )
+    }
+    assert {"capture.py", "mcp_app.py"} <= callers, (
+        f"identity must be wired into capture and the MCP tools; found: {callers}"
+    )
 
 
-def test_capture_still_writes_org_scope():
-    """The 33,037 hook rows a month keep landing at org until Phase 2."""
+def test_capture_routes_hook_writes_to_private():
+    """The 33,037 hook rows a month now land in their author's private scope."""
     import pathlib
 
     capture = (
         pathlib.Path(__file__).resolve().parents[1] / "app" / "capture.py"
     ).read_text()
-    assert "scope='private'" not in capture
-    assert 'scope="private"' not in capture
+    assert '"private", user_id' in capture
+    assert "resolve_user_id" in capture
