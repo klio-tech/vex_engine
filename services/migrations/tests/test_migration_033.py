@@ -63,9 +63,7 @@ def _insert(conn, **overrides):
 @pytest.fixture(autouse=True)
 def cleanup(conn):
     yield
-    conn.execute(
-        text("DELETE FROM project_grant_audit WHERE org_id = :o"), {"o": ORG}
-    )
+    conn.execute(text("DELETE FROM project_grant_audit WHERE org_id = :o"), {"o": ORG})
     conn.commit()
 
 
