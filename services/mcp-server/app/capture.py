@@ -53,7 +53,7 @@ import logging
 from typing import Any, Literal, Optional
 
 import anyio
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from shared import brain
 from shared.auth import KeyInfo
@@ -70,6 +70,7 @@ from sqlalchemy import text
 
 from app.auth import resolve_principal_dep, verify_api_key
 from app.db import SessionLocal
+from app.identity import resolve_user_id
 from app.recall_log import log_recall_event
 
 logger = logging.getLogger("agentguard.mcp.capture")
@@ -197,7 +198,14 @@ class RecallRequest(BaseModel):
         description="Search text; empty falls back to most-recent memories.",
     )
     limit: int = Field(default=12, ge=1, description="Max memories to return.")
-    scope: Literal["org", "agent"] = Field(default="org")
+    scope: Literal["org", "agent", "private"] = Field(
+        default="org",
+        description=(
+            "'org' (default) returns the visibility ladder — the shared brain "
+            "plus the caller's own private and project memories. 'private' "
+            "narrows to the caller's own memories alone. 'agent' is deprecated."
+        ),
+    )
     space: Optional[str] = Field(default=None, description="Optional space slug.")
     git_remote: Optional[str] = Field(default=None)
     repo_root: Optional[str] = Field(default=None)
@@ -206,6 +214,51 @@ class RecallRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _hook_write_scope(
+    request: Request,
+    key_info: Optional[KeyInfo],
+    declared_scope: str,
+) -> tuple[str, Optional[str]]:
+    """Decide the scope and owner for a passive hook capture.
+
+    This is the routing rule the user silo turns on. Hooks are not a decision —
+    nobody chose to publish when a ``Stop`` hook fired — so a capture we can
+    attribute to a person becomes theirs::
+
+        attributable   -> ('private', <user_id>)
+        unattributable -> (<declared_scope>, None)   + a warning
+
+    On the unattributable branch we do NOT write private, and we do NOT refuse.
+    Refusing would break every legacy key overnight for no gain in safety.
+    Writing private would be worse than either: migration 031's
+    ``ck_session_memories_private_has_owner`` rejects an owner-less private row
+    outright, and even without the constraint such a row is unreachable by
+    every caller INCLUDING the person who wrote it — data quietly destroyed
+    while the API reports success. So the write falls back to what the client
+    declared, which is exactly today's behaviour, and logs.
+
+    The fallback honours ``declared_scope`` rather than forcing ``'org'`` so
+    that a client already asking for the deprecated ``'agent'`` scope keeps
+    getting it. An attributable caller's declared scope is ignored on purpose:
+    ``private`` is strictly narrower than either alternative, so overriding it
+    can only ever reduce who sees the row.
+
+    Returns:
+        A ``(scope, user_id)`` pair.
+    """
+    user_id = resolve_user_id(request, key_info)
+    if user_id:
+        return "private", user_id
+    logger.warning(
+        "capture: request could not be attributed to a user; writing scope=%s "
+        "instead of private (org=%s, key=%s)",
+        declared_scope,
+        getattr(key_info, "org_id", None),
+        getattr(key_info, "key_id", None),
+    )
+    return declared_scope, None
 
 
 def _capture_session_id(org_id: str, agent_id: str, session_id: Optional[str]) -> str:
@@ -344,28 +397,66 @@ def _serialize_memory(record: Any) -> dict[str, Any]:
 
 
 def _recent_memories(
-    db: Any, *, org_id: str, project_id: Optional[str], limit: int
+    db: Any,
+    *,
+    org_id: str,
+    project_id: Optional[str],
+    limit: int,
+    user_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Return the most-recent active org memories (recency fallback).
+    """Return the most-recent active memories the caller may read.
 
-    Used when recall is called with an empty query (session start).  Tenant- and
-    brain-scoped (``org_id`` + ``scope='org'`` + ``status='active'``) so neither
-    verification's ``scope='session'`` rows nor other orgs' rows are returned.
-    Rows with ``recall_hidden = TRUE`` are excluded: these are raw passive-hook
+    Used when recall is called with an empty query (session start).  Tenant-
+    scoped (``org_id`` + ``status='active'``) so neither verification's
+    ``scope='session'`` rows nor other orgs' rows are returned.  Rows with
+    ``recall_hidden = TRUE`` are excluded: these are raw passive-hook
     observations stored as curator fuel and must not surface to agents at
     session start (mirrors the hidden-row contract of
     :func:`shared.memory.retrieve_memories_scoped`).
     When ``project_id`` is given, rows for that project OR unfiled (``NULL``)
     rows surface — the same NULL-surfacing semantics as
     :func:`shared.memory.retrieve_memories_scoped`.
+
+    The scope predicate is the SAME visibility ladder the vector path uses, and
+    it had to change in this commit or it would have become the leak: hook
+    captures now land at ``scope='private'``, so a query that still said
+    ``scope = 'org'`` would have returned nothing at session start for exactly
+    the people generating the most memories. It is written as SQL — including
+    the ``project_members`` subquery — for the same reason as the vector path:
+    a Python filter over a wider read is one bug away from returning the wider
+    read.
     """
+    scope_arms = ["scope = 'org'"]
+    params: dict[str, Any] = {
+        "org_id": org_id,
+        "project_id": project_id,
+        "limit": limit,
+    }
+    if user_id:
+        scope_arms.append("(scope = 'private' AND user_id = :user_id)")
+        # Joined through projects.org_id for the same reason as the vector
+        # path: project_members has no org_id, so a membership row in another
+        # tenant would otherwise satisfy this arm here.
+        scope_arms.append(
+            "(scope = 'project' AND project_id IN ("
+            "SELECT m.project_id FROM project_members m "
+            "JOIN projects p ON p.id = m.project_id AND p.org_id = :org_id "
+            "WHERE m.user_id = :user_id))"
+        )
+        params["user_id"] = user_id
+    # Assembled from module-local literals only — every value that came from
+    # outside this process (org_id, user_id, project_id, limit) is a bound
+    # parameter. Same construction as the WHERE-clause assembly in
+    # shared.memory.retrieve_memories_scoped.
+    scope_sql = "(" + " OR ".join(scope_arms) + ")"
+
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT id, memory_type, content, created_at
             FROM session_memories
             WHERE org_id = :org_id
-              AND scope = 'org'
+              AND {scope_sql}
               AND status = 'active'
               AND recall_hidden = FALSE
               AND (
@@ -377,7 +468,7 @@ def _recent_memories(
             LIMIT :limit
             """
         ),
-        {"org_id": org_id, "project_id": project_id, "limit": limit},
+        params,
     ).fetchall()
     return [_serialize_memory(r) for r in rows]
 
@@ -389,6 +480,7 @@ def _recent_memories(
 
 @router.post("/event")
 async def capture_event(
+    request: Request,
     req: CaptureEventRequest,
     principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
@@ -399,8 +491,13 @@ async def capture_event(
     free string for forward-compat, but only the RAW set is allowed through),
     tags ``source`` in metadata, best-effort files it under a project, and
     persists via :func:`shared.brain.write_scoped_memory` (dedup on).
+
+    Scope is decided by :func:`_hook_write_scope`, not by the caller: an
+    attributable hook capture is the author's private memory. Provenance stays
+    ``EXTRACTED`` — a hook records what was said or done; it deduces nothing.
     """
     org_id, agent_id = principal
+    scope, user_id = _hook_write_scope(request, key_info, req.scope)
     memory_type = (
         req.memory_type
         if req.memory_type in _CAPTURE_EVENT_TYPES
@@ -435,7 +532,8 @@ async def capture_event(
             session_id=_capture_session_id(org_id, agent_id, req.session_id),
             project_id=project_id,
             metadata=metadata,
-            scope=req.scope,
+            scope=scope,
+            user_id=user_id,
             recall_hidden=(memory_type == "observation"),
         )
         if result.get("stored"):
@@ -454,6 +552,7 @@ async def capture_event(
 
 @router.post("/transcript")
 async def capture_transcript(
+    request: Request,
     req: CaptureTranscriptRequest,
     principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
@@ -465,8 +564,13 @@ async def capture_transcript(
     via :func:`shared.brain.write_scoped_memory` (dedup on), so re-sending the
     same transcript is idempotent.  The curator never reprocesses these (it reads
     only RAW types, not ``fact`` / ``summary``).
+
+    Scope follows :func:`_hook_write_scope`, same as ``/capture/event``: a
+    transcript is the richest passive capture there is, and publishing one to
+    the team on a ``Stop`` hook is the exact thing decision 3 forbids.
     """
     org_id, agent_id = principal
+    scope, user_id = _hook_write_scope(request, key_info, "org")
     combined = _combine_messages(req.messages)
     if not combined:
         return {"stored": 0, "facts": 0, "summary": False, "reason": "empty_transcript"}
@@ -502,6 +606,8 @@ async def capture_transcript(
                 session_id=session_id,
                 project_id=project_id,
                 metadata=base_meta,
+                scope=scope,
+                user_id=user_id,
             )
             if result.get("stored"):
                 stored += 1
@@ -526,6 +632,8 @@ async def capture_transcript(
                 session_id=session_id,
                 project_id=project_id,
                 metadata=base_meta,
+                scope=scope,
+                user_id=user_id,
             )
             if result.get("stored"):
                 stored += 1
@@ -545,6 +653,7 @@ async def capture_transcript(
 
 @router.post("/recall")
 async def capture_recall(
+    request: Request,
     req: RecallRequest,
     principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
@@ -558,8 +667,27 @@ async def capture_recall(
     BEST-EFFORT: an unresolved filter widens to org-wide rather than returning
     empty — appropriate for passive injection (unlike the strict MCP ``recall``
     tool, which warns + empties on an unknown explicit filter).
+
+    The caller's ``user_id`` is forwarded on BOTH branches. Without it a
+    session-start injection would return the org brain and none of the caller's
+    own private captures — which, post-routing, is most of what they wrote.
+    ``scope='private'`` from an unattributable caller is refused rather than
+    quietly widened to the org: see the guard below.
     """
     org_id, agent_id = principal
+    user_id = resolve_user_id(request, key_info)
+    if req.scope == "private" and not user_id:
+        # retrieve_memories_scoped would raise; answer honestly instead of
+        # letting a 500 look like "you have no private memories".
+        return {
+            "memories": [],
+            "count": 0,
+            "error": "unattributed_caller",
+            "detail": (
+                "scope='private' needs a caller we can attribute to a person. "
+                "This request resolved to no user."
+            ),
+        }
     limit = min(req.limit, _MAX_RECALL_LIMIT)
 
     db = SessionLocal()
@@ -579,7 +707,11 @@ async def capture_recall(
         if not query:
             memories = await anyio.to_thread.run_sync(
                 lambda: _recent_memories(
-                    db, org_id=org_id, project_id=project_id, limit=limit
+                    db,
+                    org_id=org_id,
+                    project_id=project_id,
+                    limit=limit,
+                    user_id=user_id,
                 )
             )
         else:
@@ -597,6 +729,7 @@ async def capture_recall(
                 query,
                 scope=req.scope,
                 agent_id=agent_id,
+                user_id=user_id,
                 space_id=space_id,
                 project_id=project_id,
                 limit=limit,
@@ -645,17 +778,25 @@ class ForgetRequest(BaseModel):
 
 @router.post("/forget")
 async def capture_forget(
+    request: Request,
     req: ForgetRequest,
     principal: tuple[str, str] = Depends(resolve_principal_dep),
+    key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """Retract a memory. 404 unknown/cross-org, 403 cross-agent.
+    """Retract a memory. 404 unknown/cross-org/other-user-private, 403 cross-agent.
 
     Delegates to :func:`shared.memory.retract_memory` (synchronous DB I/O)
-    which enforces org_id on every query and rejects cross-agent scope='agent'
-    rows.  The route maps the storage-layer error codes to HTTP status codes:
-    ``not_found`` / ``invalid_id`` → 404, ``forbidden`` → 403.
+    which enforces org_id on every query, refuses another user's private row,
+    and rejects cross-agent scope='agent' rows.  The route maps the
+    storage-layer error codes to HTTP status codes: ``not_found`` /
+    ``invalid_id`` → 404, ``forbidden`` → 403.
+
+    ``user_id`` must be forwarded: without it every private row in the org
+    looks unowned to ``retract_memory``, and a teammate could delete memories
+    they are not permitted to even read.
     """
     org_id, agent_id = principal
+    user_id = resolve_user_id(request, key_info)
     db = SessionLocal()
     try:
         result = await anyio.to_thread.run_sync(
@@ -665,6 +806,7 @@ async def capture_forget(
                 agent_id=agent_id,
                 memory_id=req.memory_id,
                 via="hook",
+                user_id=user_id,
             )
         )
         if result.get("error") in ("not_found", "invalid_id"):

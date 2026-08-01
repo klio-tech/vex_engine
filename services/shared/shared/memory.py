@@ -132,6 +132,8 @@ class MemoryRecord:
     space_id: Optional[str] = None
     project_id: Optional[str] = None
     relevance: Optional[float] = None
+    user_id: Optional[str] = None
+    provenance: str = "EXTRACTED"
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +414,14 @@ def _row_to_record(row: tuple) -> MemoryRecord:
 
     Optional trailing columns (additive, read only if present so existing
     16-column callers are unaffected):
-        space_id (index 16), project_id (index 17)
+        space_id (index 16), project_id (index 17), user_id (index 18),
+        provenance (index 19)
+
+    ``user_id`` and ``provenance`` are read positionally like the two before
+    them, and every caller that selects them appends them in this order. A
+    caller that selects neither still gets a valid record: ``user_id`` stays
+    ``None`` (the pre-migration-031 state for 37,605 rows) and ``provenance``
+    falls back to the column's own default, ``EXTRACTED``.
     """
     return MemoryRecord(
         id=row[0],
@@ -433,6 +442,8 @@ def _row_to_record(row: tuple) -> MemoryRecord:
         updated_at=row[15],
         space_id=row[16] if len(row) > 16 else None,
         project_id=row[17] if len(row) > 17 else None,
+        user_id=row[18] if len(row) > 18 else None,
+        provenance=(row[19] if len(row) > 19 and row[19] is not None else "EXTRACTED"),
     )
 
 
@@ -448,6 +459,8 @@ async def write_memory(
     sequence_number: Optional[int] = None,
     metadata: Optional[dict] = None,
     recall_hidden: bool = False,
+    user_id: Optional[str] = None,
+    provenance: str = "EXTRACTED",
 ) -> Optional[MemoryRecord]:
     """Generate an embedding and INSERT a new row into ``session_memories``.
 
@@ -469,6 +482,16 @@ async def write_memory(
             stored recall-hidden so they act as curator fuel without polluting
             the recall surface. Deliberate writes (``note``, ``plan``,
             ``decision``, ``memory``) keep the default ``False``.
+        user_id: The human this write is attributed to, or ``None`` when the
+            request could not be attributed. On a ``private`` row this is the
+            *owner* and the only thing that makes the row readable; on a shared
+            row it is *authorship* only and grants nobody anything. The row is
+            inserted at ``scope='session'`` here regardless (see
+            :func:`shared.brain.write_scoped_memory` for the promotion), so this
+            function never creates an owner-less private row.
+        provenance: One of ``EXTRACTED`` / ``INFERRED`` / ``AMBIGUOUS``.
+            Defaults to ``EXTRACTED`` — this function records what was said or
+            done. Only the curator, which deduces, passes ``INFERRED``.
 
     Returns:
         A :class:`MemoryRecord` on success, or ``None`` if embedding
@@ -488,12 +511,14 @@ async def write_memory(
                 id, session_id, org_id, agent_id, execution_id,
                 memory_type, content, embedding, confidence,
                 sequence_number, scope, status, metadata,
-                created_at, updated_at, recall_hidden
+                created_at, updated_at, recall_hidden,
+                user_id, provenance
             ) VALUES (
                 :id, :session_id, :org_id, :agent_id, :execution_id,
                 :memory_type, :content, :embedding, :confidence,
                 :sequence_number, 'session', 'active', :metadata,
-                :created_at, :updated_at, :recall_hidden
+                :created_at, :updated_at, :recall_hidden,
+                :user_id, :provenance
             )
         """),
         {
@@ -511,6 +536,8 @@ async def write_memory(
             "created_at": now,
             "updated_at": now,
             "recall_hidden": recall_hidden,
+            "user_id": user_id,
+            "provenance": provenance,
         },
     )
     db_session.commit()
@@ -529,6 +556,8 @@ async def write_memory(
         metadata=meta,
         created_at=now,
         updated_at=now,
+        user_id=user_id,
+        provenance=provenance,
     )
 
 
@@ -635,6 +664,7 @@ async def find_similar_memory(
     *,
     scope: Optional[str] = None,
     agent_id: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> Optional[MemoryRecord]:
     """Find the closest existing memory and return it if above *threshold*.
 
@@ -652,18 +682,53 @@ async def find_similar_memory(
           the *same agent's* private rows — never against the org brain, and
           never against another agent's private rows. (Required so per-agent
           isolation holds at write time, not just recall time.)
+        * ``scope='private'`` (with ``user_id``) — user-private: rows where
+          ``scope='private' AND user_id=:user_id`` within the org, IGNORING
+          ``session_id``.
+
+          This window is a **privacy** control, not just a correctness one. A
+          dedup hit returns the matching row's id and memory_type to the
+          caller, so deduping a private write against the whole org would
+          disclose that another person already stored near-identical text, and
+          hand back their row id. The predicate is therefore the same
+          ``user_id = :user_id`` that guards recall. ``user_id`` is mandatory
+          here: without an owner there is no window that can be safely
+          searched, so the call raises rather than silently widening.
+
+    Raises:
+        ValueError: If ``scope='private'`` is requested without a ``user_id``.
 
     Returns:
         The matching :class:`MemoryRecord` if similarity >= *threshold*,
         otherwise ``None``.
     """
+    # Validate BEFORE the (expensive) embed call, and before any query could
+    # be built without the owner predicate.
+    if scope == "private" and not user_id:
+        raise ValueError("user_id is required when scope='private'")
+
     embedding = await embed_text(content)
     if embedding is None:
         return None
 
     embedding_str = str(embedding)
 
-    if scope == "agent":
+    if scope == "private":
+        # User-private dedup: compare only against this user's own private
+        # rows (org-wide, not session-scoped). See the docstring for why this
+        # predicate is a privacy control.
+        where_clause = (
+            "org_id = :org_id\n"
+            "              AND scope = 'private'\n"
+            "              AND user_id = :user_id\n"
+            "              AND status = 'active'"
+        )
+        params: dict[str, Any] = {
+            "org_id": org_id,
+            "user_id": user_id,
+            "embedding": embedding_str,
+        }
+    elif scope == "agent":
         # Agent-private dedup: compare only against this agent's own private
         # rows (org-wide, not session-scoped). agent_id must be supplied.
         where_clause = (
@@ -672,7 +737,7 @@ async def find_similar_memory(
             "              AND agent_id = :agent_id\n"
             "              AND status = 'active'"
         )
-        params: dict[str, Any] = {
+        params = {
             "org_id": org_id,
             "agent_id": agent_id,
             "embedding": embedding_str,
@@ -750,14 +815,23 @@ def retract_memory(
     agent_id: str,
     memory_id: str,
     via: str,
+    user_id: Optional[str] = None,
 ) -> dict:
     """Explicitly retract a memory (the ``forget`` tool's storage primitive).
 
     Authorization ladder (org_id always enforced):
       * unknown / cross-org id → not_found (indistinguishable by design)
+      * scope='private' row owned by another user → **not_found**
       * scope='agent' row owned by another agent → forbidden
       * otherwise → status='retracted' + audit metadata; recall never
         returns non-'active' rows, so the memory disappears immediately.
+
+    Why a private row answers ``not_found`` and not ``forbidden``: ``forbidden``
+    confirms the row exists. Someone who guessed or was shown a memory id would
+    learn that this org holds a private memory under it, which is a disclosure
+    about a scope whose whole promise is opacity from the outside. A
+    non-owner's view of another person's private memory is identical to the
+    view of an id that was never issued.
 
     Synchronous (inline psycopg2 I/O), matching the house pattern.
     """
@@ -769,7 +843,7 @@ def retract_memory(
     row = db_session.execute(
         text(
             """
-            SELECT scope, agent_id FROM session_memories
+            SELECT scope, agent_id, user_id FROM session_memories
             WHERE id = :id AND org_id = :org_id AND status = 'active'
             LIMIT 1
             """
@@ -777,6 +851,8 @@ def retract_memory(
         {"id": str(parsed), "org_id": org_id},
     ).fetchone()
     if row is None:
+        return {"forgotten": False, "error": "not_found"}
+    if row.scope == "private" and (not user_id or row.user_id != user_id):
         return {"forgotten": False, "error": "not_found"}
     if row.scope == "agent" and row.agent_id != agent_id:
         return {"forgotten": False, "error": "forbidden"}
@@ -809,6 +885,7 @@ async def retrieve_memories_scoped(
     *,
     scope: str = "org",
     agent_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     space_id: Optional[str] = None,
     project_id: Optional[str] = None,
     limit: int = 10,
@@ -825,17 +902,47 @@ async def retrieve_memories_scoped(
     Python switch — this is what keeps verification's ``scope='session'`` rows
     out of brain recall, since those rows live in the same table):
 
-        * ``"org"`` (default) → ``scope = 'org'``. The shared team brain only.
-          EXCLUDES verification's ``scope='session'`` rows AND agent-private
-          ``scope='agent'`` rows.
+        * ``"org"`` (default) → the **visibility ladder**. Without a
+          ``user_id`` this is exactly ``scope = 'org'``, byte-for-byte the
+          historical behaviour. With a ``user_id`` it is the union of the
+          three tiers the user is entitled to::
+
+              scope = 'org'
+              OR (scope = 'private' AND user_id = :user_id)
+              OR (scope = 'project' AND project_id IN (
+                    SELECT m.project_id FROM project_members m
+                    JOIN projects p ON p.id = m.project_id
+                     AND p.org_id = :org_id
+                    WHERE m.user_id = :user_id))
+
+          Note what is NOT in that predicate: the presence of ``project_id``.
+          ``project_id`` is set on 32,568 pre-existing ``scope='org'`` rows
+          where it is a *relevance* filter and explicitly not a boundary, and
+          it is set on the new ``scope='project'`` rows where the boundary is
+          the ``scope`` value. Keying access off ``project_id IS NOT NULL``
+          would hide the former from the org; keying it off ``project_id IS
+          NULL`` would leak the latter. The predicate is always ``scope``.
+        * ``"private"`` (requires ``user_id``) →
+          ``scope = 'private' AND user_id = :user_id``. Narrows to the
+          caller's own memories alone: no org rows, no project rows, and —
+          permanently, with no admin override — nobody else's private rows.
         * ``"agent"`` (requires ``agent_id``) →
           ``(scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id))``.
-          An agent sees the team's org memories PLUS its own agent-private
-          memories — never another agent's private rows.
+          Deprecated in favour of ``private`` (``agent_id`` is client-declared
+          via ``X-Vex-Agent`` and is therefore not an identity), but still
+          READ so existing rows do not vanish. When a ``user_id`` is supplied
+          the caller's own private and project tiers are unioned in as well,
+          so an agent-scoped read is never *narrower* than the default one.
         * ``"session"`` → not supported here; raises ``ValueError``. Use
           :func:`retrieve_memories` for session-scoped reads instead of
           silently reading org-wide.
         * any other value → raises ``ValueError``.
+
+    ``user_id`` is a SQL predicate on every arm that mentions it, exactly like
+    ``org_id``. It is never a Python filter over a wider result set: a
+    post-fetch filter means the wider rows were read, ranked, and one bug away
+    from being returned. A caller that cannot resolve a user passes ``None``
+    and sees the org tier only.
 
     NOTE: HNSW candidate-pool trade-off — the inner query fetches
     ``candidate_pool = limit * 4`` approximate nearest neighbours, then the
@@ -866,9 +973,14 @@ async def retrieve_memories_scoped(
             distance``).  The inner query is HNSW-accelerated
             (``ORDER BY embedding <=> :embedding LIMIT :candidate_pool``);
             the outer re-ranks the bounded candidate pool by blended score.
-        scope: One of ``"org"`` or ``"agent"`` (see the visibility ladder
-            above). ``"session"`` and any unknown value raise ``ValueError``.
+        scope: One of ``"org"``, ``"private"`` or ``"agent"`` (see the
+            visibility ladder above). ``"session"`` and any unknown value raise
+            ``ValueError``.
         agent_id: Required when ``scope == "agent"``; ignored otherwise.
+        user_id: The resolved caller. Required when ``scope == "private"``.
+            Optional otherwise, where supplying it widens the read to include
+            the caller's own private and project tiers and omitting it keeps
+            the org tier alone.
         space_id: When given, match rows whose ``space_id`` equals it OR is
             ``NULL`` (unfiled memories surface in every space filter — the safe
             default so nothing is hidden by an over-narrow filter).
@@ -888,12 +1000,19 @@ async def retrieve_memories_scoped(
 
     Raises:
         ValueError: If ``scope == "agent"`` but ``agent_id`` is ``None``; if
+            ``scope == "private"`` but ``user_id`` is ``None``; if
             ``scope == "session"`` (unsupported here); or if ``scope`` is any
             unknown value.
     """
     # Validate scope BEFORE the (expensive) embed call so bad input fails fast.
     if scope == "org":
         pass
+    elif scope == "private":
+        if not user_id:
+            # Fail rather than fall back to org: a caller asking for "mine"
+            # and silently receiving the team's brain is the wrong kind of
+            # surprise, and there is no correct owner to guess.
+            raise ValueError("user_id is required when scope='private'")
     elif scope == "agent":
         if agent_id is None:
             raise ValueError("agent_id is required when scope='agent'")
@@ -927,13 +1046,38 @@ async def retrieve_memories_scoped(
         "candidate_pool": limit * 4,
     }
 
-    if scope == "org":
-        base_clauses.append("scope = 'org'")
-    else:  # scope == "agent" (validated above; agent_id is not None)
-        base_clauses.append(
-            "(scope = 'org' OR (scope = 'agent' AND agent_id = :agent_id))"
-        )
-        params["agent_id"] = agent_id
+    # ---- the visibility ladder -------------------------------------------
+    # Built as a single OR-group of scope arms. Every arm that reaches beyond
+    # 'org' carries its own owner/membership predicate in SQL; there is no
+    # arm that admits a row on the strength of project_id alone.
+    if scope == "private":
+        # Narrowed read: mine, and only mine. No org arm, no project arm.
+        base_clauses.append("scope = 'private' AND user_id = :user_id")
+        params["user_id"] = user_id
+    else:
+        arms = ["scope = 'org'"]
+        if scope == "agent":  # validated above; agent_id is not None
+            arms.append("(scope = 'agent' AND agent_id = :agent_id)")
+            params["agent_id"] = agent_id
+        if user_id:
+            arms.append("(scope = 'private' AND user_id = :user_id)")
+            # Membership is a subquery rather than a pre-fetched Python list
+            # so the entitlement is evaluated by the same statement that
+            # returns the rows — a stale or mis-passed list cannot widen it.
+            # The JOIN to projects is not decoration. project_members has no
+            # org_id of its own, so without it a membership row in ANOTHER
+            # tenant would satisfy this arm for a row in THIS one — the outer
+            # org_id filter constrains the memory, not the entitlement. An
+            # adversarial test seeds exactly that shape.
+            arms.append(
+                "(scope = 'project' AND project_id IN ("
+                "SELECT m.project_id FROM project_members m "
+                "JOIN projects p ON p.id = m.project_id "
+                "AND p.org_id = :org_id "
+                "WHERE m.user_id = :user_id))"
+            )
+            params["user_id"] = user_id
+        base_clauses.append("(" + " OR ".join(arms) + ")")
 
     if space_id is not None:
         base_clauses.append("(space_id = :space_id OR space_id IS NULL)")
@@ -945,15 +1089,19 @@ async def retrieve_memories_scoped(
     #   Outer query — re-ranks the candidates by blended score:
     #     0.85 * similarity + 0.15 * recency_norm, where recency_norm is the
     #     fraction of the 30-day window still remaining, clamped to [0, 1].
-    # The outer SELECT * preserves the 18 record columns plus relevance at
-    # index 18.  blended_score is used only in the ORDER BY and is not a
-    # selected column, so each row has exactly 19 elements (indices 0–18).
+    # The outer SELECT * preserves the record columns plus relevance as the
+    # LAST column.  blended_score is used only in the ORDER BY and is not a
+    # selected column.  Relevance is read as ``row[-1]`` and the record from
+    # ``row[:-1]`` rather than at fixed indices, so appending a column here
+    # (user_id and provenance were appended in phase 2) does not silently
+    # shift what ``relevance`` reads.
     select_sql = """
         SELECT * FROM (
             SELECT id, session_id, org_id, agent_id, execution_id,
                    memory_type, content, embedding, confidence,
                    sequence_number, scope, status, superseded_by,
                    metadata, created_at, updated_at, space_id, project_id,
+                   user_id, provenance,
                    (1 - (embedding <=> :embedding)) AS relevance
             FROM session_memories
             WHERE {where}
@@ -995,9 +1143,10 @@ async def retrieve_memories_scoped(
 
     records = []
     for row in rows:
-        # row[:18] = the 18 record columns; row[18] = relevance (cosine sim).
-        # blended_score is not selected as a column — it only drives ORDER BY.
-        record = _row_to_record(row[:18])
-        record.relevance = round(float(row[18]), 3) if row[18] is not None else None
+        # relevance is the LAST selected column; everything before it is the
+        # record. blended_score is not selected — it only drives ORDER BY.
+        relevance = row[-1]
+        record = _row_to_record(row[:-1])
+        record.relevance = round(float(relevance), 3) if relevance is not None else None
         records.append(record)
     return records

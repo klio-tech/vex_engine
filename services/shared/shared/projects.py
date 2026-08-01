@@ -1,0 +1,318 @@
+"""Project ACL primitives — the storage layer behind ``scope='project'``.
+
+``project_members`` (migration 031) is what turns a project from a *relevance
+filter* into a *boundary*. Everything in this module exists to answer exactly
+one of two questions:
+
+* **May this user read this project?** — :func:`is_member`, and the equivalent
+  ``project_id IN (SELECT ...)`` subquery inlined into
+  :func:`shared.memory.retrieve_memories_scoped`. The recall path deliberately
+  does NOT call :func:`is_member` per row: entitlement belongs in the same
+  statement that returns the rows.
+* **May this user change who reads it?** — :func:`is_admin`, the gate on
+  :func:`add_member`.
+
+Two invariants hold throughout:
+
+1. Every query is filtered by ``org_id``, via a join to ``projects``. A
+   ``project_id`` is a UUID a caller may have obtained from anywhere, so it is
+   never trusted on its own to identify a tenant's project.
+2. Nothing here fails open. An unknown project, an unknown user, or a caller
+   who is not an admin yields ``False`` / ``None`` / a refusal — never a
+   widened result.
+
+Synchronous (blocking psycopg2 I/O), matching the house pattern in
+:mod:`shared.brain`. Call from async handlers via ``anyio.to_thread.run_sync``.
+"""
+
+import logging
+import uuid
+from typing import Any, Optional
+
+from sqlalchemy import text
+
+logger = logging.getLogger("agentguard.shared.projects")
+
+ROLE_MEMBER = "member"
+ROLE_ADMIN = "admin"
+
+# The surfaces a grant can arrive from. Recorded on every audit row so
+# "which surface" in the spec's who/what/when/which-surface is answerable.
+SURFACE_MCP = "mcp"
+SURFACE_DASHBOARD = "dashboard"
+
+
+def _owned_project_id(
+    db_session: Any, *, org_id: str, project_id: str
+) -> Optional[str]:
+    """Return ``project_id`` iff it names a project owned by ``org_id``.
+
+    Every other function here routes through this. Without it a caller could
+    pass a project UUID belonging to another tenant and have the membership
+    table — which has no ``org_id`` column of its own — answer for it.
+    """
+    try:
+        parsed = uuid.UUID(str(project_id))
+    except (ValueError, AttributeError, TypeError):
+        return None
+    row = db_session.execute(
+        text(
+            """
+            SELECT id FROM projects
+            WHERE id = :project_id AND org_id = :org_id
+            LIMIT 1
+            """
+        ),
+        {"project_id": str(parsed), "org_id": org_id},
+    ).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def is_member(
+    db_session: Any, *, org_id: str, project_id: str, user_id: Optional[str]
+) -> bool:
+    """True iff ``user_id`` may read ``scope='project'`` rows of this project.
+
+    ``None`` / empty ``user_id`` is ``False``: an unattributable caller is not
+    a member of anything.
+    """
+    if not user_id:
+        return False
+    owned = _owned_project_id(db_session, org_id=org_id, project_id=project_id)
+    if owned is None:
+        return False
+    row = db_session.execute(
+        text(
+            """
+            SELECT 1 FROM project_members
+            WHERE project_id = :project_id AND user_id = :user_id
+            LIMIT 1
+            """
+        ),
+        {"project_id": owned, "user_id": user_id},
+    ).fetchone()
+    return row is not None
+
+
+def is_admin(
+    db_session: Any, *, org_id: str, project_id: str, user_id: Optional[str]
+) -> bool:
+    """True iff ``user_id`` administers this project (may change its ACL).
+
+    This is the whole authorization for ``project_grant``. It is deliberately
+    narrower than org membership: ``project_grant`` is reachable by an LLM, so
+    the blast radius of a prompt injection has to stop at "a project the caller
+    already controls".
+    """
+    if not user_id:
+        return False
+    owned = _owned_project_id(db_session, org_id=org_id, project_id=project_id)
+    if owned is None:
+        return False
+    row = db_session.execute(
+        text(
+            """
+            SELECT 1 FROM project_members
+            WHERE project_id = :project_id
+              AND user_id = :user_id
+              AND role = :role
+            LIMIT 1
+            """
+        ),
+        {"project_id": owned, "user_id": user_id, "role": ROLE_ADMIN},
+    ).fetchone()
+    return row is not None
+
+
+def member_count(db_session: Any, *, org_id: str, project_id: str) -> Optional[int]:
+    """Number of members, or ``None`` when the project is not this org's.
+
+    Used to distinguish "a project nobody administers yet" (the 106 projects
+    ``ensure_project`` auto-created before ACLs existed) from "a project
+    someone else administers". The first may be claimed; the second may not.
+    """
+    owned = _owned_project_id(db_session, org_id=org_id, project_id=project_id)
+    if owned is None:
+        return None
+    row = db_session.execute(
+        text("SELECT COUNT(*) FROM project_members WHERE project_id = :project_id"),
+        {"project_id": owned},
+    ).fetchone()
+    return int(row[0])
+
+
+def add_member(
+    db_session: Any,
+    *,
+    org_id: str,
+    project_id: str,
+    user_id: str,
+    role: str = ROLE_MEMBER,
+    granted_by: Optional[str],
+) -> bool:
+    """Idempotently grant ``user_id`` access to a project. Returns success.
+
+    **Authorization is the caller's job** — this is the storage primitive, and
+    the only checks it performs are the structural ones (the project belongs to
+    ``org_id``, the role is a legal value). :func:`is_admin` is the gate; see
+    ``app.mcp_app``'s ``project_grant`` for the composed operation, which also
+    writes the audit row.
+
+    A repeat grant upgrades the role rather than erroring, so re-granting an
+    existing member as ``admin`` works and re-granting them as ``member`` is a
+    deliberate demotion.
+    """
+    if role not in (ROLE_MEMBER, ROLE_ADMIN):
+        raise ValueError(f"unsupported role: {role!r}")
+    if not user_id:
+        raise ValueError("user_id is required")
+    owned = _owned_project_id(db_session, org_id=org_id, project_id=project_id)
+    if owned is None:
+        return False
+    db_session.execute(
+        text(
+            """
+            INSERT INTO project_members (
+                project_id, user_id, role, granted_by
+            ) VALUES (
+                :project_id, :user_id, :role, :granted_by
+            )
+            ON CONFLICT (project_id, user_id)
+              DO UPDATE SET role = EXCLUDED.role,
+                            granted_by = EXCLUDED.granted_by,
+                            granted_at = NOW()
+            """
+        ),
+        {
+            "project_id": owned,
+            "user_id": user_id,
+            "role": role,
+            "granted_by": granted_by,
+        },
+    )
+    db_session.commit()
+    return True
+
+
+def list_members(
+    db_session: Any, *, org_id: str, project_id: str
+) -> Optional[list[dict]]:
+    """Members of a project, or ``None`` when it is not this org's project."""
+    owned = _owned_project_id(db_session, org_id=org_id, project_id=project_id)
+    if owned is None:
+        return None
+    rows = db_session.execute(
+        text(
+            """
+            SELECT user_id, role, granted_by, granted_at
+            FROM project_members
+            WHERE project_id = :project_id
+            ORDER BY granted_at ASC, user_id ASC
+            """
+        ),
+        {"project_id": owned},
+    ).fetchall()
+    return [
+        {
+            "user_id": row.user_id,
+            "role": row.role,
+            "granted_by": row.granted_by,
+            "granted_at": row.granted_at,
+        }
+        for row in rows
+    ]
+
+
+def list_projects(db_session: Any, *, org_id: str) -> list[dict]:
+    """Every project in the org, newest-seen first, with each one's role for
+    nobody in particular.
+
+    Listing projects is not a disclosure of their CONTENTS: an org member can
+    already see project names through recall's project labels and through
+    ``ensure_project``'s auto-creation. Membership, which IS the boundary, is
+    reported per project by :func:`list_members`.
+    """
+    rows = db_session.execute(
+        text(
+            """
+            SELECT p.id, p.display_name, p.git_remote, p.repo_root_path,
+                   p.last_seen_at, p.created_at,
+                   (SELECT COUNT(*) FROM project_members m
+                     WHERE m.project_id = p.id) AS member_count
+            FROM projects p
+            WHERE p.org_id = :org_id
+            ORDER BY p.last_seen_at DESC NULLS LAST, p.created_at DESC, p.id ASC
+            """
+        ),
+        {"org_id": org_id},
+    ).fetchall()
+    return [
+        {
+            "id": str(row.id),
+            "display_name": row.display_name,
+            "git_remote": row.git_remote,
+            "repo_root_path": row.repo_root_path,
+            "last_seen_at": row.last_seen_at,
+            "created_at": row.created_at,
+            "member_count": int(row.member_count),
+        }
+        for row in rows
+    ]
+
+
+def record_grant_audit(
+    db_session: Any,
+    *,
+    org_id: str,
+    project_id: str,
+    granted_to: str,
+    granted_to_email: Optional[str],
+    granted_by: Optional[str],
+    role: str,
+    surface: str,
+) -> None:
+    """Append one immutable row describing an ACL change.
+
+    Best-effort by construction: the grant itself has already committed by the
+    time this runs, and losing the log must not undo an access change the
+    caller was told succeeded. A failure is logged loudly instead — with the
+    same who/what/when/surface fields — so the record survives even when the
+    table does not.
+    """
+    try:
+        db_session.execute(
+            text(
+                """
+                INSERT INTO project_grant_audit (
+                    id, org_id, project_id, granted_to, granted_to_email,
+                    granted_by, role, surface
+                ) VALUES (
+                    :id, :org_id, :project_id, :granted_to, :granted_to_email,
+                    :granted_by, :role, :surface
+                )
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "org_id": org_id,
+                "project_id": project_id,
+                "granted_to": granted_to,
+                "granted_to_email": granted_to_email,
+                "granted_by": granted_by,
+                "role": role,
+                "surface": surface,
+            },
+        )
+        db_session.commit()
+    except Exception:
+        logger.error(
+            "project grant audit write FAILED; grant stands. "
+            "org=%s project=%s granted_to=%s granted_by=%s role=%s surface=%s",
+            org_id,
+            project_id,
+            granted_to,
+            granted_by,
+            role,
+            surface,
+            exc_info=True,
+        )

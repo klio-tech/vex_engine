@@ -1,5 +1,6 @@
 """REST capture endpoints enforce memory quota → HTTP 402."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -8,6 +9,20 @@ from fastapi import HTTPException
 from shared.usage import MemoryQuotaExceeded
 
 from app import capture
+
+
+def _request():
+    """A stand-in for the Starlette request the handler now takes.
+
+    Phase 2 gave the capture handlers a ``Request`` so they can resolve the
+    caller's identity (``resolve_user_id``) and route the write to the right
+    scope. These tests are about quota, not identity, so the request only has
+    to exist and carry no OAuth principal.
+    """
+    req = MagicMock()
+    req.state = SimpleNamespace()
+    req.headers = {}
+    return req
 
 
 @pytest.mark.asyncio
@@ -28,7 +43,9 @@ async def test_capture_event_quota_exceeded_raises_402():
         patch.object(capture, "_ensure_project_id", return_value=None),
     ):
         with pytest.raises(HTTPException) as exc:
-            await capture.capture_event(req, principal=("org-1", "a1"), key_info=info)
+            await capture.capture_event(
+                _request(), req, principal=("org-1", "a1"), key_info=info
+            )
     assert exc.value.status_code == 402
     assert exc.value.detail["suggested_plan"] == "starter"
 
@@ -50,5 +67,7 @@ async def test_capture_event_records_when_stored():
         patch.object(capture, "SessionLocal", return_value=MagicMock()),
         patch.object(capture, "_ensure_project_id", return_value=None),
     ):
-        await capture.capture_event(req, principal=("org-1", "a1"), key_info=info)
+        await capture.capture_event(
+            _request(), req, principal=("org-1", "a1"), key_info=info
+        )
     rec.assert_called_once()

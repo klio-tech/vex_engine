@@ -33,6 +33,14 @@ _REQUIRED_SCHEMA_FIELD = {
     "artifact_get": "artifact_id",
     "space": "action",
     "forget": "memory_id",
+    "share": "memory_id",
+    "project_create": "name",
+    # project_list takes no arguments at all — None means "assert nothing is
+    # required" rather than dropping it from the map, so a tool that silently
+    # GAINS a mandatory argument still shows up here.
+    "project_list": None,
+    "project_members": "project",
+    "project_grant": "project",
 }
 
 
@@ -78,6 +86,11 @@ async def test_tool_has_description_and_schema():
         assert schema.get("type") == "object", f"{tool.name} schema is not object-typed"
 
         required_field = _REQUIRED_SCHEMA_FIELD[tool.name]
+        if required_field is None:
+            assert not schema.get("required"), (
+                f"{tool.name} is supposed to take no required arguments"
+            )
+            continue
         props = schema.get("properties", {})
         assert required_field in props, (
             f"{tool.name} schema missing property '{required_field}'"

@@ -69,8 +69,18 @@ def test_retract_rejects_malformed_id():
     assert result == {"forgotten": False, "error": "invalid_id"}
 
 
-def test_forget_is_registered_as_eighth_tool():
+def test_forget_is_registered():
+    """Phase 2/3 added share + the four project tools, so the count moved from
+    10 to 15. The names are asserted rather than only the count, because a
+    count alone would pass if a tool were swapped rather than added."""
     from app.mcp_app import EXPECTED_TOOL_NAMES
 
     assert "forget" in EXPECTED_TOOL_NAMES
-    assert len(EXPECTED_TOOL_NAMES) == 10
+    assert {
+        "share",
+        "project_create",
+        "project_list",
+        "project_members",
+        "project_grant",
+    } <= set(EXPECTED_TOOL_NAMES)
+    assert len(EXPECTED_TOOL_NAMES) == 15

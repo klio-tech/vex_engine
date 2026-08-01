@@ -486,8 +486,10 @@ async def write_scoped_memory(
     dedup: bool = True,
     scope: str = "org",
     recall_hidden: bool = False,
+    user_id: Optional[str] = None,
+    provenance: str = "EXTRACTED",
 ) -> dict:
-    """Write a memory into the Klio brain at org or agent scope (with dedup).
+    """Write a memory into the Klio brain at org, project, private or agent scope.
 
     This is the brain-scoped write path layered on top of :mod:`shared.memory`.
     It reuses the existing primitives verbatim — :func:`find_similar_memory`
@@ -509,12 +511,30 @@ async def write_scoped_memory(
           brain (``scope='org'``). Visible to every agent in the org on recall.
           Dedup is session-scoped (historical behavior). Backward compatible:
           callers that omit ``scope`` are unaffected.
+        * ``scope='private'`` — the row belongs to ``user_id`` and to nobody
+          else: not teammates, not admins. ``user_id`` is therefore MANDATORY
+          and a missing one raises rather than writing an owner-less private
+          row (migration 031's ``ck_session_memories_private_has_owner`` would
+          reject it anyway, but failing here says why). Dedup is user-scoped —
+          see :func:`shared.memory.find_similar_memory` for why that window is
+          a privacy control and not merely a correctness one.
+        * ``scope='project'`` — the row is readable by members of
+          ``project_id``, which is therefore also MANDATORY. Note the caller,
+          not this function, is responsible for having checked that the author
+          is entitled to write there; this layer only refuses the
+          structurally-impossible case.
         * ``scope='agent'`` — the row is promoted to ``scope='agent'`` and stays
           private to ``agent_id``. :func:`retrieve_memories_scoped` with
           ``scope='agent'`` returns it to that agent (plus org rows) but never to
           another agent. Dedup is agent-scoped (only against this agent's own
           private rows), so one agent's write never dedups against the org brain
-          or another agent's row.
+          or another agent's row. Deprecated in favour of ``private``: an
+          ``agent_id`` comes from the client-declared ``X-Vex-Agent`` header and
+          is not an identity.
+
+    ``user_id`` on a SHARED row (``org`` / ``project``) is authorship, not
+    visibility. It records who taught the team something and grants that person
+    nothing extra; only ``scope='private'`` turns it into an access predicate.
 
     Async note: this mirrors the house pattern of :func:`write_memory` /
     :func:`find_similar_memory` — an ``async def`` performing inline synchronous
@@ -543,6 +563,11 @@ async def write_scoped_memory(
             fallback). Raw ``observation`` rows written by passive hooks should
             pass ``True``; deliberate types (``note``, ``plan``, ``decision``,
             ``memory``) should keep the default ``False``.
+        user_id: The resolved human. Mandatory for ``scope='private'``,
+            recorded as authorship on shared scopes, and ``None`` when the
+            request could not be attributed to a person.
+        provenance: ``EXTRACTED`` (default — stated or done), ``INFERRED``
+            (deduced by the curator or an LLM pass), or ``AMBIGUOUS``.
 
     Returns:
         A result dict describing the outcome (``scope`` echoes the requested
@@ -569,12 +594,24 @@ async def write_scoped_memory(
         both keys are still present with their no-op values (``False`` / ``[]``).
 
     Raises:
-        ValueError: If ``scope`` is neither ``'org'`` nor ``'agent'``.
+        ValueError: If ``scope`` is not one of ``'org'`` / ``'project'`` /
+            ``'private'`` / ``'agent'``; if ``scope='private'`` without a
+            ``user_id``; if ``scope='project'`` without a ``project_id``; or if
+            ``provenance`` is not one of the three labels.
     """
-    if scope not in ("org", "agent"):
+    if scope not in ("org", "project", "private", "agent"):
         raise ValueError(
-            f"unsupported scope: {scope!r} (write_scoped_memory accepts 'org' or 'agent')"
+            f"unsupported scope: {scope!r} (write_scoped_memory accepts "
+            "'org', 'project', 'private' or 'agent')"
         )
+    if scope == "private" and not user_id:
+        # An owner-less private row is unreachable by every caller including
+        # its author — a bug by construction, not a state to handle.
+        raise ValueError("user_id is required when scope='private'")
+    if scope == "project" and not project_id:
+        raise ValueError("project_id is required when scope='project'")
+    if provenance not in ("EXTRACTED", "INFERRED", "AMBIGUOUS"):
+        raise ValueError(f"unsupported provenance: {provenance!r}")
 
     # --- redaction (fail closed) -----------------------------------------
     # Mask secrets/PII BEFORE dedup-embedding and storage so neither the
@@ -602,10 +639,13 @@ async def write_scoped_memory(
             session_id,
             org_id,
             content,
-            # Agent-private writes dedup only against the same agent's private
-            # rows; org writes keep the session-scoped dedup window.
-            scope="agent" if scope == "agent" else None,
+            # Private and agent-private writes dedup only against the SAME
+            # owner's rows; org/project writes keep the session-scoped window.
+            # A private write must never be compared against the org brain or
+            # another person's rows: the returned dedup hit carries a row id.
+            scope=scope if scope in ("agent", "private") else None,
             agent_id=agent_id if scope == "agent" else None,
+            user_id=user_id if scope == "private" else None,
         )
         if existing is not None:
             return {
@@ -630,6 +670,8 @@ async def write_scoped_memory(
         content,
         metadata=metadata,
         recall_hidden=recall_hidden,
+        user_id=user_id,
+        provenance=provenance,
     )
     if record is None:
         # write_memory returns None when embedding generation fails.
@@ -667,6 +709,8 @@ async def write_scoped_memory(
         "scope": scope,
         "space_id": space_id,
         "project_id": project_id,
+        "user_id": user_id,
+        "provenance": provenance,
         "redacted": was_redacted,
         "redaction_kinds": redaction_kinds,
     }

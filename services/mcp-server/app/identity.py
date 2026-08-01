@@ -63,6 +63,36 @@ def resolve_user_id(
     return None
 
 
+def resolve_request_user_id(request: Request) -> Optional[str]:
+    """:func:`resolve_user_id` for callers that do not already hold a KeyInfo.
+
+    The MCP tool bodies are not FastAPI routes, so they have no
+    ``Depends(verify_api_key)`` and never see a :class:`~shared.auth.KeyInfo` —
+    ``resolve_principal_plan`` validates the key and returns only the fields it
+    needs. Rather than widen that signature (it is called from a dozen places
+    and asserted on in several tests), this walks the same two-rung ladder and
+    fetches the KeyInfo itself. The validator caches by key hash, so the second
+    lookup in a request is an in-memory hit, not a query.
+
+    Never raises. A key that fails validation here would already have failed in
+    the caller's own ``resolve_principal_plan``; if it somehow does not, an
+    unattributed write is the correct outcome and an exception is not.
+    """
+    principal = _oauth_principal(request)
+    if principal is not None:
+        user_id = getattr(principal, "user_id", None)
+        if user_id:
+            return str(user_id)
+
+    try:
+        from app.auth import verify_api_key  # noqa: PLC0415
+
+        key_info = verify_api_key(request)
+    except Exception:
+        return None
+    return resolve_user_id(request, key_info)
+
+
 def _oauth_principal(request: Request) -> Optional[Any]:
     """Return the middleware-attached OAuthPrincipal, or ``None``.
 
