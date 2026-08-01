@@ -1,4 +1,13 @@
-"""Unit tests for the org-scoped Klio brain curator (``app.curator``).
+"""Unit tests for the per-user Klio brain curator (``app.curator``).
+
+Phase 2 note: this file previously described an ORG-scoped curator, and its
+assertions said so — ``scope = 'org'`` in the read query, ``DISTINCT org_id``
+in discovery, no user anywhere. Those assertions were correct for the old
+contract and are wrong for the new one: the curator now reads one person's
+private memories and writes back into that same person's private scope, because
+under phase 2's routing an org-scoped curator would publish private captures to
+the whole team. The assertions below are the inverted form, not a relaxation —
+each one that used to pin ``org`` now pins ``private`` AND the owner predicate.
 
 Mock-based, mirroring ``shared/tests/test_brain_write.py`` and
 ``mcp-server/tests/test_recall_tool.py``: no real Postgres, no real LLM. The
@@ -33,6 +42,12 @@ from app.curator import curator_tick, run_curator_once
 # ---------------------------------------------------------------------------
 
 _BASE = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+# The user every tick in this file runs for. A real Supabase UUID shape, so a
+# test that accidentally passes an org id or an agent id where a user id
+# belongs is visible at a glance.
+USER = "11111111-2222-3333-4444-555555555555"
+OTHER_USER = "99999999-8888-7777-6666-555555555555"
 
 
 def _row(
@@ -137,7 +152,7 @@ async def test_synthesis_happy_path_writes_summary_and_facts():
     gen, ext, wsm = _patch_curator(summary="weekly digest", facts=["f1", "f2", "f3"])
 
     with gen as mock_gen, ext as mock_ext, wsm as mock_write:
-        result = await curator_tick(session, "org-1", min_inputs=3)
+        result = await curator_tick(session, "org-1", USER, min_inputs=3)
 
     # generate_summary saw the combined (newline-joined) content of the batch.
     mock_gen.assert_awaited_once()
@@ -187,7 +202,7 @@ async def test_synthesis_returns_iso_cursor():
     gen, ext, wsm = _patch_curator()
 
     with gen, ext, wsm:
-        result = await curator_tick(session, "org-1", min_inputs=3)
+        result = await curator_tick(session, "org-1", USER, min_inputs=3)
 
     assert result["cursor"] == rows[-1].created_at.isoformat()
 
@@ -217,7 +232,7 @@ async def test_same_timestamp_straddle_does_not_skip_twin():
     session1 = _make_session(cursor=None, cursor_id=None, rows=[row_a])
     gen, ext, wsm = _patch_curator(summary="s", facts=["f1"])
     with gen, ext, wsm:
-        await curator_tick(session1, "org-1", batch_size=1, min_inputs=1)
+        await curator_tick(session1, "org-1", USER, batch_size=1, min_inputs=1)
 
     # tick 1 advance binds BOTH composite-cursor columns to A's values.
     upsert1 = session1.execute.call_args_list[2]
@@ -233,7 +248,7 @@ async def test_same_timestamp_straddle_does_not_skip_twin():
     session2 = _make_session(cursor=T, cursor_id=id_a, rows=[row_b])
     gen2, ext2, wsm2 = _patch_curator(summary="s", facts=["f1"])
     with gen2, ext2, wsm2:
-        await curator_tick(session2, "org-1", batch_size=1, min_inputs=1)
+        await curator_tick(session2, "org-1", USER, batch_size=1, min_inputs=1)
 
     # The new-rows SELECT (2nd execute) binds the composite cursor...
     read_call = session2.execute.call_args_list[1]
@@ -262,7 +277,7 @@ async def test_no_new_rows_is_idempotent_no_synthesis():
     gen, ext, wsm = _patch_curator()
 
     with gen as mock_gen, ext as mock_ext, wsm as mock_write:
-        result = await curator_tick(session, "org-1", min_inputs=3)
+        result = await curator_tick(session, "org-1", USER, min_inputs=3)
 
     mock_gen.assert_not_called()
     mock_ext.assert_not_called()
@@ -294,7 +309,7 @@ async def test_below_threshold_skips_synthesis():
     gen, ext, wsm = _patch_curator()
 
     with gen as mock_gen, ext as mock_ext, wsm as mock_write:
-        result = await curator_tick(session, "org-1", min_inputs=3)
+        result = await curator_tick(session, "org-1", USER, min_inputs=3)
 
     mock_gen.assert_not_called()
     mock_ext.assert_not_called()
@@ -318,7 +333,7 @@ async def test_summary_none_skips_summary_but_still_extracts_and_advances():
     gen, ext, wsm = _patch_curator(summary=None, facts=["f1", "f2"])
 
     with gen as mock_gen, ext as mock_ext, wsm as mock_write:
-        result = await curator_tick(session, "org-1", min_inputs=3)
+        result = await curator_tick(session, "org-1", USER, min_inputs=3)
 
     mock_gen.assert_awaited_once()
     mock_ext.assert_awaited_once()  # facts still attempted
@@ -343,7 +358,7 @@ async def test_extract_facts_empty_still_advances():
     gen, ext, wsm = _patch_curator(summary="just a summary", facts=[])
 
     with gen, ext, wsm as mock_write:
-        result = await curator_tick(session, "org-1", min_inputs=3)
+        result = await curator_tick(session, "org-1", USER, min_inputs=3)
 
     types_written = [c.kwargs["memory_type"] for c in mock_write.await_args_list]
     assert types_written == ["summary"]
@@ -387,7 +402,7 @@ async def test_deduped_synthesized_write_not_counted():
             ],
         ),
     ):
-        result = await curator_tick(session, "org-1", min_inputs=3)
+        result = await curator_tick(session, "org-1", USER, min_inputs=3)
 
     # 3 write attempts, but only 2 newly stored.
     assert result["synthesized"] == 2
@@ -400,20 +415,30 @@ async def test_deduped_synthesized_write_not_counted():
 
 
 @pytest.mark.asyncio
-async def test_new_rows_select_is_org_scoped_and_excludes_self_output():
-    """The new-rows SELECT must filter scope='org' and the memory_type IN list
-    must include RAW types but EXCLUDE 'summary'/'fact' (so the curator cannot
-    reprocess its own synthesized output, nor verification's session rows)."""
+async def test_new_rows_select_is_user_private_and_excludes_self_output():
+    """The new-rows SELECT must filter scope='private' AND the owner, and the
+    memory_type IN list must include RAW types but EXCLUDE 'summary'/'fact' (so
+    the curator cannot reprocess its own synthesized output, nor verification's
+    session rows).
+
+    The owner predicate is asserted on the SQL and on the bound parameter, not
+    on the returned rows: the whole point is that another user's rows are never
+    fetched, so a test that only checked the output could pass against a query
+    that read everyone and filtered afterwards.
+    """
     rows = [_row(i, f"c{i}") for i in range(1, 6)]
     session = _make_session(cursor=None, rows=rows)
     gen, ext, wsm = _patch_curator()
 
     with gen, ext, wsm:
-        await curator_tick(session, "org-1", min_inputs=3)
+        await curator_tick(session, "org-1", USER, min_inputs=3)
 
     # The new-rows SELECT is the 2nd execute call.
     new_rows_sql = str(session.execute.call_args_list[1].args[0])
-    assert "scope = 'org'" in new_rows_sql
+    assert "scope = 'private'" in new_rows_sql
+    assert "scope = 'org'" not in new_rows_sql
+    assert "user_id = :user_id" in new_rows_sql
+    assert session.execute.call_args_list[1].args[1]["user_id"] == USER
     assert "session_memories" in new_rows_sql
     # RAW types present.
     for raw in ("observation", "note", "memory", "plan", "decision"):
@@ -431,7 +456,7 @@ async def test_new_rows_select_filters_status_active():
     gen, ext, wsm = _patch_curator()
 
     with gen, ext, wsm:
-        await curator_tick(session, "org-1", min_inputs=3)
+        await curator_tick(session, "org-1", USER, min_inputs=3)
 
     new_rows_sql = str(session.execute.call_args_list[1].args[0])
     assert "status = 'active'" in new_rows_sql
@@ -446,7 +471,7 @@ async def test_new_rows_select_includes_scope_columns():
     gen, ext, wsm = _patch_curator()
 
     with gen, ext, wsm:
-        await curator_tick(session, "org-1", min_inputs=3)
+        await curator_tick(session, "org-1", USER, min_inputs=3)
 
     new_rows_sql = str(session.execute.call_args_list[1].args[0])
     assert "project_id" in new_rows_sql
@@ -454,20 +479,30 @@ async def test_new_rows_select_includes_scope_columns():
 
 
 @pytest.mark.asyncio
-async def test_writes_target_org_scope_via_curator_agent():
-    """Synthesized memories are written through write_scoped_memory for the same
-    org under the klio-curator agent id and a curator session id."""
+async def test_writes_target_the_users_private_scope_and_are_labelled_inferred():
+    """Synthesized memories go back to the SAME user's private scope, never org.
+
+    Three properties in one test because they are one decision: the curator
+    reads Priya's memories, so its output is Priya's memory, and it is a
+    deduction rather than something she said.
+    """
     rows = [_row(i, f"c{i}") for i in range(1, 6)]
     session = _make_session(cursor=None, rows=rows)
     gen, ext, wsm = _patch_curator(summary="s", facts=["f1"])
 
     with gen, ext, wsm as mock_write:
-        await curator_tick(session, "org-1", min_inputs=3, agent_id="klio-curator")
+        await curator_tick(
+            session, "org-1", USER, min_inputs=3, agent_id="klio-curator"
+        )
 
+    assert mock_write.await_count > 0
     for c in mock_write.await_args_list:
         assert c.kwargs["org_id"] == "org-1"
         assert c.kwargs["agent_id"] == "klio-curator"
-        assert c.kwargs["session_id"] == "klio-curator:org-1"
+        assert c.kwargs["session_id"] == f"klio-curator:org-1:{USER}"
+        assert c.kwargs["scope"] == "private"
+        assert c.kwargs["user_id"] == USER
+        assert c.kwargs["provenance"] == "INFERRED"
 
 
 # ---------------------------------------------------------------------------
@@ -476,10 +511,18 @@ async def test_writes_target_org_scope_via_curator_agent():
 
 
 @pytest.mark.asyncio
-async def test_run_curator_once_iterates_orgs_and_aggregates():
-    """The DISTINCT-org query yields 2 orgs; curator_tick runs once per org via
-    a fresh session from the factory (each closed), and counts aggregate."""
-    org_rows = [SimpleNamespace(org_id="org-a"), SimpleNamespace(org_id="org-b")]
+async def test_run_curator_once_iterates_user_pairs_and_aggregates():
+    """Discovery yields 2 (org, user) pairs; curator_tick runs once per PAIR via
+    a fresh session from the factory (each closed), and counts aggregate.
+
+    Two users in the SAME org, deliberately: the old contract ticked once per
+    org, so a per-org loop would run once here and silently leave the second
+    person's memories uncurated forever.
+    """
+    org_rows = [
+        SimpleNamespace(org_id="org-a", user_id=USER),
+        SimpleNamespace(org_id="org-a", user_id=OTHER_USER),
+    ]
     distinct_result = MagicMock()
     distinct_result.fetchall.return_value = org_rows
 
@@ -500,10 +543,10 @@ async def test_run_curator_once_iterates_orgs_and_aggregates():
     with patch("app.curator.curator_tick", tick_mock):
         result = await run_curator_once(session_factory, min_inputs=3)
 
-    assert result == {"orgs": 2, "synthesized_total": 5}
+    assert result == {"orgs": 1, "users": 2, "synthesized_total": 5}
     assert tick_mock.await_count == 2
-    ticked_orgs = {c.args[1] for c in tick_mock.await_args_list}
-    assert ticked_orgs == {"org-a", "org-b"}
+    ticked = {(c.args[1], c.args[2]) for c in tick_mock.await_args_list}
+    assert ticked == {("org-a", USER), ("org-a", OTHER_USER)}
 
     # Every opened session was closed (discovery + per-org).
     discovery_session.close.assert_called_once()
@@ -512,8 +555,8 @@ async def test_run_curator_once_iterates_orgs_and_aggregates():
 
 
 @pytest.mark.asyncio
-async def test_run_curator_once_no_orgs_returns_zeroes():
-    """No orgs with raw org memories -> aggregate counts are zero."""
+async def test_run_curator_once_no_users_returns_zeroes():
+    """No users with raw private memories -> aggregate counts are zero."""
     distinct_result = MagicMock()
     distinct_result.fetchall.return_value = []
     discovery_session = MagicMock()
@@ -524,15 +567,19 @@ async def test_run_curator_once_no_orgs_returns_zeroes():
     with patch("app.curator.curator_tick", tick_mock):
         result = await run_curator_once(session_factory)
 
-    assert result == {"orgs": 0, "synthesized_total": 0}
+    assert result == {"orgs": 0, "users": 0, "synthesized_total": 0}
     tick_mock.assert_not_called()
     discovery_session.close.assert_called_once()
 
 
 @pytest.mark.asyncio
-async def test_run_curator_once_distinct_query_is_org_scope_and_raw_only():
-    """The org-discovery query reads scope='org' and only RAW types (so it does
-    not surface orgs that only have verification/session rows or curator output)."""
+async def test_run_curator_once_discovery_is_private_owned_and_raw_only():
+    """Discovery reads scope='private', requires an owner, and only RAW types.
+
+    ``user_id IS NOT NULL`` matters as much as the scope: without it the query
+    could surface the pre-existing owner-less rows and the tick would be handed
+    a NULL user, which is the one input that has no correct interpretation.
+    """
     distinct_result = MagicMock()
     distinct_result.fetchall.return_value = []
     discovery_session = MagicMock()
@@ -543,8 +590,10 @@ async def test_run_curator_once_distinct_query_is_org_scope_and_raw_only():
         await run_curator_once(session_factory)
 
     sql = str(discovery_session.execute.call_args_list[0].args[0])
-    assert "DISTINCT org_id" in sql
-    assert "scope = 'org'" in sql
+    assert "DISTINCT org_id, user_id" in sql
+    assert "scope = 'private'" in sql
+    assert "scope = 'org'" not in sql
+    assert "user_id IS NOT NULL" in sql
     for raw in ("observation", "note", "memory", "plan", "decision"):
         assert raw in sql
     assert "summary" not in sql
@@ -553,9 +602,12 @@ async def test_run_curator_once_distinct_query_is_org_scope_and_raw_only():
 
 @pytest.mark.asyncio
 async def test_run_curator_once_closes_session_even_if_tick_raises():
-    """A per-org tick failure still closes that org's session (finally), and
-    does not abort the whole run for remaining orgs."""
-    org_rows = [SimpleNamespace(org_id="org-a"), SimpleNamespace(org_id="org-b")]
+    """A per-user tick failure still closes that user's session (finally), and
+    does not abort the whole run for remaining users."""
+    org_rows = [
+        SimpleNamespace(org_id="org-a", user_id=USER),
+        SimpleNamespace(org_id="org-b", user_id=OTHER_USER),
+    ]
     distinct_result = MagicMock()
     distinct_result.fetchall.return_value = org_rows
     discovery_session = MagicMock()
@@ -597,7 +649,7 @@ async def test_distills_each_project_separately_and_tags_scope():
     gen, ext, wsm = _patch_curator(summary="s", facts=["f1"])
 
     with gen as mock_gen, ext as mock_ext, wsm as mock_write:
-        result = await curator_tick(session, "org-1", min_inputs=3)
+        result = await curator_tick(session, "org-1", USER, min_inputs=3)
 
     # Two partitions => synthesis ran once per partition.
     assert mock_gen.await_count == 2
@@ -622,7 +674,7 @@ async def test_null_project_partition_stays_org_wide():
     gen, ext, wsm = _patch_curator(summary="s", facts=["f1"])
 
     with gen, ext, wsm as mock_write:
-        await curator_tick(session, "org-1", min_inputs=3)
+        await curator_tick(session, "org-1", USER, min_inputs=3)
 
     for c in mock_write.await_args_list:
         assert c.kwargs["project_id"] is None
@@ -642,7 +694,7 @@ async def test_subthreshold_partition_is_not_distilled():
     gen, ext, wsm = _patch_curator(summary="s", facts=["f1"])
 
     with gen, ext, wsm as mock_write:
-        result = await curator_tick(session, "org-1", min_inputs=3)
+        result = await curator_tick(session, "org-1", USER, min_inputs=3)
 
     written_projects = {c.kwargs["project_id"] for c in mock_write.await_args_list}
     assert written_projects == {"proj-A"}  # proj-B skipped
@@ -666,7 +718,7 @@ async def test_input_count_is_per_partition():
     )  # summary-only keeps it simple
 
     with gen, ext, wsm as mock_write:
-        await curator_tick(session, "org-1", min_inputs=3)
+        await curator_tick(session, "org-1", USER, min_inputs=3)
 
     counts = {
         c.kwargs["project_id"]: c.kwargs["metadata"]["input_count"]
@@ -713,6 +765,7 @@ async def test_reconcile_supersedes_direct_contradiction(monkeypatch):
     sup_count, judged = await curator_mod.reconcile_fact(
         _DB(),
         org_id="org-1",
+        user_id=USER,
         new_fact_id=new_id,
         new_fact_content="Stripe MCP is connected to the MoonForge account",
         embedding=[0.1, 0.2],
@@ -752,6 +805,7 @@ async def test_reconcile_related_but_not_contradicting_is_untouched(monkeypatch)
     sup_count, judged = await curator_mod.reconcile_fact(
         _DB(),
         org_id="org-1",
+        user_id=USER,
         new_fact_id=uuid.uuid4(),
         new_fact_content="Stripe MCP is connected to the MoonForge account",
         embedding=[0.1, 0.2],
@@ -786,6 +840,7 @@ async def test_reconcile_judge_error_skips_pair(monkeypatch):
     sup_count, judged = await curator_mod.reconcile_fact(
         _DB(),
         org_id="org-1",
+        user_id=USER,
         new_fact_id=uuid.uuid4(),
         new_fact_content="new fact",
         embedding=[0.1],
@@ -815,6 +870,7 @@ async def test_store_one_returns_id_on_success(monkeypatch):
     result = await curator_mod._store_one(
         object(),
         org_id="org-1",
+        user_id=USER,
         agent_id="agent-1",
         content="some fact",
         memory_type="fact",
@@ -838,6 +894,7 @@ async def test_store_one_returns_none_on_dedup(monkeypatch):
     result = await curator_mod._store_one(
         object(),
         org_id="org-1",
+        user_id=USER,
         agent_id="agent-1",
         content="duplicate fact",
         memory_type="fact",
@@ -890,6 +947,7 @@ async def test_synthesize_and_store_reconciles_facts_not_summaries(monkeypatch):
         db_session,
         *,
         org_id,
+        user_id,
         new_fact_id,
         new_fact_content,
         embedding,
@@ -898,6 +956,7 @@ async def test_synthesize_and_store_reconciles_facts_not_summaries(monkeypatch):
         reconcile_calls.append(
             {
                 "org_id": org_id,
+                "user_id": user_id,
                 "new_fact_id": new_fact_id,
                 "new_fact_content": new_fact_content,
                 "embedding": embedding,
@@ -912,6 +971,7 @@ async def test_synthesize_and_store_reconciles_facts_not_summaries(monkeypatch):
     stored = await curator_mod._synthesize_and_store(
         object(),
         org_id="org-1",
+        user_id=USER,
         agent_id="agent-1",
         combined="content one\ncontent two",
         input_count=2,
@@ -925,6 +985,9 @@ async def test_synthesize_and_store_reconciles_facts_not_summaries(monkeypatch):
     # org_id forwarded correctly
     for c in reconcile_calls:
         assert c["org_id"] == "org-1"
+        # Reconciliation SUPERSEDES rows, so the owner must be forwarded or one
+        # user's new fact could retire another user's memory.
+        assert c["user_id"] == USER
         assert c["embedding"] == fake_embedding
     # max_judgments kwarg must be forwarded (budget enforcement).
     for c in reconcile_calls:
@@ -955,5 +1018,5 @@ def test_read_new_raw_rows_excludes_recall_hidden():
 
             return R()
 
-    curator_mod._read_new_raw_rows(_DB(), "org-1", CursorState(None, None), 50)
+    curator_mod._read_new_raw_rows(_DB(), "org-1", USER, CursorState(None, None), 50)
     assert "recall_hidden = FALSE" in captured["sql"]

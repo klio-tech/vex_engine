@@ -1,6 +1,6 @@
 """In-process background scheduler for the Klio brain curator and artifact GC.
 
-The curator (:mod:`app.curator`) synthesises each org's RAW memories into
+The curator (:mod:`app.curator`) synthesises each user's RAW private memories into
 ``summary`` / ``fact`` rows.  :func:`app.curator.run_curator_once` is a single
 pass; this module drives it on a periodic loop started from the FastAPI
 lifespan (:mod:`app.main`), so the single-service Railway deployment needs no
