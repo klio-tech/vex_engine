@@ -72,6 +72,15 @@ class KeyInfo:
     # that enforce per-plan quotas must pass this into ``get_plan_config`` so a
     # custom cap is honored at the boundary, exactly as the retention sweep does.
     plan_overrides: dict | None = None
+    # The Supabase user UUID of whoever created this key, copied from the key
+    # entry's ``created_by``. Every key already carries it; it simply never
+    # reached the caller. Optional because ingestion-api and sync-gateway
+    # construct KeyInfo directly, and because a key written before the field
+    # existed must not crash the auth path.
+    #
+    # This is the ONLY identity source on the key path. Never derive it from
+    # X-Vex-Agent, which the client declares and can therefore forge.
+    user_id: str | None = None
 
 
 @dataclass
@@ -86,6 +95,7 @@ class _CachedKey:
     revoked: bool
     plan: str = "free"
     plan_overrides: dict | None = None
+    user_id: str | None = None
     cached_at: float = field(default_factory=time.monotonic)
 
 
@@ -227,6 +237,7 @@ class KeyValidator:
             scopes=entry.scopes,
             plan=entry.plan,
             plan_overrides=entry.plan_overrides,
+            user_id=entry.user_id,
         )
 
     def flush_usage(self) -> None:
@@ -410,6 +421,7 @@ class KeyValidator:
                     revoked=key_entry.get("revoked", False),
                     plan=plan_val,
                     plan_overrides=plan_overrides_val,
+                    user_id=key_entry.get("created_by"),
                 )
 
         return None

@@ -981,3 +981,63 @@ class TestMemoryQuotaDecoupling:
 
         assert exc_info.value.status_code == 503
         assert exc_info.value.retry_after_seconds == 30
+
+
+# ---------------------------------------------------------------------------
+# Key-path identity
+#
+# Every key entry already stores `created_by` (verified in production: 55/55
+# keys, 36-char UUIDs, 14 distinct creators). It has never been propagated to
+# the caller, so the engine has had a user identity available on every keyed
+# request and thrown it away.
+# ---------------------------------------------------------------------------
+
+
+def test_keyinfo_carries_created_by_as_user_id():
+    from shared.auth import KeyInfo
+
+    info = KeyInfo(
+        org_id="acme",
+        key_id="k1",
+        scopes=["memory:write"],
+        user_id="11111111-2222-3333-4444-555555555555",
+    )
+    assert info.user_id == "11111111-2222-3333-4444-555555555555"
+
+
+def test_keyinfo_user_id_defaults_to_none():
+    """Additive: ingestion-api and sync-gateway construct KeyInfo without it."""
+    from shared.auth import KeyInfo
+
+    info = KeyInfo(org_id="acme", key_id="k1", scopes=[])
+    assert info.user_id is None
+
+
+def test_cached_key_reads_created_by_from_the_key_entry():
+    from shared.auth import _CachedKey
+
+    entry = _CachedKey(
+        org_id="acme",
+        key_id="k1",
+        scopes=[],
+        rate_limit_rpm=100,
+        expires_at=None,
+        revoked=False,
+        user_id="11111111-2222-3333-4444-555555555555",
+    )
+    assert entry.user_id == "11111111-2222-3333-4444-555555555555"
+
+
+def test_cached_key_user_id_defaults_to_none_for_legacy_entries():
+    """A key entry written before created_by existed must not crash the path."""
+    from shared.auth import _CachedKey
+
+    entry = _CachedKey(
+        org_id="acme",
+        key_id="k1",
+        scopes=[],
+        rate_limit_rpm=100,
+        expires_at=None,
+        revoked=False,
+    )
+    assert entry.user_id is None
