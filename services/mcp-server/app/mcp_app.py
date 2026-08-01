@@ -52,6 +52,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 from shared import artifact_storage, artifacts, brain, projects
+from shared.compression.structural import compress_payload
 from shared.memory import MemoryRecord, retract_memory, retrieve_memories_scoped
 from shared.plan_limits import get_plan_config
 from shared.promotion import promote_memory
@@ -1574,11 +1575,28 @@ async def _perform_recall(
             if row is not None:
                 project_label = {"id": project_id, "name": row.display_name}
         memories = [_serialize_record(r, project_label=project_label) for r in records]
-        return {
+        payload = {
             "memories": memories,
             "count": len(memories),
             "guidance": RECALL_WRITE_NUDGE,
         }
+        # Structural compression is lossless, so it is unconditional: there is
+        # no information to opt into keeping. Nulls go and fields identical on
+        # every row are hoisted into `common`, which is additive — an existing
+        # consumer reading `memories[i]["content"]` is unaffected. See the
+        # compression design spec.
+        #
+        # Wrapped even though compress_payload fails open internally: this is a
+        # request path, and a compressor is never allowed to be the reason a
+        # recall fails. The uncompressed payload is always a correct answer.
+        try:
+            payload, _stats = compress_payload(payload)
+        except Exception:
+            logger.warning(
+                "recall compression raised; returning the uncompressed payload",
+                exc_info=True,
+            )
+        return payload
     except Exception:
         logger.exception("brain recall failed (scope=%s)", scope)
         return {"error": "recall_failed", "guidance": RECALL_WRITE_NUDGE}
