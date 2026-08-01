@@ -86,3 +86,37 @@ def test_a_non_principal_object_on_state_is_ignored():
     for any attribute access; that must not be read as an identity."""
     req = _request(oauth_principal=object())
     assert resolve_user_id(req) is None
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 is a no-op at the boundary.
+#
+# The spec's promise is: "Phase 1 leaves the product behaving exactly as it
+# does now, so it is a safe place to stop if phase 2 needs rethinking." These
+# assert that promise mechanically so a later edit cannot quietly break it.
+# ---------------------------------------------------------------------------
+
+
+def test_no_write_path_calls_resolve_user_id_yet():
+    """Phase 2 wires identity into writes. If this fails, a routing change
+    landed in a phase that is supposed to be schema-only."""
+    import pathlib
+
+    app_dir = pathlib.Path(__file__).resolve().parents[1] / "app"
+    callers = [
+        p.name
+        for p in app_dir.glob("*.py")
+        if p.name not in {"identity.py"} and "resolve_user_id" in p.read_text()
+    ]
+    assert callers == [], f"Phase 1 must not wire identity into: {callers}"
+
+
+def test_capture_still_writes_org_scope():
+    """The 33,037 hook rows a month keep landing at org until Phase 2."""
+    import pathlib
+
+    capture = (
+        pathlib.Path(__file__).resolve().parents[1] / "app" / "capture.py"
+    ).read_text()
+    assert "scope='private'" not in capture
+    assert 'scope="private"' not in capture
