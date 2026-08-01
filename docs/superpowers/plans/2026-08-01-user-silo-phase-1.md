@@ -15,7 +15,7 @@
 - **Never derive identity from `X-Vex-Agent`.** Verbatim from the spec: *"`X-Vex-Agent` is client-declared. Deriving identity from it would let any caller read another person's private memories by setting a header."*
 - **`user_id` is nullable and `NULL` means "unattributed".** Verbatim from the spec: *"When `user_id` is `None`: write org-scoped and log a warning. Not private, not refused."*
 - **The predicate is always `scope`, never the presence of `project_id`.** Verbatim from the spec. `project_id` is a relevance filter on 32,568 existing org-scoped rows and is not a boundary.
-- **Existing 37,605 memories keep `scope='org'` and `user_id IS NULL`.** Decision 6. The only backfill Phase 1 performs is `confidence`.
+- **Existing 37,605 memories keep `scope='org'` and `user_id IS NULL`.** Decision 6. The only backfill Phase 1 performs is `provenance`.
 - SQL uses bound parameters via `text()`. Never f-strings into SQL.
 - `ruff format` and `ruff check` must pass before every commit.
 
@@ -44,7 +44,7 @@
 
 **Interfaces:**
 - Consumes: nothing (first task)
-- Produces: `session_memories.user_id` (VARCHAR(64), nullable), `session_memories.confidence` (VARCHAR(16), NOT NULL, default `'EXTRACTED'`), table `project_members(project_id UUID, user_id VARCHAR(64), role VARCHAR(32), granted_by VARCHAR(64), granted_at TIMESTAMPTZ)` with PK `(project_id, user_id)`, CHECK constraint `ck_session_memories_scope`, CHECK constraint `ck_session_memories_confidence`, index `ix_session_memories_private`, `brain_curator_state` PK `(org_id, user_id)`.
+- Produces: `session_memories.user_id` (VARCHAR(64), nullable), `session_memories.provenance` (VARCHAR(16), NOT NULL, default `'EXTRACTED'`), table `project_members(project_id UUID, user_id VARCHAR(64), role VARCHAR(32), granted_by VARCHAR(64), granted_at TIMESTAMPTZ)` with PK `(project_id, user_id)`, CHECK constraint `ck_session_memories_scope`, CHECK constraint `ck_session_memories_provenance`, index `ix_session_memories_private`, `brain_curator_state` PK `(org_id, user_id)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -62,7 +62,10 @@ import os
 import pytest
 from sqlalchemy import create_engine, text
 
-DB_URL = os.environ.get("TEST_DATABASE_URL", "postgresql://vex:vex@localhost:5432/vex_test")
+DB_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
+)
 
 
 @pytest.fixture(scope="module")
@@ -95,10 +98,10 @@ def test_session_memories_has_nullable_user_id(conn):
     assert cols["user_id"][0] == "YES", "user_id must be nullable — NULL means unattributed"
 
 
-def test_confidence_defaults_to_extracted_and_is_not_null(conn):
+def test_provenance_defaults_to_extracted_and_is_not_null(conn):
     cols = _columns(conn, "session_memories")
-    assert "confidence" in cols
-    assert cols["confidence"][0] == "NO"
+    assert "provenance" in cols
+    assert cols["provenance"][0] == "NO"
 
 
 def test_scope_check_constraint_rejects_a_typo(conn):
@@ -128,13 +131,13 @@ def test_scope_check_constraint_admits_private(conn):
     tx.rollback()
 
 
-def test_confidence_check_constraint_rejects_unknown_label(conn):
+def test_provenance_check_constraint_rejects_unknown_label(conn):
     tx = conn.begin_nested()
     with pytest.raises(Exception):
         conn.execute(
             text(
                 "INSERT INTO session_memories "
-                "(org_id, agent_id, session_id, scope, status, content, memory_type, confidence) "
+                "(org_id, agent_id, session_id, scope, status, content, memory_type, provenance) "
                 "VALUES ('t', 'a', 's', 'org', 'active', 'x', 'fact', 'MAYBE')"
             )
         )
@@ -147,7 +150,7 @@ def test_curator_rows_backfilled_to_inferred(conn):
     row = conn.execute(
         text(
             "SELECT count(*) FROM session_memories "
-            "WHERE metadata->>'source' = 'curator' AND confidence <> 'INFERRED'"
+            "WHERE metadata->>'source' = 'curator' AND provenance <> 'INFERRED'"
         )
     ).scalar()
     assert row == 0, "every curator-authored row must be INFERRED"
@@ -157,7 +160,7 @@ def test_non_curator_rows_are_extracted(conn):
     row = conn.execute(
         text(
             "SELECT count(*) FROM session_memories "
-            "WHERE COALESCE(metadata->>'source', '') <> 'curator' AND confidence <> 'EXTRACTED'"
+            "WHERE COALESCE(metadata->>'source', '') <> 'curator' AND provenance <> 'EXTRACTED'"
         )
     ).scalar()
     assert row == 0
@@ -231,7 +234,7 @@ counted against quota. Introducing 'private' is the right moment to close that,
 because the failure mode of a typo goes from "row is invisible" to "row that
 should be private is visible".
 
-**Backfill.** Exactly one: ``confidence``. Rows authored by the curator become
+**Backfill.** Exactly one: ``provenance``. Rows authored by the curator become
 INFERRED, everything else EXTRACTED. This is safe because it adds information
 to rows without changing who can read them. Memories are NOT backfilled to
 private — see decision 6 in the spec: retroactively hiding a team's accumulated
@@ -265,7 +268,7 @@ def upgrade() -> None:
     op.add_column(
         "session_memories",
         sa.Column(
-            "confidence",
+            "provenance",
             sa.String(16),
             nullable=False,
             server_default="EXTRACTED",
@@ -279,7 +282,7 @@ def upgrade() -> None:
     op.execute(
         """
         UPDATE session_memories
-        SET confidence = 'INFERRED'
+        SET provenance = 'INFERRED'
         WHERE metadata->>'source' = 'curator'
         """
     )
@@ -291,9 +294,9 @@ def upgrade() -> None:
         "scope IN ('private', 'project', 'org', 'session', 'agent')",
     )
     op.create_check_constraint(
-        "ck_session_memories_confidence",
+        "ck_session_memories_provenance",
         "session_memories",
-        "confidence IN ('EXTRACTED', 'INFERRED', 'AMBIGUOUS')",
+        "provenance IN ('EXTRACTED', 'INFERRED', 'AMBIGUOUS')",
     )
 
     # A private row with no owner is unreachable by every caller including its
@@ -364,9 +367,9 @@ def downgrade() -> None:
     op.drop_constraint(
         "ck_session_memories_private_has_owner", "session_memories", type_="check"
     )
-    op.drop_constraint("ck_session_memories_confidence", "session_memories", type_="check")
+    op.drop_constraint("ck_session_memories_provenance", "session_memories", type_="check")
     op.drop_constraint("ck_session_memories_scope", "session_memories", type_="check")
-    op.drop_column("session_memories", "confidence")
+    op.drop_column("session_memories", "provenance")
     op.drop_column("session_memories", "user_id")
 ```
 
@@ -400,7 +403,7 @@ git commit -m "feat(db): migration 031 — user_id, project ACLs, provenance
 
 Additive only. Adds session_memories.user_id (nullable — NULL means
 unattributed, which is legal and permanent for the 37,605 pre-existing
-rows), session_memories.confidence, the project_members ACL table, a
+rows), session_memories.provenance, the project_members ACL table, a
 partial index for private recall, and a per-user curator cursor.
 
 scope had NO check constraint, so a typo silently created rows no query
@@ -891,7 +894,7 @@ Implements phase 1 of `docs/superpowers/specs/2026-08-01-user-silo-design.md`.
 
 ## What lands
 
-- Migration `031`: `session_memories.user_id` (nullable), `confidence`, `project_members`, a partial index for private recall, a per-user curator cursor, and CHECK constraints on `scope` and `confidence`.
+- Migration `031`: `session_memories.user_id` (nullable), `provenance`, `project_members`, a partial index for private recall, a per-user curator cursor, and CHECK constraints on `scope` and `provenance`.
 - `KeyInfo.user_id`, carried through from the key entry's `created_by` — a value every one of the 55 production keys already stores and the engine has been discarding on every request.
 - `resolve_user_id()` — the single identity rule. OAuth first, then the key. **Never `X-Vex-Agent`**, with a test asserting a forged header cannot supply or override an identity.
 
@@ -929,7 +932,7 @@ All `Container Import` jobs, `Lint & Format`, `Service Tests (shared)` and `Serv
 | Partial index for private recall | 1 |
 | `project_members` table, PK `(project_id, user_id)` | 1 |
 | `brain_curator_state` PK → `(org_id, user_id)` | 1 |
-| `confidence` column + curator backfill to `INFERRED` | 1 |
+| `provenance` column + curator backfill to `INFERRED` | 1 |
 | `KeyInfo.user_id` from `created_by` | 2 |
 | `resolve_user_id`, OAuth then key, never `X-Vex-Agent` | 3 |
 | `None` is legal, caller writes org-scoped | 3 |

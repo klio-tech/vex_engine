@@ -154,7 +154,7 @@ Current head is `030`.
 | Partial index `(org_id, user_id)` WHERE `scope = 'private'` | Private recall is the hot path |
 | `project_members(project_id, user_id, role, granted_by, granted_at)` | PK `(project_id, user_id)` |
 | `brain_curator_state` PK → `(org_id, user_id)` | Per-user cursor |
-| `session_memories.confidence` — see Provenance below | |
+| `session_memories.provenance` — see Provenance below | |
 
 ### Recall — the visibility ladder
 
@@ -215,11 +215,18 @@ Adopt graphify's three labels (Apache-2.0, attribution required in NOTICE):
 | `INFERRED` | Deduced by the curator or an LLM pass |
 | `AMBIGUOUS` | Uncertain; surfaced for review rather than trusted |
 
-Concretely: a `session_memories.confidence` column (varchar, CHECK-constrained
+Concretely: a `session_memories.provenance` column (varchar, CHECK-constrained
 to the three labels), defaulting to `EXTRACTED`. Explicit tool writes and hook
 captures are `EXTRACTED` — they record what was said or done. Everything the
 curator synthesises is `INFERRED`. `recall` returns the label so a caller can
 weigh it, and the dashboard renders inferred facts differently from stated ones.
+
+**The column is `provenance`, not `confidence`.** `session_memories.confidence`
+already exists — a nullable `DOUBLE PRECISION` from migration 016 with 4,435
+rows populated (0.398–1.0), written by `store_memory()`, read into
+`MemoryRecord.confidence`, and returned verbatim in the `recall` payload. Reusing
+the name would have destroyed live data and changed an observable API type. The
+float column is untouched and an invariant test asserts so.
 
 Existing rows backfill to `EXTRACTED` **except** the 1,841 with
 `metadata.source = 'curator'`, which backfill to `INFERRED`. That is the one
@@ -331,7 +338,7 @@ This spec is deliberately larger than one sitting. It should become a plan in
 three phases, each independently shippable and verifiable:
 
 1. **Identity** — migration `031`, `resolve_user_id`, `KeyInfo.user_id`,
-   `confidence` column and backfill. No behaviour change visible to users.
+   `provenance` column and backfill. No behaviour change visible to users.
    Verifiable by unit tests alone.
 2. **Routing and recall** — hook captures go private, the ladder lands, the
    curator goes per-user, `share` ships. This is the phase where a bug is a
