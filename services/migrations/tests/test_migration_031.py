@@ -22,8 +22,14 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
 
+# Matches the repo convention (test_migration_020.py, alembic.ini,
+# docker-compose.yml). The plan specified TEST_DATABASE_URL against a vex_test
+# database that exists nowhere in this repo, which would have made every
+# assertion below skip silently for every other developer and in CI —
+# reporting green while testing nothing.
 DB_URL = os.environ.get(
-    "TEST_DATABASE_URL", "postgresql://vex:vex@localhost:5432/vex_test"
+    "DATABASE_URL",
+    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
 )
 
 
