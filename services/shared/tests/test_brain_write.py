@@ -178,6 +178,13 @@ async def test_write_scoped_memory_happy_path_promotes_to_org():
         "scope": "org",
         "space_id": "space-9",
         "project_id": "proj-7",
+        # Phase 2 additions. ``user_id`` is None because this call passes no
+        # author, which stays legal on a shared scope — it means "we could not
+        # attribute this write", not "this row is unowned and therefore
+        # private". ``provenance`` defaults to EXTRACTED because a deliberate
+        # write records what was stated, not what was deduced.
+        "user_id": None,
+        "provenance": "EXTRACTED",
         "redacted": False,
         "redaction_kinds": [],
     }
