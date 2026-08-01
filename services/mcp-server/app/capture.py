@@ -434,9 +434,14 @@ def _recent_memories(
     }
     if user_id:
         scope_arms.append("(scope = 'private' AND user_id = :user_id)")
+        # Joined through projects.org_id for the same reason as the vector
+        # path: project_members has no org_id, so a membership row in another
+        # tenant would otherwise satisfy this arm here.
         scope_arms.append(
             "(scope = 'project' AND project_id IN ("
-            "SELECT project_id FROM project_members WHERE user_id = :user_id))"
+            "SELECT m.project_id FROM project_members m "
+            "JOIN projects p ON p.id = m.project_id AND p.org_id = :org_id "
+            "WHERE m.user_id = :user_id))"
         )
         params["user_id"] = user_id
     # Assembled from module-local literals only — every value that came from

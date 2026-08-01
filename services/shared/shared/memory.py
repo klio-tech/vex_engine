@@ -1062,10 +1062,17 @@ async def retrieve_memories_scoped(
             # Membership is a subquery rather than a pre-fetched Python list
             # so the entitlement is evaluated by the same statement that
             # returns the rows — a stale or mis-passed list cannot widen it.
+            # The JOIN to projects is not decoration. project_members has no
+            # org_id of its own, so without it a membership row in ANOTHER
+            # tenant would satisfy this arm for a row in THIS one — the outer
+            # org_id filter constrains the memory, not the entitlement. An
+            # adversarial test seeds exactly that shape.
             arms.append(
                 "(scope = 'project' AND project_id IN ("
-                "SELECT project_id FROM project_members "
-                "WHERE user_id = :user_id))"
+                "SELECT m.project_id FROM project_members m "
+                "JOIN projects p ON p.id = m.project_id "
+                "AND p.org_id = :org_id "
+                "WHERE m.user_id = :user_id))"
             )
             params["user_id"] = user_id
         base_clauses.append("(" + " OR ".join(arms) + ")")
