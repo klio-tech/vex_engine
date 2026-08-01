@@ -910,8 +910,10 @@ async def retrieve_memories_scoped(
               scope = 'org'
               OR (scope = 'private' AND user_id = :user_id)
               OR (scope = 'project' AND project_id IN (
-                    SELECT project_id FROM project_members
-                    WHERE user_id = :user_id))
+                    SELECT m.project_id FROM project_members m
+                    JOIN projects p ON p.id = m.project_id
+                     AND p.org_id = :org_id
+                    WHERE m.user_id = :user_id))
 
           Note what is NOT in that predicate: the presence of ``project_id``.
           ``project_id`` is set on 32,568 pre-existing ``scope='org'`` rows
