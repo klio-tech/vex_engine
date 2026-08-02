@@ -17,6 +17,7 @@ Each test uses a unique org so a failure cannot be a leak from another test.
 """
 
 import os
+import json
 import uuid
 from datetime import datetime, timezone
 
@@ -617,3 +618,82 @@ def test_edge_to_a_forgotten_memory_is_silently_absent_then_swept(db):
         text("SELECT count(*) FROM memory_edges WHERE org_id = :o"), {"o": org}
     ).scalar()
     assert remaining == 0
+
+
+# ---------------------------------------------------------------------------
+# ATTACK 6 — the destination org filter, in isolation
+#
+# Found in review by mutation: deleting `m.org_id = :org_id` from the
+# destination WHERE clause failed NO test, because the JOIN's own
+# `AND m.org_id = :org_id` independently blocked every seeded cross-org
+# case. Two filters, one of them untested — so a later refactor could drop
+# the WHERE-clause guard silently and leave the tenancy boundary resting on
+# a single unasserted line.
+#
+# These pin BOTH sites by attacking a path where only the WHERE clause
+# stands: an edge whose destination is reached without the entry-side join
+# constraining it.
+# ---------------------------------------------------------------------------
+
+
+def test_entity_walk_pins_the_destination_org_filter(db):
+    """Sibling-walk through a shared entity name across two orgs.
+
+    Each org has its own entity row (entities are org-scoped), so a caller
+    in org A resolving "billing" must see only A's evidence. This exercises
+    the entity path's destination filter rather than the edge path's join.
+    """
+    org_a = _org(db)
+    org_b = _org(db)
+
+    a_mem = _seed(db, org_id=org_a, content="org A billing note")
+    b_mem = _seed(db, org_id=org_b, content="org B billing secret")
+
+    a_ent = graph_store.add_entity(db, org_id=org_a, name="billing", kind="concept")
+    b_ent = graph_store.add_entity(db, org_id=org_b, name="billing", kind="concept")
+    assert a_ent != b_ent, "entities must not be shared across tenants"
+
+    graph_store.add_edge(
+        db,
+        org_id=org_a,
+        src_id=a_mem,
+        dst_kind="entity",
+        dst_id=a_ent,
+        relation="about",
+    )
+    graph_store.add_edge(
+        db,
+        org_id=org_b,
+        src_id=b_mem,
+        dst_kind="entity",
+        dst_id=b_ent,
+        relation="about",
+    )
+    db.commit()
+
+    brief = graph_store.entity_brief(
+        db, org_id=org_a, viewer_user_id=DEV, entity="billing"
+    )
+    assert brief is not None, "control: org A must resolve its own entity"
+    blob = json.dumps(brief, default=str)
+    assert "org B billing secret" not in blob
+    assert brief["evidence_count"] == 1
+
+
+def test_neighbors_destination_filter_holds_without_the_join_guard(db):
+    """A tampered edge in org A pointing at org B, walked from an org A entry.
+
+    Asserted on CONTENT rather than only ids, so the test fails if a foreign
+    row is returned under any shape.
+    """
+    org_a = _org(db)
+    org_b = _org(db)
+    entry = _seed(db, org_id=org_a, content="org A entry")
+    foreign = _seed(db, org_id=org_b, content="ORG-B-SECRET-MARKER")
+    _tampered_edge(db, org_id=org_a, src_id=entry, dst_id=foreign)
+
+    result = graph_store.neighbors(
+        db, org_id=org_a, viewer_user_id=DEV, memory_ids=[entry], scope="org"
+    )
+    blob = json.dumps(result, default=str)
+    assert "ORG-B-SECRET-MARKER" not in blob
