@@ -25,6 +25,23 @@ RUN pip install --no-cache-dir \
     "litellm>=1.0.0" \
     "boto3>=1.29.0"
 
+# Tree-sitter grammars for the code compressor (shared[code]). ~4.5 MB of
+# wheels. Without them the compressor detects nothing and passes code through,
+# which is safe but useless, so they are installed rather than left optional
+# here.
+#
+# The prose model (shared[prose]) is deliberately NOT installed: onnxruntime
+# plus the int8 weights is ~350 MB, roughly doubling this image, for a
+# compressor that saves ~1% on technical text at the shipped threshold. Prose
+# compression degrades to passthrough in this image by design; install
+# shared[prose] where it is actually wanted.
+RUN pip install --no-cache-dir \
+    "tree-sitter>=0.25,<0.27" \
+    "tree-sitter-python>=0.25,<0.26" \
+    "tree-sitter-javascript>=0.25,<0.26" \
+    "tree-sitter-typescript>=0.23,<0.24" \
+    "tree-sitter-go>=0.25,<0.26"
+
 # Install the MCP server service.
 COPY services/mcp-server/pyproject.toml /app/
 COPY services/mcp-server/app /app/app

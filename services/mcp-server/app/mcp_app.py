@@ -2732,7 +2732,10 @@ def _register_tools(mcp: FastMCP) -> None:
             "you also get a `handle` that klio_retrieve turns back into the "
             "full original for the next 24 hours. Content under ~500 tokens, "
             "and anything we cannot confidently identify, is returned "
-            "untouched."
+            "untouched. Reading compressed JSON: it is minified, keys whose "
+            "value was null on every row are omitted, and keys identical on "
+            "every row are hoisted into a `common` object that applies to all "
+            "of them — no information is lost."
         ),
     )
     async def compress(
