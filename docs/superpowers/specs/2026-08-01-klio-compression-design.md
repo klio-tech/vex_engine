@@ -151,8 +151,20 @@ A router selects a compressor by content type.
 |---|---|---|---|---|
 | **Structural** | JSON, tool output, recall payloads | Fold repeated keys, drop nulls, shorten ids, hoist constants | 50–80% | no |
 | **Code** | Source, diffs | Tree-sitter AST: keep signatures and structure, drop bodies | 40–70% | yes |
-| **Prose** | Logs, docs, transcripts | `klio-compress-v1`, keep/drop score per token | 15–20% | yes |
+| **Prose** | Logs, docs, transcripts | `klio-compress-v1`, keep/drop score per token | **~1.4%** (measured) | yes |
 | **Passthrough** | Unrecognised, or under ~500 tokens | nothing | 0% | no |
+
+> **Corrected 2026-08-01, after stage 4 shipped.** This table originally
+> projected 15–20% for prose. Measured on our own markdown at the conservative
+> default it is **1.4%**, and on log files **0% at every threshold** — 56% of a
+> log's subwords sit inside protected spans (timestamps, dotted identifiers,
+> byte counts), and only 13 of 1,502 scored below 0.30 at all.
+>
+> That is the conservative threshold behaving as designed on technical text,
+> not a defect. But 15–20% was a guess, it was wrong, and it must not be
+> quoted. **The value in this system is code (72%) and JSON (66–82%), not the
+> model.** Prose compression earns its place only on genuinely prose-heavy
+> input, which agent traffic largely is not.
 
 **Structural ships first and is the most valuable.** It is pure waste removal,
 needs no model, and fixes the measured 83% envelope on Klio's own recall.
