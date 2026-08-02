@@ -52,6 +52,8 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 from shared import artifact_storage, artifacts, brain, projects
+from shared.compression.router import compress as route_compress
+from shared.compression.router import estimate_tokens
 from shared.compression.structural import compress_payload
 from shared.memory import MemoryRecord, retract_memory, retrieve_memories_scoped
 from shared.plan_limits import get_plan_config
@@ -72,7 +74,12 @@ from app.config import (
 )
 from app.db import SessionLocal
 from app.directory import resolve_org_member_by_email
-from app.compression_cache import handle_is_expired, load_original
+from app.compression_cache import (
+    OriginalTooLarge,
+    handle_is_expired,
+    load_original,
+    store_original,
+)
 from app.identity import resolve_request_user_id
 from app.recall_log import log_recall_event
 from app.session import brain_session_id
@@ -98,6 +105,7 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "project_members",
     "project_grant",
     "klio_retrieve",
+    "compress",
 )
 
 # Server-level guidance surfaced to MCP clients during ``initialize``.
@@ -1606,6 +1614,86 @@ async def _perform_recall(
         db.close()
 
 
+async def _perform_compress(
+    ctx: Context, *, content: str, lossy: bool = False
+) -> dict[str, Any]:
+    """Shared body for the Klio ``compress`` tool.
+
+    The response pairs two fields and the pairing is the whole contract:
+    ``lossy=true`` is only ever returned alongside a ``handle`` that
+    ``klio_retrieve`` resolves, and ``lossy=false`` is never returned with
+    one. A handle with nothing behind it, or lossy output with no way back,
+    are both broken promises.
+
+    **The handle is a separate field, never a marker inside the text.** Models
+    echo inline markers back, and an echoed marker inside a diff or a source
+    file corrupts it.
+
+    **If the original cannot be stored, the content comes back unchanged.**
+    Returning compressed-but-unrecoverable output would be the one failure the
+    originals cache exists to prevent, so an oversized original or a database
+    error costs the compression, not the content.
+
+    Fail-open throughout: every error path returns the input with
+    ``lossy=false``.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        return {"error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, _agent_id, _plan, _overrides = resolve_principal_plan(request)
+    except HTTPException as exc:
+        return {"error": "unauthorized", "detail": str(exc.detail)}
+
+    user_id = resolve_request_user_id(request)
+
+    def _unchanged() -> dict[str, Any]:
+        tokens = estimate_tokens(content) if isinstance(content, str) else 0
+        return {
+            "compressed": content,
+            "original_tokens": tokens,
+            "compressed_tokens": tokens,
+            "lossy": False,
+        }
+
+    if not isinstance(content, str) or not content:
+        return _unchanged()
+
+    try:
+        result = route_compress(content, allow_lossy=lossy)
+    except Exception:
+        logger.exception("compression failed; returning the content unchanged")
+        return _unchanged()
+
+    payload = {
+        "compressed": result.text,
+        "original_tokens": result.original_tokens,
+        "compressed_tokens": result.compressed_tokens,
+        "lossy": result.lossy,
+    }
+    if not result.lossy:
+        return payload
+
+    db = SessionLocal()
+    try:
+        payload["handle"] = store_original(
+            db, org_id=org_id, user_id=user_id, text=content
+        )
+    except OriginalTooLarge:
+        logger.info("original exceeds the inline cache; returning it uncompressed")
+        return _unchanged()
+    except Exception:
+        logger.exception("could not store the original; returning it uncompressed")
+        return _unchanged()
+    finally:
+        db.close()
+
+    return payload
+
+
 async def _perform_klio_retrieve(
     ctx: Context, *, handle: str, offset: int = 0
 ) -> dict[str, Any]:
@@ -2631,6 +2719,40 @@ def _register_tools(mcp: FastMCP) -> None:
         ] = 0,
     ) -> dict[str, Any]:
         return await _perform_klio_retrieve(ctx, handle=handle, offset=offset)
+
+    @mcp.tool(
+        name="compress",
+        description=(
+            "Compress content before putting it in context — tool output, "
+            "JSON, source files, logs, documentation. Returns the compressed "
+            "text with a before/after token count. By default only lossless "
+            "compression is applied. Pass lossy=true to allow the "
+            "information-dropping compressors (source code keeps signatures "
+            "and drops bodies; prose drops low-value tokens); when it does, "
+            "you also get a `handle` that klio_retrieve turns back into the "
+            "full original for the next 24 hours. Content under ~500 tokens, "
+            "and anything we cannot confidently identify, is returned "
+            "untouched. Reading compressed JSON: it is minified, keys whose "
+            "value was null on every row are omitted, and keys identical on "
+            "every row are hoisted into a `common` object that applies to all "
+            "of them — no information is lost."
+        ),
+    )
+    async def compress(
+        ctx: Context,
+        content: Annotated[str, Field(description="The text to compress.")],
+        lossy: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Allow compressors that drop information. A `handle` is "
+                    "returned with the result so the original can be "
+                    "recovered."
+                )
+            ),
+        ] = False,
+    ) -> dict[str, Any]:
+        return await _perform_compress(ctx, content=content, lossy=lossy)
 
     @mcp.tool(
         name="project_list",

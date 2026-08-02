@@ -1,0 +1,24 @@
+Klio / Vex Engine
+Copyright (c) Oppla.ai
+
+This product includes third-party material distributed under the Apache
+License, Version 2.0. A copy of that licence is available at
+http://www.apache.org/licenses/LICENSE-2.0
+
+-------------------------------------------------------------------------------
+
+kompress-v2-base
+  https://huggingface.co/chopratejas/kompress-v2-base
+  Copyright (c) Tejas Chopra
+  Licensed under the Apache License, Version 2.0.
+
+  Model weights used, unmodified, by the prose compressor
+  (services/shared/shared/compression/prose.py). No source code from the
+  upstream project is included or derived from.
+
+ModernBERT-base
+  https://huggingface.co/answerdotai/ModernBERT-base
+  Copyright (c) Answer.AI, LightOn, and contributors
+  Licensed under the Apache License, Version 2.0.
+
+  The base model that kompress-v2-base fine-tunes.
