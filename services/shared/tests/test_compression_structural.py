@@ -113,3 +113,28 @@ def test_malformed_input_returns_unchanged():
     weird = {"not": "a recall payload"}
     out, _ = compress_payload(weird)
     assert out == weird
+
+
+def test_identical_content_on_two_rows_is_never_hoisted():
+    """Two memories can legitimately hold the same text.
+
+    Hoisting is keyed on "every row agrees", so identical content would be
+    lifted into `common` and erased from the rows — a caller iterating
+    memories would see entries with no content at all. `id` has the same
+    exposure. Mutation-checked: removing "content" from the never-hoist set
+    made no test fail before this one existed, because every fixture happened
+    to have distinct content.
+    """
+    payload = {
+        "memories": [
+            {"id": "a", "content": "deploys run on Railway", "scope": "org"},
+            {"id": "b", "content": "deploys run on Railway", "scope": "org"},
+        ],
+        "count": 2,
+    }
+    out, _ = compress_payload(payload)
+    assert "content" not in out.get("common", {}), "content must never be hoisted"
+    assert "id" not in out.get("common", {}), "id must never be hoisted"
+    for row in out["memories"]:
+        assert row["content"] == "deploys run on Railway"
+        assert row["id"] in {"a", "b"}
