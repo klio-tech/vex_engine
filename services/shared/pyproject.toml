@@ -16,9 +16,30 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Tree-sitter grammars for the code compressor. Optional because they require
+# Python 3.10+ while this package still supports 3.9, and because the
+# compressor degrades to passthrough without them rather than failing.
+code = [
+    "tree-sitter>=0.25,<0.27",
+    "tree-sitter-python>=0.25,<0.26",
+    "tree-sitter-javascript>=0.25,<0.26",
+    "tree-sitter-typescript>=0.23,<0.24",
+    "tree-sitter-go>=0.25,<0.26",
+]
+# The prose model. Deliberately NOT a default dependency: onnxruntime plus the
+# weights is ~350 MB, which is not something to put in every image for a
+# compressor that reports single-digit savings. Install it where prose
+# compression is actually wanted; everywhere else it passes through.
+prose = [
+    "onnxruntime>=1.17",
+    "tokenizers>=0.20",
+    "huggingface-hub>=0.24",
+    "numpy>=1.24",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
+    "vex-shared[code]",
 ]
 
 [tool.hatch.build.targets.wheel]
