@@ -51,11 +51,17 @@ from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
-from shared import artifact_storage, artifacts, brain, projects
+from shared import artifact_storage, artifacts, brain, graph_store, projects
 from shared.compression.router import compress as route_compress
 from shared.compression.router import estimate_tokens
 from shared.compression.structural import compress_payload
-from shared.memory import MemoryRecord, retract_memory, retrieve_memories_scoped
+from shared.memory import (
+    _NO_CREDENTIALS_RULE,
+    MemoryRecord,
+    call_llm,
+    retract_memory,
+    retrieve_memories_scoped,
+)
 from shared.plan_limits import get_plan_config
 from shared.promotion import promote_memory
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
@@ -106,6 +112,7 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "project_grant",
     "klio_retrieve",
     "compress",
+    "explore",
 )
 
 # Server-level guidance surfaced to MCP clients during ``initialize``.
@@ -1900,6 +1907,118 @@ async def _perform_share(ctx: Context, *, memory_id: str, to: str) -> dict[str, 
         db.close()
 
 
+async def _synthesize_entity_summary(brief: dict[str, Any]) -> Optional[str]:
+    """LLM-synthesize the 2-3 sentence entity summary from the VISIBLE slice.
+
+    Only the caller's own visible evidence (already ladder-filtered by
+    ``graph_store.entity_brief``) reaches the prompt, so the summary can never
+    say more than the caller could read row by row. Returns ``None`` on any
+    failure — explore degrades to a summary-less brief rather than erroring.
+    """
+    contents = [m.content for m in brief.get("memories", [])[:20] if m.content]
+    if not contents:
+        return None
+    prompt = (
+        f"Synthesize what this team knows about '{brief['entity']}' "
+        "in 2-3 sentences, from the memories below. State only what the "
+        "memories support. "
+        + _NO_CREDENTIALS_RULE
+        + "\n\n- "
+        + "\n- ".join(contents)
+        + '\n\nRespond with JSON: {"summary": "<your summary>"}'
+    )
+    try:
+        result = await call_llm(prompt)
+    except Exception:
+        logger.warning("explore: summary synthesis raised", exc_info=True)
+        return None
+    if not isinstance(result, dict):
+        return None
+    summary = result.get("summary")
+    return summary if isinstance(summary, str) and summary else None
+
+
+def _contributor_labels(brief: dict[str, Any], user_id: Optional[str]) -> list[str]:
+    """Contributors as COUNTS, never identities.
+
+    ``["you", "2 teammates"]`` when the caller authored part of the visible
+    slice, ``["3 teammates"]`` when not, ``[]`` when nothing visible is
+    attributed. No user id — not even the caller's own — appears in the
+    payload: ids are principals, and a brief that echoed them would hand every
+    MCP client a directory of who wrote what.
+    """
+    total = int(brief.get("contributors", 0))
+    caller_contributed = bool(user_id) and any(
+        m.user_id == user_id for m in brief.get("memories", [])
+    )
+    teammates = total - (1 if caller_contributed else 0)
+    labels: list[str] = []
+    if caller_contributed:
+        labels.append("you")
+    if teammates > 0:
+        labels.append(f"{teammates} teammate" + ("s" if teammates != 1 else ""))
+    return labels
+
+
+async def _perform_explore(ctx: Context, *, entity: str) -> dict[str, Any]:
+    """Shared body for the ``explore`` tool: an entity brief, or not_found.
+
+    The visibility work happens in :func:`shared.graph_store.entity_brief`
+    (derived from evidence, ladder in SQL, both edge endpoints checked); this
+    layer resolves the caller and shapes the payload. Two hard rules live
+    here:
+
+    * ``None`` from the store — covering a nonexistent entity, another org's
+      entity, and one whose every evidencing memory is invisible to this
+      caller — becomes ONE opaque ``not_found`` payload. Never an empty brief
+      (it would confirm the name exists), never ``forbidden``.
+    * The raw evidence rows do NOT ship. The brief is the product; the rows
+      are reachable via ``recall`` under the same ladder.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        logger.error("explore got no transport request; cannot authenticate")
+        return {"error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, _agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"error": "unauthorized", "detail": str(exc.detail)}
+
+    user_id = resolve_request_user_id(request)
+
+    db = SessionLocal()
+    try:
+        brief = graph_store.entity_brief(
+            db, org_id=org_id, viewer_user_id=user_id, entity=entity
+        )
+        if brief is None:
+            return {"error": "not_found", "entity": entity}
+
+        summary = await _synthesize_entity_summary(brief)
+        return {
+            "entity": brief["entity"],
+            "kind": brief["kind"],
+            "summary": summary,
+            # The summary is an on-the-fly LLM deduction over the caller's
+            # visible slice; labelled so a client never mistakes it for
+            # something a person stated.
+            "summary_provenance": "INFERRED" if summary else None,
+            "decisions": brief["decisions"],
+            "superseded": brief["superseded"],
+            "contributors": _contributor_labels(brief, user_id),
+            "provenance": brief["provenance"],
+            "evidence_count": brief["evidence_count"],
+        }
+    except Exception:
+        logger.exception("explore failed")
+        return {"error": "explore_failed"}
+    finally:
+        db.close()
+
+
 def _serialize_project(p: dict[str, Any]) -> dict[str, Any]:
     """JSON-safe projection of a :func:`shared.projects.list_projects` row."""
     return {
@@ -2753,6 +2872,27 @@ def _register_tools(mcp: FastMCP) -> None:
         ] = False,
     ) -> dict[str, Any]:
         return await _perform_compress(ctx, content=content, lossy=lossy)
+
+    @mcp.tool(
+        name="explore",
+        description=(
+            "Explore everything the team's memory knows about one entity — a "
+            "system, person, project, tool, or concept — as a structured "
+            "brief: a synthesized summary, decisions in order, what was "
+            "superseded and by what, contributor counts, and provenance "
+            "(stated vs inferred). Built from YOUR visible slice of memory "
+            "(org + your projects + your private notes), so teammates may see "
+            "different briefs. Arg: entity (its name)."
+        ),
+    )
+    async def explore(
+        ctx: Context,
+        entity: Annotated[
+            str,
+            Field(description="The entity name to explore, e.g. 'auth service'."),
+        ],
+    ) -> dict[str, Any]:
+        return await _perform_explore(ctx, entity=entity)
 
     @mcp.tool(
         name="project_list",

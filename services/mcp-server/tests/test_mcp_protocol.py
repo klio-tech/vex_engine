@@ -43,6 +43,7 @@ _REQUIRED_SCHEMA_FIELD = {
     "project_grant": "project",
     "klio_retrieve": "handle",
     "compress": "content",
+    "explore": "entity",
 }
 
 
