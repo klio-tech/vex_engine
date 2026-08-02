@@ -145,7 +145,7 @@ def compress(
     text: str,
     *,
     prose_threshold: float = DEFAULT_THRESHOLD,
-    keep_bodies: bool = False,
+    allow_lossy: bool = True,
 ) -> CompressionResult:
     """Route ``text`` to a compressor and report what happened.
 
@@ -153,6 +153,14 @@ def compress(
     and input that is not text all return the input unchanged with
     ``lossy=False``. Compression is never allowed to raise into a request
     path.
+
+    Args:
+        text: the content to compress.
+        prose_threshold: minimum keep-probability for the prose model.
+        allow_lossy: when false, a compressor that would drop information is
+            declined *before* it runs. Suppressing the result afterwards would
+            still have paid for the model call, and would leave the decision
+            somewhere the caller cannot see it.
     """
     if not isinstance(text, str) or not text:
         return _passthrough(text)
@@ -166,8 +174,10 @@ def compress(
     try:
         if choice is Compressor.STRUCTURAL:
             out, lossy = compress_json_text(text), False
+        elif not allow_lossy:
+            return _passthrough(text)
         elif choice is Compressor.CODE:
-            out, lossy = compress_code(text, keep_bodies=keep_bodies), True
+            out, lossy = compress_code(text), True
         elif choice is Compressor.PROSE:
             out, lossy = compress_prose(text, threshold=prose_threshold), True
         else:

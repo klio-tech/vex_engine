@@ -300,3 +300,22 @@ def test_a_module_of_only_class_definitions_is_still_code():
     result = compress(source)
     assert result.text == source
     assert result.lossy is False
+
+
+def test_allow_lossy_false_declines_before_the_compressor_runs(monkeypatch):
+    """Suppressing a lossy result afterwards would still have paid for it."""
+    from shared.compression import router as router_module
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("the lossy compressor was called anyway")
+
+    monkeypatch.setattr(router_module, "compress_code", must_not_run)
+    result = compress(LONG_PYTHON, allow_lossy=False)
+    assert result.text == LONG_PYTHON
+    assert result.lossy is False
+
+
+def test_allow_lossy_false_still_runs_the_lossless_compressor():
+    result = compress(LONG_JSON, allow_lossy=False)
+    assert result.compressor == Compressor.STRUCTURAL.value
+    assert result.compressed_tokens < result.original_tokens
