@@ -82,6 +82,23 @@ Truncation applies ONLY to the vector input — stored ``content`` is never
 modified. This also prevents oversized content from returning HTTP 400 and
 looping the embedder (which previously flooded logs at the host's rate limit)."""
 
+GRAPH_EXPANSION_CAP: int = 5
+"""Max rows recall's stage-B graph expansion may ADD beyond the vector stage.
+
+A hard payload bound: a hub memory with hundreds of edges must not turn one
+recall into a graph dump. The expansion itself is depth-1 and ladder-scoped in
+SQL inside :func:`shared.graph_store.neighbors`; this cap only bounds volume.
+"""
+
+# Stage-C blended re-rank weights (spec: recall learns to walk). Similarity
+# dominates; recency and edge-connectedness are equal minority signals. The
+# pre-graph SQL rank used 0.85/0.15 with no connectedness term — the 0.15 the
+# graph gets comes out of similarity's share, not recency's.
+_RERANK_SIMILARITY_WEIGHT = 0.70
+_RERANK_RECENCY_WEIGHT = 0.15
+_RERANK_CONNECTEDNESS_WEIGHT = 0.15
+_RECENCY_WINDOW_SECONDS = 30 * 86400
+
 EMBED_MIN_CHARS: int = 256
 """Smallest truncation floor for :func:`embed_text`'s progressive retry.
 
@@ -878,6 +895,95 @@ def retract_memory(
     return {"forgotten": True, "id": str(parsed)}
 
 
+def _recency_norm(created_at: Optional[datetime]) -> float:
+    """Fraction of the 30-day window remaining, clamped to [0, 1].
+
+    The Python twin of the SQL recency term in the stage-A ORDER BY, used by
+    the stage-C re-rank (which has to blend rows from two queries and so
+    cannot stay in one statement).
+    """
+    if created_at is None:
+        return 0.0
+    age = (datetime.now(timezone.utc) - created_at).total_seconds()
+    return min(1.0, max(0.0, 1.0 - age / _RECENCY_WINDOW_SECONDS))
+
+
+def _expand_via_graph(
+    db_session: Any,
+    records: list[MemoryRecord],
+    *,
+    org_id: str,
+    scope: str,
+    agent_id: Optional[str],
+    user_id: Optional[str],
+    space_id: Optional[str],
+    project_id: Optional[str],
+) -> list[MemoryRecord]:
+    """Recall stage B+C: one-hop graph expansion, then the blended re-rank.
+
+    Stage B calls :func:`shared.graph_store.neighbors` ONCE over the stage-A
+    entry ids. Every argument that shapes visibility — scope, viewer, agent,
+    space/project filters — is forwarded verbatim, so the expansion evaluates
+    the SAME ladder in SQL and can never introduce a row the vector stage
+    would have been forbidden to return. Volume is bounded by
+    :data:`GRAPH_EXPANSION_CAP` extra rows.
+
+    Stage C re-ranks the merged set by ``0.70·similarity + 0.15·recency +
+    0.15·connectedness`` (connectedness = edge count into the entry set,
+    normalized by the batch max). Expanded rows keep ``relevance=None`` — they
+    did not earn a similarity score and faking one would misrepresent why
+    they are present — and contribute 0 to the similarity term.
+
+    Failure containment: the graph is an enhancement, never a dependency. Any
+    error here logs and returns the stage-A records untouched.
+    """
+    if not records:
+        return records
+
+    # Imported lazily: graph_store imports MemoryRecord/_row_to_record from
+    # THIS module, so a top-level import would be circular. This function is
+    # the single composition point between the two.
+    from shared import graph_store
+
+    try:
+        expansion = graph_store.neighbors(
+            db_session,
+            org_id=org_id,
+            viewer_user_id=user_id,
+            memory_ids=[str(r.id) for r in records],
+            scope=scope,
+            agent_id=agent_id,
+            space_id=space_id,
+            project_id=project_id,
+            limit=GRAPH_EXPANSION_CAP,
+        )
+    except Exception:
+        logger.warning(
+            "recall graph expansion failed; returning vector results alone",
+            exc_info=True,
+        )
+        return records
+
+    entry_ids = {str(r.id) for r in records}
+    extra = [r for r in expansion["records"] if str(r.id) not in entry_ids]
+    if not extra:
+        return records
+
+    connections: dict[str, int] = expansion["connections"]
+    max_connections = max(connections.values(), default=0) or 1
+
+    def _blended(record: MemoryRecord) -> float:
+        similarity = record.relevance if record.relevance is not None else 0.0
+        connectedness = connections.get(str(record.id), 0) / max_connections
+        return (
+            _RERANK_SIMILARITY_WEIGHT * similarity
+            + _RERANK_RECENCY_WEIGHT * _recency_norm(record.created_at)
+            + _RERANK_CONNECTEDNESS_WEIGHT * connectedness
+        )
+
+    return sorted(records + extra, key=_blended, reverse=True)
+
+
 async def retrieve_memories_scoped(
     db_session: Any,
     org_id: str,
@@ -1149,4 +1255,18 @@ async def retrieve_memories_scoped(
         record = _row_to_record(row[:-1])
         record.relevance = round(float(relevance), 3) if relevance is not None else None
         records.append(record)
-    return records
+
+    # Stage B+C (knowledge graph): one-hop, ladder-scoped expansion around the
+    # vector entry points, then the blended re-rank. Adds at most
+    # GRAPH_EXPANSION_CAP rows; on any failure the vector results above are
+    # returned unchanged.
+    return _expand_via_graph(
+        db_session,
+        records,
+        org_id=org_id,
+        scope=scope,
+        agent_id=agent_id,
+        user_id=user_id,
+        space_id=space_id,
+        project_id=project_id,
+    )
