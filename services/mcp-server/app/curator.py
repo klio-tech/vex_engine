@@ -5,9 +5,12 @@ time. Periodically it reads one user's RAW private memories — the passive hook
 captures and discrete writes (``observation`` / ``note`` / ``memory`` /
 ``plan`` / ``decision``) — and synthesises higher-level memories back into the
 **same user's private scope**: a single ``summary`` plus discrete ``fact`` rows.
-It reuses the existing LLM helpers (:func:`shared.memory.generate_summary` /
-:func:`shared.memory.extract_facts`) and the brain write path
-(:func:`shared.brain.write_scoped_memory`) verbatim.
+It reuses the existing LLM helpers (:func:`shared.memory.generate_summary` and
+the extended :func:`extract_graph` pass, which subsumed the old facts-only
+extraction) and the brain write path
+(:func:`shared.brain.write_scoped_memory`) verbatim. Since phase 2 of the
+knowledge graph the same extraction pass also yields entities and edges,
+stored through the :mod:`shared.graph_store` seam, every one ``INFERRED``.
 
 Why per user, and why it never touches ``org``:
     Until phase 2 this job read ``scope='org'`` and wrote ``scope='org'``. Hook
@@ -78,16 +81,18 @@ Scheduling:
 
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, NamedTuple, Optional
 
 from sqlalchemy import text
 
+from shared import graph_store
 from shared.brain import write_scoped_memory
 from shared.memory import (
+    _NO_CREDENTIALS_RULE,
     call_llm,
     embed_text,
-    extract_facts,
     generate_summary,
     supersede_memory,
 )
@@ -120,6 +125,33 @@ DEFAULT_CURATOR_AGENT_ID: str = "klio-curator"
 RECONCILE_SIMILARITY_THRESHOLD = 0.85
 RECONCILE_CANDIDATES_PER_FACT = 5
 
+# Relations the extraction pass may draw. Deliberately NOT the full closed set
+# from graph_store: `supersedes` is reconciliation's judgment (a compared pair,
+# not a single-batch impression) and `derived_from` is bookkeeping the code
+# records itself. An extractor that "notices" either is hallucinating history.
+_EXTRACTABLE_RELATIONS: tuple[str, ...] = ("about", "relates_to")
+
+
+def _entity_cap() -> int:
+    """Max NEW entities one curator tick may create (god-entity guard part 3).
+
+    Overflow is logged and dropped, never stored: a single runaway extraction
+    must not be able to hairball the org's graph in one tick.
+    """
+    return int(os.environ.get("CURATOR_ENTITY_CAP", "12"))
+
+
+@dataclass
+class EntityBudget:
+    """The per-TICK entity allowance, threaded through per-partition synthesis.
+
+    Deliberately mutable (like the reconcile budget integer this module already
+    threads): the whole point is that partitions within one tick draw down a
+    single shared allowance rather than each getting a fresh one.
+    """
+
+    remaining: int
+
 
 def _reconcile_budget() -> int:
     """Max LLM judge calls (``call_llm`` attempts) across all facts in one curator tick.
@@ -132,6 +164,165 @@ def _reconcile_budget() -> int:
     bounded by this value — not merely accounted after the fact.
     """
     return int(os.environ.get("CURATOR_RECONCILE_MAX", "50"))
+
+
+async def extract_graph(combined: str) -> dict[str, Any]:
+    """One extended LLM pass: facts PLUS the entities and edges they evidence.
+
+    This replaces the old facts-only extraction call in the tick — same single
+    ``call_llm`` round trip, extended prompt (spec decision 2: the curator is
+    the graph builder precisely because it already reads every memory; no new
+    LLM pass, no new cost centre).
+
+    Output contract (always all three keys, empty lists on any failure)::
+
+        {"facts": ["..."],
+         "entities": [{"name": "auth service", "kind": "system"}],
+         "edges": [{"src": 0, "relation": "about", "entity": "auth service"}]}
+
+    Edge parsing accepts the spec's wire shape — ``{"src": <fact idx>,
+    "<relation>": "<entity name>"}`` — and NORMALIZES it to the explicit form
+    above. Only :data:`_EXTRACTABLE_RELATIONS` survive: an extractor claiming
+    ``supersedes`` or ``derived_from`` is inventing history, and a
+    non-integer ``src`` cannot be attached to anything. Malformed items are
+    dropped one by one; they never take the batch down.
+    """
+    kinds = "|".join(sorted(graph_store.ENTITY_KINDS))
+    prompt = (
+        "Extract discrete, verifiable facts from the following notes, AND the "
+        "named entities those facts concern. "
+        + _NO_CREDENTIALS_RULE
+        + "Entities must be specific named things (a service, a person, a "
+        "project, a tool, a decision subject) — NEVER generic terms like "
+        "'the code', 'the user', 'the system', weekdays, or bare programming "
+        "language names. Prefer few precise entities over many vague ones."
+        "\n\n" + combined + "\n\nRespond with JSON exactly of this shape:\n"
+        '{"facts": ["<fact>", ...],\n'
+        f' "entities": [{{"name": "<name>", "kind": "<{kinds}>"}}, ...],\n'
+        ' "edges": [{"src": <fact index>, "about": "<entity name>"},\n'
+        '           {"src": <fact index>, "relates_to": "<entity name>"}, ...]}'
+    )
+
+    empty: dict[str, Any] = {"facts": [], "entities": [], "edges": []}
+    try:
+        result = await call_llm(prompt)
+    except Exception:
+        logger.warning("curator: extract_graph LLM call raised", exc_info=True)
+        return empty
+    if not isinstance(result, dict):
+        return empty
+
+    facts_raw = result.get("facts", [])
+    facts = (
+        [f for f in facts_raw if isinstance(f, str)]
+        if isinstance(facts_raw, list)
+        else []
+    )
+
+    entities_raw = result.get("entities", [])
+    entities = (
+        [
+            e
+            for e in entities_raw
+            if isinstance(e, dict) and isinstance(e.get("name"), str)
+        ]
+        if isinstance(entities_raw, list)
+        else []
+    )
+
+    edges: list[dict[str, Any]] = []
+    edges_raw = result.get("edges", [])
+    if isinstance(edges_raw, list):
+        for edge in edges_raw:
+            if not isinstance(edge, dict):
+                continue
+            relation = next(
+                (r for r in _EXTRACTABLE_RELATIONS if isinstance(edge.get(r), str)),
+                None,
+            )
+            src = edge.get("src")
+            if relation is None or not isinstance(src, int) or isinstance(src, bool):
+                continue
+            edges.append({"src": src, "relation": relation, "entity": edge[relation]})
+
+    return {"facts": facts, "entities": entities, "edges": edges}
+
+
+def _store_graph(
+    db_session: Any,
+    *,
+    org_id: str,
+    entities: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    fact_row_ids: dict[int, str],
+    entity_budget: EntityBudget,
+) -> int:
+    """Persist one partition's extracted entities and edges via the GraphStore.
+
+    Everything here is best-effort telemetry on top of the facts, and every
+    write is ``INFERRED``: a refused entity (god-entity guard), an exhausted
+    per-tick cap, or an edge whose fact deduped away (no new row → nothing to
+    attach; drawing the edge to some OTHER row would be misattribution) is
+    logged and skipped — a graph problem must never abort the tick.
+
+    Returns the number of edges drawn.
+    """
+    entity_ids: dict[str, str] = {}
+    for spec in entities:
+        name = spec.get("name") or ""
+        kind = spec.get("kind") or ""
+        norm = graph_store.normalize_entity_name(name)
+        if not norm or norm in entity_ids:
+            continue
+        if entity_budget.remaining <= 0:
+            logger.warning(
+                "curator: per-tick entity cap reached for org %s; dropping %r "
+                "(and any further entities this tick)",
+                org_id,
+                norm,
+            )
+            break
+        try:
+            entity_ids[norm] = graph_store.add_entity(
+                db_session, org_id=org_id, name=name, kind=kind
+            )
+            entity_budget.remaining -= 1
+        except graph_store.EntityRefused as exc:
+            logger.info("curator: entity refused for org %s: %s", org_id, exc)
+        except Exception:
+            logger.warning(
+                "curator: add_entity failed for org %s (%r); skipping",
+                org_id,
+                norm,
+                exc_info=True,
+            )
+
+    drawn = 0
+    for edge in edges:
+        src_row_id = fact_row_ids.get(edge.get("src"))
+        entity_id = entity_ids.get(
+            graph_store.normalize_entity_name(edge.get("entity") or "")
+        )
+        if src_row_id is None or entity_id is None:
+            continue  # deduped fact, refused/capped entity, or bad index
+        try:
+            graph_store.add_edge(
+                db_session,
+                org_id=org_id,
+                src_id=src_row_id,
+                dst_kind="entity",
+                dst_id=entity_id,
+                relation=edge["relation"],
+                provenance="INFERRED",
+            )
+            drawn += 1
+        except Exception:
+            logger.warning(
+                "curator: add_edge failed for org %s; skipping",
+                org_id,
+                exc_info=True,
+            )
+    return drawn
 
 
 async def reconcile_fact(
@@ -211,6 +402,28 @@ async def reconcile_fact(
         if verdict and verdict.get("contradicts") is True:
             supersede_memory(db_session, row.id, new_fact_id)
             superseded += 1
+            # Record the judgment it just made as a supersedes edge (spec:
+            # "it already makes the judgment; today it only flips status").
+            # Best-effort: the status flip is the contract, the edge is the
+            # explanation, and a graph problem must never undo or abort a
+            # reconciliation that already happened.
+            try:
+                graph_store.add_edge(
+                    db_session,
+                    org_id=org_id,
+                    src_id=str(new_fact_id),
+                    dst_kind="memory",
+                    dst_id=str(row.id),
+                    relation="supersedes",
+                    provenance="INFERRED",
+                )
+            except Exception:
+                logger.warning(
+                    "reconcile: supersedes edge write failed for org %s; "
+                    "the status flip stands",
+                    org_id,
+                    exc_info=True,
+                )
     return superseded, judged
 
 
@@ -397,6 +610,7 @@ async def _synthesize_and_store(
     input_count: int,
     space_id: Optional[str] = None,
     project_id: Optional[str] = None,
+    entity_budget: Optional[EntityBudget] = None,
 ) -> int:
     """Run the LLM synthesis over ``combined`` and store the results.
 
@@ -404,7 +618,15 @@ async def _synthesize_and_store(
     summary write is skipped but fact extraction is still attempted, and any
     individual write failure is logged without aborting the rest. Returns the
     number of memories that were *newly stored* (dedup hits do NOT count).
+
+    Since phase 2 of the knowledge graph the fact pass is the extended
+    :func:`extract_graph` (same single LLM call): entities and edges ride
+    along and are stored through the GraphStore seam AFTER the facts land, so
+    every edge src is a real stored row. ``entity_budget`` is the shared
+    per-tick allowance; a caller that omits it (direct test invocation) gets
+    a fresh one at the configured cap.
     """
+    budget = entity_budget if entity_budget is not None else EntityBudget(_entity_cap())
     # The session id carries user_id so the dedup window (which is keyed on
     # session_id for shared writes) cannot straddle two people.
     session_id = f"{agent_id}:{org_id}:{user_id}"
@@ -440,19 +662,24 @@ async def _synthesize_and_store(
     else:
         logger.info("curator: no summary produced for org %s", org_id)
 
-    # --- facts ----------------------------------------------------------
+    # --- facts + graph (ONE extended LLM pass) ---------------------------
     try:
-        facts = await extract_facts(combined)
+        graph = await extract_graph(combined)
     except Exception:
         logger.warning(
-            "curator: extract_facts raised for org %s; no facts stored",
+            "curator: extract_graph raised for org %s; no facts stored",
             org_id,
             exc_info=True,
         )
-        facts = []
+        graph = {"facts": [], "entities": [], "edges": []}
+    facts = graph.get("facts", [])
+
+    # Fact index -> newly stored row id. Dedup hits are deliberately ABSENT:
+    # their edges are skipped rather than attached to somebody else's row.
+    fact_row_ids: dict[int, str] = {}
 
     reconcile_budget = _reconcile_budget()
-    for fact in facts:
+    for fact_idx, fact in enumerate(facts):
         if not fact:
             continue
         new_id = await _store_one(
@@ -469,6 +696,7 @@ async def _synthesize_and_store(
         )
         if new_id:
             stored += 1
+            fact_row_ids[fact_idx] = new_id
             if reconcile_budget > 0:
                 fact_embedding = await embed_text(fact)
                 if fact_embedding is not None:
@@ -482,6 +710,23 @@ async def _synthesize_and_store(
                         max_judgments=reconcile_budget,
                     )
                     reconcile_budget -= max(judged, 1)
+
+    # --- the graph itself -------------------------------------------------
+    try:
+        _store_graph(
+            db_session,
+            org_id=org_id,
+            entities=graph.get("entities", []),
+            edges=graph.get("edges", []),
+            fact_row_ids=fact_row_ids,
+            entity_budget=budget,
+        )
+    except Exception:
+        logger.warning(
+            "curator: graph storage failed for org %s; facts are unaffected",
+            org_id,
+            exc_info=True,
+        )
 
     return stored
 
@@ -605,6 +850,9 @@ async def curator_tick(
         partitions.setdefault((r.space_id, r.project_id), []).append(r)
 
     synthesized = 0
+    # ONE entity allowance for the whole tick, drawn down across partitions —
+    # the cap is per tick, not per partition.
+    entity_budget = EntityBudget(_entity_cap())
     for (space_id, project_id), part_rows in partitions.items():
         # Per-partition threshold: a project needs real signal before it gets a
         # distilled fact. Sub-threshold rows stay recallable as raw observations.
@@ -620,6 +868,7 @@ async def curator_tick(
             input_count=len(part_rows),
             space_id=space_id,
             project_id=project_id,
+            entity_budget=entity_budget,
         )
 
     # Rows are ordered (created_at ASC, id ASC), so the LAST row carries the

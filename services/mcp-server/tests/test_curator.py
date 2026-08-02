@@ -11,7 +11,7 @@ each one that used to pin ``org`` now pins ``private`` AND the owner predicate.
 
 Mock-based, mirroring ``shared/tests/test_brain_write.py`` and
 ``mcp-server/tests/test_recall_tool.py``: no real Postgres, no real LLM. The
-LLM helpers (``generate_summary`` / ``extract_facts``) and the write primitive
+LLM helpers (``generate_summary`` / ``extract_graph``) and the write primitive
 (``write_scoped_memory``) are patched at the ``app.curator`` module boundary so
 the synthesis flow can be asserted in isolation.
 
@@ -112,7 +112,12 @@ def _make_session(*, cursor=None, cursor_id=None, rows=None):
 
 
 def _patch_curator(*, summary="a synthesized summary", facts=None):
-    """Context-manager bundle patching the LLM + write seams at app.curator."""
+    """Context-manager bundle patching the LLM + write seams at app.curator.
+
+    Since phase 2 of the knowledge graph, fact extraction is the extended
+    ``extract_graph`` pass (same seam, richer payload); these tests exercise
+    the facts half, so the mock returns an empty graph alongside them.
+    """
     facts = facts if facts is not None else ["fact one", "fact two"]
     return (
         patch(
@@ -121,9 +126,9 @@ def _patch_curator(*, summary="a synthesized summary", facts=None):
             return_value=summary,
         ),
         patch(
-            "app.curator.extract_facts",
+            "app.curator.extract_graph",
             new_callable=AsyncMock,
-            return_value=facts,
+            return_value={"facts": facts, "entities": [], "edges": []},
         ),
         patch(
             "app.curator.write_scoped_memory",
@@ -387,9 +392,9 @@ async def test_deduped_synthesized_write_not_counted():
             return_value="dup summary",
         ),
         patch(
-            "app.curator.extract_facts",
+            "app.curator.extract_graph",
             new_callable=AsyncMock,
-            return_value=["f1", "f2"],
+            return_value={"facts": ["f1", "f2"], "entities": [], "edges": []},
         ),
         patch(
             "app.curator.write_scoped_memory",
@@ -920,8 +925,14 @@ async def test_synthesize_and_store_reconciles_facts_not_summaries(monkeypatch):
     )
     monkeypatch.setattr(
         curator_mod,
-        "extract_facts",
-        AsyncMock(return_value=["fact one", "fact two"]),
+        "extract_graph",
+        AsyncMock(
+            return_value={
+                "facts": ["fact one", "fact two"],
+                "entities": [],
+                "edges": [],
+            }
+        ),
     )
     monkeypatch.setattr(
         curator_mod,
