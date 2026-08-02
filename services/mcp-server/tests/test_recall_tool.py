@@ -111,13 +111,22 @@ async def test_recall_happy_path_serializes_without_embedding():
 
     assert result["count"] == 2
     assert len(result["memories"]) == 2
+    # Structural compression hoists fields identical on every row into
+    # `common` and drops nulls, so a field lives either on the row or on the
+    # envelope. The assertion is over the merged view, which is what the
+    # serialized shape now means. See test_recall_compression.py.
+    common = result.get("common", {})
+    assert "embedding" not in common
     for mem in result["memories"]:
+        merged = {**common, **mem}
         assert "embedding" not in mem
-        assert isinstance(mem["id"], str)
-        assert isinstance(mem["created_at"], (str, type(None)))
-        # Spot-check the serialized shape (additive update: includes
-        # 'relevance' and 'project' added in Task 10).
-        assert set(mem.keys()) == {
+        assert isinstance(merged["id"], str)
+        assert isinstance(merged["created_at"], (str, type(None)))
+        # Spot-check the serialized shape. 'relevance' and 'project' (added
+        # in Task 10) are None on this fixture and nulls are dropped, so they
+        # are absent here; both are still asserted directly in
+        # test_recall_result_includes_relevance_and_project_name.
+        assert set(merged.keys()) == {
             "id",
             "memory_type",
             "content",
@@ -126,10 +135,8 @@ async def test_recall_happy_path_serializes_without_embedding():
             # Added in phase 2: EXTRACTED / INFERRED / AMBIGUOUS, so a caller
             # can tell what the user said from what a model deduced.
             "provenance",
-            "relevance",
             "space_id",
             "project_id",
-            "project",
             "created_at",
             "metadata",
         }
@@ -170,7 +177,13 @@ async def test_recall_stringifies_uuid_space_and_project_ids():
 
 @pytest.mark.asyncio
 async def test_recall_serializes_null_space_and_project_ids():
-    """When space_id/project_id are None they stay None (no 'None' string)."""
+    """When space_id/project_id are None they never become the string 'None'.
+
+    Structural compression represents null by absence, so the assertion is
+    that the key is gone rather than that it is present-and-None. The bug this
+    guards — a UUID or None stringified into "None" — would show up as a
+    present key with a junk value, which is still caught.
+    """
     rec = _make_record()
     rec.space_id = None
     rec.project_id = None
@@ -186,14 +199,24 @@ async def test_recall_serializes_null_space_and_project_ids():
     ):
         result = await _recall_fn()(_fake_ctx(), "q")
 
-    mem = result["memories"][0]
-    assert mem["space_id"] is None
-    assert mem["project_id"] is None
+    import json
+
+    mem = {**result.get("common", {}), **result["memories"][0]}
+    assert mem.get("space_id") is None
+    assert mem.get("project_id") is None
+    # The failure mode being guarded: stringified into "None" rather than
+    # dropped as a genuine null.
+    assert "None" not in json.dumps(result)
 
 
 @pytest.mark.asyncio
 async def test_recall_serializes_null_created_at():
-    """A record with created_at=None serializes created_at as None, not a crash."""
+    """A record with created_at=None serializes as a null, not a crash.
+
+    Structural compression represents null by absence, so the key is dropped
+    rather than present-and-None. The behaviour under test — no exception, and
+    never the string "None" — is unchanged.
+    """
     fn = _recall_fn()
     rec = _make_record()
     rec.created_at = None
@@ -209,8 +232,12 @@ async def test_recall_serializes_null_created_at():
     ):
         result = await fn(_fake_ctx(), "q")
 
+    import json
+
     assert result["count"] == 1
-    assert result["memories"][0]["created_at"] is None
+    mem = {**result.get("common", {}), **result["memories"][0]}
+    assert mem.get("created_at") is None
+    assert "None" not in json.dumps(result)
 
 
 # ---------------------------------------------------------------------------

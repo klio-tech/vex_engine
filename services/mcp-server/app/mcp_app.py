@@ -52,6 +52,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
 from shared import artifact_storage, artifacts, brain, projects
+from shared.compression.structural import compress_payload
 from shared.memory import MemoryRecord, retract_memory, retrieve_memories_scoped
 from shared.plan_limits import get_plan_config
 from shared.promotion import promote_memory
@@ -71,6 +72,7 @@ from app.config import (
 )
 from app.db import SessionLocal
 from app.directory import resolve_org_member_by_email
+from app.compression_cache import handle_is_expired, load_original
 from app.identity import resolve_request_user_id
 from app.recall_log import log_recall_event
 from app.session import brain_session_id
@@ -95,6 +97,7 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "project_list",
     "project_members",
     "project_grant",
+    "klio_retrieve",
 )
 
 # Server-level guidance surfaced to MCP clients during ``initialize``.
@@ -1574,14 +1577,86 @@ async def _perform_recall(
             if row is not None:
                 project_label = {"id": project_id, "name": row.display_name}
         memories = [_serialize_record(r, project_label=project_label) for r in records]
-        return {
+        payload = {
             "memories": memories,
             "count": len(memories),
             "guidance": RECALL_WRITE_NUDGE,
         }
+        # Structural compression is lossless, so it is unconditional: there is
+        # no information to opt into keeping. Nulls go and fields identical on
+        # every row are hoisted into `common`, which is additive — an existing
+        # consumer reading `memories[i]["content"]` is unaffected. See the
+        # compression design spec.
+        #
+        # Wrapped even though compress_payload fails open internally: this is a
+        # request path, and a compressor is never allowed to be the reason a
+        # recall fails. The uncompressed payload is always a correct answer.
+        try:
+            payload, _stats = compress_payload(payload)
+        except Exception:
+            logger.warning(
+                "recall compression raised; returning the uncompressed payload",
+                exc_info=True,
+            )
+        return payload
     except Exception:
         logger.exception("brain recall failed (scope=%s)", scope)
         return {"error": "recall_failed", "guidance": RECALL_WRITE_NUDGE}
+    finally:
+        db.close()
+
+
+async def _perform_klio_retrieve(
+    ctx: Context, *, handle: str, offset: int = 0
+) -> dict[str, Any]:
+    """Shared body for ``klio_retrieve``: recover a compressed original.
+
+    Paging is deliberately the ``artifact_get`` contract — ``TEXT_PAGE_CHARS``
+    per page, ``offset`` to continue, ``has_more`` to stop — so an agent that
+    knows one knows the other.
+
+    **Refusals carry no signal.** A handle belonging to another user, another
+    org, or nobody at all returns the same ``not_found``. ``expired`` is told
+    only to the owner: for anyone else it would confirm the handle is real,
+    which is exactly what ``not_found`` exists to avoid.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        return {"error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, _agent_id, _plan, _overrides = resolve_principal_plan(request)
+    except HTTPException as exc:
+        return {"error": "unauthorized", "detail": str(exc.detail)}
+
+    user_id = resolve_request_user_id(request)
+
+    db = SessionLocal()
+    try:
+        original = load_original(db, org_id=org_id, user_id=user_id, handle=handle)
+        if original is None:
+            # Only the owner of a real-but-stale row learns it expired.
+            if handle_is_expired(db, org_id=org_id, user_id=user_id, handle=handle):
+                return {
+                    "error": "expired",
+                    "detail": (
+                        "This original has passed its 24-hour retention window "
+                        "and is no longer recoverable."
+                    ),
+                }
+            return {"error": "not_found"}
+
+        page = original[offset : offset + artifacts.TEXT_PAGE_CHARS]
+        return {
+            "text": page,
+            "offset": offset,
+            "has_more": (offset + len(page)) < len(original),
+        }
+    except Exception:
+        logger.exception("klio_retrieve failed")
+        return {"error": "internal_error"}
     finally:
         db.close()
 
@@ -2536,6 +2611,26 @@ def _register_tools(mcp: FastMCP) -> None:
         return await _perform_project_create(
             ctx, name=name, git_remote=git_remote, repo_root_path=repo_root_path
         )
+
+    @mcp.tool(
+        name="klio_retrieve",
+        description=(
+            "Recover the full original behind a compression handle (the "
+            "`handle` field returned alongside compressed content). Returns "
+            "the text one page at a time — use `offset` to continue, exactly "
+            "as with artifact_get. Originals are kept for 24 hours."
+        ),
+    )
+    async def klio_retrieve(
+        ctx: Context,
+        handle: Annotated[
+            str, Field(description="The `kc_...` handle issued with compressed output.")
+        ],
+        offset: Annotated[
+            int, Field(description="Character offset for paging text.", ge=0)
+        ] = 0,
+    ) -> dict[str, Any]:
+        return await _perform_klio_retrieve(ctx, handle=handle, offset=offset)
 
     @mcp.tool(
         name="project_list",
