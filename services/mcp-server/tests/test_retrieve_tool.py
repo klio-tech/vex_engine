@@ -12,7 +12,6 @@ Two halves, deliberately:
   mirror ``test_compression_cache_isolation.py``'s fixture.
 """
 
-import os
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -23,32 +22,15 @@ from sqlalchemy import create_engine, text
 from app.compression_cache import store_original
 from app.mcp_app import build_mcp_server
 from shared.artifacts import TEXT_PAGE_CHARS
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
 
 ALICE = "11111111-1111-1111-1111-111111111111"
 BOB = "22222222-2222-2222-2222-222222222222"
 
 
-def _db_reachable() -> bool:
-    try:
-        engine = create_engine(DB_URL)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        engine.dispose()
-        return True
-    except Exception:
-        return False
-
-
-_DB_UP = _db_reachable()
-requires_db = pytest.mark.skipif(
-    not _DB_UP,
-    reason="Postgres not reachable; the klio_retrieve boundary tests require it",
-)
+needs_db = requires_db("the klio_retrieve boundary tests")
 
 
 def _fake_ctx(headers: dict | None = None):
@@ -118,7 +100,7 @@ def _live(db, *, org_id: str, user_id: str | None):
 # ---------------------------------------------------------------------------
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_owner_retrieves_the_original(db, acme):
     """Positive control: without it, a tool that never returns anything would
@@ -134,7 +116,7 @@ async def test_owner_retrieves_the_original(db, acme):
     assert result["has_more"] is False
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_another_users_handle_is_not_found_not_forbidden(db, acme):
     """`forbidden` would confirm the handle exists. Refusals must be
@@ -153,7 +135,7 @@ async def test_another_users_handle_is_not_found_not_forbidden(db, acme):
     assert "secret log" not in str(stolen)
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_an_unattributed_caller_gets_not_found(db, acme):
     """No resolvable user means no user-scoped read can succeed."""
@@ -166,7 +148,7 @@ async def test_an_unattributed_caller_gets_not_found(db, acme):
     assert result == {"error": "not_found"}
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_expired_handle_says_expired(db, acme):
     """Silence would look like an empty original. Name the reason."""
@@ -184,7 +166,7 @@ async def test_expired_handle_says_expired(db, acme):
     assert "secret log" not in str(result)
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_another_users_expired_handle_is_still_only_not_found(db, acme):
     """`expired` is itself a confirmation that the handle was real."""
@@ -199,7 +181,7 @@ async def test_another_users_expired_handle_is_still_only_not_found(db, acme):
     assert result == {"error": "not_found"}
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_paging_matches_the_artifact_get_contract(db, acme):
     """Same contract as artifact_get, so an agent that knows one knows the
@@ -236,7 +218,7 @@ async def test_paging_matches_the_artifact_get_contract(db, acme):
     assert "".join(pages) == original
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_offset_past_the_end_is_empty_not_an_error(db, acme):
     handle = store_original(db, org_id=acme, user_id=ALICE, text="short")

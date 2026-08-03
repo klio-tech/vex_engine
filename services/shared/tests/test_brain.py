@@ -6,7 +6,6 @@ test uses a unique ``org_id`` so runs are isolated on the shared dev DB, and a
 session-scoped fixture cleans up any rows created for those org ids.
 """
 
-import os
 import threading
 import time
 import uuid
@@ -16,32 +15,12 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from shared.brain import ensure_project, ensure_space
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
 
 
-def _db_reachable() -> bool:
-    """True if the test Postgres is reachable. These brain tests exercise real
-    ON CONFLICT / pgvector behaviour that cannot be mocked, so when no DB is
-    available (e.g. CI runs the unit-test matrix without Postgres) the whole
-    module is skipped rather than erroring."""
-    try:
-        engine = create_engine(DB_URL)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        engine.dispose()
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _db_reachable(),
-    reason="Postgres not reachable; brain DB tests require the live test DB",
-)
+pytestmark = requires_db("the brain storage tests")
 
 
 def _unique_org() -> str:

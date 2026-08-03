@@ -17,7 +17,6 @@ WHERE clause admits, never their order.
 Each test uses a unique org so a failure cannot be a leak from another test.
 """
 
-import os
 import uuid
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
@@ -28,28 +27,12 @@ from sqlalchemy import create_engine, text
 from shared import projects
 from shared.memory import retract_memory, retrieve_memories_scoped
 from shared.promotion import promote_memory
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
 
 
-def _db_reachable() -> bool:
-    try:
-        engine = create_engine(DB_URL)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        engine.dispose()
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _db_reachable(),
-    reason="Postgres not reachable; the user-silo boundary tests require it",
-)
+pytestmark = requires_db("the user-silo boundary tests")
 
 EMBED_DIM = 1024
 FIXED_EMBEDDING = [0.1] * EMBED_DIM

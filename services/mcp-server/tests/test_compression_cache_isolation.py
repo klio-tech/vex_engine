@@ -17,35 +17,18 @@ Postgres, and gating them the same way would let a tenancy boundary go
 unverified on every ordinary test run — a skip is not a pass.
 """
 
-import os
 import uuid
 
 import pytest
 from sqlalchemy import create_engine, text
 
 from app.compression_cache import load_original, store_original
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
 
 
-def _db_reachable() -> bool:
-    try:
-        engine = create_engine(DB_URL)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        engine.dispose()
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _db_reachable(),
-    reason="Postgres not reachable; the compression-cache boundary tests require it",
-)
+pytestmark = requires_db("the compression-cache boundary tests")
 
 ALICE = "11111111-1111-1111-1111-111111111111"
 BOB = "22222222-2222-2222-2222-222222222222"

@@ -13,7 +13,6 @@ this file proves ``retrieve_memories_scoped`` composes with it rather than
 around it.
 """
 
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -23,28 +22,12 @@ from sqlalchemy import create_engine, text
 
 from shared import graph_store
 from shared.memory import GRAPH_EXPANSION_CAP, retrieve_memories_scoped
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
 
 
-def _db_reachable() -> bool:
-    try:
-        engine = create_engine(DB_URL)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        engine.dispose()
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _db_reachable(),
-    reason="Postgres not reachable; the expansion tests require it",
-)
+pytestmark = requires_db("the graph-expansion recall tests")
 
 EMBED_DIM = 1024
 FIXED_EMBEDDING = [0.1] * EMBED_DIM

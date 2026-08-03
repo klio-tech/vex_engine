@@ -16,8 +16,6 @@ and the curator backfill are all exactly as the spec requires; only the name
 differs, because the spec's chosen name was already taken.
 """
 
-import os
-
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
@@ -27,24 +25,22 @@ from sqlalchemy.exc import IntegrityError
 # database that exists nowhere in this repo, which would have made every
 # assertion below skip silently for every other developer and in CI —
 # reporting green while testing nothing.
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+from shared.testing import database_url, requires_db
+
+DB_URL = database_url()
+
+pytestmark = requires_db("the migration 031 tests")
 
 
 @pytest.fixture(scope="module")
 def conn():
+    """A real Connection. Reachability is the ``requires_db`` gate's job."""
+    engine = create_engine(DB_URL)
     try:
-        engine = create_engine(DB_URL)
         with engine.connect() as c:
-            c.execute(text("SELECT 1"))
-    except Exception:
-        pytest.skip(
-            "Postgres not reachable; migration 031 tests require the live test DB"
-        )
-    with create_engine(DB_URL).connect() as c:
-        yield c
+            yield c
+    finally:
+        engine.dispose()
 
 
 def _columns(conn, table):

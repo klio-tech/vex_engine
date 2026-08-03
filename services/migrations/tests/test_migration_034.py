@@ -3,27 +3,24 @@
 Mirrors test_migration_031.py's conventions — real Postgres, skips without it.
 """
 
-import os
-
 import pytest
 from sqlalchemy import create_engine, text
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
+
+pytestmark = requires_db("the migration 034 tests")
 
 
 @pytest.fixture(scope="module")
 def conn():
+    """A real Connection. Reachability is the ``requires_db`` gate's job."""
+    engine = create_engine(DB_URL)
     try:
-        engine = create_engine(DB_URL)
         with engine.connect() as c:
-            c.execute(text("SELECT 1"))
-    except Exception:
-        pytest.skip("Postgres not reachable; migration 034 tests require the live DB")
-    with create_engine(DB_URL).connect() as c:
-        yield c
+            yield c
+    finally:
+        engine.dispose()
 
 
 def _columns(conn, table):
