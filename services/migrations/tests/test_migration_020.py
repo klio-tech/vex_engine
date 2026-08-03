@@ -6,11 +6,11 @@ import uuid
 import pytest
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
+
+pytestmark = requires_db("the migration 020 tests")
 
 
 def _alembic_upgrade_head():

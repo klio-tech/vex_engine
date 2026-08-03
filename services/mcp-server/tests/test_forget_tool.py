@@ -1,4 +1,20 @@
-"""forget: retract a memory by id with org/agent authorization."""
+"""forget: the pure-Python half of retract_memory's authorization ladder.
+
+Scope, deliberately: ``FakeDB`` can test the branches that are decided in
+Python — a malformed id, a private row with the wrong owner, an agent row with
+the wrong agent, and that a refusal emits no UPDATE. It CANNOT test the
+tenancy boundary, and no fake can. ``retract_memory`` builds its parameter
+dict from its own arguments, so ``params`` is identical whether or not the SQL
+references ``:org_id``; a params-inspecting fake would see no difference
+between the guarded query and an unguarded one, and asserting on the emitted
+SQL *text* only proves the string was written, not that the server honoured
+it.
+
+The cross-org attack therefore lives on real Postgres, in
+``services/shared/tests/test_forget_isolation.py``. Deleting
+``org_id = :org_id`` from the SELECT above fails five tests there and none
+here — which is the correct division of labour, not a gap in this file.
+"""
 
 import uuid
 
@@ -43,13 +59,20 @@ def test_retract_unknown_id_returns_not_found():
 
 
 def test_retract_org_row_any_agent_succeeds():
+    """An org-scoped row is retractable by any agent in that org — the ladder
+    falls through both the private and the agent check.
+
+    This asserts the ladder's *decision*, not the SQL text. The old version
+    also asserted ``"status = 'retracted'" in update_sql``, which passed
+    whether or not the UPDATE matched a row and so proved nothing; that the
+    retraction actually lands is asserted against a real server in
+    ``test_forget_isolation.py::test_the_owning_org_can_retract_it``."""
     db = FakeDB(row=_Row(scope="org", agent_id="someone-else"))
     result = retract_memory(
         db, org_id="org-1", agent_id="a1", memory_id=str(uuid.uuid4()), via="mcp"
     )
     assert result["forgotten"] is True
-    update_sql = [s for s, _ in db.updates if "UPDATE" in s][0]
-    assert "status = 'retracted'" in update_sql
+    assert any("UPDATE" in s for s, _ in db.updates)
 
 
 def test_retract_agent_row_wrong_agent_forbidden():

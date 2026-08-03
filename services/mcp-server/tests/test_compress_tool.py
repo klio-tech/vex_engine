@@ -16,7 +16,6 @@ who can spend it.
 """
 
 import json
-import os
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -25,31 +24,15 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from app.mcp_app import build_mcp_server
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
 
 ALICE = "11111111-1111-1111-1111-111111111111"
 BOB = "22222222-2222-2222-2222-222222222222"
 
 
-def _db_reachable() -> bool:
-    try:
-        engine = create_engine(DB_URL)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        engine.dispose()
-        return True
-    except Exception:
-        return False
-
-
-_DB_UP = _db_reachable()
-requires_db = pytest.mark.skipif(
-    not _DB_UP, reason="Postgres not reachable; the compress handle tests require it"
-)
+needs_db = requires_db("the compress handle tests")
 
 
 LONG_PYTHON = "import os\n\n\n" + "".join(
@@ -151,7 +134,7 @@ def test_compress_is_a_registered_tool():
 # ---------------------------------------------------------------------------
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_lossless_compression_returns_no_handle(db, acme):
     """Nothing was lost, so there is nothing to recover and no row to write."""
@@ -165,7 +148,7 @@ async def test_lossless_compression_returns_no_handle(db, acme):
     assert result["original_tokens"] > 0
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_lossy_is_refused_unless_the_caller_asks(db, acme):
     """`lossy=false` is the default, and it is a promise, not a preference."""
@@ -178,7 +161,7 @@ async def test_lossy_is_refused_unless_the_caller_asks(db, acme):
     assert "handle" not in result
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_lossy_compression_returns_a_recoverable_handle(db, acme):
     a, b, c = _live(db, org_id=acme, user_id=ALICE)
@@ -196,7 +179,7 @@ async def test_lossy_compression_returns_a_recoverable_handle(db, acme):
     assert recovered["text"] == LONG_PYTHON
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_the_handle_is_never_a_marker_inside_the_text(db, acme):
     """An inline marker gets echoed back by a model and corrupts code."""
@@ -208,7 +191,7 @@ async def test_the_handle_is_never_a_marker_inside_the_text(db, acme):
     assert "kc_" not in result["compressed"]
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_content_under_the_floor_is_returned_untouched(db, acme):
     a, b, c = _live(db, org_id=acme, user_id=ALICE)
@@ -225,7 +208,7 @@ async def test_content_under_the_floor_is_returned_untouched(db, acme):
 # ---------------------------------------------------------------------------
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_another_user_cannot_spend_the_handle(db, acme):
     """The originals cache is a tenancy boundary. A handle is not a bearer
@@ -242,7 +225,7 @@ async def test_another_user_cannot_spend_the_handle(db, acme):
     assert stolen == {"error": "not_found"}
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_another_org_cannot_spend_the_handle(db, acme):
     a, b, c = _live(db, org_id=acme, user_id=ALICE)
@@ -264,7 +247,7 @@ async def test_another_org_cannot_spend_the_handle(db, acme):
 # ---------------------------------------------------------------------------
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_an_unstorable_original_is_never_returned_lossy(db, acme):
     """If the original cannot be cached there is no way back, so the caller
@@ -286,7 +269,7 @@ async def test_an_unstorable_original_is_never_returned_lossy(db, acme):
     assert "handle" not in result
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_a_compressor_that_raises_returns_the_content_unchanged(db, acme):
     a, b, c = _live(db, org_id=acme, user_id=ALICE)
@@ -324,7 +307,7 @@ async def test_auth_failure_returns_a_clean_error():
 # ---------------------------------------------------------------------------
 
 
-@requires_db
+@needs_db
 @pytest.mark.asyncio
 async def test_a_stack_trace_survives_the_tool_byte_for_byte(db, acme):
     trace = (

@@ -5,11 +5,11 @@ import sys
 import uuid
 
 from sqlalchemy import create_engine, inspect, text
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
+
+pytestmark = requires_db("the migration 022 tests")
 
 _MIGRATIONS_DIR = os.path.join(os.path.dirname(__file__), "..")
 _VERSION_022 = os.path.join(
