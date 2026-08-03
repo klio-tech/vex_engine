@@ -42,6 +42,12 @@ dev = [
     "vex-shared[code]",
 ]
 
+# Registers shared.testing.db_gate as a pytest plugin wherever vex-shared is
+# installed. That is what lets services/migrations/tests — which installs no
+# package of its own — honour the same KLIO_REQUIRE_DB gate as everything else.
+[project.entry-points.pytest11]
+klio_db_gate = "shared.testing.db_gate"
+
 [tool.hatch.build.targets.wheel]
 packages = ["shared"]
 
