@@ -850,6 +850,17 @@ def retract_memory(
     non-owner's view of another person's private memory is identical to the
     view of an id that was never issued.
 
+    ANY status is retractable — deliberately. This used to require
+    ``status = 'active'``, which made a memory the curator had auto-superseded
+    permanently unforgettable: the owner got the indistinguishable
+    ``not_found``, believed it was gone, and the knowledge graph went on
+    serving its content back to them as ``superseded[].old_content`` forever.
+    The status filter never granted anything either — the four checks below
+    (org, existence, private-owner, agent-owner) are the whole authorization
+    ladder, and none of them reads ``status`` — so removing it widens what can
+    be FORGOTTEN without widening what can be SEEN. Retracting an
+    already-retracted row is a harmless idempotent no-op.
+
     Synchronous (inline psycopg2 I/O), matching the house pattern.
     """
     try:
@@ -861,7 +872,7 @@ def retract_memory(
         text(
             """
             SELECT scope, agent_id, user_id FROM session_memories
-            WHERE id = :id AND org_id = :org_id AND status = 'active'
+            WHERE id = :id AND org_id = :org_id
             LIMIT 1
             """
         ),
