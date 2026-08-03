@@ -2011,6 +2011,18 @@ async def _perform_explore(ctx: Context, *, entity: str) -> dict[str, Any]:
       (it would confirm the name exists), never ``forbidden``.
     * The raw evidence rows do NOT ship. The brief is the product; the rows
       are reachable via ``recall`` under the same ladder.
+
+    Metering and audit are ``recall``'s, not a parallel scheme of explore's
+    own. explore is a READ over the caller's memory that also spends an LLM
+    call over up to 20 memory contents (see :func:`_synthesize_entity_summary`), so
+    it checks the org's recall quota BEFORE doing either, records the usage
+    after, and writes a ``brain_recall_events`` row through the same
+    best-effort helper the recall tool uses.
+
+    Both outcomes are metered and audited, ``not_found`` included. That is
+    deliberate: ``not_found`` is the enumeration path — the caller who probes
+    entity names to learn which exist is exactly the caller whose reads must
+    leave a trace, and the graph query ran regardless of what it returned.
     """
     request = ctx.request_context.request
     if request is None:
@@ -2020,7 +2032,7 @@ async def _perform_explore(ctx: Context, *, entity: str) -> dict[str, Any]:
     _attach_client_name(ctx, request)
 
     try:
-        org_id, _agent_id = resolve_principal(request)
+        org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
     except HTTPException as exc:
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
@@ -2028,9 +2040,48 @@ async def _perform_explore(ctx: Context, *, entity: str) -> dict[str, Any]:
 
     db = SessionLocal()
     try:
+        # Before the graph read and before the LLM call: a cap enforced after
+        # the spend is a receipt, not a cap. ``check_memory_quota`` raises on
+        # a hard block and otherwise returns the ``over_cap`` flag; it fails
+        # OPEN on any metering error, so a broken counter never denies a read.
+        try:
+            over_cap = check_memory_quota(
+                db,
+                org_id,
+                get_plan_config(plan, plan_overrides),
+                "recall",
+                plan_name=plan,
+            )
+        except MemoryQuotaExceeded as exc:
+            return {
+                "error": "quota_exceeded",
+                "detail": exc.message,
+                "suggested_plan": exc.suggested_plan,
+            }
+
         brief = graph_store.entity_brief(
             db, org_id=org_id, viewer_user_id=user_id, entity=entity
         )
+
+        # Audit + meter BOTH outcomes here, before either payload is shaped,
+        # so no return path can skip them. Same two calls as _perform_recall,
+        # in the same order, for the same reasons: ``log_recall_event``
+        # redacts the entity name and swallows (and rolls back) its own
+        # failures, and ``record_usage`` never raises — so neither can take
+        # down the read, and a failed audit cannot cost the org its billing
+        # write. ``source`` names the read path so the audit trail can tell an
+        # entity walk from a search.
+        log_recall_event(
+            db,
+            org_id=org_id,
+            agent_id=agent_id,
+            project_id=None,
+            query_text=(entity or None),
+            result_count=(brief["evidence_count"] if brief else 0),
+            source="mcp:explore",
+        )
+        record_usage(db, org_id, "recall", over_cap=over_cap)
+
         if brief is None:
             return {"error": "not_found", "entity": entity}
 
