@@ -44,7 +44,7 @@ def compress_payload(payload: Any) -> tuple[Any, CompressionStats]:
     an optimisation and must never raise into a request path.
     """
     try:
-        before = len(json.dumps(payload, default=str))
+        before = len(json.dumps(payload, ensure_ascii=False, default=str))
     except Exception:
         # Not even serialisable — nothing to measure and nothing to compress.
         logger.warning("payload is not JSON-serialisable; passing through")
@@ -57,7 +57,7 @@ def compress_payload(payload: Any) -> tuple[Any, CompressionStats]:
         out = payload
 
     try:
-        after = len(json.dumps(out, default=str))
+        after = len(json.dumps(out, ensure_ascii=False, default=str))
     except Exception:
         logger.warning("compressed payload is not serialisable; passing through")
         return payload, CompressionStats(before_chars=before, after_chars=before)
@@ -209,7 +209,16 @@ def compress_json_text(text: str) -> str:
             payload = _compress_generic(payload)
         # Compact separators alone are a large, entirely safe win on the
         # pretty-printed JSON that tools actually emit.
-        return json.dumps(payload, separators=(",", ":"), default=str)
+        #
+        # `ensure_ascii=False` is not cosmetic. The default escapes every
+        # non-ASCII character to `\uXXXX` -- six characters where there was
+        # one -- so a payload of Chinese, Russian, Arabic or emoji came out
+        # several times LARGER than it went in, and the inflation was reported
+        # as a saving. JSON is UTF-8 by specification; escaping is optional
+        # and, here, actively harmful.
+        return json.dumps(
+            payload, separators=(",", ":"), ensure_ascii=False, default=str
+        )
     except Exception:
         logger.warning(
             "generic JSON compression failed; passing through", exc_info=True

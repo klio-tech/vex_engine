@@ -168,6 +168,58 @@ def test_a_compressor_that_achieves_nothing_reports_no_loss(monkeypatch):
     assert result.lossy is False
 
 
+def test_a_compressor_that_inflates_is_rejected(monkeypatch):
+    """The guard is `no bigger than it went in`, not `not identical`.
+
+    `out == text` only catches a compressor that did literally nothing. A
+    compressor that made the content LARGER passed straight through and the
+    inflation was reported as a saving. This is the backstop for every
+    compressor, present and future: whatever it does, the caller is never
+    handed more tokens than it asked to be relieved of.
+    """
+    from shared.compression import router as router_module
+
+    monkeypatch.setattr(
+        router_module, "compress_json_text", lambda text: text + "x" * 100
+    )
+    result = compress(LONG_JSON)
+    assert result.text == LONG_JSON
+    assert result.compressor == Compressor.PASSTHROUGH.value
+    assert result.compressed_tokens == result.original_tokens
+
+
+def test_a_lossy_compressor_that_inflates_is_also_rejected(monkeypatch):
+    from shared.compression import router as router_module
+
+    monkeypatch.setattr(
+        router_module, "compress_code", lambda text: text + "# padding\n" * 50
+    )
+    result = compress(LONG_PYTHON)
+    assert result.text == LONG_PYTHON
+    assert result.lossy is False, "an inflated result must not claim a handle"
+
+
+def test_compression_never_returns_more_than_it_was_given():
+    """The property, over every fixture in this module and a non-ASCII one."""
+    cjk = json.dumps(
+        {
+            "memories": [
+                {"id": f"id-{i}", "content": "配置文件已更新，请检查数据库连接池设置。"}
+                for i in range(40)
+            ],
+            "count": 40,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    for text in (LONG_JSON, LONG_PYTHON, LONG_PROSE, cjk):
+        result = compress(text)
+        assert len(result.text) <= len(text), (
+            f"{len(text)} chars in, {len(result.text)} chars out"
+        )
+        assert result.compressed_tokens <= result.original_tokens
+
+
 def test_token_counts_describe_the_actual_texts():
     result = compress(LONG_PYTHON)
     assert result.original_tokens == estimate_tokens(LONG_PYTHON)

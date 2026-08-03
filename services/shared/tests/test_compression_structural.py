@@ -258,3 +258,46 @@ def test_the_recall_path_does_not_overwrite_a_caller_common_key():
     assert out["common"] == {"tenant": "acme"}
     for row in out["memories"]:
         assert row["scope"] == "org", "nothing may be hoisted with no envelope free"
+
+
+# --------------------------------------------------------------------------
+# Non-ASCII content must not be inflated
+# --------------------------------------------------------------------------
+
+
+CJK_PAYLOAD = {
+    "memories": [
+        {
+            "id": f"id-{i}",
+            "content": "配置文件已更新，请检查数据库连接池设置。",
+            "scope": "org",
+            "project": None,
+        }
+        for i in range(40)
+    ],
+    "count": 40,
+}
+
+
+def test_non_ascii_content_is_not_escaped_into_three_times_the_bytes():
+    """`json.dumps` escapes to ASCII by default, so a CJK char becomes
+    `\\uXXXX` -- six characters where there was one. An org whose memories are
+    in Chinese, Russian, Arabic or emoji calls a tool that promises to save
+    context and gets several times more of it."""
+    text = json.dumps(CJK_PAYLOAD, ensure_ascii=False, indent=2)
+    out = compress_json_text(text)
+    assert "配置文件已更新" in out, "the content came back escaped"
+    assert len(out) < len(text), f"{len(text)} chars in, {len(out)} chars out"
+
+
+def test_the_generic_path_round_trips_non_ascii_payloads():
+    assert _round_trips(CJK_PAYLOAD)
+    assert _round_trips(
+        {
+            "rows": [
+                {"id": "1", "content": "🎉 déjà vu — Привет", "scope": None},
+                {"id": "2", "content": "مرحبا بالعالم", "scope": None},
+            ],
+            "count": 2,
+        }
+    )

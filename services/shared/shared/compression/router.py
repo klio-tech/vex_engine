@@ -188,9 +188,24 @@ def compress(
         )
         return _passthrough(text)
 
-    if out == text:
-        # Nothing changed, so nothing was lost and there is nothing to
+    if len(out) >= len(text):
+        # Two cases, one guard.
+        #
+        # Equal: nothing changed, so nothing was lost and there is nothing to
         # recover. Reporting otherwise would cost a pointless cache write.
+        #
+        # Larger: the compressor made the content worse. This half is the
+        # backstop for every compressor, present and future -- the guard used
+        # to be `out == text`, which let an inflating compressor through and
+        # reported the inflation as a saving. A caller that asked to be
+        # relieved of tokens must never be handed more of them.
+        if len(out) > len(text):
+            logger.warning(
+                "%s inflated %d chars to %d; passing through",
+                choice.value,
+                len(text),
+                len(out),
+            )
         return _passthrough(text)
 
     return CompressionResult(
