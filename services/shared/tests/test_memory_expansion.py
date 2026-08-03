@@ -13,7 +13,6 @@ this file proves ``retrieve_memories_scoped`` composes with it rather than
 around it.
 """
 
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -23,28 +22,12 @@ from sqlalchemy import create_engine, text
 
 from shared import graph_store
 from shared.memory import GRAPH_EXPANSION_CAP, retrieve_memories_scoped
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
 
 
-def _db_reachable() -> bool:
-    try:
-        engine = create_engine(DB_URL)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        engine.dispose()
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _db_reachable(),
-    reason="Postgres not reachable; the expansion tests require it",
-)
+pytestmark = requires_db("the graph-expansion recall tests")
 
 EMBED_DIM = 1024
 FIXED_EMBEDDING = [0.1] * EMBED_DIM
@@ -309,3 +292,104 @@ async def test_expansion_failure_never_breaks_recall(db, monkeypatch):
     monkeypatch.setattr(graph_store, "neighbors", _boom)
     records = await _recall_ids(db, org, user_id=DEV, limit=10)
     assert {str(r.id) for r in records} == {entry}
+
+
+# ---------------------------------------------------------------------------
+# M2 — why a row is here must survive the wire, not just the process
+# ---------------------------------------------------------------------------
+
+
+async def test_a_graph_expanded_row_is_labelled_as_such(db):
+    """``relevance=None`` was the ONLY thing marking an expanded row.
+
+    Structural compression drops null keys per row, so on the wire the
+    expanded row simply had no ``relevance`` key and NOTHING distinguished a
+    semantic match from a graph walk. A caller weighing "the model found this
+    similar to my question" against "this was one hop away from something
+    similar" could not tell them apart. The marker has to be positive.
+    """
+    org = _org(db)
+    entry = _seed(db, org_id=org, content="we chose flat pricing", age_days=0)
+    connected = _seed(
+        db, org_id=org, content="usage pricing confused customers", age_days=20
+    )
+    _edge(db, org_id=org, src_id=entry, dst_id=connected)
+
+    records = await _recall_ids(db, org, user_id=DEV, limit=1)
+    by_id = {str(r.id): r for r in records}
+    assert set(by_id) == {entry, connected}, "control: the expansion happened"
+
+    assert by_id[connected].via == "graph"
+    assert by_id[connected].relevance is None
+    # The vector row is NOT relabelled — it earned its similarity score.
+    assert by_id[entry].via != "graph"
+    assert by_id[entry].relevance is not None
+
+
+async def test_the_graph_marker_survives_structural_compression(db):
+    """The marker is only worth having if it reaches the caller. Compression
+    strips null-valued keys row by row, which is exactly how the old marker
+    was erased; a non-null value is never stripped."""
+    from shared.compression.structural import compress_payload
+
+    org = _org(db)
+    entry = _seed(db, org_id=org, content="we chose flat pricing", age_days=0)
+    connected = _seed(
+        db, org_id=org, content="usage pricing confused customers", age_days=20
+    )
+    _edge(db, org_id=org, src_id=entry, dst_id=connected)
+
+    records = await _recall_ids(db, org, user_id=DEV, limit=1)
+    payload = {
+        "memories": [
+            {
+                "id": str(r.id),
+                "content": r.content,
+                "relevance": r.relevance,
+                "via": r.via,
+            }
+            for r in records
+        ]
+    }
+    compressed, _stats = compress_payload(payload)
+
+    rows = {row["id"]: row for row in compressed["memories"]}
+    hoisted = compressed.get("common", {})
+    assert rows[connected].get("via", hoisted.get("via")) == "graph", (
+        "the graph marker did not survive compression"
+    )
+    # And the semantic row is still distinguishable after the strip.
+    assert rows[entry].get("via", hoisted.get("via")) != "graph"
+
+
+# ---------------------------------------------------------------------------
+# M4 — a failed expansion must not poison the session it borrowed
+# ---------------------------------------------------------------------------
+
+
+async def test_a_real_database_error_in_expansion_leaves_the_session_usable(db):
+    """The existing containment test raises a pure ``RuntimeError``, which
+    never touches the DB, so it cannot see this: a genuine SQL error aborts
+    the transaction and leaves psycopg2 in ``InFailedSqlTransaction``. Recall
+    survives (the handler catches), but EVERY later statement on that session
+    fails — including the recall audit/billing event, whose own handler
+    swallows the failure. Result: zero audit rows, silently.
+
+    Assert on the session, not on the log: after a failed expansion the
+    caller must be able to write.
+    """
+    org = _org(db)
+    entry = _seed(db, org_id=org, content="entry")
+
+    def _bad_sql(db_session, **kwargs):
+        db_session.execute(text("SELECT * FROM a_table_that_does_not_exist"))
+        raise AssertionError("unreachable: the statement above must raise")
+
+    with patch.object(graph_store, "neighbors", _bad_sql):
+        records = await _recall_ids(db, org, user_id=DEV, limit=10)
+    assert {str(r.id) for r in records} == {entry}, "recall still returns its rows"
+
+    # THE assertion: the session is not left in a failed transaction, so the
+    # audit write that follows a recall actually lands.
+    probe = db.execute(text("SELECT 1")).scalar()
+    assert probe == 1, "expansion left the session in a failed transaction"

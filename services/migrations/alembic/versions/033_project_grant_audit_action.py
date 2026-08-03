@@ -33,10 +33,24 @@ it. Nothing about 032's constraint is touched here.
 The table remains append-only: a revoke is a NEW row, never an update or a
 delete of the grant it undoes.
 
+**The downgrade refuses while a revoke is on record.** Dropping ``action``
+does not merely remove a column: every revoke left in the table becomes
+indistinguishable from a grant, which is the exact corruption described four
+paragraphs up — an incident reconstruction that shows access being handed out
+at the moment it was taken away. Set ``KLIO_ALLOW_AUDIT_LOSS=1`` to accept
+that deliberately.
+
+Rows that are all ``action = 'grant'`` downgrade freely, and so does an empty
+table: the column's default puts ``'grant'`` back on the way up, so nothing is
+lost and nothing is misrepresented. Refusing there would make the guard noise,
+and a guard people route around by reflex protects nothing.
+
 Revision ID: 033
 Revises: 032
 Create Date: 2026-08-01
 """
+
+import os
 
 import sqlalchemy as sa
 from alembic import op
@@ -45,6 +59,8 @@ revision = "033"
 down_revision = "032"
 branch_labels = None
 depends_on = None
+
+AUDIT_LOSS_OVERRIDE = "KLIO_ALLOW_AUDIT_LOSS"
 
 
 def upgrade() -> None:
@@ -69,5 +85,24 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    non_grants = (
+        op.get_bind()
+        .execute(
+            sa.text("SELECT count(*) FROM project_grant_audit WHERE action <> 'grant'")
+        )
+        .scalar()
+    )
+    if non_grants and os.environ.get(AUDIT_LOSS_OVERRIDE) != "1":
+        raise RuntimeError(
+            f"Refusing to downgrade 033: dropping column project_grant_audit.action "
+            f"would leave {non_grants} recorded revoke(s) indistinguishable from "
+            f"grants. The rows survive, but they start asserting the opposite of "
+            f"what happened — an audit trail that reads as access being granted at "
+            f"the moment it was taken away is worse than a missing row. Export the "
+            f"table first, e.g. `pg_dump --data-only --table=project_grant_audit`, "
+            f"then re-run this downgrade with {AUDIT_LOSS_OVERRIDE}=1 to accept the "
+            f"loss deliberately."
+        )
+
     op.drop_constraint("ck_project_grant_audit_action", "project_grant_audit")
     op.drop_column("project_grant_audit", "action")

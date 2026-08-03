@@ -10,31 +10,27 @@ constraint is still exactly as it was, because "add a verb" must not quietly
 become "let anything into role".
 """
 
-import os
 import uuid
 
 import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import IntegrityError
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
+
+pytestmark = requires_db("the migration 033 tests")
 
 
 @pytest.fixture(scope="module")
 def conn():
+    """A real Connection. Reachability is the ``requires_db`` gate's job."""
+    engine = create_engine(DB_URL)
     try:
-        engine = create_engine(DB_URL)
         with engine.connect() as c:
-            c.execute(text("SELECT 1"))
-    except Exception:
-        pytest.skip(
-            "Postgres not reachable; migration 033 tests require the live test DB"
-        )
-    with create_engine(DB_URL).connect() as c:
-        yield c
+            yield c
+    finally:
+        engine.dispose()
 
 
 ORG = "test-org-033"

@@ -44,7 +44,7 @@ def compress_payload(payload: Any) -> tuple[Any, CompressionStats]:
     an optimisation and must never raise into a request path.
     """
     try:
-        before = len(json.dumps(payload, default=str))
+        before = len(json.dumps(payload, ensure_ascii=False, default=str))
     except Exception:
         # Not even serialisable — nothing to measure and nothing to compress.
         logger.warning("payload is not JSON-serialisable; passing through")
@@ -57,7 +57,7 @@ def compress_payload(payload: Any) -> tuple[Any, CompressionStats]:
         out = payload
 
     try:
-        after = len(json.dumps(out, default=str))
+        after = len(json.dumps(out, ensure_ascii=False, default=str))
     except Exception:
         logger.warning("compressed payload is not serialisable; passing through")
         return payload, CompressionStats(before_chars=before, after_chars=before)
@@ -77,13 +77,18 @@ def _compress(payload: Any) -> Any:
     stripped = [{k: v for k, v in row.items() if v is not None} for row in rows]
 
     common: dict[str, Any] = {}
-    if len(stripped) >= MIN_ROWS_TO_HOIST:
+    # A payload that already has a `common` key owns it. Hoisting into it
+    # would delete the caller's value, and this path has no inverse at all --
+    # the recall envelope goes straight back to the caller -- so the loss
+    # could never be undone. Fewer bytes saved is the correct trade.
+    can_hoist = COMMON_KEY not in payload
+    if can_hoist and len(stripped) >= MIN_ROWS_TO_HOIST:
         candidate_keys = set(stripped[0])
         for row in stripped[1:]:
             candidate_keys &= set(row)
         for key in sorted(candidate_keys):
-            if key in {"id", "content"}:
-                # Never hoist identity or payload, even if two rows collide.
+            if key in NEVER_HOIST:
+                # Never hoist identity, payload or visibility. See NEVER_HOIST.
                 continue
             values = {_hashable(row[key]) for row in stripped}
             if len(values) == 1:
@@ -131,7 +136,52 @@ def _hashable(value: Any) -> Any:
 
 META_KEY = "_klio"
 COMMON_KEY = "common"
-NEVER_HOIST = frozenset({"id", "content"})
+# Identity, payload and visibility stay on the row they describe.
+#
+# `id` and `content` are obvious: a row without them is not a row. `scope` is
+# here because it is the field a consumer is most likely to branch on, and
+# because rows agree about it constantly — ten private memories all say
+# "private", so it was hoisted and every row came back with `scope` absent. A
+# caller reading `memories[i]["scope"]` got None for all ten. The server never
+# re-reads its own output, so server-side authz was never affected; every SDK
+# and dashboard consumer walks straight into it. A handful of bytes is not
+# worth that trap.
+NEVER_HOIST = frozenset({"id", "content", "scope"})
+
+# Bumped if the meta shape ever changes. Its real job is to make `expand_rows`
+# safe to call speculatively: without it, a caller's own `_klio` field that
+# happens to look like ours would be treated as our metadata and the payload
+# rewritten around it.
+META_VERSION = 1
+
+# `common` and `_klio` are ordinary JSON key names and a caller's payload is
+# entitled to use them. Writing the envelope over one destroys the caller's
+# value, and because the generic path reports `lossy=False` the router issues
+# no handle and writes no cache row -- so the loss is permanent and there is
+# nothing to recover it from. `_largest_row_list` already skips both keys when
+# CHOOSING a row list, so the collision was seen; it just was not handled on
+# the way out.
+#
+# The handling, in order of preference:
+#
+# * `common` collides -> rename our envelope to a key the payload does not
+#   use, and record the name in the metadata so `expand_rows` knows where to
+#   look. Nothing is lost and compression still happens.
+# * `_klio` collides -> decline to compress this payload. The metadata is what
+#   makes the reductions reversible, and there is nowhere else to put it that
+#   `expand_rows` could find without metadata of its own. A payload returned
+#   verbatim is a worse ratio; a payload returned wrong is a broken contract.
+_ALTERNATE_COMMON_KEYS = ("_klio_common", "_klio_common_2", "_klio_common_3")
+
+
+def _pick_common_key(payload: dict) -> Optional[str]:
+    """A key for the hoist envelope that ``payload`` does not already use."""
+    if COMMON_KEY not in payload:
+        return COMMON_KEY
+    for candidate in _ALTERNATE_COMMON_KEYS:
+        if candidate not in payload:
+            return candidate
+    return None
 
 
 def _largest_row_list(payload: dict) -> Optional[str]:
@@ -169,7 +219,16 @@ def compress_json_text(text: str) -> str:
             payload = _compress_generic(payload)
         # Compact separators alone are a large, entirely safe win on the
         # pretty-printed JSON that tools actually emit.
-        return json.dumps(payload, separators=(",", ":"), default=str)
+        #
+        # `ensure_ascii=False` is not cosmetic. The default escapes every
+        # non-ASCII character to `\uXXXX` -- six characters where there was
+        # one -- so a payload of Chinese, Russian, Arabic or emoji came out
+        # several times LARGER than it went in, and the inflation was reported
+        # as a saving. JSON is UTF-8 by specification; escaping is optional
+        # and, here, actively harmful.
+        return json.dumps(
+            payload, separators=(",", ":"), ensure_ascii=False, default=str
+        )
     except Exception:
         logger.warning(
             "generic JSON compression failed; passing through", exc_info=True
@@ -178,6 +237,14 @@ def compress_json_text(text: str) -> str:
 
 
 def _compress_generic(payload: dict) -> dict:
+    if META_KEY in payload:
+        # The caller owns this key. See the note above _ALTERNATE_COMMON_KEYS.
+        logger.info(
+            "payload already uses %r; declining to compress rather than "
+            "overwriting the caller's field",
+            META_KEY,
+        )
+        return payload
     rows_key = _largest_row_list(payload)
     if rows_key is None:
         return payload
@@ -208,14 +275,36 @@ def _compress_generic(payload: dict) -> dict:
                 {k: v for k, v in row.items() if k not in common} for row in stripped
             ]
 
+    common_key = _pick_common_key(payload) if common else COMMON_KEY
+    if common and common_key is None:
+        # Every candidate envelope name is taken. Hoisting would destroy one
+        # of them, so hoist nothing and keep only the null reduction.
+        logger.info("no free envelope key; skipping the hoist for this payload")
+        common = {}
+        stripped = [
+            {k: v for k, v in row.items() if not (k in null_keys and v is None)}
+            for row in rows
+        ]
+        common_key = COMMON_KEY
+
     if not null_keys and not common:
         return payload
 
+    meta: dict[str, Any] = {
+        "v": META_VERSION,
+        "rows_key": rows_key,
+        "null_keys": null_keys,
+    }
     out = dict(payload)
     out[rows_key] = stripped
     if common:
-        out[COMMON_KEY] = common
-    out[META_KEY] = {"rows_key": rows_key, "null_keys": null_keys}
+        # Recorded ALWAYS, not only when it differs from the default. Absence
+        # then means "no envelope was written", which is what stops
+        # `expand_rows` from mistaking a caller's own `common` field for our
+        # hoist and merging it into every row.
+        out[common_key] = common
+        meta["common_key"] = common_key
+    out[META_KEY] = meta
     return out
 
 
@@ -228,7 +317,9 @@ def expand_rows(payload: Any) -> Any:
     if not isinstance(payload, dict):
         return payload
     meta = payload.get(META_KEY)
-    if not isinstance(meta, dict):
+    if not isinstance(meta, dict) or meta.get("v") != META_VERSION:
+        # Either we did not compress this, or the `_klio` here belongs to the
+        # caller. Both mean: hands off.
         return payload
 
     rows_key = meta.get("rows_key")
@@ -237,7 +328,16 @@ def expand_rows(payload: Any) -> Any:
     if not isinstance(rows, list):
         return payload
 
-    common = payload.get(COMMON_KEY) or {}
+    # Where the hoist envelope went, if there was one at all. No key recorded
+    # means nothing was hoisted -- so any `common` field present in the
+    # payload belongs to the caller and must be left exactly where it is.
+    common_key = meta.get("common_key")
+    common = payload.get(common_key) if common_key else {}
+    if common is None:
+        common = {}
+    if not isinstance(common, dict):
+        return payload
+
     restored = []
     for row in rows:
         merged = dict(common)
@@ -246,6 +346,7 @@ def expand_rows(payload: Any) -> Any:
             merged.setdefault(key, None)
         restored.append(merged)
 
-    out = {k: v for k, v in payload.items() if k not in {META_KEY, COMMON_KEY}}
+    dropped = {META_KEY} | ({common_key} if common_key else set())
+    out = {k: v for k, v in payload.items() if k not in dropped}
     out[rows_key] = restored
     return out

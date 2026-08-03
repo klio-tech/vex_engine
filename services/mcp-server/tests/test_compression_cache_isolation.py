@@ -17,35 +17,18 @@ Postgres, and gating them the same way would let a tenancy boundary go
 unverified on every ordinary test run — a skip is not a pass.
 """
 
-import os
 import uuid
 
 import pytest
 from sqlalchemy import create_engine, text
 
-from app.compression_cache import load_original, store_original
+from app.compression_cache import handle_is_expired, load_original, store_original
+from shared.testing import database_url, requires_db
 
-DB_URL = os.environ.get(
-    "DATABASE_URL",
-    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
-)
+DB_URL = database_url()
 
 
-def _db_reachable() -> bool:
-    try:
-        engine = create_engine(DB_URL)
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        engine.dispose()
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _db_reachable(),
-    reason="Postgres not reachable; the compression-cache boundary tests require it",
-)
+pytestmark = requires_db("the compression-cache boundary tests")
 
 ALICE = "11111111-1111-1111-1111-111111111111"
 BOB = "22222222-2222-2222-2222-222222222222"
@@ -192,3 +175,47 @@ def test_storing_again_refreshes_the_expiry(db, acme):
     again = store_original(db, org_id=acme, user_id=ALICE, text="hot file")
     assert again == handle
     assert load_original(db, org_id=acme, user_id=ALICE, handle=again) == "hot file"
+
+
+# --------------------------------------------------------------------------
+# The unattributed principal
+# --------------------------------------------------------------------------
+#
+# `resolve_request_user_id` returns None by design, to keep legacy API keys
+# working. That principal is real and it calls `compress`. The lossy path had
+# already dropped its function bodies by the time it discovered its handle
+# could never be redeemed: the row was written with user_id NULL and the read
+# filtered on `user_id = :user`, which is never true against NULL.
+#
+# The rule that must NOT be weakened to fix that: a NULL-user row is its own
+# bucket inside the org. An attributed user cannot reach into it and it cannot
+# reach into theirs. It is org-scoped, which is exactly how the identity
+# design already treats everything an unattributed caller writes.
+
+
+def test_an_unattributed_caller_can_redeem_its_own_handle(db, acme):
+    """The bug: the lossy path is only safe if the way back actually works."""
+    handle = store_original(db, org_id=acme, user_id=None, text="unattributed log")
+    assert load_original(db, org_id=acme, user_id=None, handle=handle) == (
+        "unattributed log"
+    )
+
+
+def test_an_attributed_user_cannot_read_an_unattributed_entry(db, acme):
+    """Redeemability must not become a hole in the other direction."""
+    handle = store_original(db, org_id=acme, user_id=None, text="unattributed log")
+    assert load_original(db, org_id=acme, user_id=ALICE, handle=handle) is None
+
+
+def test_an_unattributed_caller_in_another_org_gets_nothing(db, acme, other):
+    """Org is still the outer boundary for the unattributed bucket."""
+    handle = store_original(db, org_id=acme, user_id=None, text="unattributed log")
+    assert load_original(db, org_id=other, user_id=None, handle=handle) is None
+
+
+def test_an_expired_unattributed_entry_is_not_returned(db, acme):
+    handle = store_original(
+        db, org_id=acme, user_id=None, text="unattributed log", ttl_seconds=-1
+    )
+    assert load_original(db, org_id=acme, user_id=None, handle=handle) is None
+    assert handle_is_expired(db, org_id=acme, user_id=None, handle=handle) is True

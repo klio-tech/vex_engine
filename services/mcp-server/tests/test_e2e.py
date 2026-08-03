@@ -57,33 +57,15 @@ from sqlalchemy import text
 # it explicitly (autouse fixture below) so this never depends on ambient env.
 from shared.auth import KeyInfo
 
-# --- DB-availability skip guard -------------------------------------------
+# --- DB-availability gate --------------------------------------------------
 #
-# This whole module drives the REAL Postgres test DB. CI runs unit tests only
-# (no Postgres service), so without a guard this module would ERROR there. We
-# probe the SAME engine ``app.db`` built at import time (bound to
-# ``config.DATABASE_URL``, which itself reads ``DATABASE_URL`` at import). If
-# the DB is unreachable we SKIP the whole module rather than fail.
-#
-# This is purely additive: when Postgres IS up (local default), the probe
-# succeeds, the module runs, and every assertion below is exercised unchanged.
-from app.db import engine as _engine
+# This whole module drives the REAL Postgres test DB. Locally that database may
+# not be running, so the shared gate skips; in CI ``KLIO_REQUIRE_DB=1`` turns
+# the same condition into a failure, because "CI runs unit tests only" is
+# exactly the assumption that let 112 boundary tests go unrun.
+from shared.testing import database_url, requires_db
 
-
-def _postgres_reachable() -> bool:
-    """Return True iff a trivial SELECT 1 succeeds on the app's DB engine."""
-    try:
-        with _engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-        return True
-    except Exception:
-        return False
-
-
-pytestmark = pytest.mark.skipif(
-    not _postgres_reachable(),
-    reason="Postgres not reachable; e2e requires the live test DB (CI runs unit tests only)",
-)
+pytestmark = requires_db("the MCP end-to-end tests")
 
 # A fixed embedding vector of the exact column dimension (vector(1024)). A
 # written row and any later query both embed to THIS vector, so cosine
@@ -95,7 +77,7 @@ _FIXED_EMBEDDING = [0.1] * 1024
 # spaces/projects/brain_curator_state exist). The app's config default already
 # resolves to this, but we set it explicitly so app.db.SessionLocal in the
 # in-process server connects here regardless of ambient env.
-_TEST_DATABASE_URL = "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard"
+_TEST_DATABASE_URL = database_url()
 
 
 @pytest.fixture(autouse=True)

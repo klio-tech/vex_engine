@@ -15,6 +15,31 @@ never existed, one that expired, and one that belongs to somebody else. The
 caller cannot tell those apart from the return value alone, which is the point:
 distinguishing "not yours" from "no such thing" confirms the handle exists.
 
+**The unattributed principal is a real principal.** ``resolve_request_user_id``
+returns ``None`` by design so legacy API keys keep working, and that caller
+calls ``compress`` like any other. Matching on ``user_id = :user`` is never
+true against a NULL parameter, so such a caller was handed a handle it could
+never redeem — after the lossy compressor had already dropped its content.
+That is the exact broken promise this cache exists to prevent.
+
+The predicate is therefore ``user_id IS NOT DISTINCT FROM :user``: NULL matches
+NULL and nothing else. This does not widen tenancy, and the widening is what
+the tests here attack rather than what the comment asserts:
+
+* a NULL-user row is its own bucket inside one org. An attributed user's
+  parameter is their own id, which is distinct from NULL, so they cannot read
+  it; an unattributed caller's NULL is distinct from any real id, so they
+  cannot read anybody's.
+* the bucket is org-scoped, which is precisely how the identity design already
+  treats everything an unattributed caller writes (see ``app/identity.py``):
+  org-scoped, never private to a person who was never identified.
+* redemption still requires the handle, which is salted by the full principal
+  and by the content itself.
+
+The alternative — refusing the lossy path outright for unattributed callers —
+was rejected because it would take a working feature away from every legacy
+key to close a hole that ``IS NOT DISTINCT FROM`` does not open.
+
 **Why the handle is salted by (org_id, user_id) and not (org_id, content).**
 The design spec says org-salted, so that one tenant's content can never satisfy
 another's lookup. That is necessary but not sufficient. The handle is also the
@@ -149,11 +174,12 @@ def load_original(
     docstring. The three predicates below are the boundary; removing any one
     of them is a privacy breach, not a bad result.
 
-    ``user_id = :user`` with a NULL parameter is never true in SQL, so an
-    unattributable caller matches nothing rather than everything. That is the
-    behaviour we want, and
-    ``test_unattributed_caller_cannot_read_an_owned_entry`` asserts it rather
-    than trusting it.
+    ``user_id IS NOT DISTINCT FROM :user`` is NULL-aware equality: an
+    unattributed caller matches only rows that are themselves unattributed,
+    and an attributed one matches only their own. Neither degrades into
+    match-anything. ``test_unattributed_caller_cannot_read_an_owned_entry``
+    and ``test_an_attributed_user_cannot_read_an_unattributed_entry`` assert
+    both directions rather than trusting this note.
     """
     row = db.execute(
         sa.text(
@@ -162,7 +188,7 @@ def load_original(
             FROM compression_cache
             WHERE id = :handle
               AND org_id = :org
-              AND user_id = :user
+              AND user_id IS NOT DISTINCT FROM :user
               AND expires_at > NOW()
             """
         ),
@@ -185,7 +211,8 @@ def handle_is_expired(
     Only ever consulted after :func:`load_original` returned ``None``, and
     only for a principal who owns the row — so it distinguishes "expired" from
     "never existed" for the owner without telling anybody else that somebody
-    else's handle is real.
+    else's handle is real. Uses the same NULL-aware predicate, so the
+    unattributed principal is told the truth about its own expiry too.
     """
     row = db.execute(
         sa.text(
@@ -194,7 +221,7 @@ def handle_is_expired(
             FROM compression_cache
             WHERE id = :handle
               AND org_id = :org
-              AND user_id = :user
+              AND user_id IS NOT DISTINCT FROM :user
               AND expires_at <= NOW()
             """
         ),

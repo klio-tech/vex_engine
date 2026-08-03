@@ -3,7 +3,8 @@
 The curator is a server-side background job that "tunes" a person's memory over
 time. Periodically it reads one user's RAW private memories — the passive hook
 captures and discrete writes (``observation`` / ``note`` / ``memory`` /
-``plan`` / ``decision``) — and synthesises higher-level memories back into the
+``plan`` / ``decision``), **including the ``recall_hidden`` ones**, which in
+practice are nearly all of them — and synthesises higher-level memories back into the
 **same user's private scope**: a single ``summary`` plus discrete ``fact`` rows.
 It reuses the existing LLM helpers (:func:`shared.memory.generate_summary` and
 the extended :func:`extract_graph` pass, which subsumed the old facts-only
@@ -41,6 +42,16 @@ No self-reprocessing:
     own outputs (``summary``/``fact``). Combined with the per-org keyset cursor
     (it only reads rows *past* the cursor), this makes a tick unable to loop on
     its own synthesised memories.
+
+Hidden rows are fuel, not noise:
+    The input predicate deliberately does NOT filter on ``recall_hidden``.
+    That flag keeps raw hook captures out of *recall*; it says nothing about
+    synthesis, and the two goals are compatible — the curator eats the noise,
+    recall never sees it. Filtering on it was the reason the knowledge graph
+    stayed empty: migration 026 backfilled ``recall_hidden=TRUE`` onto every
+    passive capture, so ``recall_hidden = FALSE`` AND a RAW-only type list
+    intersected to the empty set on real data. The separation of input from
+    output now rests entirely on :data:`RAW_MEMORY_TYPES` and the cursor.
 
 Reconciliation:
     After storing each new ``fact`` the curator runs a bounded reconciliation
@@ -102,7 +113,10 @@ logger = logging.getLogger("agentguard.mcp.curator")
 # RAW input memory types the curator reads. Deliberately EXCLUDES the curator's
 # own outputs ('summary'/'fact') so a tick cannot reprocess what it produced,
 # and is read only under scope='private' so verification's scope='session' rows
-# and the team's scope='org' brain are never touched.
+# and the team's scope='org' brain are never touched. This type list is the
+# ONLY thing separating input from output now that `recall_hidden` no longer
+# narrows the batch: adding 'fact' or 'summary' here would close a feedback
+# loop in which the curator re-digests its own distillate.
 RAW_MEMORY_TYPES: tuple[str, ...] = (
     "observation",
     "note",
@@ -483,11 +497,19 @@ def _read_new_raw_rows(
     """Read up to ``batch_size`` of ONE user's RAW private memories past ``cursor``.
 
     Scoped by ``org_id`` AND ``user_id`` and locked to ``scope='private'`` +
-    ``status='active'`` and ``recall_hidden=FALSE`` so neither verification's
-    session rows nor the curator's own ``summary``/``fact`` output are ever
-    returned, and passive hook tool-call captures (stored as ``observation``
-    rows with ``recall_hidden=TRUE`` by migration 026) are NOT distilled into
-    facts — the curator synthesizes only deliberate writes.
+    ``status='active'``, and restricted to :data:`RAW_MEMORY_TYPES` so neither
+    verification's ``scope='session'`` rows nor the curator's own
+    ``summary``/``fact`` output are ever returned.
+
+    Deliberately **not** filtered on ``recall_hidden``. That flag exists to keep
+    raw hook noise out of *recall*; it was never a statement about synthesis.
+    Filtering on it here starved the curator completely: migration 026 backfills
+    ``recall_hidden=TRUE`` onto every passive hook capture, and those
+    ``observation`` rows are the overwhelming majority of a user's RAW private
+    stream — so a ``recall_hidden=FALSE`` predicate combined with a RAW-only
+    type list matched nothing at all, and the knowledge graph could never
+    populate. Hidden rows are fuel; hidden still means invisible to recall,
+    because nothing here changes how they are read back.
 
     Pagination is **keyset** over the composite ``(created_at, id)``: a row is
     new if its ``created_at`` is strictly past the cursor's, OR it shares the
@@ -506,7 +528,6 @@ def _read_new_raw_rows(
               AND scope = 'private'
               AND user_id = :user_id
               AND status = 'active'
-              AND recall_hidden = FALSE
               AND memory_type IN ({_RAW_TYPES_SQL})
               AND (
                 :cursor_ts IS NULL

@@ -23,10 +23,19 @@ live in a different database entirely, and ``project_id`` must remain readable
 after a project row is gone — an audit row that disappears with the thing it
 describes is not an audit row.
 
+**The downgrade refuses to run while the trail has rows.** ``drop_table`` on an
+append-only record is not a schema change, it is the deletion of the only copy
+of who was given access to what. A rollback of the surrounding release is a
+routine operation; losing the ACL history is not, and the two must not be the
+same keystroke. Set ``KLIO_ALLOW_AUDIT_LOSS=1`` to say the loss is intended.
+An empty table downgrades freely — there is nothing to lose.
+
 Revision ID: 032
 Revises: 031
 Create Date: 2026-08-01
 """
+
+import os
 
 import sqlalchemy as sa
 from alembic import op
@@ -36,6 +45,8 @@ revision = "032"
 down_revision = "031"
 branch_labels = None
 depends_on = None
+
+AUDIT_LOSS_OVERRIDE = "KLIO_ALLOW_AUDIT_LOSS"
 
 
 def upgrade() -> None:
@@ -79,6 +90,24 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    rows = (
+        op.get_bind()
+        .execute(sa.text("SELECT count(*) FROM project_grant_audit"))
+        .scalar()
+    )
+    if rows and os.environ.get(AUDIT_LOSS_OVERRIDE) != "1":
+        raise RuntimeError(
+            f"Refusing to downgrade 032: dropping table project_grant_audit would "
+            f"permanently destroy {rows} append-only audit row(s) — the complete "
+            f"record of who was granted or revoked access to which project, by "
+            f"whom, when, and over which surface. Nothing else in this database "
+            f"holds that history, and it is the record an access incident is "
+            f"reconstructed from. Export it first, e.g. "
+            f"`pg_dump --data-only --table=project_grant_audit`, then re-run this "
+            f"downgrade with {AUDIT_LOSS_OVERRIDE}=1 to accept the loss "
+            f"deliberately."
+        )
+
     op.drop_index("ix_project_grant_audit_org", table_name="project_grant_audit")
     op.drop_index("ix_project_grant_audit_project", table_name="project_grant_audit")
     op.drop_table("project_grant_audit")

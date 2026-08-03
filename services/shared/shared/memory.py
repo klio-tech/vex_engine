@@ -11,7 +11,7 @@ import logging
 import os
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -90,6 +90,9 @@ recall into a graph dump. The expansion itself is depth-1 and ladder-scoped in
 SQL inside :func:`shared.graph_store.neighbors`; this cap only bounds volume.
 """
 
+VIA_GRAPH: str = "graph"
+"""Value of :attr:`MemoryRecord.via` on a row that arrived by graph expansion."""
+
 # Stage-C blended re-rank weights (spec: recall learns to walk). Similarity
 # dominates; recency and edge-connectedness are equal minority signals. The
 # pre-graph SQL rank used 0.85/0.15 with no connectedness term — the 0.15 the
@@ -151,6 +154,15 @@ class MemoryRecord:
     relevance: Optional[float] = None
     user_id: Optional[str] = None
     provenance: str = "EXTRACTED"
+    via: Optional[str] = None
+    """How this record reached the caller: ``"graph"`` for a row that rode in
+    on :data:`VIA_GRAPH` expansion, ``None`` for everything else.
+
+    A POSITIVE marker on purpose. Expanded rows used to be identifiable only
+    by ``relevance is None``, and structural compression strips null-valued
+    keys row by row — so on the wire the expanded row simply had no
+    ``relevance`` key and nothing at all separated a semantic match from a
+    graph walk. An absent key is not a signal; a value is."""
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +862,17 @@ def retract_memory(
     non-owner's view of another person's private memory is identical to the
     view of an id that was never issued.
 
+    ANY status is retractable — deliberately. This used to require
+    ``status = 'active'``, which made a memory the curator had auto-superseded
+    permanently unforgettable: the owner got the indistinguishable
+    ``not_found``, believed it was gone, and the knowledge graph went on
+    serving its content back to them as ``superseded[].old_content`` forever.
+    The status filter never granted anything either — the four checks below
+    (org, existence, private-owner, agent-owner) are the whole authorization
+    ladder, and none of them reads ``status`` — so removing it widens what can
+    be FORGOTTEN without widening what can be SEEN. Retracting an
+    already-retracted row is a harmless idempotent no-op.
+
     Synchronous (inline psycopg2 I/O), matching the house pattern.
     """
     try:
@@ -861,7 +884,7 @@ def retract_memory(
         text(
             """
             SELECT scope, agent_id, user_id FROM session_memories
-            WHERE id = :id AND org_id = :org_id AND status = 'active'
+            WHERE id = :id AND org_id = :org_id
             LIMIT 1
             """
         ),
@@ -932,10 +955,19 @@ def _expand_via_graph(
     0.15·connectedness`` (connectedness = edge count into the entry set,
     normalized by the batch max). Expanded rows keep ``relevance=None`` — they
     did not earn a similarity score and faking one would misrepresent why
-    they are present — and contribute 0 to the similarity term.
+    they are present — and contribute 0 to the similarity term. They are
+    instead labelled ``via=VIA_GRAPH``: a POSITIVE marker, because a null
+    ``relevance`` is erased by structural compression's null-key strip and
+    left nothing on the wire to tell a semantic match from a graph walk.
 
     Failure containment: the graph is an enhancement, never a dependency. Any
-    error here logs and returns the stage-A records untouched.
+    error here logs and returns the stage-A records untouched — after rolling
+    the session back. The rollback is not tidiness: a genuine SQL failure in
+    the expansion aborts the transaction, and every later statement on the
+    session then raises ``InFailedSqlTransaction``. Recall itself survives
+    (its rows are already fetched), but the recall audit/billing event that
+    follows swallows its own errors, so the run would silently write ZERO
+    audit rows. Healing the session here is what keeps that from happening.
     """
     if not records:
         return records
@@ -962,10 +994,21 @@ def _expand_via_graph(
             "recall graph expansion failed; returning vector results alone",
             exc_info=True,
         )
+        try:
+            db_session.rollback()
+        except Exception:
+            logger.warning(
+                "rollback after a failed graph expansion also failed",
+                exc_info=True,
+            )
         return records
 
     entry_ids = {str(r.id) for r in records}
-    extra = [r for r in expansion["records"] if str(r.id) not in entry_ids]
+    extra = [
+        replace(r, via=VIA_GRAPH)
+        for r in expansion["records"]
+        if str(r.id) not in entry_ids
+    ]
     if not extra:
         return records
 
