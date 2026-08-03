@@ -87,8 +87,8 @@ def _compress(payload: Any) -> Any:
         for row in stripped[1:]:
             candidate_keys &= set(row)
         for key in sorted(candidate_keys):
-            if key in {"id", "content"}:
-                # Never hoist identity or payload, even if two rows collide.
+            if key in NEVER_HOIST:
+                # Never hoist identity, payload or visibility. See NEVER_HOIST.
                 continue
             values = {_hashable(row[key]) for row in stripped}
             if len(values) == 1:
@@ -136,7 +136,17 @@ def _hashable(value: Any) -> Any:
 
 META_KEY = "_klio"
 COMMON_KEY = "common"
-NEVER_HOIST = frozenset({"id", "content"})
+# Identity, payload and visibility stay on the row they describe.
+#
+# `id` and `content` are obvious: a row without them is not a row. `scope` is
+# here because it is the field a consumer is most likely to branch on, and
+# because rows agree about it constantly — ten private memories all say
+# "private", so it was hoisted and every row came back with `scope` absent. A
+# caller reading `memories[i]["scope"]` got None for all ten. The server never
+# re-reads its own output, so server-side authz was never affected; every SDK
+# and dashboard consumer walks straight into it. A handful of bytes is not
+# worth that trap.
+NEVER_HOIST = frozenset({"id", "content", "scope"})
 
 # Bumped if the meta shape ever changes. Its real job is to make `expand_rows`
 # safe to call speculatively: without it, a caller's own `_klio` field that

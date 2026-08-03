@@ -74,11 +74,15 @@ def test_null_fields_are_dropped():
 
 
 def test_values_identical_across_all_rows_are_hoisted_not_repeated():
-    """scope, provenance and project_id are the same on every row here."""
+    """provenance and project_id are the same on every row here.
+
+    Not `scope`: it is on the never-hoist list, for the reason spelled out in
+    `test_scope_is_never_hoisted_out_of_a_row`.
+    """
     out, _ = compress_payload(RECALL)
     rows = out["memories"]
-    assert all("scope" not in r for r in rows), "constant field left on rows"
-    assert out.get("common", {}).get("scope") == "org"
+    assert all("provenance" not in r for r in rows), "constant field left on rows"
+    assert out.get("common", {}).get("provenance") == "EXTRACTED"
 
 
 def test_a_field_that_differs_stays_on_the_row():
@@ -301,3 +305,40 @@ def test_the_generic_path_round_trips_non_ascii_payloads():
             "count": 2,
         }
     )
+
+
+def test_scope_is_never_hoisted_out_of_a_row():
+    """`scope` is the field a consumer is most likely to act on.
+
+    Ten private memories all agree, so it was lifted into `common` and every
+    row came back with `scope` missing — a caller reading
+    `memories[i]["scope"]` got None for all ten. The server never re-reads its
+    own output so authz was unaffected, but every SDK and dashboard consumer
+    walks straight into it. It costs a few bytes to keep and it is never worth
+    the trap.
+    """
+    payload = {
+        "memories": [
+            {"id": f"id-{i}", "content": f"note {i}", "scope": "private"}
+            for i in range(10)
+        ],
+        "count": 10,
+    }
+    out, _ = compress_payload(payload)
+    assert "scope" not in out.get("common", {}), "scope must never be hoisted"
+    for row in out["memories"]:
+        assert row["scope"] == "private"
+
+
+def test_the_generic_path_also_keeps_scope_on_the_row():
+    payload = {
+        "rows": [
+            {"id": f"id-{i}", "content": f"note {i}", "scope": "private", "tag": None}
+            for i in range(10)
+        ]
+    }
+    out = json.loads(compress_json_text(json.dumps(payload)))
+    assert "scope" not in out.get("common", {})
+    for row in out["rows"]:
+        assert row["scope"] == "private"
+    assert _round_trips(payload)

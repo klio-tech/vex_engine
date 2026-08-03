@@ -2436,7 +2436,12 @@ def _register_tools(mcp: FastMCP) -> None:
             "'agent'), space, project, limit. Set the X-Vex-Agent header to "
             "scope by agent. "
             "Results with memory_type 'artifact' are stored files or documents: "
-            "call artifact_get with the metadata's artifact_id to read them."
+            "call artifact_get with the metadata's artifact_id to read them. "
+            "The result is structurally compressed: null fields are omitted "
+            "from a row, and fields identical on every row may be hoisted "
+            "into a top-level `common` object — read a memory as `common` "
+            "merged with the row. `id`, `content` and `scope` always stay on "
+            "the row itself."
         ),
     )
     async def recall(
@@ -2851,10 +2856,14 @@ def _register_tools(mcp: FastMCP) -> None:
             "you also get a `handle` that klio_retrieve turns back into the "
             "full original for the next 24 hours. Content under ~500 tokens, "
             "and anything we cannot confidently identify, is returned "
-            "untouched. Reading compressed JSON: it is minified, keys whose "
-            "value was null on every row are omitted, and keys identical on "
-            "every row are hoisted into a `common` object that applies to all "
-            "of them — no information is lost."
+            "untouched. Reading compressed JSON: it is minified; a key is "
+            "omitted from any row where its value was null (per row, not only "
+            "when null everywhere); and keys whose value is identical on every "
+            "row are hoisted into a `common` object that applies to all of "
+            "them — read a row as `common` merged with the row. `id`, "
+            "`content` and `scope` always stay on the row. A `_klio` object "
+            "carries the metadata that reverses all of it; no information is "
+            "lost."
         ),
     )
     async def compress(
