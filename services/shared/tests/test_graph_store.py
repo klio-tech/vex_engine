@@ -367,6 +367,45 @@ def test_neighbors_empty_entry_set_is_empty(db):
 
 
 # ---------------------------------------------------------------------------
+# The destination org guard, pinned where behaviour cannot reach it
+# ---------------------------------------------------------------------------
+
+
+def test_neighbors_keeps_both_destination_org_guards():
+    """``neighbors`` must pin the destination row's org in BOTH places.
+
+    The JOIN (``ON m.id = scored.other_id AND m.org_id = :org_id``) and the
+    WHERE clause list (``"m.org_id = :org_id"``) are deliberate defence in
+    depth: a tampered cross-org edge must grant nothing even if one guard is
+    later refactored away by accident.
+
+    This assertion is STRUCTURAL, and that is not laziness. On an INNER JOIN
+    the two are the same predicate on the same column of the same row, so
+    every query returns identical results with either one removed — verified
+    by mutation, each single-site deletion leaves the whole 579-test shared
+    suite green. There is no behavioural test that can distinguish them.
+    Redundancy that no result can observe can only be pinned at the source,
+    or it is not pinned at all.
+    """
+    import inspect
+    import re
+
+    source = inspect.getsource(graph_store.neighbors)
+    flat = re.sub(r"\s+", " ", source)
+
+    assert '"m.org_id = :org_id",' in source, (
+        "the WHERE-clause destination org guard is gone from neighbors(); "
+        "restore it — the JOIN guard alone leaves the tenancy boundary "
+        "resting on a single unasserted line"
+    )
+    assert "ON m.id = scored.other_id AND m.org_id = :org_id" in flat, (
+        "the JOIN destination org guard is gone from neighbors(); restore it "
+        "— the WHERE guard alone leaves the tenancy boundary resting on a "
+        "single unasserted line"
+    )
+
+
+# ---------------------------------------------------------------------------
 # The engine-swap boundary: no SQL against the graph tables anywhere else
 # ---------------------------------------------------------------------------
 
