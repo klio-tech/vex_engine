@@ -340,3 +340,60 @@ async def test_a_stack_trace_survives_the_tool_byte_for_byte(db, acme):
 
     assert "/Users/dev/app/main.py" in result["compressed"]
     assert "loader.load(path)" in result["compressed"]
+
+
+# ---------------------------------------------------------------------------
+# The unattributed caller
+# ---------------------------------------------------------------------------
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_an_unattributed_caller_can_redeem_its_handle(db, acme):
+    """`resolve_request_user_id` returns None by design, for legacy API keys.
+
+    That caller still calls `compress`, and the lossy compressor has already
+    dropped its function bodies by the time it finds out. A handle it cannot
+    redeem is precisely the broken promise `_perform_compress` exists to
+    prevent — two lines above the code that made it.
+    """
+    a, b, c = _live(db, org_id=acme, user_id=None)
+    with a, b, c:
+        result = await _tool_fn("compress")(_fake_ctx(), LONG_PYTHON, lossy=True)
+        assert result["lossy"] is True, "the premise of this test"
+        assert result["handle"].startswith("kc_")
+
+        recovered = await _tool_fn("klio_retrieve")(_fake_ctx(), result["handle"])
+
+    assert recovered.get("text") == LONG_PYTHON, f"unredeemable handle: {recovered!r}"
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_an_attributed_user_cannot_spend_an_unattributed_handle(db, acme):
+    """Making the handle redeemable must not widen who can redeem it."""
+    a, b, c = _live(db, org_id=acme, user_id=None)
+    with a, b, c:
+        result = await _tool_fn("compress")(_fake_ctx(), LONG_PYTHON, lossy=True)
+        handle = result["handle"]
+
+    a, b, c = _live(db, org_id=acme, user_id=ALICE)
+    with a, b, c:
+        recovered = await _tool_fn("klio_retrieve")(_fake_ctx(), handle)
+
+    assert recovered == {"error": "not_found"}
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_an_unattributed_caller_cannot_spend_an_attributed_handle(db, acme):
+    a, b, c = _live(db, org_id=acme, user_id=ALICE)
+    with a, b, c:
+        result = await _tool_fn("compress")(_fake_ctx(), LONG_PYTHON, lossy=True)
+        handle = result["handle"]
+
+    a, b, c = _live(db, org_id=acme, user_id=None)
+    with a, b, c:
+        recovered = await _tool_fn("klio_retrieve")(_fake_ctx(), handle)
+
+    assert recovered == {"error": "not_found"}
