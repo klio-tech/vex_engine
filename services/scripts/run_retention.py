@@ -40,6 +40,59 @@ logging.basicConfig(
 logger = logging.getLogger("retention")
 
 
+def sweep_expired_originals(db, *, org_id: str) -> int:
+    """Delete this org's compression originals whose TTL has passed.
+
+    Migration 034 gave ``compression_cache`` an ``expires_at`` column, an
+    index created explicitly for "the expiry sweep", and a docstring promising
+    24-hour retention — and then nothing ever deleted a row. ``expires_at``
+    was read only as a predicate in ``load_original`` / ``handle_is_expired``,
+    so an expired original became unreachable to its owner while staying on
+    disk forever. The rows are whatever the user compressed (logs, source
+    files, API responses); content a user can neither retrieve nor be rid of
+    is a retention-policy hole, and the unbounded growth is the lesser half
+    of it.
+
+    Expiry is absolute, not plan-derived: the TTL is hours, far inside any
+    plan's retention window, so there is nothing for a plan to lengthen.
+
+    Returns the number of originals removed.
+    """
+    result = db.execute(
+        text(
+            """
+            DELETE FROM compression_cache
+            WHERE org_id = :org_id
+              AND expires_at <= NOW()
+            """
+        ),
+        {"org_id": org_id},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
+
+
+def _contained(sweep, conn, *, org_id: str, what: str) -> None:
+    """Run one org's sweep so that its failure stays its own.
+
+    Hygiene, not the job: a sweep that blows up must not leave every later
+    org's retention unenforced. The rollback matters as much as the except —
+    a failed statement aborts the transaction, and without it every
+    subsequent statement on this connection would raise
+    ``InFailedSqlTransaction``, converting one org's bad sweep into a
+    silently empty retention run.
+    """
+    try:
+        removed = sweep(conn, org_id=org_id)
+        logger.info("Swept %s: %s row(s) for org=%s", what, removed, org_id)
+    except Exception:
+        logger.exception("%s sweep failed for org=%s", what, org_id)
+        try:
+            conn.rollback()
+        except Exception:
+            logger.exception("rollback after the %s sweep also failed", what)
+
+
 def main() -> None:
     database_url = os.environ.get("DATABASE_URL")
     supabase_url = os.environ.get("SUPABASE_DATABASE_URL")
@@ -109,23 +162,41 @@ def main() -> None:
                     plan,
                 )
 
-                # Retention deletes from session_memories only; the graph's
-                # edge table carries no foreign keys BY DESIGN (a forget must
-                # never fail because of an edge), so nothing else collects the
-                # edges whose endpoints just vanished. Routed through the
-                # GraphStore seam, which is the only module allowed to name
-                # the graph tables.
+                # Retention deletes from session_memories only. Everything the
+                # memory row anchored has to be collected here, each sweep
+                # contained per-org so one failure cannot silently empty the
+                # rest of the run.
                 #
-                # Hygiene, not the job: a sweep that blows up must not leave
-                # every later org's retention unenforced, so it is contained
-                # per-org and logged.
-                try:
-                    swept = graph_store.sweep_orphan_edges(tsdb_conn, org_id=org_id)
-                    logger.info(
-                        "Swept %d orphan graph edge(s) for org=%s", swept, org_id
-                    )
-                except Exception:
-                    logger.exception("Orphan-edge sweep failed for org=%s", org_id)
+                # 1. Edges. The edge table carries no foreign keys BY DESIGN
+                #    (a forget must never fail because of an edge), so nothing
+                #    else collects the edges whose endpoints just vanished.
+                # 2. Entities. An entity's evidence IS its edges, so this must
+                #    run AFTER the edge sweep: until the dead edges are gone
+                #    they still count as evidence and the entity is spared.
+                #
+                # Both routed through the GraphStore seam, the only module
+                # allowed to name the graph tables.
+                _contained(
+                    graph_store.sweep_orphan_edges,
+                    tsdb_conn,
+                    org_id=org_id,
+                    what="orphan graph edges",
+                )
+                _contained(
+                    graph_store.sweep_orphan_entities,
+                    tsdb_conn,
+                    org_id=org_id,
+                    what="orphan graph entities",
+                )
+                # 3. Compression originals. Not anchored to a memory at all —
+                #    these expire on their own short TTL and, until now, were
+                #    never deleted by anything.
+                _contained(
+                    sweep_expired_originals,
+                    tsdb_conn,
+                    org_id=org_id,
+                    what="expired compression originals",
+                )
 
             # Hidden raw captures are curator fuel with a short shelf life:
             # sweep them on a fixed TTL regardless of plan retention.
