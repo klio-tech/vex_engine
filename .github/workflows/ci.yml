@@ -78,7 +78,13 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install shared models
-        run: pip install -e services/shared
+        # [code] pulls the tree-sitter grammars (~4.5 MB). Without them the
+        # code compressor degrades to passthrough, `lossy` comes back False and
+        # four compress tests in mcp-server fail rather than skip. The
+        # production mcp-server Dockerfile installs the same grammars, so this
+        # matches production. [prose] is deliberately NOT installed: the
+        # Dockerfile omits it too (~350 MB of onnxruntime plus weights).
+        run: pip install -e "services/shared[code]"
       - name: Install verification engine (if needed)
         if: matrix.extra_deps != ''
         run: pip install -e ${{ matrix.extra_deps }}
@@ -103,6 +109,15 @@ jobs:
     # is still the only thing that exercises the upgrade/downgrade cycle and
     # the CHECK constraints against a real server, so it gets a real database
     # and the same KLIO_REQUIRE_DB gate.
+    #
+    # POSTGRES_USER is the image's superuser, so `agentguard` has CREATEDB.
+    # The downgrade round-trip tests need it: they create and drop their own
+    # scratch database rather than moving a shared schema up and down, and
+    # their fixture errors rather than skips without the privilege. Do not
+    # replace this with a lesser role for tests.
+    #
+    # KLIO_ALLOW_AUDIT_LOSS is deliberately NOT set here: a test asserts that a
+    # destructive audit-table downgrade is refused when it is absent.
     services:
       postgres:
         image: timescale/timescaledb-ha:pg16
