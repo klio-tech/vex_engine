@@ -371,3 +371,45 @@ def test_allow_lossy_false_still_runs_the_lossless_compressor():
     result = compress(LONG_JSON, allow_lossy=False)
     assert result.compressor == Compressor.STRUCTURAL.value
     assert result.compressed_tokens < result.original_tokens
+
+
+# --------------------------------------------------------------------------
+# Legibility: what the router chose, not only what came out
+# --------------------------------------------------------------------------
+#
+# The shipped image deliberately omits the prose model (~350 MB for a measured
+# ~1.4% gain). Nothing about that is dishonest -- the router selects prose,
+# `compress_prose` finds no weights, the content comes back verbatim and the
+# result says `lossy=false`. No invented ratio, no phantom handle.
+#
+# It is, however, illegible. "Returned unchanged" is indistinguishable from
+# "already optimal", so the only rational inference a calling model can draw
+# from the response is the wrong one. The router knows which it was; it just
+# had nowhere to say so.
+
+
+def test_the_selected_compressor_is_reported_even_when_it_did_not_run(monkeypatch):
+    from shared.compression import prose as prose_module
+
+    monkeypatch.setattr(prose_module, "_score_tokens", lambda _text: None)
+    monkeypatch.setattr(prose_module, "model_available", lambda: False)
+    result = compress(LONG_PROSE)
+
+    assert result.text == LONG_PROSE
+    assert result.compressor == Compressor.PASSTHROUGH.value, "nothing ran"
+    assert result.selected == Compressor.PROSE.value, "but prose is what was chosen"
+    assert result.available is False
+
+
+def test_a_compressor_that_ran_reports_itself_as_both():
+    result = compress(LONG_JSON)
+    assert result.compressor == Compressor.STRUCTURAL.value
+    assert result.selected == Compressor.STRUCTURAL.value
+    assert result.available is True
+
+
+def test_declining_to_compress_reports_passthrough_as_the_selection():
+    """Genuinely nothing to do, and the caller can tell that apart."""
+    result = compress("short")
+    assert result.selected == Compressor.PASSTHROUGH.value
+    assert result.available is True

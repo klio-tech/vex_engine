@@ -78,6 +78,39 @@ LONG_JSON = json.dumps(
 
 SHORT = "def f(a):\n    return a + 1\n"
 
+LONG_PROSE = (
+    "The deployment failed because the database connection pool was exhausted "
+    "and we should probably look into raising the pool size at some point. "
+    "The error surfaced in the checkout service during the evening peak, and "
+    "it is the sort of thing that will happen again if nobody changes it. "
+) * 8
+
+
+def _code_compressor_available() -> bool:
+    """Whether the tree-sitter grammars are installed here.
+
+    `shared[code]` is an optional extra. Without it `detect_language` returns
+    None, the router never selects the code compressor, `lossy` comes back
+    False and no handle is issued -- so every test below that needs a handle
+    fails on `assert False is True`, which says nothing about what is wrong.
+    An optional dependency silently changing test outcomes is the same disease
+    as a tool description silently over-promising: the failure is illegible.
+    A named skip is not a pass, but it is the truth.
+    """
+    from shared.compression.code import detect_language
+
+    return detect_language(LONG_PYTHON) is not None
+
+
+requires_code_extra = pytest.mark.skipif(
+    not _code_compressor_available(),
+    reason=(
+        "the tree-sitter grammars (shared[code]) are not installed, so code "
+        "compression degrades to passthrough and issues no handle. Production "
+        "installs them; see services/mcp-server/Dockerfile."
+    ),
+)
+
 
 def _fake_ctx(headers: dict | None = None):
     request = SimpleNamespace(headers=headers if headers is not None else {})
@@ -179,6 +212,7 @@ async def test_lossy_is_refused_unless_the_caller_asks(db, acme):
 
 
 @requires_db
+@requires_code_extra
 @pytest.mark.asyncio
 async def test_lossy_compression_returns_a_recoverable_handle(db, acme):
     a, b, c = _live(db, org_id=acme, user_id=ALICE)
@@ -197,6 +231,7 @@ async def test_lossy_compression_returns_a_recoverable_handle(db, acme):
 
 
 @requires_db
+@requires_code_extra
 @pytest.mark.asyncio
 async def test_the_handle_is_never_a_marker_inside_the_text(db, acme):
     """An inline marker gets echoed back by a model and corrupts code."""
@@ -226,6 +261,7 @@ async def test_content_under_the_floor_is_returned_untouched(db, acme):
 
 
 @requires_db
+@requires_code_extra
 @pytest.mark.asyncio
 async def test_another_user_cannot_spend_the_handle(db, acme):
     """The originals cache is a tenancy boundary. A handle is not a bearer
@@ -243,6 +279,7 @@ async def test_another_user_cannot_spend_the_handle(db, acme):
 
 
 @requires_db
+@requires_code_extra
 @pytest.mark.asyncio
 async def test_another_org_cannot_spend_the_handle(db, acme):
     a, b, c = _live(db, org_id=acme, user_id=ALICE)
@@ -348,6 +385,7 @@ async def test_a_stack_trace_survives_the_tool_byte_for_byte(db, acme):
 
 
 @requires_db
+@requires_code_extra
 @pytest.mark.asyncio
 async def test_an_unattributed_caller_can_redeem_its_handle(db, acme):
     """`resolve_request_user_id` returns None by design, for legacy API keys.
@@ -369,6 +407,7 @@ async def test_an_unattributed_caller_can_redeem_its_handle(db, acme):
 
 
 @requires_db
+@requires_code_extra
 @pytest.mark.asyncio
 async def test_an_attributed_user_cannot_spend_an_unattributed_handle(db, acme):
     """Making the handle redeemable must not widen who can redeem it."""
@@ -385,6 +424,7 @@ async def test_an_attributed_user_cannot_spend_an_unattributed_handle(db, acme):
 
 
 @requires_db
+@requires_code_extra
 @pytest.mark.asyncio
 async def test_an_unattributed_caller_cannot_spend_an_attributed_handle(db, acme):
     a, b, c = _live(db, org_id=acme, user_id=ALICE)
@@ -397,3 +437,60 @@ async def test_an_unattributed_caller_cannot_spend_an_attributed_handle(db, acme
         recovered = await _tool_fn("klio_retrieve")(_fake_ctx(), handle)
 
     assert recovered == {"error": "not_found"}
+
+
+# ---------------------------------------------------------------------------
+# Legibility of what actually happened
+# ---------------------------------------------------------------------------
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_the_response_says_which_compressor_ran(db, acme):
+    a, b, c = _live(db, org_id=acme, user_id=ALICE)
+    with a, b, c:
+        result = await _tool_fn("compress")(_fake_ctx(), LONG_JSON)
+
+    assert result["compressor"] == "structural"
+    assert result["selected_compressor"] == "structural"
+    assert "note" not in result
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_an_unavailable_compressor_is_named_rather_than_hidden(db, acme):
+    """The shipped image omits the prose model on purpose.
+
+    The behaviour is honest -- content back verbatim, `lossy:false`, no
+    handle, nothing invented. It is not legible: a caller cannot tell that
+    from "already optimal", and the only rational inference it can draw is the
+    wrong one. The response now names the compressor the router chose and says
+    it was unavailable.
+    """
+    a, b, c = _live(db, org_id=acme, user_id=ALICE)
+    with (
+        a,
+        b,
+        c,
+        patch("shared.compression.router.prose_model_available", lambda: False),
+    ):
+        result = await _tool_fn("compress")(_fake_ctx(), LONG_PROSE, lossy=True)
+
+    assert result["compressed"] == LONG_PROSE
+    assert result["lossy"] is False
+    assert "handle" not in result
+    assert result["compressor"] == "passthrough"
+    assert result["selected_compressor"] == "prose"
+    assert "not available" in result["note"]
+
+
+@requires_db
+@pytest.mark.asyncio
+async def test_content_below_the_floor_is_not_reported_as_unavailable(db, acme):
+    a, b, c = _live(db, org_id=acme, user_id=ALICE)
+    with a, b, c:
+        result = await _tool_fn("compress")(_fake_ctx(), SHORT, lossy=True)
+
+    assert result["compressor"] == "passthrough"
+    assert result["selected_compressor"] == "passthrough"
+    assert "note" not in result

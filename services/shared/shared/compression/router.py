@@ -29,7 +29,11 @@ from dataclasses import dataclass
 from enum import Enum
 
 from shared.compression.code import compress_code, detect_language, looks_like_a_diff
-from shared.compression.prose import DEFAULT_THRESHOLD, compress_prose
+from shared.compression.prose import (
+    DEFAULT_THRESHOLD,
+    compress_prose,
+)
+from shared.compression.prose import model_available as prose_model_available
 from shared.compression.structural import compress_json_text
 
 logger = logging.getLogger("klio.compression.router")
@@ -79,6 +83,14 @@ class CompressionResult:
     reputation: a lossy compressor that achieved nothing returns
     ``lossy=False``, so the caller does not write a cache entry for a recovery
     nobody will ever need.
+
+    ``compressor`` is what actually produced ``text`` -- ``passthrough`` when
+    nothing did. ``selected`` is what the router CHOSE for this content, and
+    ``available`` whether that choice could run here. The three together are
+    what let a caller tell "there was nothing to compress" apart from "that
+    compressor is not installed in this deployment": both return the content
+    verbatim, and only the second is a deployment fact rather than a fact
+    about the content.
     """
 
     text: str
@@ -86,6 +98,8 @@ class CompressionResult:
     compressed_tokens: int
     lossy: bool
     compressor: str
+    selected: str = Compressor.PASSTHROUGH.value
+    available: bool = True
 
 
 def estimate_tokens(text: str) -> int:
@@ -130,7 +144,28 @@ def select_compressor(text: str) -> Compressor:
     return Compressor.PASSTHROUGH
 
 
-def _passthrough(text: str) -> CompressionResult:
+def _compressor_available(choice: "Compressor") -> bool:
+    """Whether ``choice`` can actually run in this deployment.
+
+    Only prose can be selected and then be missing. `detect_language` returns
+    None without the tree-sitter grammars, so CODE is never selected when it
+    could not run; the prose detector is a pure-text heuristic and has no such
+    coupling to its weights.
+    """
+    if choice is not Compressor.PROSE:
+        return True
+    try:
+        return prose_model_available()
+    except Exception:
+        return False
+
+
+def _passthrough(
+    text: str,
+    *,
+    selected: "Compressor" = Compressor.PASSTHROUGH,
+    available: bool = True,
+) -> CompressionResult:
     tokens = estimate_tokens(text)
     return CompressionResult(
         text=text,
@@ -138,6 +173,8 @@ def _passthrough(text: str) -> CompressionResult:
         compressed_tokens=tokens,
         lossy=False,
         compressor=Compressor.PASSTHROUGH.value,
+        selected=selected.value,
+        available=available,
     )
 
 
@@ -171,22 +208,24 @@ def compress(
         logger.warning("compressor selection failed; passing through", exc_info=True)
         return _passthrough(text)
 
+    available = _compressor_available(choice)
+
     try:
         if choice is Compressor.STRUCTURAL:
             out, lossy = compress_json_text(text), False
         elif not allow_lossy:
-            return _passthrough(text)
+            return _passthrough(text, selected=choice, available=available)
         elif choice is Compressor.CODE:
             out, lossy = compress_code(text), True
         elif choice is Compressor.PROSE:
             out, lossy = compress_prose(text, threshold=prose_threshold), True
         else:
-            return _passthrough(text)
+            return _passthrough(text, selected=choice, available=available)
     except Exception:
         logger.warning(
             "compressor %s raised; passing through", choice.value, exc_info=True
         )
-        return _passthrough(text)
+        return _passthrough(text, selected=choice, available=available)
 
     if len(out) >= len(text):
         # Two cases, one guard.
@@ -206,7 +245,7 @@ def compress(
                 len(text),
                 len(out),
             )
-        return _passthrough(text)
+        return _passthrough(text, selected=choice, available=available)
 
     return CompressionResult(
         text=out,
@@ -214,4 +253,6 @@ def compress(
         compressed_tokens=estimate_tokens(out),
         lossy=lossy,
         compressor=choice.value,
+        selected=choice.value,
+        available=available,
     )
