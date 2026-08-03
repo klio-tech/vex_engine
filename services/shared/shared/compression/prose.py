@@ -33,12 +33,16 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import threading
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from shared.compression.protect import protect, restore
+from shared.compression.protect import (
+    SENTINEL_CLOSE,
+    SENTINEL_OPEN,
+    protect,
+    restore,
+)
 
 logger = logging.getLogger("klio.compression.prose")
 
@@ -55,7 +59,51 @@ DEFAULT_ONNX_FILE = "onnx/kompress-int8-wo.onnx"
 MAX_MODEL_TOKENS = 8192
 
 # Sentinels emitted by protect(); any subword touching one is force-kept.
-_SENTINEL_SPAN_RE = re.compile("\\d+")
+#
+# The span has to cover the WHOLE sentinel -- both delimiters and everything
+# between them -- because ``restore()`` matches ``<open>N<close>`` and nothing
+# else. Drop one delimiter and the sentinel stops matching: a protected URL
+# comes back as a bare integer beside an orphaned private-use character.
+# Silent corruption of exactly the content this module promised not to touch.
+#
+# The delimiters are also the part of a sentinel most likely to be dropped,
+# not the least: a byte-level BPE tokeniser has no vocabulary entry for
+# U+E000/U+E001 and emits them as their own unknown-byte fragments, which is
+# the sort of token a keep/drop classifier scores lowest.
+#
+# A regex cannot express this, which is the bug this scan replaces.
+# ``protect()`` applies its patterns in sequence, so sentinels NEST -- a path
+# stashed first has its index re-stashed by the number pattern, giving
+# ``<open><open>1<close><close>``. ``SENTINEL_RE`` matches only the innermost
+# pair, so a regex scan leaves every outer delimiter unprotected and
+# droppable. The scan below pairs opens with closes and yields a span for
+# every pair at every depth, so nesting cannot hide a delimiter.
+#
+# Unbalanced delimiters -- which a pattern that matches across a sentinel
+# boundary can produce -- are force-kept individually. Keeping a character
+# that did not need keeping costs a byte; dropping one costs the content.
+
+
+def _protected_spans(text: str) -> list[tuple[int, int]]:
+    """Every sentinel span in ``text``, at every nesting depth.
+
+    Spans may overlap (an inner pair sits inside its outer pair); the caller
+    only asks whether a token touches any of them, so that is harmless.
+    """
+    spans: list[tuple[int, int]] = []
+    open_stack: list[int] = []
+    for index, char in enumerate(text):
+        if char == SENTINEL_OPEN:
+            open_stack.append(index)
+        elif char == SENTINEL_CLOSE:
+            if open_stack:
+                spans.append((open_stack.pop(), index + 1))
+            else:
+                # A close with no open. Still un-droppable: restore needs it.
+                spans.append((index, index + 1))
+    spans.extend((start, start + 1) for start in open_stack)
+    return spans
+
 
 _lock = threading.Lock()
 _model: Optional["_ProseModel"] = None
@@ -204,10 +252,6 @@ def _score_tokens(text: str) -> Optional[list[tuple[int, int, float]]]:
         (start, end, float(scores[index]))
         for index, (start, end) in enumerate(encoded.offsets)
     ]
-
-
-def _protected_spans(text: str) -> list[tuple[int, int]]:
-    return [(m.start(), m.end()) for m in _SENTINEL_SPAN_RE.finditer(text)]
 
 
 def _overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
