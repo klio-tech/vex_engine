@@ -637,9 +637,20 @@ def entity_brief(
         if m.memory_type == "decision"
     ]
 
-    # Supersessions within the visible slice. The retired side may itself be
-    # status='superseded' (that is the point), so it is fetched under the
-    # ladder arms but WITHOUT the active-status requirement.
+    # Supersessions within the visible slice. This query returns ``m.content``
+    # — the RETIRED memory's own text — so it needs every read-path guard the
+    # evidence query above has, minus the one that would defeat its purpose.
+    #
+    # * ``status != 'retracted'`` and NOT ``status = 'active'``: the retired
+    #   side is status='superseded' by construction (that IS the point), so an
+    #   active-only filter would empty the feature. But a retracted row is
+    #   forgotten, and forgotten means forgotten, the graph included — its
+    #   content must never come back as ``old_content``. Without this a
+    #   ``forget`` on a superseded memory would succeed and change nothing
+    #   the caller can observe.
+    # * ``recall_hidden = FALSE``: hidden raw captures are curator fuel that
+    #   NO read path returns. Omitting it here was a live hole in the store's
+    #   contract even while the only supersedes-edge writer never made one.
     superseded_rows = db.execute(
         text(
             f"""
@@ -653,6 +664,8 @@ def entity_brief(
               AND e.relation = 'supersedes'
               AND e.dst_kind = 'memory'
               AND e.src_id = ANY(CAST(:evidence_ids AS uuid[]))
+              AND m.status != 'retracted'
+              AND m.recall_hidden = FALSE
               AND {ladder_sql}
             ORDER BY e.created_at ASC
             """

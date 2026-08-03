@@ -30,6 +30,7 @@ from sqlalchemy import create_engine, text
 # so that `from shared.plan_limits import ...` resolves to
 # services/shared/shared/plan_limits.py.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
+from shared import graph_store
 from shared.plan_limits import get_plan_config
 
 logging.basicConfig(
@@ -107,6 +108,24 @@ def main() -> None:
                     org_id,
                     plan,
                 )
+
+                # Retention deletes from session_memories only; the graph's
+                # edge table carries no foreign keys BY DESIGN (a forget must
+                # never fail because of an edge), so nothing else collects the
+                # edges whose endpoints just vanished. Routed through the
+                # GraphStore seam, which is the only module allowed to name
+                # the graph tables.
+                #
+                # Hygiene, not the job: a sweep that blows up must not leave
+                # every later org's retention unenforced, so it is contained
+                # per-org and logged.
+                try:
+                    swept = graph_store.sweep_orphan_edges(tsdb_conn, org_id=org_id)
+                    logger.info(
+                        "Swept %d orphan graph edge(s) for org=%s", swept, org_id
+                    )
+                except Exception:
+                    logger.exception("Orphan-edge sweep failed for org=%s", org_id)
 
             # Hidden raw captures are curator fuel with a short shelf life:
             # sweep them on a fixed TTL regardless of plan retention.

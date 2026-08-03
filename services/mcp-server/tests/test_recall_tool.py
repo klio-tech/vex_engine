@@ -703,3 +703,39 @@ def test_recall_serializer_unchanged_and_guidance_is_separate():
         )
     )
     assert "guidance" not in out  # nudge lives on the envelope, not each record
+
+
+def test_serialize_record_carries_the_graph_marker():
+    """A row that rode in on graph expansion must SAY so on the wire.
+
+    ``relevance=None`` was its only marker, and structural compression strips
+    null keys row by row — so the agent received a row with no way to tell a
+    semantic match from a one-hop graph walk. The marker is only a fix if the
+    serializer forwards it.
+    """
+    import uuid as _uuid
+
+    from app.mcp_app import _serialize_record
+    from shared.memory import VIA_GRAPH, MemoryRecord
+
+    expanded = MemoryRecord(
+        id=_uuid.uuid4(),
+        session_id="s",
+        org_id="o",
+        agent_id="a",
+        memory_type="fact",
+        content="rode in on an edge",
+        via=VIA_GRAPH,
+    )
+    semantic = MemoryRecord(
+        id=_uuid.uuid4(),
+        session_id="s",
+        org_id="o",
+        agent_id="a",
+        memory_type="fact",
+        content="matched the query",
+        relevance=0.873,
+    )
+
+    assert _serialize_record(expanded)["via"] == "graph"
+    assert _serialize_record(semantic)["via"] is None

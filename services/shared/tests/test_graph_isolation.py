@@ -108,6 +108,8 @@ def _seed(
     memory_type: str = "fact",
     provenance: str = "EXTRACTED",
     status: str = "active",
+    recall_hidden: bool = False,
+    superseded_by: str | None = None,
 ) -> str:
     memory_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
@@ -118,11 +120,13 @@ def _seed(
                 id, session_id, org_id, agent_id, execution_id,
                 memory_type, content, embedding, scope, status,
                 user_id, provenance, project_id, metadata,
+                recall_hidden, superseded_by,
                 created_at, updated_at
             ) VALUES (
                 :id, :session_id, :org_id, :agent_id, NULL,
                 :memory_type, :content, :embedding, :scope, :status,
                 :user_id, :provenance, :project_id, '{}'::jsonb,
+                :recall_hidden, :superseded_by,
                 :created_at, :updated_at
             )
             """
@@ -140,6 +144,8 @@ def _seed(
             "user_id": user_id,
             "provenance": provenance,
             "project_id": project_id,
+            "recall_hidden": recall_hidden,
+            "superseded_by": superseded_by,
             "created_at": now,
             "updated_at": now,
         },
@@ -680,3 +686,501 @@ def test_neighbors_destination_filter_holds_without_the_join_guard(db):
     )
     blob = json.dumps(result, default=str)
     assert "ORG-B-SECRET-MARKER" not in blob
+
+
+# ---------------------------------------------------------------------------
+# ATTACK 7 — the right to be forgotten, applied to the SUPERSEDED half
+#
+# The curator auto-supersedes a memory when a newer one contradicts it. The
+# old row stays in the table as history, and ``entity_brief`` deliberately
+# reports it as ``superseded[].old_content`` so a caller can see what changed.
+# That is the feature. What is NOT the feature: the owner asking to forget
+# that row, being told ``not_found``, and the graph serving its content back
+# to them forever.
+# ---------------------------------------------------------------------------
+
+
+def _superseded_pair(db, *, org, entity_name, old_content, new_content, **seed_kw):
+    """Seed old <-supersedes- new, both evidencing one entity. Returns ids."""
+    entity = graph_store.add_entity(db, org_id=org, name=entity_name, kind="concept")
+    new_id = _seed(db, org_id=org, content=new_content, **seed_kw)
+    old_id = _seed(
+        db,
+        org_id=org,
+        content=old_content,
+        status="superseded",
+        superseded_by=new_id,
+        **seed_kw,
+    )
+    for src in (new_id, old_id):
+        _edge(
+            db,
+            org_id=org,
+            src_id=src,
+            dst_id=entity,
+            dst_kind="entity",
+            relation="about",
+        )
+    _edge(db, org_id=org, src_id=new_id, dst_id=old_id, relation="supersedes")
+    return old_id, new_id
+
+
+def _brief_old_contents(db, *, org, viewer, entity, scope="org", agent_id=None):
+    brief = graph_store.entity_brief(
+        db,
+        org_id=org,
+        viewer_user_id=viewer,
+        entity=entity,
+        scope=scope,
+        agent_id=agent_id,
+    )
+    if brief is None:
+        return None
+    return [s["old_content"] for s in brief["superseded"]]
+
+
+def test_a_superseded_memory_is_forgettable(db):
+    """H1, half one: ``retract_memory`` used to require status='active', so a
+    row the curator had already superseded answered the indistinguishable
+    ``not_found`` and could never be retracted. The owner cannot tell "you may
+    not" from "it isn't there" — so they believe it is gone."""
+    org = _org(db)
+    old_id, _new_id = _superseded_pair(
+        db,
+        org=org,
+        entity_name="api key rotation",
+        old_content="My personal API key is sk-live-ABC123",
+        new_content="I rotated my key; it lives in 1Password now",
+        scope="private",
+        user_id=PRIYA,
+    )
+
+    result = retract_memory(
+        db, org_id=org, agent_id="agent-1", memory_id=old_id, via="mcp", user_id=PRIYA
+    )
+    assert result == {"forgotten": True, "id": old_id}, (
+        "the owner of a superseded memory must be able to forget it"
+    )
+    status = db.execute(
+        text("SELECT status FROM session_memories WHERE id = :i"), {"i": old_id}
+    ).scalar()
+    assert status == "retracted"
+
+
+def test_forgetting_a_superseded_memory_removes_it_from_the_brief(db):
+    """H1, the full sequence, production functions only: forget then explore."""
+    org = _org(db)
+    old_id, _new_id = _superseded_pair(
+        db,
+        org=org,
+        entity_name="api key rotation",
+        old_content="My personal API key is sk-live-ABC123",
+        new_content="I rotated my key; it lives in 1Password now",
+        scope="private",
+        user_id=PRIYA,
+    )
+
+    # Control: before the forget, the supersession history IS served — the
+    # fixture is not vacuous and the feature still works.
+    before = _brief_old_contents(db, org=org, viewer=PRIYA, entity="api key rotation")
+    assert before == ["My personal API key is sk-live-ABC123"]
+
+    assert (
+        retract_memory(
+            db,
+            org_id=org,
+            agent_id="agent-1",
+            memory_id=old_id,
+            via="mcp",
+            user_id=PRIYA,
+        )["forgotten"]
+        is True
+    )
+
+    brief = graph_store.entity_brief(
+        db, org_id=org, viewer_user_id=PRIYA, entity="api key rotation"
+    )
+    assert brief is not None, "control: the surviving memory still evidences it"
+    blob = json.dumps(brief, default=str)
+    assert "sk-live-ABC123" not in blob, "forgotten content came back through explore"
+    assert brief["superseded"] == []
+
+
+def test_a_retracted_memory_is_never_served_as_old_content(db):
+    """H1, half two, at the store layer: the superseded query must carry a
+    status guard. Attacks the SQL directly, with no forget call in sight."""
+    org = _org(db)
+    entity = graph_store.add_entity(
+        db, org_id=org, name="deploy target", kind="concept"
+    )
+    new_id = _seed(db, org_id=org, content="we deploy to fly.io now")
+    dead_id = _seed(
+        db, org_id=org, content="RETRACTED-MARKER heroku creds", status="retracted"
+    )
+    live_id = _seed(
+        db,
+        org_id=org,
+        content="LIVE-MARKER we used to deploy to heroku",
+        status="superseded",
+        superseded_by=new_id,
+    )
+    _edge(
+        db,
+        org_id=org,
+        src_id=new_id,
+        dst_id=entity,
+        dst_kind="entity",
+        relation="about",
+    )
+    _edge(db, org_id=org, src_id=new_id, dst_id=dead_id, relation="supersedes")
+    _edge(db, org_id=org, src_id=new_id, dst_id=live_id, relation="supersedes")
+
+    olds = _brief_old_contents(db, org=org, viewer=DEV, entity="deploy target")
+    assert "LIVE-MARKER we used to deploy to heroku" in olds, (
+        "control: a genuinely superseded row is still history worth showing"
+    )
+    assert not any("RETRACTED-MARKER" in o for o in olds)
+
+
+def test_a_hidden_raw_capture_is_never_served_as_old_content(db):
+    """H1, half two continued: ``recall_hidden`` rows are curator fuel that no
+    read path may return. The superseded query omitted the predicate."""
+    org = _org(db)
+    entity = graph_store.add_entity(db, org_id=org, name="oncall rota", kind="concept")
+    new_id = _seed(db, org_id=org, content="priya is on call this week")
+    hidden_id = _seed(
+        db,
+        org_id=org,
+        content="HIDDEN-MARKER raw transcript",
+        recall_hidden=True,
+        status="superseded",
+        superseded_by=new_id,
+    )
+    shown_id = _seed(
+        db,
+        org_id=org,
+        content="SHOWN-MARKER dev was on call",
+        status="superseded",
+        superseded_by=new_id,
+    )
+    _edge(
+        db,
+        org_id=org,
+        src_id=new_id,
+        dst_id=entity,
+        dst_kind="entity",
+        relation="about",
+    )
+    _edge(db, org_id=org, src_id=new_id, dst_id=hidden_id, relation="supersedes")
+    _edge(db, org_id=org, src_id=new_id, dst_id=shown_id, relation="supersedes")
+
+    olds = _brief_old_contents(db, org=org, viewer=DEV, entity="oncall rota")
+    assert "SHOWN-MARKER dev was on call" in olds, "control: the query returns rows"
+    assert not any("HIDDEN-MARKER" in o for o in olds)
+
+
+def test_retract_still_answers_not_found_for_someone_elses_superseded_private_row(db):
+    """Dropping the status filter must NOT turn ``forget`` into an existence
+    oracle: a superseded private row belonging to Priya answers ``not_found``
+    for Dev, exactly as an id that was never issued does."""
+    org = _org(db)
+    old_id, _new = _superseded_pair(
+        db,
+        org=org,
+        entity_name="priyas topic",
+        old_content="priya's old private note",
+        new_content="priya's new private note",
+        scope="private",
+        user_id=PRIYA,
+    )
+    never_issued = str(uuid.uuid4())
+
+    mine = retract_memory(
+        db, org_id=org, agent_id="agent-1", memory_id=old_id, via="mcp", user_id=DEV
+    )
+    ghost = retract_memory(
+        db,
+        org_id=org,
+        agent_id="agent-1",
+        memory_id=never_issued,
+        via="mcp",
+        user_id=DEV,
+    )
+    assert mine == ghost == {"forgotten": False, "error": "not_found"}
+
+    # ...and cross-org is likewise indistinguishable.
+    other_org = _org(db)
+    assert retract_memory(
+        db,
+        org_id=other_org,
+        agent_id="agent-1",
+        memory_id=old_id,
+        via="mcp",
+        user_id=PRIYA,
+    ) == {"forgotten": False, "error": "not_found"}
+
+    # Control: the owner still gets through.
+    assert (
+        retract_memory(
+            db,
+            org_id=org,
+            agent_id="agent-1",
+            memory_id=old_id,
+            via="mcp",
+            user_id=PRIYA,
+        )["forgotten"]
+        is True
+    )
+
+
+def test_retract_still_forbids_another_agents_superseded_row(db):
+    """The agent arm of the ladder survives the status change too."""
+    org = _org(db)
+    old_id, _new = _superseded_pair(
+        db,
+        org=org,
+        entity_name="agent topic",
+        old_content="old agent-scoped note",
+        new_content="new agent-scoped note",
+        scope="agent",
+        agent_id="priya-laptop",
+    )
+    assert retract_memory(
+        db, org_id=org, agent_id="dev-laptop", memory_id=old_id, via="mcp"
+    ) == {"forgotten": False, "error": "forbidden"}
+    # Control: the owning agent may.
+    assert (
+        retract_memory(
+            db, org_id=org, agent_id="priya-laptop", memory_id=old_id, via="mcp"
+        )["forgotten"]
+        is True
+    )
+
+
+# ---------------------------------------------------------------------------
+# ATTACK 8 — the unguarded predicates (H2)
+#
+# Each predicate below survived mutation: deleting it produced zero test
+# failures, because no test anywhere seeded a row that made it evaluate.
+# One test per predicate, each with a positive control.
+# ---------------------------------------------------------------------------
+
+
+def test_neighbors_never_returns_a_hidden_raw_capture(db):
+    """Pins ``m.recall_hidden = FALSE`` in ``neighbors``."""
+    org = _org(db)
+    entry = _seed(db, org_id=org, content="entry")
+    hidden = _seed(db, org_id=org, content="raw transcript fuel", recall_hidden=True)
+    shown = _seed(db, org_id=org, content="a normal neighbour")
+    _edge(db, org_id=org, src_id=entry, dst_id=hidden)
+    _edge(db, org_id=org, src_id=entry, dst_id=shown)
+
+    found = _neighbor_ids(db, org_id=org, viewer=DEV, entry=entry)
+    assert shown in found, "control: the walk reaches ordinary neighbours"
+    assert hidden not in found
+
+
+def test_entity_brief_never_admits_a_hidden_raw_capture(db):
+    """Pins ``m.recall_hidden = FALSE`` in ``entity_brief``'s evidence query."""
+    org = _org(db)
+    entity = graph_store.add_entity(db, org_id=org, name="checkout", kind="system")
+    hidden = _seed(
+        db, org_id=org, content="HIDDEN-EVIDENCE raw checkout log", recall_hidden=True
+    )
+    shown = _seed(db, org_id=org, content="checkout uses stripe")
+    for m in (hidden, shown):
+        _edge(
+            db, org_id=org, src_id=m, dst_id=entity, dst_kind="entity", relation="about"
+        )
+
+    brief = graph_store.entity_brief(
+        db, org_id=org, viewer_user_id=DEV, entity="checkout"
+    )
+    assert brief is not None, "control: the visible evidence still resolves"
+    assert brief["evidence_count"] == 1
+    assert "HIDDEN-EVIDENCE" not in json.dumps(brief, default=str)
+
+
+def test_entity_brief_is_not_found_when_only_hidden_evidence_exists(db):
+    """The stronger form: hidden evidence must not even prove the name."""
+    org = _org(db)
+    entity = graph_store.add_entity(db, org_id=org, name="shadow-topic", kind="concept")
+    hidden = _seed(db, org_id=org, content="raw capture only", recall_hidden=True)
+    _edge(
+        db,
+        org_id=org,
+        src_id=hidden,
+        dst_id=entity,
+        dst_kind="entity",
+        relation="about",
+    )
+
+    assert (
+        graph_store.entity_brief(
+            db, org_id=org, viewer_user_id=DEV, entity="shadow-topic"
+        )
+        is None
+    )
+
+
+def test_neighbors_never_returns_a_row_marked_superseded_by(db):
+    """Pins ``m.superseded_by IS NULL`` in ``neighbors``, ON ITS OWN.
+
+    ``status`` and ``superseded_by`` are two columns that are supposed to move
+    together, and the sibling ``m.status = 'active'`` predicate masks this one
+    for any row where they agree. So the row seeded here has them DISAGREE —
+    superseded_by set, status still 'active' — which is precisely the drift the
+    second predicate exists to catch.
+    """
+    org = _org(db)
+    entry = _seed(db, org_id=org, content="entry")
+    replacement = _seed(db, org_id=org, content="the current version")
+    retired = _seed(
+        db,
+        org_id=org,
+        content="the retired version",
+        status="active",
+        superseded_by=replacement,
+    )
+    _edge(db, org_id=org, src_id=entry, dst_id=retired)
+    _edge(db, org_id=org, src_id=entry, dst_id=replacement)
+
+    found = _neighbor_ids(db, org_id=org, viewer=DEV, entry=entry)
+    assert replacement in found, "control: the un-retired neighbour is returned"
+    assert retired not in found
+
+
+def test_agent_scoped_rows_expand_only_for_their_own_agent(db):
+    """Pins the agent arm of ``_ladder_clause`` from BOTH sides.
+
+    Deleting the arm narrows the read rather than widening it, so a negative
+    test alone cannot catch it — the positive half is what dies. The existing
+    sweep at ``test_no_scope_argument_reaches_the_forbidden_row`` iterates
+    scope='agent' but its victim row is 'private', so the arm never evaluates.
+    """
+    org = _org(db)
+    entry = _seed(db, org_id=org, content="entry")
+    mine = _seed(
+        db,
+        org_id=org,
+        content="my agent's working note",
+        scope="agent",
+        agent_id="dev-laptop",
+    )
+    theirs = _seed(
+        db,
+        org_id=org,
+        content="another agent's working note",
+        scope="agent",
+        agent_id="priya-laptop",
+    )
+    _edge(db, org_id=org, src_id=entry, dst_id=mine)
+    _edge(db, org_id=org, src_id=entry, dst_id=theirs)
+
+    found = _neighbor_ids(
+        db, org_id=org, viewer=DEV, entry=entry, scope="agent", agent_id="dev-laptop"
+    )
+    assert mine in found, "control: scope='agent' must reach my own agent's rows"
+    assert theirs not in found
+
+    # And at scope='org' the agent arm is not built at all: neither surfaces.
+    org_found = _neighbor_ids(db, org_id=org, viewer=DEV, entry=entry, scope="org")
+    assert mine not in org_found
+    assert theirs not in org_found
+
+
+def test_entity_brief_agent_arm_admits_only_the_callers_agent(db):
+    """The same arm, through the other read: entity_brief shares _ladder_clause."""
+    org = _org(db)
+    entity = graph_store.add_entity(
+        db, org_id=org, name="migration plan", kind="concept"
+    )
+    mine = _seed(
+        db,
+        org_id=org,
+        content="MINE-MARKER migration plan draft",
+        scope="agent",
+        agent_id="dev-laptop",
+    )
+    theirs = _seed(
+        db,
+        org_id=org,
+        content="THEIRS-MARKER migration plan draft",
+        scope="agent",
+        agent_id="priya-laptop",
+    )
+    for m in (mine, theirs):
+        _edge(
+            db, org_id=org, src_id=m, dst_id=entity, dst_kind="entity", relation="about"
+        )
+
+    brief = graph_store.entity_brief(
+        db,
+        org_id=org,
+        viewer_user_id=DEV,
+        entity="migration plan",
+        scope="agent",
+        agent_id="dev-laptop",
+    )
+    assert brief is not None, "control: my own agent's evidence resolves the entity"
+    blob = json.dumps(brief, default=str)
+    assert "MINE-MARKER" in blob
+    assert "THEIRS-MARKER" not in blob
+    assert brief["evidence_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# ATTACK 9 (M5) — retention must not leave the graph behind
+# ---------------------------------------------------------------------------
+
+
+def test_retention_leaves_no_orphan_edges_once_the_sweep_runs(db):
+    """``enforce_memory_retention`` deletes from ``session_memories`` only;
+    ``memory_edges`` has no FKs by design, so without the sweep the edges
+    outlive their endpoints forever."""
+    org = _org(db)
+    keep = _seed(db, org_id=org, content="recent enough to survive")
+    old_a = _seed(db, org_id=org, content="old one")
+    old_b = _seed(db, org_id=org, content="old two")
+    _edge(db, org_id=org, src_id=keep, dst_id=old_a)
+    _edge(db, org_id=org, src_id=old_a, dst_id=old_b)
+    _edge(db, org_id=org, src_id=old_b, dst_id=keep)
+
+    db.execute(
+        text(
+            "UPDATE session_memories SET created_at = NOW() - INTERVAL '400 days' "
+            "WHERE id = ANY(CAST(:ids AS uuid[]))"
+        ),
+        {"ids": [old_a, old_b]},
+    )
+    db.commit()
+
+    db.execute(
+        text("SELECT enforce_memory_retention(:org_id, :days)"),
+        {"org_id": org, "days": 30},
+    )
+    db.commit()
+
+    survivors = db.execute(
+        text("SELECT count(*) FROM session_memories WHERE org_id = :o"), {"o": org}
+    ).scalar()
+    assert survivors == 1, "control: retention actually deleted the aged rows"
+
+    swept = graph_store.sweep_orphan_edges(db, org_id=org)
+    assert swept == 3
+    orphans = db.execute(
+        text(
+            """
+            SELECT count(*) FROM memory_edges e
+            WHERE e.org_id = :o
+              AND NOT EXISTS (
+                SELECT 1 FROM session_memories s WHERE s.id = e.src_id)
+            """
+        ),
+        {"o": org},
+    ).scalar()
+    assert orphans == 0
+    remaining = db.execute(
+        text("SELECT count(*) FROM memory_edges WHERE org_id = :o"), {"o": org}
+    ).scalar()
+    assert remaining == 0

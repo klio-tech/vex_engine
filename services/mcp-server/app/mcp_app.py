@@ -1227,6 +1227,12 @@ def _serialize_record(
     ``project`` carries the human-readable project label dict
     (``{"id": ..., "name": ...}``) resolved once per recall response, or
     ``None`` when no project scope is active.
+
+    ``via`` says HOW the row got here: ``"graph"`` when it rode in on stage-B
+    graph expansion rather than matching the query vector, ``None`` otherwise.
+    A positive marker, because ``relevance is None`` — the previous and only
+    signal — is erased by structural compression's null-key strip, leaving the
+    agent unable to tell a semantic match from a one-hop walk.
     """
     return {
         "id": str(record.id),
@@ -1240,6 +1246,7 @@ def _serialize_record(
         # from ``confidence`` above, which is a float and always has been.
         "provenance": record.provenance,
         "relevance": record.relevance,
+        "via": record.via,
         # space_id/project_id are ``sa.UUID()`` columns, so a raw ``text()``
         # SELECT yields ``uuid.UUID`` objects (not strings). Stringify them —
         # like ``id`` above — so the result is plain-``json``-serializable and
