@@ -523,8 +523,15 @@ async def test_the_cursor_walks_a_hidden_backlog_without_stalling_or_skipping(db
     ]
 
 
-async def test_ticks_drain_a_hidden_backlog_to_completion(db):
-    """Repeated ticks over a hidden backlog terminate, having seen every row."""
+async def test_ticks_drain_a_hidden_backlog_and_park_on_the_sub_threshold_tail(db):
+    """Repeated ticks drain the hidden backlog, then hold — they do not loop.
+
+    Nine hidden captures, ``batch_size=4``, ``min_inputs=3``: two ticks consume
+    4 each, and the 1-row tail falls below ``min_inputs``. That tick takes the
+    documented no-op path — cursor untouched, so the row is *retained* for when
+    more accumulates, not silently dropped. Every subsequent tick reports the
+    same single pending row rather than advancing past it or re-synthesising.
+    """
     org = _org(db)
     base = datetime.now(timezone.utc)
     for i in range(9):
@@ -538,10 +545,47 @@ async def test_ticks_drain_a_hidden_backlog_to_completion(db):
             created_at=base + timedelta(seconds=i),
         )
 
-    total = 0
-    for _ in range(5):
-        result = await _run_tick(db, org, PRIYA, _AUTH_GRAPH, batch_size=4)
-        total += result["processed"]
-        if result["processed"] == 0:
-            break
-    assert total == 9, "every hidden row processed exactly once"
+    results = [
+        await _run_tick(db, org, PRIYA, _AUTH_GRAPH, batch_size=4) for _ in range(4)
+    ]
+
+    assert [r["processed"] for r in results] == [4, 4, 1, 1]
+    assert [r.get("reason") for r in results] == [
+        None,
+        None,
+        "below_threshold",
+        "below_threshold",
+    ]
+    # The tail is pending, not consumed and not lost.
+    cursor_row = db.execute(
+        text(
+            "SELECT last_processed_at, last_processed_id FROM brain_curator_state "
+            "WHERE org_id = :o AND user_id = :u"
+        ),
+        {"o": org, "u": PRIYA},
+    ).fetchone()
+    pending = _read_new_raw_rows(
+        db,
+        org,
+        PRIYA,
+        CursorState(cursor_row.last_processed_at, cursor_row.last_processed_id),
+        50,
+    )
+    assert [r.content for r in pending] == ["hidden capture 08"]
+
+    # Positive control: two more hidden rows push the tail over min_inputs and
+    # the stalled remainder is finally consumed — the parking is a wait, not a
+    # permanent stall.
+    for i in (9, 10):
+        _seed(
+            db,
+            org_id=org,
+            user_id=PRIYA,
+            content=f"hidden capture {i:02d}",
+            memory_type="observation",
+            recall_hidden=True,
+            created_at=base + timedelta(seconds=i),
+        )
+    final = await _run_tick(db, org, PRIYA, _AUTH_GRAPH, batch_size=4)
+    assert final["processed"] == 3
+    assert "reason" not in final

@@ -1006,14 +1006,12 @@ async def test_synthesize_and_store_reconciles_facts_not_summaries(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# recall_hidden exclusion: passive hook captures must not be synthesized
+# recall_hidden is NOT an input filter: hidden hook captures are graph fuel
 # ---------------------------------------------------------------------------
 
 
-def test_read_new_raw_rows_excludes_recall_hidden():
-    """The curator must not ingest passive hook tool-call observations
-    (recall_hidden=TRUE); synthesizing those into 'Tool X was used' facts is
-    the noise leak. It synthesizes only from deliberate writes."""
+def _capture_raw_rows_sql() -> str:
+    """Run ``_read_new_raw_rows`` against a stub and return the SQL it issued."""
     import app.curator as curator_mod
     from app.curator import CursorState
 
@@ -1030,4 +1028,27 @@ def test_read_new_raw_rows_excludes_recall_hidden():
             return R()
 
     curator_mod._read_new_raw_rows(_DB(), "org-1", USER, CursorState(None, None), 50)
-    assert "recall_hidden = FALSE" in captured["sql"]
+    return captured["sql"]
+
+
+def test_read_new_raw_rows_does_not_filter_on_recall_hidden():
+    """``recall_hidden`` keeps raw hook noise out of *recall*, not out of
+    synthesis. Migration 026 backfills it TRUE onto every passive capture, so
+    filtering on it here matched nothing on real data and the knowledge graph
+    could never populate. Hidden rows are the curator's fuel."""
+    assert "recall_hidden" not in _capture_raw_rows_sql()
+
+
+def test_read_new_raw_rows_still_filters_scope_status_and_type():
+    """Positive control for the assertion above: the predicates that DO carry
+    the guarantees are all still there, so the absence of ``recall_hidden`` is
+    a targeted relaxation and not a vanished WHERE clause."""
+    sql = _capture_raw_rows_sql()
+    assert "scope = 'private'" in sql
+    assert "status = 'active'" in sql
+    assert "user_id = :user_id" in sql
+    assert "org_id = :org_id" in sql
+    # The type list is now the ONLY thing separating curator input from output.
+    assert "'observation'" in sql
+    assert "'fact'" not in sql
+    assert "'summary'" not in sql
