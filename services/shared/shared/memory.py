@@ -1042,6 +1042,10 @@ async def retrieve_memories_scoped(
     """Brain recall across sessions, scoped to an org (and optionally an
     agent / space / project).
 
+    ``limit`` bounds the vector stage, NOT the returned list: graph expansion
+    can append up to :data:`GRAPH_EXPANSION_CAP` connected records on top of
+    it. See *Returns*.
+
     Distinct from :func:`retrieve_memories`, which is session-scoped and used
     for verification context. This function deliberately does NOT narrow by
     ``session_id``: it spans every session in the org so the "brain" can recall
@@ -1140,12 +1144,23 @@ async def retrieve_memories_scoped(
               remaining slots.
             * Rows filed under OTHER projects are NEVER surfaced. This replaces
               the old flat ``(project_id = X OR project_id IS NULL)`` filter.
-        limit: Maximum number of records to return.
+        limit: Maximum number of records the VECTOR SEARCH may return. It is
+            NOT a bound on the length of the returned list — see below.
 
     Returns:
         A list of :class:`MemoryRecord` ordered by blended score (descending),
-        or an empty list if embedding generation fails. Each record's
-        ``relevance`` field holds the rounded cosine-similarity score (0–1).
+        or an empty list if embedding generation fails. Vector-matched records
+        carry a rounded cosine-similarity score (0–1) in ``relevance``.
+
+        **The list can be longer than ``limit``.** After the vector stage,
+        graph expansion appends up to :data:`GRAPH_EXPANSION_CAP` further
+        records that are connected to the vector matches, so the true bound is
+        ``limit + GRAPH_EXPANSION_CAP`` — ``limit=1`` can return 6. Expanded
+        records are marked ``via=VIA_GRAPH`` and have ``relevance=None``,
+        which is how a caller tells them apart. This is intentional (the
+        connected row is often the answer the query could not phrase), and it
+        is why every caller that budgets a context window must size against
+        ``limit + GRAPH_EXPANSION_CAP`` rather than ``limit``.
 
     Raises:
         ValueError: If ``scope == "agent"`` but ``agent_id`` is ``None``; if

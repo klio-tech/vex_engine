@@ -57,6 +57,7 @@ from shared.compression.router import estimate_tokens
 from shared.compression.structural import compress_payload
 from shared.memory import (
     _NO_CREDENTIALS_RULE,
+    GRAPH_EXPANSION_CAP,
     MemoryRecord,
     call_llm,
     retract_memory,
@@ -1445,12 +1446,21 @@ async def _perform_recall(
             fail-open fallback (unresolvable header yields org-wide recall, not
             an error — explicit ``project`` args keep their strict warn-and-empty
             semantics).
-        limit: Maximum number of memories to return (clamped to 1–50).
+        limit: How many SEARCH MATCHES to return (clamped to 1–50). It is not
+            a bound on the response: :func:`shared.memory.retrieve_memories_scoped`
+            adds up to :data:`shared.memory.GRAPH_EXPANSION_CAP` further
+            memories reached through the knowledge graph, so ``count`` can be
+            as high as ``limit + GRAPH_EXPANSION_CAP``. Expansion is the
+            feature; callers sizing a context window must budget for the
+            larger number.
 
     Returns:
         ``{"memories": [...], "count": N}`` on success, ``{"memories": [],
         "count": 0, "warning": ...}`` for an unknown space/project filter, or a
-        clean error dict on auth failure / unexpected error.
+        clean error dict on auth failure / unexpected error. ``count`` is the
+        number of memories actually returned and may EXCEED ``limit`` by up to
+        ``GRAPH_EXPANSION_CAP`` graph-expanded rows (each marked
+        ``via: graph``, with no ``relevance``).
     """
     request = ctx.request_context.request
     if request is None:
@@ -2462,6 +2472,9 @@ def _register_tools(mcp: FastMCP) -> None:
             "Args: query (required); optional scope ('org' default | "
             "'agent'), space, project, limit. Set the X-Vex-Agent header to "
             "scope by agent. "
+            "`limit` bounds the search matches only: up to "
+            f"{GRAPH_EXPANSION_CAP} connected memories are added on top, so "
+            "`count` can exceed `limit`. "
             "Results with memory_type 'artifact' are stored files or documents: "
             "call artifact_get with the metadata's artifact_id to read them. "
             "The result is structurally compressed: null fields are omitted "
@@ -2498,7 +2511,17 @@ def _register_tools(mcp: FastMCP) -> None:
         limit: Annotated[
             int,
             Field(
-                description="Max memories to return (1-50, default 10).",
+                description=(
+                    "How many search matches to return (1-50, default 10). "
+                    "Recall then adds up to "
+                    f"{GRAPH_EXPANSION_CAP} further memories connected to "
+                    "those matches through the knowledge graph, so `count` "
+                    f"can exceed `limit` by up to {GRAPH_EXPANSION_CAP} "
+                    f"(true maximum {50 + GRAPH_EXPANSION_CAP}). The extra "
+                    "rows are marked `via: graph` and carry no relevance "
+                    "score. Size your context for the true maximum, not for "
+                    "`limit`."
+                ),
                 ge=1,
                 le=50,
             ),
