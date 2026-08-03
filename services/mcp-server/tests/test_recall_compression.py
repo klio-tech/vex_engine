@@ -118,10 +118,15 @@ async def test_recall_payload_is_compressed():
 
     # Nulls are gone and the genuinely constant fields were hoisted once
     # instead of repeated on every row.
-    assert result["common"]["scope"] == "org"
     assert result["common"]["memory_type"] == "fact"
-    assert all("scope" not in m for m in result["memories"])
+    assert all("memory_type" not in m for m in result["memories"])
     assert '"confidence": null' not in json.dumps(result, default=str)
+
+    # `scope` is deliberately NOT among them. It is the field a consumer is
+    # most likely to branch on, and hoisting it left every row reporting
+    # `scope: None`.
+    assert "scope" not in result["common"]
+    assert all(m["scope"] == "org" for m in result["memories"])
 
 
 @pytest.mark.asyncio

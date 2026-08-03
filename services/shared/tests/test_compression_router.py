@@ -168,6 +168,58 @@ def test_a_compressor_that_achieves_nothing_reports_no_loss(monkeypatch):
     assert result.lossy is False
 
 
+def test_a_compressor_that_inflates_is_rejected(monkeypatch):
+    """The guard is `no bigger than it went in`, not `not identical`.
+
+    `out == text` only catches a compressor that did literally nothing. A
+    compressor that made the content LARGER passed straight through and the
+    inflation was reported as a saving. This is the backstop for every
+    compressor, present and future: whatever it does, the caller is never
+    handed more tokens than it asked to be relieved of.
+    """
+    from shared.compression import router as router_module
+
+    monkeypatch.setattr(
+        router_module, "compress_json_text", lambda text: text + "x" * 100
+    )
+    result = compress(LONG_JSON)
+    assert result.text == LONG_JSON
+    assert result.compressor == Compressor.PASSTHROUGH.value
+    assert result.compressed_tokens == result.original_tokens
+
+
+def test_a_lossy_compressor_that_inflates_is_also_rejected(monkeypatch):
+    from shared.compression import router as router_module
+
+    monkeypatch.setattr(
+        router_module, "compress_code", lambda text: text + "# padding\n" * 50
+    )
+    result = compress(LONG_PYTHON)
+    assert result.text == LONG_PYTHON
+    assert result.lossy is False, "an inflated result must not claim a handle"
+
+
+def test_compression_never_returns_more_than_it_was_given():
+    """The property, over every fixture in this module and a non-ASCII one."""
+    cjk = json.dumps(
+        {
+            "memories": [
+                {"id": f"id-{i}", "content": "配置文件已更新，请检查数据库连接池设置。"}
+                for i in range(40)
+            ],
+            "count": 40,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    for text in (LONG_JSON, LONG_PYTHON, LONG_PROSE, cjk):
+        result = compress(text)
+        assert len(result.text) <= len(text), (
+            f"{len(text)} chars in, {len(result.text)} chars out"
+        )
+        assert result.compressed_tokens <= result.original_tokens
+
+
 def test_token_counts_describe_the_actual_texts():
     result = compress(LONG_PYTHON)
     assert result.original_tokens == estimate_tokens(LONG_PYTHON)
@@ -319,3 +371,45 @@ def test_allow_lossy_false_still_runs_the_lossless_compressor():
     result = compress(LONG_JSON, allow_lossy=False)
     assert result.compressor == Compressor.STRUCTURAL.value
     assert result.compressed_tokens < result.original_tokens
+
+
+# --------------------------------------------------------------------------
+# Legibility: what the router chose, not only what came out
+# --------------------------------------------------------------------------
+#
+# The shipped image deliberately omits the prose model (~350 MB for a measured
+# ~1.4% gain). Nothing about that is dishonest -- the router selects prose,
+# `compress_prose` finds no weights, the content comes back verbatim and the
+# result says `lossy=false`. No invented ratio, no phantom handle.
+#
+# It is, however, illegible. "Returned unchanged" is indistinguishable from
+# "already optimal", so the only rational inference a calling model can draw
+# from the response is the wrong one. The router knows which it was; it just
+# had nowhere to say so.
+
+
+def test_the_selected_compressor_is_reported_even_when_it_did_not_run(monkeypatch):
+    from shared.compression import prose as prose_module
+
+    monkeypatch.setattr(prose_module, "_score_tokens", lambda _text: None)
+    monkeypatch.setattr(prose_module, "model_available", lambda: False)
+    result = compress(LONG_PROSE)
+
+    assert result.text == LONG_PROSE
+    assert result.compressor == Compressor.PASSTHROUGH.value, "nothing ran"
+    assert result.selected == Compressor.PROSE.value, "but prose is what was chosen"
+    assert result.available is False
+
+
+def test_a_compressor_that_ran_reports_itself_as_both():
+    result = compress(LONG_JSON)
+    assert result.compressor == Compressor.STRUCTURAL.value
+    assert result.selected == Compressor.STRUCTURAL.value
+    assert result.available is True
+
+
+def test_declining_to_compress_reports_passthrough_as_the_selection():
+    """Genuinely nothing to do, and the caller can tell that apart."""
+    result = compress("short")
+    assert result.selected == Compressor.PASSTHROUGH.value
+    assert result.available is True

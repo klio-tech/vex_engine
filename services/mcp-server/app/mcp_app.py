@@ -1671,6 +1671,8 @@ async def _perform_compress(
             "original_tokens": tokens,
             "compressed_tokens": tokens,
             "lossy": False,
+            "compressor": "passthrough",
+            "selected_compressor": "passthrough",
         }
 
     if not isinstance(content, str) or not content:
@@ -1682,12 +1684,30 @@ async def _perform_compress(
         logger.exception("compression failed; returning the content unchanged")
         return _unchanged()
 
+    # `compressor` is what ran; `selected_compressor` is what the router chose.
+    # They differ when the chosen compressor achieved nothing or could not run
+    # here -- and this deployment deliberately ships without the prose model
+    # (~350 MB for a measured ~1.4% gain on technical text). The behaviour in
+    # that case is honest: content back verbatim, `lossy:false`, no handle,
+    # nothing invented. It was simply not legible -- indistinguishable from
+    # "already optimal" -- because the router's choice was computed and then
+    # dropped. A calling model can now tell a fact about its content from a
+    # fact about this deployment.
     payload = {
         "compressed": result.text,
         "original_tokens": result.original_tokens,
         "compressed_tokens": result.compressed_tokens,
         "lossy": result.lossy,
+        "compressor": result.compressor,
+        "selected_compressor": result.selected,
     }
+    if not result.available:
+        payload["note"] = (
+            f"The {result.selected} compressor was selected for this content "
+            "but is not available in this deployment, so the content was "
+            "returned unchanged. This is a property of the deployment, not of "
+            "the content."
+        )
     if not result.lossy:
         return payload
 
@@ -2443,7 +2463,12 @@ def _register_tools(mcp: FastMCP) -> None:
             "'agent'), space, project, limit. Set the X-Vex-Agent header to "
             "scope by agent. "
             "Results with memory_type 'artifact' are stored files or documents: "
-            "call artifact_get with the metadata's artifact_id to read them."
+            "call artifact_get with the metadata's artifact_id to read them. "
+            "The result is structurally compressed: null fields are omitted "
+            "from a row, and fields identical on every row may be hoisted "
+            "into a top-level `common` object — read a memory as `common` "
+            "merged with the row. `id`, `content` and `scope` always stay on "
+            "the row itself."
         ),
     )
     async def recall(
@@ -2858,10 +2883,21 @@ def _register_tools(mcp: FastMCP) -> None:
             "you also get a `handle` that klio_retrieve turns back into the "
             "full original for the next 24 hours. Content under ~500 tokens, "
             "and anything we cannot confidently identify, is returned "
-            "untouched. Reading compressed JSON: it is minified, keys whose "
-            "value was null on every row are omitted, and keys identical on "
-            "every row are hoisted into a `common` object that applies to all "
-            "of them — no information is lost."
+            "untouched. The response names the compressor that ran "
+            "(`compressor`) and the one the router chose "
+            "(`selected_compressor`); when they differ the chosen one either "
+            "achieved nothing or is not installed in this deployment, and a "
+            "`note` says which. Prose compression in particular depends on an "
+            "optional model that many deployments omit — where it is missing, "
+            "prose content is returned unchanged rather than compressed. "
+            "Reading compressed JSON: it is minified; a key is "
+            "omitted from any row where its value was null (per row, not only "
+            "when null everywhere); and keys whose value is identical on every "
+            "row are hoisted into a `common` object that applies to all of "
+            "them — read a row as `common` merged with the row. `id`, "
+            "`content` and `scope` always stay on the row. A `_klio` object "
+            "carries the metadata that reverses all of it; no information is "
+            "lost."
         ),
     )
     async def compress(
