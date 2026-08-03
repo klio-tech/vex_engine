@@ -31,6 +31,38 @@ jobs:
     name: Service Tests (${{ matrix.service }})
     runs-on: ubuntu-latest
     needs: [lint]
+    # Every tenancy-boundary suite in this repo needs a real Postgres, because
+    # the boundary IS the SQL: a mocked session would pass against a query with
+    # no WHERE clause at all. This job used to have no database. The suites
+    # noticed, skipped themselves, and the job went green — 112 adversarial
+    # tests (graph isolation, user silo, compression cache, curator, migrations)
+    # reported as "skipped" and nobody read the number.
+    #
+    # The image matches docker-compose.yml so the extensions the migrations
+    # create (pgvector, timescaledb) are the same ones production has.
+    services:
+      postgres:
+        image: timescale/timescaledb-ha:pg16
+        env:
+          POSTGRES_DB: agentguard
+          POSTGRES_USER: agentguard
+          POSTGRES_PASSWORD: agentguard_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentguard"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://agentguard:agentguard_dev@localhost:5432/agentguard
+      # The second half of the fix, and the half that cannot be skipped past.
+      # A Postgres service can break — image pull, port clash, a health check
+      # that lies — and without this the suites would quietly go back to
+      # skipping and the check would go back to green. With it set, an
+      # unreachable database fails every test that needed one. See
+      # services/shared/shared/testing/db_gate.py.
+      KLIO_REQUIRE_DB: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -52,8 +84,60 @@ jobs:
         run: pip install -e ${{ matrix.extra_deps }}
       - name: Install service
         run: pip install -e "services/${{ matrix.service }}[dev]"
+      - name: Install alembic
+        run: pip install "alembic>=1.12.0" "psycopg2-binary>=2.9.0"
+      - name: Migrate the test database
+        working-directory: services/migrations
+        run: alembic upgrade head
       - name: Run tests
         run: pytest services/${{ matrix.service }}/tests/ -v --tb=short
+
+  migration-tests:
+    name: Migration Tests
+    runs-on: ubuntu-latest
+    needs: [lint]
+    # Its own job rather than a `service-tests` matrix entry: services/migrations
+    # ships no importable package (hatchling has nothing to build a wheel from)
+    # and declares no [dev] extra, so the matrix's
+    # `pip install -e "services/<svc>[dev]"` step cannot install it. The suite
+    # is still the only thing that exercises the upgrade/downgrade cycle and
+    # the CHECK constraints against a real server, so it gets a real database
+    # and the same KLIO_REQUIRE_DB gate.
+    services:
+      postgres:
+        image: timescale/timescaledb-ha:pg16
+        env:
+          POSTGRES_DB: agentguard
+          POSTGRES_USER: agentguard
+          POSTGRES_PASSWORD: agentguard_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentguard"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://agentguard:agentguard_dev@localhost:5432/agentguard
+      KLIO_REQUIRE_DB: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install shared
+        # Not for the models — for the pytest11 entry point that registers the
+        # requires_db gate. Without it these tests would skip on a dead
+        # database exactly the way they used to.
+        run: pip install -e services/shared
+      - name: Install migration tooling
+        run: pip install "alembic>=1.12.0" "psycopg2-binary>=2.9.0" "sqlalchemy>=2.0.0" pytest
+      - name: Migrate the test database
+        working-directory: services/migrations
+        run: alembic upgrade head
+      - name: Run tests
+        working-directory: services/migrations
+        run: pytest tests/ -v --tb=short
 
   container-import:
     name: Container Import (${{ matrix.service }})
