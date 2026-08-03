@@ -367,6 +367,45 @@ def test_neighbors_empty_entry_set_is_empty(db):
 
 
 # ---------------------------------------------------------------------------
+# The destination org guard, pinned where behaviour cannot reach it
+# ---------------------------------------------------------------------------
+
+
+def test_neighbors_keeps_both_destination_org_guards():
+    """``neighbors`` must pin the destination row's org in BOTH places.
+
+    The JOIN (``ON m.id = scored.other_id AND m.org_id = :org_id``) and the
+    WHERE clause list (``"m.org_id = :org_id"``) are deliberate defence in
+    depth: a tampered cross-org edge must grant nothing even if one guard is
+    later refactored away by accident.
+
+    This assertion is STRUCTURAL, and that is not laziness. On an INNER JOIN
+    the two are the same predicate on the same column of the same row, so
+    every query returns identical results with either one removed — verified
+    by mutation, each single-site deletion leaves the whole 579-test shared
+    suite green. There is no behavioural test that can distinguish them.
+    Redundancy that no result can observe can only be pinned at the source,
+    or it is not pinned at all.
+    """
+    import inspect
+    import re
+
+    source = inspect.getsource(graph_store.neighbors)
+    flat = re.sub(r"\s+", " ", source)
+
+    assert '"m.org_id = :org_id",' in source, (
+        "the WHERE-clause destination org guard is gone from neighbors(); "
+        "restore it — the JOIN guard alone leaves the tenancy boundary "
+        "resting on a single unasserted line"
+    )
+    assert "ON m.id = scored.other_id AND m.org_id = :org_id" in flat, (
+        "the JOIN destination org guard is gone from neighbors(); restore it "
+        "— the WHERE guard alone leaves the tenancy boundary resting on a "
+        "single unasserted line"
+    )
+
+
+# ---------------------------------------------------------------------------
 # The engine-swap boundary: no SQL against the graph tables anywhere else
 # ---------------------------------------------------------------------------
 
@@ -413,3 +452,138 @@ def test_no_module_but_graph_store_touches_the_graph_tables():
         f"SQL against the graph tables outside graph_store.py: {offenders}. "
         "The GraphStore seam is the engine-swap boundary; route through it."
     )
+
+
+# ---------------------------------------------------------------------------
+# sweep_orphan_entities — the entity GC
+#
+# Retention deletes from ``session_memories``; ``sweep_orphan_edges`` then
+# collects the edges whose endpoints vanished. Nothing collected the ENTITIES
+# those edges used to evidence, so an entity outlived every memory that ever
+# mentioned it, forever.
+#
+# The delete is user data, so the tests below assert both halves: exactly the
+# unevidenced entities go, and nothing else does.
+# ---------------------------------------------------------------------------
+
+
+def _entity_ids(db, *, org_id: str) -> set[str]:
+    rows = db.execute(
+        text("SELECT id FROM entities WHERE org_id = :o"), {"o": org_id}
+    ).fetchall()
+    return {str(r[0]) for r in rows}
+
+
+def _age_entity(db, entity_id: str, *, days: int = 30) -> None:
+    """Backdate an entity past any grace window, so the test is about
+    evidence and not about the anti-race guard."""
+    db.execute(
+        text(
+            "UPDATE entities SET created_at = NOW() - make_interval(days => :d) "
+            "WHERE id = :id"
+        ),
+        {"d": days, "id": entity_id},
+    )
+    db.commit()
+
+
+def test_sweep_collects_an_entity_whose_every_evidencing_memory_is_gone(db):
+    org = _org(db)
+    mem = _seed(db, org_id=org, content="the billing service is flaky")
+    ent = graph_store.add_entity(db, org_id=org, name="billing", kind="system")
+    graph_store.add_edge(
+        db, org_id=org, src_id=mem, dst_kind="entity", dst_id=ent, relation="about"
+    )
+    _age_entity(db, ent)
+
+    # Positive control: while the evidence stands, the sweep must take nothing.
+    assert graph_store.sweep_orphan_entities(db, org_id=org) == 0
+    assert ent in _entity_ids(db, org_id=org)
+
+    # Retention removes the memory; the edge sweep then removes the edge.
+    db.execute(text("DELETE FROM session_memories WHERE id = :id"), {"id": mem})
+    db.commit()
+    graph_store.sweep_orphan_edges(db, org_id=org)
+
+    assert graph_store.sweep_orphan_entities(db, org_id=org) == 1
+    assert ent not in _entity_ids(db, org_id=org)
+
+
+def test_sweep_spares_an_entity_evidenced_by_a_memory_the_caller_cannot_see(db):
+    """Evidence is evidence, whoever can see it.
+
+    The visibility ladder decides what a CALLER is shown. A retention sweep is
+    not a caller: an entity evidenced only by somebody's private memory is
+    still evidenced, and collecting it would delete one user's data because a
+    different user could not see it.
+    """
+    org = _org(db)
+    private_mem = _seed(
+        db,
+        org_id=org,
+        content="priya's private note about billing",
+        scope="private",
+        user_id=PRIYA,
+    )
+    ent = graph_store.add_entity(db, org_id=org, name="billing", kind="system")
+    graph_store.add_edge(
+        db,
+        org_id=org,
+        src_id=private_mem,
+        dst_kind="entity",
+        dst_id=ent,
+        relation="about",
+    )
+    _age_entity(db, ent)
+
+    assert graph_store.sweep_orphan_entities(db, org_id=org) == 0
+    assert ent in _entity_ids(db, org_id=org)
+
+
+def test_sweep_never_reaches_into_another_org(db):
+    org_a = _org(db)
+    org_b = _org(db)
+    orphan_a = graph_store.add_entity(db, org_id=org_a, name="billing", kind="system")
+    orphan_b = graph_store.add_entity(db, org_id=org_b, name="billing", kind="system")
+    _age_entity(db, orphan_a)
+    _age_entity(db, orphan_b)
+
+    assert graph_store.sweep_orphan_entities(db, org_id=org_a) == 1
+    assert orphan_a not in _entity_ids(db, org_id=org_a)
+    assert orphan_b in _entity_ids(db, org_id=org_b), (
+        "one org's retention run deleted another org's entity"
+    )
+
+
+def test_sweep_spares_an_entity_that_is_merely_new(db):
+    """add_entity and add_edge are two statements.
+
+    An entity created microseconds before the sweep has no edge yet. Deleting
+    it is a race that loses data the caller is in the middle of writing, so
+    the sweep only collects entities older than its grace window.
+    """
+    org = _org(db)
+    fresh = graph_store.add_entity(db, org_id=org, name="brand-new", kind="concept")
+
+    assert graph_store.sweep_orphan_entities(db, org_id=org) == 0
+    assert fresh in _entity_ids(db, org_id=org)
+
+    # Positive control: the fixture is not vacuous — age it and it goes.
+    _age_entity(db, fresh)
+    assert graph_store.sweep_orphan_entities(db, org_id=org) == 1
+
+
+def test_sweep_leaves_evidenced_siblings_untouched(db):
+    """Exactness: the sweep removes the orphan and ONLY the orphan."""
+    org = _org(db)
+    mem = _seed(db, org_id=org, content="auth service owns login")
+    kept = graph_store.add_entity(db, org_id=org, name="auth", kind="system")
+    orphan = graph_store.add_entity(db, org_id=org, name="ghost", kind="concept")
+    graph_store.add_edge(
+        db, org_id=org, src_id=mem, dst_kind="entity", dst_id=kept, relation="about"
+    )
+    _age_entity(db, kept)
+    _age_entity(db, orphan)
+
+    assert graph_store.sweep_orphan_entities(db, org_id=org) == 1
+    assert _entity_ids(db, org_id=org) == {kept}

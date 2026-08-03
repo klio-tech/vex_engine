@@ -667,6 +667,40 @@ async def test_recall_schema_has_limit_field():
     )
 
 
+@pytest.mark.asyncio
+async def test_recall_limit_description_admits_graph_expansion():
+    """The schema text a model reads must match what recall actually returns.
+
+    Recall runs a graph-expansion stage that adds up to GRAPH_EXPANSION_CAP
+    rows ON TOP of ``limit`` — ``limit=1`` really can return 6. Describing
+    ``limit`` as "max memories to return" is therefore false, and a caller
+    that sizes its context window on it can be blown out by rows it never
+    asked for. The expansion is the feature; the description is the defect.
+    """
+    from mcp.shared.memory import create_connected_server_and_client_session
+    from shared.memory import GRAPH_EXPANSION_CAP
+
+    mcp = build_mcp_server()
+    async with create_connected_server_and_client_session(mcp) as session:
+        result = await session.list_tools()
+
+    recall_tool = next(t for t in result.tools if t.name == "recall")
+    described = recall_tool.inputSchema["properties"]["limit"].get("description", "")
+
+    # The true ceiling must be stated as a number, not left to be inferred.
+    true_max = 50 + GRAPH_EXPANSION_CAP
+    assert str(true_max) in described, (
+        f"limit description must state the true maximum ({true_max}); got {described!r}"
+    )
+    # And it must say WHY more rows can come back, so the extra rows do not
+    # read as a bug to whatever is on the other end.
+    assert any(
+        word in described.lower() for word in ("connected", "expansion", "related")
+    ), f"limit description must explain the extra rows; got {described!r}"
+    # A description that no longer bounds the vector stage is not a fix.
+    assert "50" in described, f"limit description lost its own bound; got {described!r}"
+
+
 # ---------------------------------------------------------------------------
 # Task 1: RECALL_WRITE_NUDGE constant + guidance on every recall return
 # ---------------------------------------------------------------------------

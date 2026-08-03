@@ -610,18 +610,32 @@ def test_edge_to_a_forgotten_memory_is_silently_absent_then_swept(db):
 
 
 # ---------------------------------------------------------------------------
-# ATTACK 6 — the destination org filter, in isolation
+# ATTACK 6 — the destination org filter
 #
-# Found in review by mutation: deleting `m.org_id = :org_id` from the
-# destination WHERE clause failed NO test, because the JOIN's own
-# `AND m.org_id = :org_id` independently blocked every seeded cross-org
-# case. Two filters, one of them untested — so a later refactor could drop
-# the WHERE-clause guard silently and leave the tenancy boundary resting on
-# a single unasserted line.
+# `neighbors` pins the destination row's org TWICE: once in the JOIN
+# (`ON m.id = scored.other_id AND m.org_id = :org_id`) and once in the WHERE
+# clause list (`"m.org_id = :org_id"`). Defence in depth against a tampered
+# or buggy cross-org edge.
 #
-# These pin BOTH sites by attacking a path where only the WHERE clause
-# stands: an edge whose destination is reached without the entry-side join
-# constraining it.
+# WHAT THESE TESTS COVER, exactly — an earlier version of this comment
+# claimed they "pin BOTH sites", and re-running the mutation showed that is
+# false:
+#
+#   drop the WHERE-clause guard alone → 579 passed (nothing fails)
+#   drop the JOIN guard alone         → 579 passed (nothing fails)
+#   drop both                         → 3 failed
+#
+# That is not a gap in the tests; it is a property of the SQL. On an INNER
+# JOIN, `ON ... AND m.org_id = :org_id` and `WHERE ... m.org_id = :org_id`
+# are the SAME predicate on the SAME column of the SAME row. No query result
+# can ever distinguish them, so NO behavioural test can pin one while the
+# other stands. Anyone who writes one has written a test that passes for a
+# different reason.
+#
+# So the behavioural tests below pin the destination filter as a whole (the
+# boundary holds, by content and not merely by id), and the redundancy itself
+# — the thing a refactor could quietly halve — is pinned structurally by
+# `test_neighbors_keeps_both_destination_org_guards` in test_graph_store.py.
 # ---------------------------------------------------------------------------
 
 
@@ -629,8 +643,12 @@ def test_entity_walk_pins_the_destination_org_filter(db):
     """Sibling-walk through a shared entity name across two orgs.
 
     Each org has its own entity row (entities are org-scoped), so a caller
-    in org A resolving "billing" must see only A's evidence. This exercises
-    the entity path's destination filter rather than the edge path's join.
+    in org A resolving "billing" must see only A's evidence.
+
+    Scope note: this covers ``entity_brief``'s own org scoping, which is a
+    DIFFERENT query from ``neighbors``. Mutating either of ``neighbors``'
+    destination org guards leaves this test passing — it is not, and cannot
+    be, a pin on them.
     """
     org_a = _org(db)
     org_b = _org(db)

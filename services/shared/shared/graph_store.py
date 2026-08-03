@@ -748,3 +748,62 @@ def sweep_orphan_edges(db: Any, *, org_id: str) -> int:
     )
     db.commit()
     return int(result.rowcount or 0)
+
+
+#: How long an entity is immune from collection after it is created.
+#: ``add_entity`` and ``add_edge`` are two statements: a retention run landing
+#: between them would delete a row the caller is in the middle of evidencing.
+#: Generous on purpose — the cost of waiting a day is one dead row; the cost of
+#: losing the race is data the user just wrote.
+ENTITY_SWEEP_GRACE_HOURS: int = 24
+
+
+def sweep_orphan_entities(db: Any, *, org_id: str) -> int:
+    """Delete this org's entities that nothing evidences any more.
+
+    Retention deletes from ``session_memories``; :func:`sweep_orphan_edges`
+    then collects the edges whose endpoints vanished. Nothing collected the
+    ENTITIES those edges evidenced, so an entity outlived every memory that
+    ever mentioned it — forever, and invisibly, since ``entity_brief`` answers
+    ``None`` for an entity with no visible evidence. Growth is the small half
+    of that; a named thing surviving the deletion of everything that named it
+    is the retention-policy half.
+
+    **Evidence is counted without the visibility ladder, deliberately.** An
+    entity evidenced only by one user's private memory is still evidenced.
+    The ladder decides what a CALLER is shown; a retention sweep is not a
+    caller, and scoping the anti-join to what some viewer can see would delete
+    one user's data because another user could not see it. So the ``NOT
+    EXISTS`` below matches ANY edge into the entity, whatever the source
+    memory's scope, owner or project.
+
+    Ordering: run this AFTER :func:`sweep_orphan_edges`, which is what turns
+    "every evidencing memory was deleted or retracted" into "no edges remain".
+    Running it first is safe but collects nothing — edges into dead memories
+    still count as evidence until they are themselves swept.
+
+    Same-org edges only. A cross-org edge into this entity is tampered data
+    (``add_edge`` refuses to create one) and grants nothing anywhere else in
+    this module; letting it pin an entity row would hand another tenant a
+    veto over this org's retention.
+
+    Returns the number of entities removed.
+    """
+    result = db.execute(
+        text(
+            """
+            DELETE FROM entities e
+            WHERE e.org_id = :org_id
+              AND e.created_at < NOW() - make_interval(hours => :grace_hours)
+              AND NOT EXISTS (
+                    SELECT 1 FROM memory_edges m
+                    WHERE m.org_id = e.org_id
+                      AND m.dst_kind = 'entity'
+                      AND m.dst_id = e.id
+              )
+            """
+        ),
+        {"org_id": org_id, "grace_hours": ENTITY_SWEEP_GRACE_HOURS},
+    )
+    db.commit()
+    return int(result.rowcount or 0)
