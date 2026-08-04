@@ -100,7 +100,7 @@ def _patched(brief, *, user_id=DEV, summary_result={"summary": "a synthesis"}):
 
 def test_explore_is_in_the_tool_inventory():
     assert "explore" in EXPECTED_TOOL_NAMES
-    assert len(EXPECTED_TOOL_NAMES) == 18
+    assert len(EXPECTED_TOOL_NAMES) == 19
 
 
 # ---------------------------------------------------------------------------

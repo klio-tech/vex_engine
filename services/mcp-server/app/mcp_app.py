@@ -87,6 +87,7 @@ from app.compression_cache import (
     load_original,
     store_original,
 )
+from app import onboarding
 from app.identity import resolve_request_user_id
 from app.recall_log import log_recall_event
 from app.session import brain_session_id
@@ -114,6 +115,7 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "klio_retrieve",
     "compress",
     "explore",
+    "init",
 )
 
 # Server-level guidance surfaced to MCP clients during ``initialize``.
@@ -3066,3 +3068,47 @@ def _register_tools(mcp: FastMCP) -> None:
         ] = "member",
     ) -> dict[str, Any]:
         return await _perform_project_grant(ctx, project=project, user=user, role=role)
+
+    @mcp.tool(
+        name="init",
+        description=(
+            "Onboard a new user onto Klio and set up their memory workplace — "
+            "use this when the user asks to be onboarded, to set up Klio, or "
+            "to get started with Klio. Three phases: init(phase='start') "
+            "returns a playbook of collection steps; perform them, then call "
+            "init(phase='submit', candidates=[{content, kind, source}, ...]) "
+            "one or more times; then init(phase='finish') for a summary to "
+            "relay to the user. Everything submitted is redacted, "
+            "deduplicated, and stored PRIVATE to the calling user."
+        ),
+    )
+    async def init(
+        ctx: Context,
+        phase: Annotated[
+            Literal["start", "submit", "finish"],
+            Field(description="Which onboarding phase to run."),
+        ],
+        candidates: Annotated[
+            Optional[list[dict[str, Any]]],
+            Field(
+                description=(
+                    "For phase='submit': up to 25 candidate memories, each "
+                    "{content, kind, source}. kind: observation|note|plan|"
+                    "decision|memory. source: conversation|repo|user."
+                )
+            ),
+        ] = None,
+        git_remote: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    "For phase='submit': the repo's canonical git remote URL, "
+                    "when the repo step produced candidates, so they are "
+                    "filed under the right project."
+                )
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        return await onboarding.perform_init(
+            ctx, phase=phase, candidates=candidates, git_remote=git_remote
+        )
