@@ -29,7 +29,11 @@ _REQUIRED_SCHEMA_FIELD = {
     "plan": "content",
     "decide": "content",
     "note": "content",
-    "artifact_put": "title",
+    # `kind`, not `title`: the confirm branch of the two-step upload takes its
+    # title and summary from the pending row, so requiring them in the schema
+    # made the tool's own documented call fail before it ever ran. `kind` is
+    # the one argument every branch needs.
+    "artifact_put": "kind",
     "artifact_get": "artifact_id",
     "space": "action",
     "forget": "memory_id",

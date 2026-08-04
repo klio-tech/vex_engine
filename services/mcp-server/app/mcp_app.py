@@ -447,8 +447,8 @@ def _resolve_artifact_project(
 async def _perform_artifact_put(
     ctx: Context,
     *,
-    title: str,
-    summary: str,
+    title: Optional[str] = None,
+    summary: Optional[str] = None,
     kind: str,
     content: Optional[str] = None,
     mime_type: Optional[str] = None,
@@ -464,6 +464,16 @@ async def _perform_artifact_put(
     behaviours select on the arguments present: inline (``content`` given),
     presigned request (neither ``content`` nor ``artifact_id``), and confirm
     (``artifact_id`` given).
+
+    ``title`` and ``summary`` are optional in the SIGNATURE and mandatory on
+    two of the three branches. They describe an artifact that does not exist
+    yet, so inline and request both need them; confirm is finishing an upload
+    whose pending row already carries the pair given at request time, and in
+    fact reads them from that row rather than from these arguments. Requiring
+    them there made the two-step upload the tool's own description documents
+    fail with ``title Field required`` before reaching any of this code. The
+    check below is what keeps "optional in the schema" from meaning "optional
+    in practice" on the branches that genuinely need them.
 
     Quota is enforced on each branch before that branch does anything durable,
     but *what* it can be enforced against differs, and the difference matters:
@@ -506,6 +516,24 @@ async def _perform_artifact_put(
 
     cfg = get_plan_config(plan, plan_overrides)
     session_id = brain_session_id(request, org_id, agent_id)
+
+    # Enforced here rather than in the schema so the confirm branch — which
+    # takes both from its pending row — is not forced to repeat them. An
+    # artifact created with neither is discoverable by nothing, since the card
+    # built from them IS the discovery mechanism, so the other two branches
+    # still refuse. Refusing before ``SessionLocal()`` does any work, and with
+    # an explanation rather than a schema error.
+    if artifact_id is None and not ((title or "").strip() and (summary or "").strip()):
+        return {
+            "stored": False,
+            "error": "title_and_summary_required",
+            "detail": (
+                "Provide `title` and `summary` when storing new content. They "
+                "are how other agents find the artifact; they are only "
+                "optional when confirming an upload with `artifact_id`, which "
+                "reuses the pair given when the upload was requested."
+            ),
+        }
 
     db = SessionLocal()
     try:
@@ -2764,31 +2792,44 @@ def _register_tools(mcp: FastMCP) -> None:
         name="artifact_put",
         description=(
             "Store a durable artifact — a document, a JSON record, or a file — "
-            "and make it discoverable to every agent in the org. Pass `content` "
-            "for text up to 64KB (one call). Omit `content` to get an upload URL "
-            "for larger or binary data, then call again with the returned "
-            "`artifact_id` to confirm. Args: title, summary, kind "
-            "('document'|'record'|'file')."
+            "and make it discoverable. Pass `content` for text up to 64KB (one "
+            "call). Omit `content` to get an upload URL for larger or binary "
+            "data, then call again with just `kind` and the returned "
+            "`artifact_id` to confirm — the title and summary you gave when "
+            "requesting the URL are reused. Args: kind "
+            "('document'|'record'|'file'), plus title and summary except on "
+            "that confirm call. Pass `project` to share it with that project's "
+            "members only; omit it to share with the whole org."
         ),
     )
     async def artifact_put(
         ctx: Context,
-        title: Annotated[
-            str, Field(description="Short name for the artifact.", max_length=200)
-        ],
-        summary: Annotated[
-            str,
-            Field(
-                description="One line describing what this is; other agents find it by this.",
-                max_length=500,
-            ),
-        ],
         kind: Annotated[
             Literal["document", "record", "file"],
             Field(
                 description="'document' (prose), 'record' (JSON), or 'file' (binary)."
             ),
         ],
+        title: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    "Short name for the artifact. Required unless confirming "
+                    "an upload with `artifact_id`."
+                ),
+                max_length=200,
+            ),
+        ] = None,
+        summary: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    "One line describing what this is; other agents find it by "
+                    "this. Required unless confirming with `artifact_id`."
+                ),
+                max_length=500,
+            ),
+        ] = None,
         content: Annotated[
             Optional[str],
             Field(description="Inline text, up to 64KB. Omit for the upload-URL path."),
@@ -2809,7 +2850,14 @@ def _register_tools(mcp: FastMCP) -> None:
         ] = None,
         space: SpaceParam = None,
         project: Annotated[
-            Optional[str], Field(description="Optional project id.")
+            Optional[str],
+            Field(
+                description=(
+                    "Project id, name, git remote or repo path. Filing the "
+                    "artifact under a project also LIMITS it to that project's "
+                    "members; omit it to share with the whole org."
+                )
+            ),
         ] = None,
         supersedes: Annotated[
             Optional[str], Field(description="Artifact id this replaces.")

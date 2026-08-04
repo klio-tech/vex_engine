@@ -1322,3 +1322,100 @@ async def test_confirm_writes_the_card_at_org_scope_when_the_row_has_no_project(
     card_kwargs = storage.brain.write_scoped_memory.await_args.kwargs
     assert card_kwargs["project_id"] is None
     assert card_kwargs["scope"] == "org"
+
+
+# ---------------------------------------------------------------------------
+# D3: the two-step upload the tool description documents must actually work.
+# ---------------------------------------------------------------------------
+
+
+def test_confirm_does_not_require_title_and_summary_in_the_schema():
+    """The schema is the contract a client validates against before calling.
+
+    The description promises "call again with the returned `artifact_id` to
+    confirm", but `title` and `summary` sat in the schema's `required` list, so
+    the documented call was rejected before it reached any of our code with
+    `title Field required` / `summary Field required`.
+    """
+    tool = build_mcp_server()._tool_manager.get_tool("artifact_put")
+    required = tool.parameters.get("required", [])
+
+    assert "artifact_id" not in required
+    assert "title" not in required
+    assert "summary" not in required
+    # `kind` is still required — it is in the documented call and the schema
+    # must not be loosened further than the bug requires.
+    assert "kind" in required
+
+
+@pytest.mark.asyncio
+async def test_the_documented_two_step_upload_works_end_to_end(storage):
+    """Request an upload URL, then confirm with ONLY kind + artifact_id.
+
+    This is the exact sequence in the tool description, run through
+    ``call_tool`` so the schema validation a real client trips on is in the
+    path — calling the bare function would skip the very layer that failed.
+    """
+    manager = build_mcp_server()._tool_manager
+
+    async def _call(**arguments):
+        # convert_result=False hands back the tool's own dict, and `context`
+        # is injected as the `ctx` parameter — so this is the real
+        # validate-then-dispatch path, minus only the transport.
+        return await manager.call_tool("artifact_put", arguments, context=_ctx())
+
+    # Step 1: no `content` -> an upload URL and a reserved id.
+    requested = await _call(
+        title="quarterly report",
+        summary="Q3 numbers, final",
+        kind="file",
+        mime_type="application/pdf",
+        size_bytes=2048,
+    )
+    assert requested["upload_url"] == "https://example/upload"
+    artifact_id = requested["artifact_id"]
+
+    # The bytes are uploaded out of band; the pending row already carries the
+    # title and summary given in step 1.
+    storage.artifacts.get_artifact.return_value = _pending_row(
+        id=artifact_id, title="quarterly report", summary="Q3 numbers, final"
+    )
+
+    # Step 2: exactly what the description says to send. Nothing more.
+    confirmed = await _call(kind="file", artifact_id=artifact_id)
+
+    assert confirmed["stored"] is True
+    assert confirmed["status"] == "active"
+    # The card is filed from the PENDING ROW's title/summary, which is why the
+    # caller never needed to repeat them.
+    card_kwargs = storage.brain.write_scoped_memory.await_args.kwargs
+    assert card_kwargs["content"] == "[artifact] t — s (document, 3 B)"
+
+
+@pytest.mark.asyncio
+async def test_title_and_summary_are_still_required_when_not_confirming(storage):
+    """The control: relaxing them for confirm must not relax them everywhere.
+
+    An artifact created with no title and no summary is discoverable by
+    nothing — the card IS the discovery mechanism — so the two non-confirm
+    branches must still refuse, and refuse with an explanation rather than a
+    schema error.
+    """
+    manager = build_mcp_server()._tool_manager
+
+    async def _call(**arguments):
+        # convert_result=False hands back the tool's own dict, and `context`
+        # is injected as the `ctx` parameter — so this is the real
+        # validate-then-dispatch path, minus only the transport.
+        return await manager.call_tool("artifact_put", arguments, context=_ctx())
+
+    inline = await _call(kind="document", content="hey")
+    assert inline["stored"] is False
+    assert inline["error"] == "title_and_summary_required"
+
+    request = await _call(kind="file", mime_type="application/pdf", size_bytes=2048)
+    assert request["stored"] is False
+    assert request["error"] == "title_and_summary_required"
+
+    # Nothing durable may be created for a call we refuse.
+    storage.artifacts.create_pending.assert_not_called()
