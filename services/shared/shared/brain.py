@@ -226,6 +226,65 @@ def ensure_project(
     return str(row.id)
 
 
+def rename_project(
+    db_session: Any, *, org_id: str, project_id: str, display_name: str
+) -> bool:
+    """Set a project's ``display_name``. Returns whether a row was updated.
+
+    :func:`ensure_project` writes ``display_name`` on INSERT only — its
+    ``ON CONFLICT DO UPDATE`` deliberately touches nothing but ``last_seen_at``,
+    because it runs on the hot write path where the "name" is just whatever the
+    current repo directory happens to be called and must never clobber a name a
+    human chose. That leaves no way to name a project that already exists,
+    which is precisely what ``project_create`` advertises.
+
+    This is that missing operation, kept separate rather than folded into
+    ``ensure_project`` so the two callers stay honest about their intent: an
+    ordinary write proposes a name, and only an explicit, authorised rename
+    imposes one.
+
+    **No authorisation happens here.** A rename changes a project's shared
+    identity for everyone in the org, so the caller MUST establish that the
+    principal administers the project before calling — see
+    ``_perform_project_create``, which does this only after its adoption rule
+    has admitted the caller as an admin. Tenant scoping IS enforced here: the
+    ``org_id`` predicate means a project id from another tenant matches no row
+    and returns ``False`` rather than renaming it.
+
+    Threading contract:
+        Synchronous (blocking psycopg2 I/O). When called from an async handler,
+        invoke via ``anyio.to_thread.run_sync(...)`` — never inline from a
+        coroutine, or you block the event loop.
+
+    Args:
+        db_session: A synchronous SQLAlchemy session/connection.
+        org_id: Owning org id (tenant scope).
+        project_id: The project to rename.
+        display_name: The new human-readable name.
+
+    Returns:
+        ``True`` if a row was updated, ``False`` if no project in this org has
+        that id.
+    """
+    row = db_session.execute(
+        text(
+            """
+            UPDATE projects
+            SET display_name = :display_name
+            WHERE id = :project_id AND org_id = :org_id
+            RETURNING id
+            """
+        ),
+        {
+            "display_name": display_name,
+            "project_id": project_id,
+            "org_id": org_id,
+        },
+    ).fetchone()
+    db_session.commit()
+    return row is not None
+
+
 def find_space_id(db_session: Any, *, org_id: str, slug: str) -> Optional[str]:
     """Return the space id for ``(org_id, slug)``, or ``None`` if no such space.
 
@@ -277,7 +336,18 @@ def find_project_id(db_session: Any, *, org_id: str, identifier: str) -> Optiona
         2. ``git_remote`` — unique per org via ``ix_projects_org_remote``.
         3. ``repo_root_path`` — unique per org for non-git projects via
            ``ix_projects_org_path``.
-        4. ``display_name`` — NOT unique; see the ambiguity note below.
+        4. ``display_name`` — matched CASE-INSENSITIVELY; NOT unique; see the
+           ambiguity note below.
+
+    Why the name match is case-insensitive and the other two are not:
+    ``git_remote`` and ``repo_root_path`` are machine-produced identifiers
+    where case is meaningful (a path can differ only in case on a
+    case-sensitive filesystem), so they stay exact. ``display_name`` is what a
+    person types. A project auto-created from a repo is named after its last
+    path segment — ``klio`` — so the human who then types ``Klio``, including
+    the human who just named it that, got ``unknown_project`` and every tool
+    taking a project identifier failed for them. Case is not a distinction any
+    caller intends to draw here.
 
     Why ``repo_root_path`` is here: :func:`ensure_project` dedups on
     ``git_remote`` when present and ``repo_root_path`` otherwise, so a project
@@ -293,7 +363,10 @@ def find_project_id(db_session: Any, *, org_id: str, identifier: str) -> Optiona
     unstable between calls — silently resolving to the WRONG project, which is
     worse than not resolving at all. Matches are now ranked by specificity, and
     ties within ``display_name`` break by most-recently-seen then by id, so the
-    result is deterministic and the likeliest intent wins.
+    result is deterministic and the likeliest intent wins. Case-insensitivity
+    widens that tie bucket — ``web``, ``Web`` and ``WEB`` collapse into one — so
+    it is only safe BECAUSE that total ordering is already there; the two
+    changes cannot be separated.
 
     Returns ``None`` when nothing matches so the caller can surface "unknown
     project" rather than silently widening the search.
@@ -349,7 +422,7 @@ def find_project_id(db_session: Any, *, org_id: str, identifier: str) -> Optiona
               AND (
                 git_remote = :ident
                 OR repo_root_path = :ident
-                OR display_name = :ident
+                OR lower(display_name) = lower(:ident)
               )
             ORDER BY
               CASE
