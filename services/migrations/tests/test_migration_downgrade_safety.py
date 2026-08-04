@@ -69,6 +69,32 @@ def _require(proc, what: str) -> None:
     assert proc.returncode == 0, f"{what} failed:\n{proc.stdout}\n{proc.stderr}"
 
 
+def _head_revision() -> str:
+    """The current head revision, read from alembic rather than hard-coded.
+
+    These tests assert "the schema is still at head" and "a round trip lands
+    back at head". Spelling head as a literal made every one of them a test of
+    the revision NUMBER, so adding an unrelated migration failed them for a
+    reason that had nothing to do with what they check.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-m", "alembic", "heads"],
+        cwd=MIGRATIONS_DIR,
+        env={**os.environ},
+        capture_output=True,
+        text=True,
+    )
+    assert proc.returncode == 0, f"could not read alembic heads:\n{proc.stderr}"
+    # e.g. "036 (head)" — possibly preceded by alembic's log lines.
+    for line in reversed(proc.stdout.strip().splitlines()):
+        if "(head)" in line:
+            return line.split()[0]
+    raise AssertionError(f"no head revision in alembic output:\n{proc.stdout}")
+
+
+HEAD = _head_revision()
+
+
 @pytest.fixture(scope="module")
 def scratch_url():
     admin_url = _with_database(DB_URL, "postgres")
@@ -183,7 +209,7 @@ def test_downgrade_survives_per_user_curator_rows(scratch_url, db):
     _seed_per_user_curator_rows(db)
 
     down = _alembic(scratch_url, "downgrade", "030")
-    _require(down, "downgrade 035 -> 030")
+    _require(down, "downgrade head -> 030")
 
     assert _current_revision(db) == "030"
     orgs = db.execute(
@@ -202,10 +228,10 @@ def test_reupgrade_survives_private_memories(scratch_url, db):
     _reset_to_head(scratch_url, db)
     _seed_private_memories(db)
 
-    _require(_alembic(scratch_url, "downgrade", "030"), "downgrade 035 -> 030")
-    _require(_alembic(scratch_url, "upgrade", "035"), "re-upgrade 030 -> 035")
+    _require(_alembic(scratch_url, "downgrade", "030"), "downgrade head -> 030")
+    _require(_alembic(scratch_url, "upgrade", "head"), "re-upgrade 030 -> head")
 
-    assert _current_revision(db) == "035"
+    assert _current_revision(db) == HEAD
     ownerless = db.execute(
         text(
             "SELECT count(*) FROM session_memories "
@@ -225,10 +251,10 @@ def test_reupgrade_survives_private_memories(scratch_url, db):
 def test_upgrade_quarantines_typoed_scopes(scratch_url, db):
     """Failure 2: 031 aborts on the rows its own docstring says exist."""
     _reset_to_head(scratch_url, db)
-    _require(_alembic(scratch_url, "downgrade", "030"), "downgrade 035 -> 030")
+    _require(_alembic(scratch_url, "downgrade", "030"), "downgrade head -> 030")
     _seed_typo_scopes(db)
 
-    _require(_alembic(scratch_url, "upgrade", "035"), "re-upgrade over typo'd scopes")
+    _require(_alembic(scratch_url, "upgrade", "head"), "re-upgrade over typo'd scopes")
 
     live = db.execute(
         text("SELECT count(*) FROM session_memories WHERE scope = 'privte'")
@@ -252,9 +278,9 @@ def test_round_trip_is_repeatable(scratch_url, db):
     for cycle in range(2):
         _require(_alembic(scratch_url, "downgrade", "030"), f"cycle {cycle} downgrade")
         _seed_typo_scopes(db, count=1)
-        _require(_alembic(scratch_url, "upgrade", "035"), f"cycle {cycle} upgrade")
+        _require(_alembic(scratch_url, "upgrade", "head"), f"cycle {cycle} upgrade")
 
-        assert _current_revision(db) == "035"
+        assert _current_revision(db) == HEAD
         assert (
             db.execute(
                 text(
@@ -294,7 +320,7 @@ def test_032_downgrade_refuses_to_destroy_audit_history(scratch_url, db):
     assert "project_grant_audit" in combined
     assert "KLIO_ALLOW_AUDIT_LOSS" in combined
     assert "2" in combined, "the refusal must say how many rows would be lost"
-    assert _current_revision(db) == "035", "a refused downgrade must change nothing"
+    assert _current_revision(db) == HEAD, "a refused downgrade must change nothing"
 
 
 def test_032_downgrade_proceeds_with_explicit_override(scratch_url, db):
@@ -304,7 +330,7 @@ def test_032_downgrade_proceeds_with_explicit_override(scratch_url, db):
     down = _alembic(
         scratch_url, "downgrade", "031", env_extra={"KLIO_ALLOW_AUDIT_LOSS": "1"}
     )
-    _require(down, "overridden downgrade 035 -> 031")
+    _require(down, "overridden downgrade head -> 031")
     assert _current_revision(db) == "031"
     _require(_alembic(scratch_url, "upgrade", "head"), "restore to head")
 
@@ -328,7 +354,7 @@ def test_033_downgrade_refuses_when_revokes_would_become_grants(scratch_url, db)
     combined = down.stdout + down.stderr
     assert "revoke" in combined
     assert "KLIO_ALLOW_AUDIT_LOSS" in combined
-    assert _current_revision(db) == "035"
+    assert _current_revision(db) == HEAD
 
 
 def test_033_downgrade_proceeds_with_explicit_override(scratch_url, db):
@@ -338,7 +364,7 @@ def test_033_downgrade_proceeds_with_explicit_override(scratch_url, db):
     down = _alembic(
         scratch_url, "downgrade", "032", env_extra={"KLIO_ALLOW_AUDIT_LOSS": "1"}
     )
-    _require(down, "overridden downgrade 035 -> 032")
+    _require(down, "overridden downgrade head -> 032")
     assert _current_revision(db) == "032"
     _require(_alembic(scratch_url, "upgrade", "head"), "restore to head")
 

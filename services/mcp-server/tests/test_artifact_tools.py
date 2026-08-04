@@ -1242,3 +1242,83 @@ async def test_request_path_refuses_oversized_without_reserving_anything(storage
     storage.artifacts.create_pending.assert_not_called()
     storage.storage.presign_put.assert_not_called()
     storage.brain.ensure_space.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# D1: the card must be written at the scope the caller's `project` implies.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_inline_put_with_a_project_writes_the_card_at_project_scope(seams):
+    """A caller who names a project means "these people", not "the whole org".
+
+    ``project_id`` was already flowing through, but the card was hard-coded to
+    ``scope='org'`` — so an artifact filed under a project was readable by
+    every agent in the org. project_id on an org-scoped row is a relevance
+    filter, never a boundary, so the boundary the caller asked for did not
+    exist.
+    """
+    seams.brain.find_project_id.return_value = "project-apollo"
+
+    result = await _tool("artifact_put")(
+        _ctx(),
+        title="t",
+        summary="s",
+        kind="document",
+        content="hey",
+        project="apollo",
+    )
+
+    assert result["stored"] is True
+    card_kwargs = seams.brain.write_scoped_memory.await_args.kwargs
+    assert card_kwargs["project_id"] == "project-apollo"
+    assert card_kwargs["scope"] == "project"
+
+
+@pytest.mark.asyncio
+async def test_inline_put_without_a_project_writes_the_card_at_org_scope(seams):
+    """The control: no project resolved means no narrowing. Unchanged behaviour.
+
+    Without this, "always project" would pass the test above and silently make
+    every org-wide artifact unreadable.
+    """
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="document", content="hey"
+    )
+
+    assert result["stored"] is True
+    card_kwargs = seams.brain.write_scoped_memory.await_args.kwargs
+    assert card_kwargs["project_id"] is None
+    assert card_kwargs["scope"] == "org"
+
+
+@pytest.mark.asyncio
+async def test_confirm_writes_the_card_at_project_scope_when_the_row_has_one(storage):
+    """The confirm branch files the card from the pending row's own project."""
+    storage.artifacts.get_artifact.return_value = _pending_row()
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["stored"] is True
+    card_kwargs = storage.brain.write_scoped_memory.await_args.kwargs
+    assert card_kwargs["project_id"] == "project-1"
+    assert card_kwargs["scope"] == "project"
+
+
+@pytest.mark.asyncio
+async def test_confirm_writes_the_card_at_org_scope_when_the_row_has_no_project(
+    storage,
+):
+    storage.artifacts.get_artifact.return_value = _pending_row(project_id=None)
+
+    result = await _tool("artifact_put")(
+        _ctx(), title="t", summary="s", kind="file", artifact_id="new-artifact-id"
+    )
+
+    assert result["stored"] is True
+    card_kwargs = storage.brain.write_scoped_memory.await_args.kwargs
+    assert card_kwargs["project_id"] is None
+    assert card_kwargs["scope"] == "org"
