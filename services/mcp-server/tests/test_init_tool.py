@@ -12,10 +12,17 @@ Two layers, mirroring the house pattern:
   pass with no door at all.
 """
 
+import hashlib
+import math
+import os
+import uuid
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from shared.testing import requires_db
+from sqlalchemy import create_engine
+from sqlalchemy import text as sql_text
 
 import app.onboarding as onboarding
 from app.mcp_app import EXPECTED_TOOL_NAMES, build_mcp_server
@@ -482,3 +489,455 @@ async def test_finish_writes_the_rerun_marker_note_with_dedup_off():
     assert kwargs["content"].startswith("Onboarded via init on ")
     assert "5 memories seeded" in kwargs["content"]
     assert result["marker_id"] == "marker-id"
+
+
+# ===========================================================================
+# The five spec invariants — real Postgres, real chokepoint.
+#
+# Everything below uses the REAL SessionLocal / write_scoped_memory /
+# redaction / dedup SQL. Only three seams are faked:
+#   * the identity resolvers (this suite is not an auth suite — the identity
+#     ATTACK is that the payload must not override what they resolve);
+#   * quota metering (has its own suites);
+#   * embed_text — a deterministic content-hash vector, so identical content
+#     embeds identically (dedup fires at the real threshold) and different
+#     content embeds ~orthogonally (no false dedup). No network calls.
+# ===========================================================================
+
+needs_db = requires_db("the init tool security-invariant tests")
+
+_DB_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
+)
+
+EMBED_DIM = 1024
+CALLER = "aaaaaaaa-1111-2222-3333-444444444444"
+VICTIM = "bbbbbbbb-5555-6666-7777-888888888888"
+
+
+def _deterministic_embedding(content: str) -> list[float]:
+    """Unit vector derived from the content hash: equal text -> equal vector
+    (cosine 1.0, above the 0.95 dedup threshold); different text -> a fresh
+    pseudo-random direction (cosine ~0 in 1024 dims, far below it)."""
+    out: list[float] = []
+    counter = 0
+    while len(out) < EMBED_DIM:
+        digest = hashlib.sha256(f"{content}:{counter}".encode()).digest()
+        out.extend(b / 255.0 - 0.5 for b in digest)
+        counter += 1
+    vec = out[:EMBED_DIM]
+    norm = math.sqrt(sum(v * v for v in vec)) or 1.0
+    return [v / norm for v in vec]
+
+
+@pytest.fixture()
+def dbconn():
+    engine = create_engine(_DB_URL)
+    conn = engine.connect()
+    orgs: set[str] = set()
+    conn.created_org_ids = orgs  # type: ignore[attr-defined]
+    try:
+        yield conn
+    finally:
+        try:
+            conn.rollback()
+            for org_id in orgs:
+                conn.execute(
+                    sql_text("DELETE FROM session_memories WHERE org_id = :o"),
+                    {"o": org_id},
+                )
+            conn.commit()
+        finally:
+            conn.close()
+            engine.dispose()
+
+
+def _org(dbconn) -> str:
+    org_id = f"org_init_{uuid.uuid4().hex[:8]}"
+    dbconn.created_org_ids.add(org_id)
+    return org_id
+
+
+async def _init_call(org_id, user_id, phase, candidates=None, git_remote=None):
+    """Drive the real tool body against real Postgres.
+
+    Identity comes from the patched resolvers — matching production, where it
+    comes from the key/OAuth and NEVER from the payload the agent controls.
+    """
+    fn = _get_tool().fn
+    async_embed = AsyncMock(side_effect=lambda c: _deterministic_embedding(c))
+    with (
+        patch(
+            "app.onboarding.resolve_principal_plan",
+            return_value=(org_id, "agent-init", "free", None),
+        ),
+        patch("app.onboarding.resolve_request_user_id", return_value=user_id),
+        patch("app.onboarding.check_memory_quota", return_value=False),
+        patch("app.onboarding.record_usage"),
+        patch("shared.memory.embed_text", async_embed),
+    ):
+        return await fn(
+            _fake_ctx(), phase=phase, candidates=candidates, git_remote=git_remote
+        )
+
+
+def _rows(dbconn, org_id):
+    return dbconn.execute(
+        sql_text(
+            "SELECT content, scope, user_id, memory_type, provenance, metadata "
+            "FROM session_memories WHERE org_id = :o "
+            "AND COALESCE(metadata->>'init_marker', 'false') <> 'true' "
+            "ORDER BY created_at"
+        ),
+        {"o": org_id},
+    ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# Invariant 1 — no redaction bypass
+# ---------------------------------------------------------------------------
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_invariant1_secret_in_a_candidate_is_masked_before_storage(dbconn):
+    org = _org(dbconn)
+    secret = "sk_live_" + "a1B2c3D4e5F6g7H8i9J0" * 2
+    result = await _init_call(
+        org,
+        CALLER,
+        "submit",
+        candidates=[
+            {
+                "content": f"deploy uses stripe key {secret} in the worker",
+                "kind": "note",
+                "source": "repo",
+            }
+        ],
+    )
+    assert len(result["accepted"]) == 1
+    assert "stripe_secret_key" in result["redacted_kinds"]
+    rows = _rows(dbconn, org)
+    assert len(rows) == 1
+    assert secret not in rows[0].content
+    assert "[REDACTED:stripe_secret_key" in rows[0].content
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_invariant1_pii_email_in_a_candidate_is_masked_before_storage(dbconn):
+    org = _org(dbconn)
+    result = await _init_call(
+        org,
+        CALLER,
+        "submit",
+        candidates=[
+            {
+                "content": "escalations go to oncall-root@example-corp.com first",
+                "kind": "note",
+                "source": "conversation",
+            }
+        ],
+    )
+    assert len(result["accepted"]) == 1
+    assert "email" in result["redacted_kinds"]
+    rows = _rows(dbconn, org)
+    assert "oncall-root@example-corp.com" not in rows[0].content
+    assert "[REDACTED:email" in rows[0].content
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_invariant1_positive_control_clean_content_stored_verbatim(dbconn):
+    """Proves the redaction fixture is not vacuous: content with nothing to
+    redact passes through the same door unchanged."""
+    org = _org(dbconn)
+    clean = "the team prefers trunk-based development with small PRs"
+    result = await _init_call(
+        org,
+        CALLER,
+        "submit",
+        candidates=[{"content": clean, "kind": "note", "source": "conversation"}],
+    )
+    assert len(result["accepted"]) == 1
+    assert result["redacted_kinds"] == []
+    rows = _rows(dbconn, org)
+    assert rows[0].content == clean
+    assert "[REDACTED" not in rows[0].content
+
+
+# ---------------------------------------------------------------------------
+# Invariant 2 — private only
+# ---------------------------------------------------------------------------
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_invariant2_no_payload_field_can_widen_the_scope(dbconn):
+    """Adversarial candidates name every scope spelling a client might try;
+    every stored row must still be scope='private'."""
+    org = _org(dbconn)
+    result = await _init_call(
+        org,
+        CALLER,
+        "submit",
+        candidates=[
+            {"content": "widen me A", "kind": "note", "source": "repo", "scope": "org"},
+            {
+                "content": "widen me B",
+                "kind": "decision",
+                "source": "user",
+                "scope": "project",
+                "visibility": "org",
+                "share": True,
+            },
+            {"content": "an honest one", "kind": "note", "source": "repo"},
+        ],
+    )
+    # Positive control inside the same test: the writes actually happened.
+    assert len(result["accepted"]) == 3
+    rows = _rows(dbconn, org)
+    assert len(rows) == 3
+    assert {r.scope for r in rows} == {"private"}
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_invariant2_rows_are_invisible_to_a_teammates_recall(dbconn):
+    """The point of 'private': a teammate's ladder never includes these rows."""
+    from shared.memory import retrieve_memories_scoped
+
+    org = _org(dbconn)
+    await _init_call(
+        org,
+        CALLER,
+        "submit",
+        candidates=[
+            {
+                "content": "the caller's own onboarding context",
+                "kind": "note",
+                "source": "conversation",
+            }
+        ],
+    )
+    async_embed = AsyncMock(side_effect=lambda c: _deterministic_embedding(c))
+    with patch("shared.memory.embed_text", async_embed):
+        teammate_sees = await retrieve_memories_scoped(
+            dbconn,
+            org,
+            "the caller's own onboarding context",
+            scope="org",
+            agent_id="agent-other",
+            user_id=VICTIM,
+            limit=10,
+        )
+        owner_sees = await retrieve_memories_scoped(
+            dbconn,
+            org,
+            "the caller's own onboarding context",
+            scope="private",
+            agent_id="agent-init",
+            user_id=CALLER,
+            limit=10,
+        )
+    assert teammate_sees == []
+    # Positive control: the owner CAN see it, so the empty result above is
+    # the boundary, not a broken fixture.
+    assert len(owner_sees) == 1
+
+
+# ---------------------------------------------------------------------------
+# Invariant 3 — identity is server-resolved
+# ---------------------------------------------------------------------------
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_invariant3_payload_identity_fields_never_reach_the_row(dbconn):
+    org = _org(dbconn)
+    result = await _init_call(
+        org,
+        CALLER,
+        "submit",
+        candidates=[
+            {
+                "content": "attribute this to someone else",
+                "kind": "note",
+                "source": "repo",
+                "user_id": VICTIM,
+                "org_id": "victim-org",
+                "agent_id": "victim-agent",
+            }
+        ],
+    )
+    assert len(result["accepted"]) == 1
+    rows = _rows(dbconn, org)
+    assert len(rows) == 1
+    assert str(rows[0].user_id) == CALLER
+    # And nothing landed in the org the payload named.
+    foreign = dbconn.execute(
+        sql_text("SELECT COUNT(*) FROM session_memories WHERE org_id = 'victim-org'")
+    ).scalar()
+    assert foreign == 0
+
+
+# ---------------------------------------------------------------------------
+# Invariant 4 — caps are server-side
+# ---------------------------------------------------------------------------
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_invariant4_run_cap_holds_against_a_client_that_ignores_the_playbook(
+    dbconn,
+):
+    """Three max-size batches: 25 + 25 accepted, then 10 accepted + 15
+    refused, then the next call is refused outright. Counted from rows, so
+    reconnecting or skipping start resets nothing."""
+    org = _org(dbconn)
+
+    def batch(tag, n):
+        return [
+            {
+                "content": f"distinct durable fact {tag}-{i:03d} about the system",
+                "kind": "note",
+                "source": "repo",
+            }
+            for i in range(n)
+        ]
+
+    first = await _init_call(org, CALLER, "submit", candidates=batch("a", 25))
+    second = await _init_call(org, CALLER, "submit", candidates=batch("b", 25))
+    third = await _init_call(org, CALLER, "submit", candidates=batch("c", 25))
+    assert len(first["accepted"]) == 25
+    assert len(second["accepted"]) == 25
+    assert len(third["accepted"]) == 10
+    assert [r["reason"] for r in third["refused"]] == ["run_cap_reached"] * 15
+
+    fourth = await _init_call(org, CALLER, "submit", candidates=batch("d", 1))
+    assert fourth["error"] == "run_cap_reached"
+    assert len(_rows(dbconn, org)) == 60
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_invariant4_daily_run_limit_counts_real_markers(dbconn):
+    """Three finished runs -> the fourth start is refused, derived purely
+    from marker notes in the DB."""
+    org = _org(dbconn)
+    for _ in range(3):
+        result = await _init_call(org, CALLER, "finish")
+        assert result["phase"] == "finish"
+    refused = await _init_call(org, CALLER, "start")
+    assert refused["error"] == "run_limit_reached"
+    # Positive control: a DIFFERENT user in the same org still may start.
+    ok = await _init_call(org, VICTIM, "start")
+    assert ok["phase"] == "start"
+
+
+# ---------------------------------------------------------------------------
+# Invariant 5 — idempotence
+# ---------------------------------------------------------------------------
+
+_RERUN_CANDIDATES = [
+    {
+        "content": "the deploy pipeline promotes via Railway from GitHub source",
+        "kind": "note",
+        "source": "repo",
+    },
+    {
+        "content": "health checks live at /healthz, not /health",
+        "kind": "decision",
+        "source": "repo",
+    },
+    {
+        "content": "the user prefers status reports as short bullet points",
+        "kind": "memory",
+        "source": "user",
+    },
+]
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_invariant5_rerunning_init_on_the_same_context_accepts_zero(dbconn):
+    org = _org(dbconn)
+    first = await _init_call(org, CALLER, "submit", candidates=_RERUN_CANDIDATES)
+    assert len(first["accepted"]) == 3  # positive control: run one stores
+    await _init_call(org, CALLER, "finish")
+
+    rerun = await _init_call(org, CALLER, "submit", candidates=_RERUN_CANDIDATES)
+    assert rerun["accepted"] == []
+    assert rerun["deduplicated"] == 3
+    assert len(_rows(dbconn, org)) == 3
+
+
+# ---------------------------------------------------------------------------
+# The full exchange, end to end
+# ---------------------------------------------------------------------------
+
+
+@needs_db
+@pytest.mark.asyncio
+async def test_full_onboarding_exchange_start_submit_finish(dbconn, capsys):
+    org = _org(dbconn)
+    start = await _init_call(org, CALLER, "start")
+    assert start["phase"] == "start"
+    assert start["playbook"]["version"] == "v1"
+
+    submit = await _init_call(
+        org,
+        CALLER,
+        "submit",
+        candidates=[
+            {
+                "content": "Abhi is building Klio, a memory product on the Vex engine",
+                "kind": "memory",
+                "source": "conversation",
+            },
+            {
+                "content": "decided: MCP is the primary protocol; skills and hooks layer on top",
+                "kind": "decision",
+                "source": "conversation",
+            },
+            {
+                "content": "repo convention: many small files, 200-400 lines typical",
+                "kind": "note",
+                "source": "repo",
+            },
+            {
+                "content": "agents keep getting wrong: docker hub publish is NOT the deploy path",
+                "kind": "memory",
+                "source": "user",
+            },
+        ],
+    )
+    assert len(submit["accepted"]) == 4
+    assert submit["refused"] == []
+
+    finish = await _init_call(org, CALLER, "finish")
+    assert finish["seeded"] == 4
+    assert finish["by_source"] == {"conversation": 2, "repo": 1, "user": 1}
+    assert finish["by_kind"] == {"memory": 2, "decision": 1, "note": 1}
+    assert "Klio now knows 4 things" in finish["relay"]
+    assert finish["marker_id"]
+
+    # Provenance mapping held end to end.
+    rows = _rows(dbconn, org)
+    prov = {r.content[:20]: r.provenance for r in rows}
+    assert prov["agents keep getting "] == "EXTRACTED"
+    assert all(
+        p == "INFERRED" for c, p in prov.items() if not c.startswith("agents keep")
+    )
+
+    print("\n--- init exchange transcript ---")
+    print("agent -> init(phase='start')")
+    print(f"server -> playbook v{start['playbook']['version']}, caps {start['caps']}")
+    print("agent -> init(phase='submit', candidates=[4 items])")
+    print(
+        f"server -> accepted={len(submit['accepted'])} deduplicated="
+        f"{submit['deduplicated']} refused={submit['refused']}"
+    )
+    print("agent -> init(phase='finish')")
+    print(f"server -> relay: {finish['relay']}")
