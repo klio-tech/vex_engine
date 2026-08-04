@@ -1138,6 +1138,15 @@ async def _write_artifact_card(
     Dedup is disabled: two artifacts may legitimately carry near-identical
     summaries, and silently collapsing their cards would make one of them
     permanently unfindable.
+
+    Scope follows the project. A caller who passes ``project`` is asking for
+    "these people", not "everyone in the org" — but the card used to be written
+    ``scope='org'`` unconditionally while ``project_id`` flowed through beside
+    it. On an org-scoped row ``project_id`` is a relevance filter and
+    explicitly NOT a boundary (see ``shared.memory``'s visibility ladder), so
+    the boundary the caller believed they had asked for did not exist and the
+    artifact was readable org-wide. With no project resolved there is nothing
+    to narrow to and the row stays ``scope='org'`` as before.
     """
     await brain.write_scoped_memory(
         db,
@@ -1150,7 +1159,7 @@ async def _write_artifact_card(
         project_id=project_id,
         metadata={"artifact_id": artifact_id, "source": "mcp"},
         dedup=False,
-        scope="org",
+        scope="project" if project_id else "org",
     )
 
 
