@@ -40,6 +40,9 @@ from typing import Any, Optional
 import logging
 
 from fastapi import HTTPException
+from shared import brain
+from shared.plan_limits import get_plan_config
+from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from sqlalchemy import text
 
 from app.auth import resolve_principal_plan
@@ -299,6 +302,62 @@ def _phase_start(db: Any, *, org_id: str, user_id: str) -> dict[str, Any]:
     }
 
 
+def _validate_candidate(candidate: Any) -> Optional[dict[str, Any]]:
+    """Return a refusal dict (sans index) for a bad candidate, else ``None``.
+
+    Candidate-level, not batch-level: one malformed entry never sinks its
+    neighbours (spec: "reject the candidate, not the batch").
+    """
+    if not isinstance(candidate, dict):
+        return {
+            "reason": "invalid_candidate",
+            "detail": "expected {content, kind, source}",
+        }
+    kind = candidate.get("kind")
+    if kind not in ALLOWED_KINDS:
+        return {
+            "reason": "invalid_kind",
+            "detail": f"kind must be one of {sorted(ALLOWED_KINDS)}",
+        }
+    source = candidate.get("source")
+    if source not in ALLOWED_SOURCES:
+        return {
+            "reason": "invalid_source",
+            "detail": f"source must be one of {sorted(ALLOWED_SOURCES)}",
+        }
+    content = candidate.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return {"reason": "empty_content", "detail": "content must be non-empty text"}
+    if len(content) > MAX_CANDIDATE_CHARS:
+        return {
+            "reason": "content_too_long",
+            "limit": MAX_CANDIDATE_CHARS,
+        }
+    return None
+
+
+def _resolve_project_id(
+    db: Any, *, org_id: str, git_remote: Optional[str]
+) -> Optional[str]:
+    """Best-effort, read-only project lookup for filing; never raises.
+
+    The existing ``find_project_id`` path (same as capture's read side): it
+    never CREATES a project, so onboarding cannot mint tenant rows, and a
+    miss files the memories unfiled rather than failing the run.
+    """
+    if not git_remote or not git_remote.strip():
+        return None
+    try:
+        return brain.find_project_id(db, org_id=org_id, identifier=git_remote.strip())
+    except Exception:
+        logger.warning(
+            "init: find_project_id failed for org %s; filing unfiled",
+            org_id,
+            exc_info=True,
+        )
+        return None
+
+
 async def _phase_submit(
     db: Any,
     *,
@@ -310,7 +369,132 @@ async def _phase_submit(
     candidates: Optional[list[dict[str, Any]]],
     git_remote: Optional[str],
 ) -> dict[str, Any]:
-    raise NotImplementedError
+    if not candidates:
+        return {
+            "error": "no_candidates",
+            "detail": (
+                "phase='submit' needs candidates=[{content, kind, source}, ...]. "
+                "Run init(phase='start') for the playbook."
+            ),
+        }
+    if len(candidates) > MAX_CANDIDATES_PER_SUBMIT:
+        return {
+            "error": "too_many_candidates",
+            "detail": (
+                f"{len(candidates)} candidates in one call (limit "
+                f"{MAX_CANDIDATES_PER_SUBMIT}). Prioritise the most durable, "
+                "highest-signal facts and resubmit in smaller batches."
+            ),
+        }
+
+    accepted_today = _count_accepted_today(db, org_id=org_id, user_id=user_id)
+    remaining = MAX_ACCEPTED_PER_RUN - accepted_today
+    if remaining <= 0:
+        return {
+            "error": "run_cap_reached",
+            "detail": (
+                f"this run already accepted {accepted_today} memories (limit "
+                f"{MAX_ACCEPTED_PER_RUN} per run). Call init(phase='finish') "
+                "to summarise what was seeded."
+            ),
+        }
+
+    # The org's monthly memory quota applies to onboarding exactly as it
+    # applies to every other write; a hard block refuses the call cleanly.
+    try:
+        over_cap = check_memory_quota(
+            db, org_id, get_plan_config(plan, plan_overrides), "memory", plan_name=plan
+        )
+    except MemoryQuotaExceeded as exc:
+        return {
+            "error": "quota_exceeded",
+            "detail": exc.message,
+            "suggested_plan": exc.suggested_plan,
+        }
+
+    project_id = _resolve_project_id(db, org_id=org_id, git_remote=git_remote)
+    session_id = _init_session_id(org_id, user_id)
+
+    accepted: list[str] = []
+    refused: list[dict[str, Any]] = []
+    deduplicated = 0
+    redacted_kinds: set[str] = set()
+
+    for index, candidate in enumerate(candidates):
+        problem = _validate_candidate(candidate)
+        if problem is not None:
+            refused.append({"index": index, **problem})
+            continue
+        if len(accepted) >= remaining:
+            refused.append(
+                {
+                    "index": index,
+                    "reason": "run_cap_reached",
+                    "detail": f"limit {MAX_ACCEPTED_PER_RUN} accepted per run",
+                }
+            )
+            continue
+
+        source = candidate["source"]
+        # EXTRACTED only when the user stated it; everything the agent
+        # derived from a conversation or repo is the agent's deduction.
+        provenance = "EXTRACTED" if source == "user" else "INFERRED"
+        kind = candidate["kind"]
+
+        # THE DOOR. The same chokepoint capture and remember use:
+        # redaction fail-closed, then user-scoped dedup, then embedding.
+        # scope is the module constant 'private' — never an input.
+        result = await brain.write_scoped_memory(
+            db,
+            org_id=org_id,
+            agent_id=agent_id,
+            content=candidate["content"],
+            memory_type=kind,
+            session_id=session_id,
+            project_id=project_id,
+            metadata={"source": _META_SOURCE, "init_source": source},
+            scope=_INIT_SCOPE,
+            user_id=user_id,
+            provenance=provenance,
+            # Raw observations are curator fuel, not recall results — the
+            # same visibility rule capture applies.
+            recall_hidden=(kind == "observation"),
+        )
+
+        if result.get("stored"):
+            accepted.append(result["id"])
+            record_usage(db, org_id, "memory", over_cap=over_cap)
+        elif result.get("deduplicated"):
+            deduplicated += 1
+        else:
+            refused.append(
+                {
+                    "index": index,
+                    "reason": result.get("error", "write_failed"),
+                }
+            )
+        if result.get("redacted"):
+            redacted_kinds.update(result.get("redaction_kinds") or [])
+
+    return {
+        "phase": "submit",
+        "accepted": accepted,
+        "deduplicated": deduplicated,
+        # Kinds only, never contents — the agent may relay this list.
+        "redacted_kinds": sorted(redacted_kinds),
+        "refused": refused,
+        "remaining_run_capacity": max(remaining - len(accepted), 0),
+    }
+
+
+def _init_session_id(org_id: str, user_id: str) -> str:
+    """Stable session id for init writes.
+
+    Private-scope dedup ignores session_id (the window is the user's own
+    rows), so this is grouping/traceability only — like capture's
+    ``klio-hook:`` prefix.
+    """
+    return f"klio-init:{org_id}:{user_id}"
 
 
 async def _phase_finish(
