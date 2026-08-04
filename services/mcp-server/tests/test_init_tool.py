@@ -411,3 +411,74 @@ async def test_submit_surfaces_a_quota_block_cleanly():
             candidates=[{"content": "c", "kind": "note", "source": "repo"}],
         )
     assert result["error"] == "quota_exceeded"
+
+
+# ---------------------------------------------------------------------------
+# Phase: finish
+# ---------------------------------------------------------------------------
+
+
+_RUN_SUMMARY = {
+    "total": 5,
+    "by_kind": {"note": 3, "decision": 2},
+    "by_source": {"repo": 4, "user": 1},
+    "redacted_kinds": ["email_address"],
+}
+
+
+async def _run_finish(write_mock=None, summary=None):
+    fn = _get_tool().fn
+    write_mock = write_mock or AsyncMock(
+        return_value={"stored": True, "id": "marker-id", "deduplicated": False}
+    )
+    p = _principal_patches()
+    with (
+        p[0],
+        p[1],
+        p[2],
+        patch(
+            "app.onboarding._summarize_run_today",
+            return_value=summary if summary is not None else dict(_RUN_SUMMARY),
+        ),
+        patch("app.onboarding.brain.write_scoped_memory", write_mock),
+    ):
+        result = await fn(_fake_ctx(), phase="finish")
+    return result, write_mock
+
+
+@pytest.mark.asyncio
+async def test_finish_reports_counts_by_kind_and_source_and_kinds_only_redactions():
+    result, _ = await _run_finish()
+    assert result["phase"] == "finish"
+    assert result["seeded"] == 5
+    assert result["by_kind"] == {"note": 3, "decision": 2}
+    assert result["by_source"] == {"repo": 4, "user": 1}
+    # Kinds only, never contents.
+    assert result["redacted_kinds"] == ["email_address"]
+
+
+@pytest.mark.asyncio
+async def test_finish_returns_a_relay_paragraph_the_agent_repeats_verbatim():
+    result, _ = await _run_finish()
+    relay = result["relay"]
+    assert isinstance(relay, str)
+    assert "Klio now knows" in relay
+    assert "5" in relay
+
+
+@pytest.mark.asyncio
+async def test_finish_writes_the_rerun_marker_note_with_dedup_off():
+    """The marker makes re-runs detectable AND countable (3/day derives from
+    it), so it must be written even when its text matches a prior run's."""
+    result, write_mock = await _run_finish()
+    write_mock.assert_awaited_once()
+    kwargs = write_mock.await_args.kwargs
+    assert kwargs["memory_type"] == "note"
+    assert kwargs["scope"] == "private"
+    assert kwargs["user_id"] == USER
+    assert kwargs["dedup"] is False
+    assert kwargs["metadata"]["init_marker"] is True
+    assert kwargs["metadata"]["source"] == "init"
+    assert kwargs["content"].startswith("Onboarded via init on ")
+    assert "5 memories seeded" in kwargs["content"]
+    assert result["marker_id"] == "marker-id"

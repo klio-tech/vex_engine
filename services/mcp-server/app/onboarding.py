@@ -497,7 +497,115 @@ def _init_session_id(org_id: str, user_id: str) -> str:
     return f"klio-init:{org_id}:{user_id}"
 
 
+def _summarize_run_today(db: Any, *, org_id: str, user_id: str) -> dict[str, Any]:
+    """Aggregate today's init rows: counts by kind and source, redaction KINDS.
+
+    One pass over the same window the caps count against. Redactions surface
+    as kinds only (e.g. ``stripe_secret_key``) — the contents were masked at
+    the chokepoint and are not recoverable here, which is the point.
+    """
+    rows = db.execute(
+        text(
+            """
+            SELECT memory_type,
+                   metadata->>'init_source' AS init_source,
+                   metadata->'redactions' AS redactions
+            FROM session_memories
+            WHERE org_id = :org_id
+              AND user_id = :user_id
+              AND scope = 'private'
+              AND metadata->>'source' = :source
+              AND COALESCE(metadata->>:marker_key, 'false') <> 'true'
+              AND created_at >= :day_start
+            """
+        ),
+        {
+            "org_id": org_id,
+            "user_id": user_id,
+            "source": _META_SOURCE,
+            "marker_key": _META_MARKER_KEY,
+            "day_start": _utc_day_start(),
+        },
+    ).fetchall()
+
+    by_kind: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    redacted_kinds: set[str] = set()
+    for memory_type, init_source, redactions in rows:
+        by_kind[memory_type] = by_kind.get(memory_type, 0) + 1
+        label = init_source or "unknown"
+        by_source[label] = by_source.get(label, 0) + 1
+        if redactions:
+            redacted_kinds.update(str(k) for k in redactions)
+    return {
+        "total": len(rows),
+        "by_kind": by_kind,
+        "by_source": by_source,
+        "redacted_kinds": sorted(redacted_kinds),
+    }
+
+
+def _relay_paragraph(summary: dict[str, Any]) -> str:
+    """The one paragraph the agent relays to the user verbatim."""
+    total = summary["total"]
+    if total == 0:
+        return (
+            "Klio now knows nothing new from this onboarding run — no "
+            "candidates were accepted. Everything submitted was either a "
+            "duplicate of what Klio already knew or was refused."
+        )
+    kinds = ", ".join(f"{n} {k}" for k, n in sorted(summary["by_kind"].items()))
+    sources = ", ".join(
+        f"{n} from {s}" for s, n in sorted(summary["by_source"].items())
+    )
+    text_out = (
+        f"Klio now knows {total} things about you and your work: {kinds} "
+        f"({sources}). They are stored PRIVATE to you — nothing was shared "
+        "with your team; use the share tool to promote anything deliberately. "
+        "Klio's curator will distil them into your knowledge graph on its "
+        "next pass, so recall and explore get richer over the next hour."
+    )
+    if summary["redacted_kinds"]:
+        text_out += (
+            " Some submissions contained secrets or personal data "
+            f"({', '.join(summary['redacted_kinds'])}); those values were "
+            "masked before anything was stored."
+        )
+    return text_out
+
+
 async def _phase_finish(
     db: Any, *, org_id: str, agent_id: str, user_id: str
 ) -> dict[str, Any]:
-    raise NotImplementedError
+    summary = _summarize_run_today(db, org_id=org_id, user_id=user_id)
+
+    # The marker note: makes re-runs detectable (spec, phase `finish`) and is
+    # what the 3-runs-per-day cap counts. dedup OFF — two identical-looking
+    # runs must still leave two countable markers, exactly like artifact
+    # cards disable dedup to stay individually discoverable.
+    marker_content = (
+        f"Onboarded via init on {datetime.now(timezone.utc).date().isoformat()}, "
+        f"{summary['total']} memories seeded"
+    )
+    marker = await brain.write_scoped_memory(
+        db,
+        org_id=org_id,
+        agent_id=agent_id,
+        content=marker_content,
+        memory_type="note",
+        session_id=_init_session_id(org_id, user_id),
+        metadata={"source": _META_SOURCE, _META_MARKER_KEY: True},
+        dedup=False,
+        scope=_INIT_SCOPE,
+        user_id=user_id,
+    )
+
+    return {
+        "phase": "finish",
+        "seeded": summary["total"],
+        "by_kind": summary["by_kind"],
+        "by_source": summary["by_source"],
+        "redacted_kinds": summary["redacted_kinds"],
+        "relay": _relay_paragraph(summary),
+        "marker_id": marker.get("id"),
+    }
