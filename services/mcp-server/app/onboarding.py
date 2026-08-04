@@ -70,7 +70,7 @@ CAPS: dict[str, int] = {
 }
 
 # Candidate sources (spec: phase `submit`). "import" is reserved for v1.1.
-ALLOWED_SOURCES: frozenset[str] = frozenset({"conversation", "repo", "user"})
+ALLOWED_SOURCES: frozenset[str] = frozenset({"conversation", "repo", "user", "import"})
 
 # Candidate kinds: the established RAW input set the curator consumes —
 # imported, not redeclared, so the two can never drift.
@@ -87,7 +87,7 @@ _INIT_SCOPE = "private"
 _META_SOURCE = "init"
 _META_MARKER_KEY = "init_marker"
 
-PLAYBOOK_VERSION = "v1"
+PLAYBOOK_VERSION = "v1.1"
 
 # Versioned server-side so it can improve without a client update.
 PLAYBOOK: dict[str, Any] = {
@@ -125,6 +125,20 @@ PLAYBOOK: dict[str, Any] = {
                 "The second is a consent gate, not decoration — anything the "
                 "user marks off-limits must not be submitted. Submit their "
                 "answers with source='user'."
+            ),
+        },
+        {
+            "id": "import",
+            "title": "Offer to import memory from another assistant",
+            "instructions": (
+                "Only if the user offers it or asks for it: they can paste "
+                "an export of their memory from another assistant (Claude's "
+                "memory summary, a ChatGPT memory export, or similar). "
+                "Distil the pasted text into durable facts and submit them "
+                "with source='import'. Do not solicit exports yourself, do "
+                "not read other tools' storage, and never submit the raw "
+                "paste — distil first. Skip this step entirely if the user "
+                "does not bring it up."
             ),
         },
     ],
@@ -436,9 +450,7 @@ async def _phase_submit(
             continue
 
         source = candidate["source"]
-        # EXTRACTED only when the user stated it; everything the agent
-        # derived from a conversation or repo is the agent's deduction.
-        provenance = "EXTRACTED" if source == "user" else "INFERRED"
+        provenance = _provenance_for(source)
         kind = candidate["kind"]
 
         # THE DOOR. The same chokepoint capture and remember use:
@@ -545,9 +557,17 @@ def _summarize_run_today(db: Any, *, org_id: str, user_id: str) -> dict[str, Any
     }
 
 
+def _provenance_for(source: str) -> str:
+    """EXTRACTED only when the user stated it directly. Everything the agent
+    derived (conversation, repo) is its deduction — and a pasted export from
+    another assistant is machine-distilled second-hand, so ``import`` is
+    INFERRED too, never EXTRACTED."""
+    return "EXTRACTED" if source == "user" else "INFERRED"
+
+
 def _relay_paragraph(summary: dict[str, Any]) -> str:
     """The one paragraph the agent relays to the user verbatim."""
-    total = summary["total"]
+    total = summary.get("total", sum(summary["by_kind"].values()))
     if total == 0:
         return (
             "Klio now knows nothing new from this onboarding run — no "
@@ -559,7 +579,8 @@ def _relay_paragraph(summary: dict[str, Any]) -> str:
         f"{n} from {s}" for s, n in sorted(summary["by_source"].items())
     )
     text_out = (
-        f"Klio now knows {total} things about you and your work: {kinds} "
+        f"Klio now knows {total} thing{'s' if total != 1 else ''} about you "
+        f"and your work: {kinds} "
         f"({sources}). They are stored PRIVATE to you — nothing was shared "
         "with your team; use the share tool to promote anything deliberately. "
         "Klio's curator will distil them into your knowledge graph on its "
