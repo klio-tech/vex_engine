@@ -44,6 +44,7 @@ _REQUIRED_SCHEMA_FIELD = {
     "klio_retrieve": "handle",
     "compress": "content",
     "explore": "entity",
+    "init": "phase",
 }
 
 
