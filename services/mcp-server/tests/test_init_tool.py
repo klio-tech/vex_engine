@@ -108,7 +108,7 @@ async def test_start_returns_versioned_playbook_with_three_steps_and_caps():
     assert result["phase"] == "start"
     playbook = result["playbook"]
     assert playbook["version"] == onboarding.PLAYBOOK_VERSION
-    assert len(playbook["steps"]) == 3
+    assert len(playbook["steps"]) == 4  # v1.1 added the consent-gated import step
     # Step 3 is the consent gate, not decoration.
     joined = " ".join(s["instructions"] for s in playbook["steps"]).lower()
     assert "not" in joined and "remember" in joined
@@ -246,7 +246,7 @@ async def test_submit_rejects_an_oversize_candidate_but_not_the_batch():
 async def test_submit_refuses_bad_kind_bad_source_and_empty_content_per_candidate():
     candidates = [
         {"content": "c", "kind": "fact", "source": "repo"},  # curator output type
-        {"content": "c", "kind": "note", "source": "import"},  # v1.1, not yet
+        {"content": "c", "kind": "note", "source": "scraped"},  # never a source
         {"content": "   ", "kind": "note", "source": "repo"},
         "not even a dict",
         {"content": "legit", "kind": "decision", "source": "conversation"},
@@ -884,7 +884,7 @@ async def test_full_onboarding_exchange_start_submit_finish(dbconn, capsys):
     org = _org(dbconn)
     start = await _init_call(org, CALLER, "start")
     assert start["phase"] == "start"
-    assert start["playbook"]["version"] == "v1"
+    assert start["playbook"]["version"] == onboarding.PLAYBOOK_VERSION
 
     submit = await _init_call(
         org,
@@ -941,3 +941,49 @@ async def test_full_onboarding_exchange_start_submit_finish(dbconn, capsys):
     )
     print("agent -> init(phase='finish')")
     print(f"server -> relay: {finish['relay']}")
+
+
+# ---------------------------------------------------------------------------
+# v1.1 — the import source, and the relay grammar fix that rode along with it
+# ---------------------------------------------------------------------------
+
+
+def test_relay_pluralizes_a_count_of_one():
+    """'Klio now knows 1 things' shipped to production; pin the grammar."""
+    from app.onboarding import _relay_paragraph
+
+    one = _relay_paragraph(
+        {"by_kind": {"decision": 1}, "by_source": {"user": 1}, "redacted_kinds": []}
+    )
+    many = _relay_paragraph(
+        {
+            "by_kind": {"decision": 2, "note": 1},
+            "by_source": {"user": 3},
+            "redacted_kinds": [],
+        }
+    )
+    assert "1 thing " in one and "1 things" not in one
+    assert "3 things" in many
+
+
+def test_import_is_an_allowed_source_and_lands_inferred():
+    """v1.1: a pasted export from another assistant is fuel, but it is
+    machine-distilled second-hand — INFERRED, never EXTRACTED."""
+    from app.onboarding import ALLOWED_SOURCES, _provenance_for
+
+    assert "import" in ALLOWED_SOURCES
+    assert _provenance_for("import") == "INFERRED"
+    assert _provenance_for("user") == "EXTRACTED"
+
+
+def test_playbook_has_an_import_step_with_consent_language():
+    """The start playbook must tell the agent how to handle a pasted
+    Claude-memory / ChatGPT export: only when the user offers it, never
+    solicited by the agent scraping another tool itself."""
+    from app.onboarding import PLAYBOOK
+
+    steps = {s["id"]: s for s in PLAYBOOK["steps"]}
+    assert "import" in steps
+    text = steps["import"]["instructions"].lower()
+    assert "paste" in text and "source='import'" in steps["import"]["instructions"]
+    assert "do not" in text or "only if" in text or "never" in text
