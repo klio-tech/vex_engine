@@ -2241,6 +2241,21 @@ async def _perform_project_create(
             role=projects.ROLE_ADMIN,
             surface=projects.SURFACE_MCP,
         )
+
+        # Persist the name. ``ensure_project`` only writes display_name on
+        # INSERT, so for a project that already existed — every auto-created
+        # one, i.e. the common case this tool exists to tidy up — the rename
+        # silently did not happen and the response below reported a name that
+        # was never stored. The caller's next lookup by that name then failed.
+        #
+        # Deliberately AFTER the adoption rule above: reaching this line means
+        # the caller now administers the project (they were already a member,
+        # or it had no members at all). Renaming before the check would make
+        # project_create a way to rewrite another team's project identity.
+        brain.rename_project(
+            db, org_id=org_id, project_id=project_id, display_name=stripped
+        )
+
         return {
             "created": True,
             "id": project_id,

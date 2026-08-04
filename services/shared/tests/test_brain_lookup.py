@@ -111,7 +111,8 @@ def test_find_project_id_uuid_miss_falls_back_to_name_query():
     assert db_session.execute.call_count == 2
     fallback_sql = str(db_session.execute.call_args_list[1].args[0])
     assert "git_remote = :ident" in fallback_sql
-    assert "display_name = :ident" in fallback_sql
+    # Names are matched case-insensitively; the exact keys are not.
+    assert "lower(display_name) = lower(:ident)" in fallback_sql
     fallback_params = db_session.execute.call_args_list[1].args[1]
     assert fallback_params == {"org_id": "org-1", "ident": valid_uuid}
     db_session.commit.assert_not_called()
@@ -132,7 +133,9 @@ def test_find_project_id_non_uuid_hits_name_query():
     assert "FROM projects" in sql
     assert "org_id = :org_id" in sql
     assert "git_remote = :ident" in sql
-    assert "display_name = :ident" in sql
+    # A human types "Klio" for a project stored as "klio"; case is not a
+    # distinction any caller means to draw on a display name.
+    assert "lower(display_name) = lower(:ident)" in sql
     params = _executed_params(db_session)
     assert params == {"org_id": "org-1", "ident": "git@github.com:acme/app.git"}
     db_session.commit.assert_not_called()
