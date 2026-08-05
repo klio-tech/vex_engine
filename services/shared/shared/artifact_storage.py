@@ -13,6 +13,7 @@ different blast radius.
 import codecs
 import hashlib
 import os
+import threading
 from typing import Any, Optional
 
 import boto3
@@ -76,21 +77,60 @@ def _artifact_s3_setting(name: str, fallback: str) -> str:
     )
 
 
+_s3_client: Any = None
+_s3_client_lock = threading.Lock()
+
+
 def get_artifact_s3_client() -> Any:
-    """Return a boto3 S3 client configured for the artifact bucket."""
-    return boto3.client(
-        "s3",
-        endpoint_url=_artifact_s3_setting("ENDPOINT", "http://localhost:9000"),
-        aws_access_key_id=_artifact_s3_setting("ACCESS_KEY", "agentguard"),
-        aws_secret_access_key=_artifact_s3_setting("SECRET_KEY", "agentguard_dev"),
-        region_name=ARTIFACT_S3_REGION,
-        config=Config(
-            signature_version="s3v4",
-            retries={"max_attempts": 3, "mode": "adaptive"},
-            connect_timeout=5,
-            read_timeout=30,
-        ),
-    )
+    """Return the process's boto3 S3 client for the artifact bucket.
+
+    Built once and reused. Every artifact operation called this fresh — five
+    sites across the MCP tool surface and the GC sweep — and each new botocore
+    client opens its own connection pool, so every ``artifact_put``,
+    ``artifact_get`` and sweep tick paid a TLS handshake that an existing,
+    warm connection would have served. botocore clients are safe to share
+    across threads and are the intended unit of connection pooling.
+
+    A failed build is **not** cached. Endpoint and credentials are read from
+    the environment and this raises when they are missing or wrong; caching
+    that would make a transient misconfiguration permanent for the life of the
+    process, so the next caller retries.
+
+    Reconfiguration requires :func:`reset_artifact_s3_client`, which is
+    correct: the settings are read at process start everywhere else too.
+    """
+    global _s3_client
+    client = _s3_client
+    if client is not None:
+        return client
+    with _s3_client_lock:
+        # Re-check under the lock: several callers can arrive together on a
+        # cold process and must end up sharing one client, not racing to
+        # build several and keeping the last.
+        if _s3_client is not None:
+            return _s3_client
+        built = boto3.client(
+            "s3",
+            endpoint_url=_artifact_s3_setting("ENDPOINT", "http://localhost:9000"),
+            aws_access_key_id=_artifact_s3_setting("ACCESS_KEY", "agentguard"),
+            aws_secret_access_key=_artifact_s3_setting("SECRET_KEY", "agentguard_dev"),
+            region_name=ARTIFACT_S3_REGION,
+            config=Config(
+                signature_version="s3v4",
+                retries={"max_attempts": 3, "mode": "adaptive"},
+                connect_timeout=5,
+                read_timeout=30,
+            ),
+        )
+        _s3_client = built
+        return built
+
+
+def reset_artifact_s3_client() -> None:
+    """Drop the cached client so the next call rebuilds it. For tests."""
+    global _s3_client
+    with _s3_client_lock:
+        _s3_client = None
 
 
 def object_key(org_id: str, artifact_id: str, version: int) -> str:
@@ -209,8 +249,18 @@ def checksum(s3: Any, key: str, *, chunk_bytes: int = CHECKSUM_CHUNK_BYTES) -> s
     """
     digest = hashlib.sha256()
     body = s3.get_object(Bucket=ARTIFACT_BUCKET, Key=key)["Body"]
-    for chunk in body.iter_chunks(chunk_size=chunk_bytes):
-        digest.update(chunk)
+    try:
+        for chunk in body.iter_chunks(chunk_size=chunk_bytes):
+            digest.update(chunk)
+    finally:
+        # Same reason :func:`get_text_page` closes its body: a stream that is
+        # merely dropped releases its connection only when the garbage
+        # collector gets round to it, which under load is exactly when the
+        # connection is needed. A stream aborted mid-read (a reset, a size
+        # rejection) must release it immediately, not eventually.
+        close = getattr(body, "close", None)
+        if close is not None:
+            close()
     return digest.hexdigest()
 
 

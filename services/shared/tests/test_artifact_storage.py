@@ -485,10 +485,18 @@ _S3_VARS = (
 
 @pytest.fixture
 def clean_s3_env(monkeypatch):
-    """Remove every S3 variable so each test states its own environment."""
+    """Remove every S3 variable so each test states its own environment.
+
+    The cached S3 client is dropped too. It is built once per process from
+    these variables, so a test that sets its own environment must also start
+    from an unbuilt client or it would assert against the previous test's
+    endpoint.
+    """
     for var in _S3_VARS:
         monkeypatch.delenv(var, raising=False)
-    return monkeypatch
+    st.reset_artifact_s3_client()
+    yield monkeypatch
+    st.reset_artifact_s3_client()
 
 
 def _client_settings(client):
