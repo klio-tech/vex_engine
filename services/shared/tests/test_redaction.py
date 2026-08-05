@@ -364,6 +364,23 @@ def test_bare_aws_secret_access_key_is_redacted():
     assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" not in result.clean_text
 
 
+def test_aws_secret_pattern_matches_in_assignment_form_on_its_own():
+    """The AWS pattern must fire on ``KEY=<secret>`` without leaning on the
+    credential_assignment detector to cover for it.
+
+    Regression: the character class originally included ``=`` for base64
+    padding, which put ``=`` in the lookbehind as well and made the single
+    most common way the secret is written unmatchable by this pattern. The
+    credential_assignment detector masked the failure end-to-end.
+    """
+    from shared.redaction import _PATTERNS
+
+    pattern = dict(_PATTERNS)["aws_secret_access_key"]
+    assert pattern.search(
+        "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    )
+
+
 def test_aws_secret_pattern_does_not_eat_ordinary_long_tokens():
     """Positive control on the false-positive side: a 40-char base64-ish
     string that is not adjacent to AWS context must survive."""

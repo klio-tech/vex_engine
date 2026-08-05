@@ -42,9 +42,14 @@ _PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
     # _aws_secret_guard rejects anything that is not mixed-case-plus-digit with
     # a base64-only character. That guard is what keeps 40-char lowercase hex —
     # a git tree hash — out of the net.
+    #
+    # ``=`` is deliberately NOT in the character class. A real 40-char AWS
+    # secret never carries base64 padding, and including ``=`` put it in the
+    # lookbehind too — which made ``AWS_SECRET_ACCESS_KEY=<secret>``, the form
+    # the secret is overwhelmingly written in, unmatchable by this pattern.
     (
         "aws_secret_access_key",
-        re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"),
+        re.compile(r"(?<![A-Za-z0-9/+])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+])"),
     ),
     # --- GitHub ---------------------------------------------------------------
     (
@@ -265,14 +270,14 @@ def _aws_secret_guard(secret: str) -> bool:
     The regex can only match the shape, which 40-char lowercase hex (a git
     tree hash) also satisfies. A real AWS secret access key is generated from
     the full base64 alphabet, so requiring an upper, a lower, a digit and at
-    least one ``/``, ``+`` or ``=`` separates it from hashes and from ordinary
+    least one ``/`` or ``+`` separates it from hashes and from ordinary
     identifiers without needing surrounding context.
     """
     return (
         any(c.isupper() for c in secret)
         and any(c.islower() for c in secret)
         and any(c.isdigit() for c in secret)
-        and any(c in "/+=" for c in secret)
+        and any(c in "/+" for c in secret)
     )
 
 
