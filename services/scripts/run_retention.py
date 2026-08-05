@@ -15,7 +15,10 @@ Environment:
     RAW_OBSERVATION_TTL_DAYS: Days to retain recall_hidden raw observations
         before they are swept (default: 7). These rows are curator fuel with
         a short shelf life and are deleted on a fixed TTL independent of
-        per-plan retention settings.
+        per-plan retention settings. Must be a whole number of days in
+        [1, 3650], or one of "off" / "never" / "disabled" to skip the sweep
+        entirely. Anything else is fatal — see
+        :func:`parse_raw_observation_ttl_days`.
 """
 
 import json
@@ -38,6 +41,96 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 logger = logging.getLogger("retention")
+
+
+# --- RAW_OBSERVATION_TTL_DAYS ------------------------------------------
+#
+# This is the only unbounded-blast-radius value in the retention job. The
+# hidden-raw sweep below is the one DELETE in this module with NO ``org_id``
+# predicate — it deliberately sits outside the per-org loop and is bounded by
+# age alone — so the parsed TTL is the only thing standing between a cron run
+# and every tenant's ``recall_hidden`` rows.
+#
+# Executed against Postgres 16, ``NOW() - (:days || ' days')::interval`` gives:
+#
+#      7 -> cutoff 7 days ago -> a one-second-old row survives
+#      0 -> cutoff NOW()      -> a one-second-old row is deleted
+#     -1 -> cutoff TOMORROW   -> everything is deleted
+#
+# and a seeded run with ``days = 0`` removed 3 of 3 hidden rows spanning two
+# orgs. The input that triggers it is not adversarial, it is the obvious thing
+# an operator types when they want the sweep to stop. So ``0`` and negatives
+# are fatal, and there is a real "off" token for them to reach for instead.
+
+DEFAULT_RAW_OBSERVATION_TTL_DAYS = 7
+
+#: Below this the cutoff is at or ahead of NOW() and the sweep stops being a
+#: TTL at all.
+MIN_RAW_OBSERVATION_TTL_DAYS = 1
+
+#: Ten years. Not a safety property — a sanity bound, so a value that is
+#: obviously a typo (a timestamp, a byte count) is reported rather than
+#: silently turning the sweep into a no-op nobody notices for a decade.
+MAX_RAW_OBSERVATION_TTL_DAYS = 3650
+
+#: Tokens that mean "do not run the hidden-raw sweep at all".
+_TTL_DISABLED_TOKENS = frozenset({"off", "never", "disabled"})
+
+
+class RetentionConfigError(ValueError):
+    """A retention environment variable is unusable; the run must not start."""
+
+
+def parse_raw_observation_ttl_days(raw: str | None) -> int | None:
+    """Parse and validate ``RAW_OBSERVATION_TTL_DAYS``.
+
+    Args:
+        raw: The raw environment value, or ``None`` when unset.
+
+    Returns:
+        The TTL in days, or ``None`` when the sweep is explicitly disabled.
+
+    Raises:
+        RetentionConfigError: On any value that is not a whole number of days
+            in ``[MIN, MAX]`` and not a disable token. Deliberately fatal
+            rather than clamped: an operator who typed ``0`` meant "stop
+            deleting", and substituting the 7-day default would delete a week
+            of curator fuel while appearing to obey.
+    """
+    if raw is None:
+        return DEFAULT_RAW_OBSERVATION_TTL_DAYS
+
+    token = raw.strip()
+    if token.lower() in _TTL_DISABLED_TOKENS:
+        return None
+
+    try:
+        days = int(token)
+    except ValueError:
+        raise RetentionConfigError(
+            f"RAW_OBSERVATION_TTL_DAYS={raw!r} is not a whole number of days. "
+            f"Use an integer in [{MIN_RAW_OBSERVATION_TTL_DAYS}, "
+            f"{MAX_RAW_OBSERVATION_TTL_DAYS}], or 'off' to skip the sweep."
+        ) from None
+
+    if days < MIN_RAW_OBSERVATION_TTL_DAYS:
+        raise RetentionConfigError(
+            f"RAW_OBSERVATION_TTL_DAYS={days} would put the delete cutoff at or "
+            f"after NOW(), deleting every recall_hidden row in EVERY org "
+            f"(the sweep has no org_id predicate by design). Refusing to run. "
+            f"To turn the sweep off, set RAW_OBSERVATION_TTL_DAYS=off."
+        )
+
+    if days > MAX_RAW_OBSERVATION_TTL_DAYS:
+        raise RetentionConfigError(
+            f"RAW_OBSERVATION_TTL_DAYS={days} exceeds the "
+            f"{MAX_RAW_OBSERVATION_TTL_DAYS}-day sanity bound and is almost "
+            f"certainly a typo. Use a value in "
+            f"[{MIN_RAW_OBSERVATION_TTL_DAYS}, {MAX_RAW_OBSERVATION_TTL_DAYS}], "
+            f"or 'off' to skip the sweep."
+        )
+
+    return days
 
 
 def sweep_expired_originals(db, *, org_id: str) -> int:
@@ -102,6 +195,19 @@ def main() -> None:
         sys.exit(1)
     if not supabase_url:
         logger.error("SUPABASE_DATABASE_URL environment variable is required")
+        sys.exit(1)
+
+    # Validated here, at the top, and not where it is used: everything below
+    # this point issues DELETEs (the per-org edge, entity and compression
+    # sweeps each commit as they go). Validating at the point of use would
+    # leave a run that dies on a bad TTL having already committed deletions
+    # for every org.
+    try:
+        raw_ttl_days = parse_raw_observation_ttl_days(
+            os.environ.get("RAW_OBSERVATION_TTL_DAYS")
+        )
+    except RetentionConfigError as exc:
+        logger.error("%s", exc)
         sys.exit(1)
 
     tsdb_engine = create_engine(database_url, pool_pre_ping=True)
@@ -199,23 +305,31 @@ def main() -> None:
                 )
 
             # Hidden raw captures are curator fuel with a short shelf life:
-            # sweep them on a fixed TTL regardless of plan retention.
-            raw_ttl_days = int(os.environ.get("RAW_OBSERVATION_TTL_DAYS", "7"))
-            deleted = tsdb_conn.execute(
-                text(
-                    """
-                    DELETE FROM session_memories
-                    WHERE recall_hidden = TRUE
-                      AND created_at < NOW() - (:days || ' days')::interval
-                    """
-                ),
-                {"days": raw_ttl_days},
-            )
-            logger.info(
-                "Swept hidden raw observations older than %d days (%s rows)",
-                raw_ttl_days,
-                getattr(deleted, "rowcount", "?"),
-            )
+            # sweep them on a fixed TTL regardless of plan retention. This is
+            # the one DELETE here with no org_id predicate — global by design,
+            # age its only bound — which is why ``raw_ttl_days`` was validated
+            # before the first statement of the run.
+            if raw_ttl_days is None:
+                logger.info(
+                    "RAW_OBSERVATION_TTL_DAYS is off; skipping the hidden raw "
+                    "observation sweep"
+                )
+            else:
+                deleted = tsdb_conn.execute(
+                    text(
+                        """
+                        DELETE FROM session_memories
+                        WHERE recall_hidden = TRUE
+                          AND created_at < NOW() - (:days || ' days')::interval
+                        """
+                    ),
+                    {"days": raw_ttl_days},
+                )
+                logger.info(
+                    "Swept hidden raw observations older than %d days (%s rows)",
+                    raw_ttl_days,
+                    getattr(deleted, "rowcount", "?"),
+                )
 
             tsdb_conn.commit()
 

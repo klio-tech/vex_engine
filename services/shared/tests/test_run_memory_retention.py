@@ -58,16 +58,64 @@ def test_calls_enforce_memory_retention_with_memory_days():
     )
 
 
-def test_hidden_raw_ttl_sql_present():
-    """run_retention must sweep recall_hidden rows on a fixed short TTL."""
-    import os
+def test_hidden_raw_ttl_sweep_runs_with_the_configured_ttl():
+    """run_retention must sweep recall_hidden rows on a fixed short TTL.
 
-    path = os.path.join(
-        os.path.dirname(__file__), "..", "..", "scripts", "run_retention.py"
+    This used to assert that the strings ``"recall_hidden = TRUE"`` and
+    ``"RAW_OBSERVATION_TTL_DAYS"`` appeared somewhere in the source file — a
+    grep that would have passed just as happily against a DELETE with the
+    predicate commented out. It now executes the sweep and inspects the
+    statement and its bound parameter.
+
+    The destructive half of this knob (``0``/``-1``/garbage) is covered in
+    ``test_retention_ttl_guard.py``.
+    """
+    mod = _load_run_retention()
+    statements = []
+
+    class FakeConn:
+        def execute(self, stmt, params=None):
+            statements.append((getattr(stmt, "text", str(stmt)), params))
+            result = MagicMock()
+            result.fetchall.return_value = [("acct", "pro", None)]
+            result.fetchone.return_value = ("org-1",)
+            result.rowcount = 0
+            return result
+
+        def commit(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    fake_engine = MagicMock()
+    fake_engine.connect.return_value = FakeConn()
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "DATABASE_URL": "x",
+                "SUPABASE_DATABASE_URL": "y",
+                "RAW_OBSERVATION_TTL_DAYS": "9",
+            },
+        ),
+        patch.object(mod, "create_engine", return_value=fake_engine),
+    ):
+        mod.main()
+
+    sweeps = [
+        (sql, params)
+        for sql, params in statements
+        if "DELETE" in sql.upper() and "recall_hidden = TRUE" in sql
+    ]
+    assert len(sweeps) == 1, "exactly one hidden-raw sweep should have run"
+    assert sweeps[0][1] == {"days": 9}, (
+        "the sweep must be bound to the configured TTL, not a hardcoded one"
     )
-    source = open(path).read()
-    assert "recall_hidden = TRUE" in source
-    assert "RAW_OBSERVATION_TTL_DAYS" in source
 
 
 def test_sweeps_orphan_graph_edges_for_every_org():
