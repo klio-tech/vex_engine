@@ -376,7 +376,14 @@ def test_row_to_record():
 
 @pytest.mark.asyncio
 async def test_write_memory_inserts_row():
-    """write_memory should embed, insert, and commit."""
+    """write_memory should release, embed, insert, and commit.
+
+    Two commits, not one. The first is :func:`shared.memory.release_connection`
+    returning the caller's pooled connection before the embed is awaited — the
+    caller reaches here with a transaction already open from its quota check,
+    and holding it across a network call to the embedding backend is what
+    exhausted the pool at 16 concurrent writes. The second is the insert's own.
+    """
     db_session = MagicMock()
     db_session.execute = MagicMock()
     db_session.commit = MagicMock()
@@ -403,7 +410,7 @@ async def test_write_memory_inserts_row():
     assert result.content == "Agent completed task"
     assert result.embedding == SAMPLE_EMBEDDING
     db_session.execute.assert_called_once()
-    db_session.commit.assert_called_once()
+    assert db_session.commit.call_count == 2
 
 
 @pytest.mark.asyncio

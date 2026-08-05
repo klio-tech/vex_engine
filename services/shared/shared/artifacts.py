@@ -322,8 +322,39 @@ def mark_superseded(db: Any, *, org_id: str, artifact_id: str) -> None:
     db.commit()
 
 
-def collect_abandoned(db: Any, *, older_than_hours: int = PENDING_TTL_HOURS) -> list:
+def _limit_clause(limit: Optional[int]) -> str:
+    """``LIMIT n`` for a positive *limit*, or the empty string for ``None``.
+
+    ``limit`` is interpolated rather than bound because ``LIMIT`` will not take
+    a bind parameter in every dialect path this module is used through. It is
+    forced through ``int()`` first, so the value reaching the SQL is an integer
+    literal and nothing else — a caller cannot smuggle a fragment in.
+
+    Zero and negative are refused rather than treated as "no limit". They mean
+    the caller computed a bound and got it wrong, and quietly turning that into
+    an unbounded sweep is precisely the failure the bound exists to prevent.
+    """
+    if limit is None:
+        return ""
+    bound = int(limit)
+    if bound <= 0:
+        raise ValueError(f"limit must be positive or None, got {limit!r}")
+    return f"LIMIT {bound}"
+
+
+def collect_abandoned(
+    db: Any,
+    *,
+    older_than_hours: int = PENDING_TTL_HOURS,
+    limit: Optional[int] = None,
+) -> list:
     """Pending artifacts whose upload never arrived. Caller deletes the bytes.
+
+    ``limit`` bounds one sweep tick. It is paired with an oldest-first
+    ``ORDER BY`` deliberately: a LIMIT with no order can hand back the same
+    window every tick, so the oldest rows would never be collected and the
+    backlog the bound exists to drain would never drain. Oldest-first makes
+    successive ticks make progress.
 
     Intentionally cross-org: this is the background maintenance sweep, not a
     request-scoped query, so it has no ``org_id`` predicate and returns stale
@@ -336,10 +367,12 @@ def collect_abandoned(db: Any, *, older_than_hours: int = PENDING_TTL_HOURS) -> 
     """
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT id, org_id, version FROM artifacts
             WHERE status = 'pending'
               AND created_at < NOW() - (:hours || ' hours')::interval
+            ORDER BY created_at ASC
+            {_limit_clause(limit)}
             """
         ),
         {"hours": older_than_hours},
@@ -347,8 +380,20 @@ def collect_abandoned(db: Any, *, older_than_hours: int = PENDING_TTL_HOURS) -> 
     return [{"id": str(r[0]), "org_id": r[1], "version": int(r[2])} for r in rows]
 
 
-def collect_purgeable(db: Any, *, older_than_hours: int = PURGE_GRACE_HOURS) -> list:
+def collect_purgeable(
+    db: Any,
+    *,
+    older_than_hours: int = PURGE_GRACE_HOURS,
+    limit: Optional[int] = None,
+) -> list:
     """Dead artifacts whose bytes are still on disk. Caller deletes them.
+
+    ``limit`` bounds one sweep tick, paired with oldest-first ordering for the
+    reason given on :func:`collect_abandoned`. This selector is the one that
+    most needs it: unlike pending rows, which are capped at
+    :data:`MAX_PENDING_PER_ORG` per org, dead rows have no natural ceiling —
+    retention or a mass ``forget`` can make every artifact in the deployment
+    purgeable at once.
 
     ``retract`` (``forget``) and ``mark_superseded`` only change ``status``.
     Nothing else in this module ever removes an object or clears
@@ -375,11 +420,13 @@ def collect_purgeable(db: Any, *, older_than_hours: int = PURGE_GRACE_HOURS) -> 
     """
     rows = db.execute(
         text(
-            """
+            f"""
             SELECT id, org_id, version, status FROM artifacts
             WHERE status IN ('retracted', 'superseded')
               AND COALESCE(retracted_at, created_at)
                   < NOW() - (:hours || ' hours')::interval
+            ORDER BY COALESCE(retracted_at, created_at) ASC
+            {_limit_clause(limit)}
             """
         ),
         {"hours": older_than_hours},

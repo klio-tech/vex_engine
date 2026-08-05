@@ -41,6 +41,7 @@ import asyncio
 import logging
 from typing import Any, Callable, Optional
 
+import anyio
 from sqlalchemy import text as sa_text
 
 from app.config import ARTIFACT_GC_ENABLED, CURATOR_ENABLED, CURATOR_INTERVAL_SECONDS
@@ -49,6 +50,17 @@ from app.db import SessionLocal
 from shared import artifact_storage, artifacts
 
 logger = logging.getLogger("agentguard.mcp.scheduler")
+
+ARTIFACT_GC_ROW_LIMIT = 500
+"""Rows each GC selector may return in one tick.
+
+A tick bound, not a memory bound. Each row costs a commit plus a boto3
+``delete_object`` (5 s connect / 30 s read / 3 adaptive retries), so an
+unbounded selector makes tick duration a function of how much work happened to
+accumulate — and against a degraded object store that is ~105 s per row. 500
+rows is far more than an hourly sweep normally sees while keeping the
+worst-case tick finite; the selectors are ordered oldest-first, so successive
+ticks drain any backlog rather than re-walking the same window."""
 
 
 async def _curator_loop(
@@ -250,56 +262,79 @@ async def collect_artifacts_once(db_factory: Callable[[], Any]) -> int:
     case for an abandoned upload is that no object was ever put to S3 at all,
     so a missing-object failure here is expected, not exceptional, and must
     not stop the sweep or prevent other rows from being collected.
+
+    **Bounded, and off the event loop.** Everything below is blocking work:
+    synchronous psycopg2, a commit per row, and boto3 ``delete_object`` with a
+    5 s connect / 30 s read timeout and 3 adaptive retries. Run inline on the
+    loop it cost ~2.5 s of wedged loop per hour in the normal case, and against
+    a blackholed object store roughly 105 s **per row** — 50 rows would hold
+    the loop, and therefore every request this process serves, for about an
+    hour and a half. So the whole pass runs in a worker thread, and each tick
+    takes at most :data:`ARTIFACT_GC_ROW_LIMIT` rows per selector.
+
+    The bound is a tick bound, not a memory bound: pending rows are already
+    capped at ``artifacts.MAX_PENDING_PER_ORG`` (32) per org. What was
+    genuinely unbounded is ``collect_purgeable``, and what was unbounded in
+    *duration* is the loop-blocking, which is what this fixes.
     """
-    db = db_factory()
-    try:
-        stale = artifacts.collect_abandoned(db)
-        dead = artifacts.collect_purgeable(db)
-        if not stale and not dead:
-            # Nothing to collect means nothing to connect to. Building the
-            # client reads endpoint and credentials from the environment and
-            # raises when they are missing or wrong, so doing it
-            # unconditionally turns every tick of an idle deployment into a
-            # logged exception — noise that trains on-call to ignore this
-            # sweep's alerts, on a job whose real failures delete data.
-            return 0
 
-        s3 = artifact_storage.get_artifact_s3_client()
-        collected = 0
-        for row in stale:
-            deleted = db.execute(
-                sa_text(
-                    "DELETE FROM artifacts WHERE id = :id AND status = 'pending' "
-                    "RETURNING id"
-                ),
-                {"id": row["id"]},
-            ).fetchone()
-            db.commit()
+    def _sweep() -> int:
+        db = db_factory()
+        try:
+            return _collect_artifacts_sync(db)
+        finally:
+            db.close()
 
-            if not deleted:
-                # Confirmed between collect_abandoned's SELECT and this
-                # DELETE: the row is no longer pending, so it was NOT removed
-                # above. Its object must be left alone.
-                logger.info("artifact GC: skipping %s, no longer pending", row["id"])
-                continue
+    return await anyio.to_thread.run_sync(_sweep)
 
-            key = artifact_storage.object_key(row["org_id"], row["id"], row["version"])
-            try:
-                artifact_storage.delete(s3, key)
-            except Exception:
-                logger.debug("artifact GC: no object at %s", key)
-            collected += 1
 
-        if collected:
-            logger.info("artifact GC: collected %d abandoned uploads", collected)
+def _collect_artifacts_sync(db: Any) -> int:
+    """One bounded GC pass. Blocking; call via :func:`collect_artifacts_once`."""
+    stale = artifacts.collect_abandoned(db, limit=ARTIFACT_GC_ROW_LIMIT)
+    dead = artifacts.collect_purgeable(db, limit=ARTIFACT_GC_ROW_LIMIT)
+    if not stale and not dead:
+        # Nothing to collect means nothing to connect to. Building the
+        # client reads endpoint and credentials from the environment and
+        # raises when they are missing or wrong, so doing it
+        # unconditionally turns every tick of an idle deployment into a
+        # logged exception — noise that trains on-call to ignore this
+        # sweep's alerts, on a job whose real failures delete data.
+        return 0
 
-        # Second pass: destroy the bytes of artifacts that are dead but whose
-        # objects nothing else in the system would ever remove. See
-        # ``_purge_dead_artifacts``.
-        collected += _purge_dead_artifacts(db, s3, dead)
-        return collected
-    finally:
-        db.close()
+    s3 = artifact_storage.get_artifact_s3_client()
+    collected = 0
+    for row in stale:
+        deleted = db.execute(
+            sa_text(
+                "DELETE FROM artifacts WHERE id = :id AND status = 'pending' "
+                "RETURNING id"
+            ),
+            {"id": row["id"]},
+        ).fetchone()
+        db.commit()
+
+        if not deleted:
+            # Confirmed between collect_abandoned's SELECT and this
+            # DELETE: the row is no longer pending, so it was NOT removed
+            # above. Its object must be left alone.
+            logger.info("artifact GC: skipping %s, no longer pending", row["id"])
+            continue
+
+        key = artifact_storage.object_key(row["org_id"], row["id"], row["version"])
+        try:
+            artifact_storage.delete(s3, key)
+        except Exception:
+            logger.debug("artifact GC: no object at %s", key)
+        collected += 1
+
+    if collected:
+        logger.info("artifact GC: collected %d abandoned uploads", collected)
+
+    # Second pass: destroy the bytes of artifacts that are dead but whose
+    # objects nothing else in the system would ever remove. See
+    # ``_purge_dead_artifacts``.
+    collected += _purge_dead_artifacts(db, s3, dead)
+    return collected
 
 
 async def _artifact_gc_loop(

@@ -28,8 +28,28 @@ from typing import Any, Optional
 
 import httpx
 import jwt as pyjwt
+from sqlalchemy.exc import SQLAlchemyError
 
 logger = logging.getLogger("agentguard.mcp.oauth")
+
+
+class GrantStoreUnavailable(Exception):
+    """The grant store (Supabase / TSDB) is temporarily unreachable.
+
+    Raised by :meth:`GrantResolver.resolve` when the lookup fails with a
+    database-level error — pool exhaustion, a dropped connection, a refused
+    socket — rather than because no grant exists. Distinct from an absent
+    grant (which yields ``None``): callers must map this to 503 +
+    Retry-After, not 403 ``not_connected``.
+
+    It exists because the two were previously indistinguishable. The Supabase
+    engine is a 5+10 pool, so the 16th concurrent Bearer resolution queued for
+    ``pool_timeout`` and raised ``sqlalchemy.exc.TimeoutError``, which
+    ``except Exception: return None`` turned into a message telling a
+    correctly-connected user to go re-authorize their workspace. This mirrors
+    :class:`VerifierUnavailable`, which already draws exactly this line one
+    rung up the ladder.
+    """
 
 
 class VerifierUnavailable(Exception):
@@ -321,7 +341,21 @@ class GrantResolver:
                     return principal
         try:
             principal = self._lookup(identity)
+        except SQLAlchemyError as exc:
+            # The store is down, not the grant absent. Denying here would tell
+            # a correctly-connected user to re-authorize their workspace, and
+            # the denial would then be CACHED for the negative TTL — so the
+            # advice would outlive the outage that produced it. Raise instead,
+            # and cache nothing.
+            logger.warning(
+                "oauth: grant store unavailable (%s); signalling retryable",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            raise GrantStoreUnavailable(str(exc)) from exc
         except Exception:
+            # Not a database failure: this is a bug in the lookup, and a bug is
+            # not evidence the caller may retry. Fail closed, as before.
             logger.warning("oauth: grant lookup failed (fail closed)", exc_info=True)
             return None
         with self._lock:

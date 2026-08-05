@@ -6,20 +6,25 @@ memory.  All DB access uses raw SQL via ``sqlalchemy.text()`` and pgvector's
 cosine distance operator (``<=>``) for similarity queries.
 """
 
+import asyncio
 import json
 import logging
 import os
 import re
+import threading
+import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+import anyio
 import litellm
 from litellm import acompletion, aembedding
 from sqlalchemy import text
 
-from shared.env_config import parse_float
+from shared.env_config import parse_float, parse_int
 
 # Project ACLs. Safe at module scope: ``projects`` imports nothing from this
 # module (recall inlines its membership subquery rather than calling back
@@ -119,6 +124,48 @@ path for "the content was long". Consequently a short input that fails returns
 ``None`` on a single attempt (no needless retries), while a long/dense input is
 shrunk repeatedly until it fits under the model's token cap."""
 
+DEFAULT_EMBED_TIMEOUT_S: float = 15.0
+"""Default per-attempt bound on one ``litellm.aembedding`` call, in seconds.
+
+Overridable at run time via ``KLIO_EMBED_TIMEOUT_S``. Before this bound the
+call was awaited with nothing at all: a hung embedding backend held the
+awaiting coroutine forever, and — because the caller held a pooled DB
+connection across that await — took the connection pool down with it.
+
+15 s is generous for an embedding of at most :data:`MAX_EMBED_CHARS`
+characters (a healthy gateway answers in tens of milliseconds) while still
+being an order of magnitude below the 30 s pool checkout queue it used to
+exhaust."""
+
+DEFAULT_EMBED_MAX_CONCURRENCY: int = 32
+"""Default cap on embedding calls this process may have in flight at once.
+
+Overridable via ``KLIO_EMBED_MAX_CONCURRENCY``. This bounds fan-out at the
+embedding *backend*, which nothing previously did: the DB pool incidentally
+capped it at 15 only because every embed was holding a connection, and fixing
+that (correctly) removed the accidental limit. Without an explicit cap, a burst
+of writes becomes an unbounded burst at the gateway."""
+
+EMBED_MEMO_TTL_S: float = 60.0
+"""How long a computed embedding stays reusable, in seconds.
+
+Deliberately short. This is a *within-request collapse*, not a cache: a single
+write embeds the same string twice — once in :func:`find_similar_memory` to
+look for a duplicate, once in :func:`write_memory` to store it — and this memo
+exists to make that one call instead of two. A TTL of seconds is enough for
+that and short enough that the process is not carrying a content cache around.
+
+It lives at module scope rather than in a request-scoped context because the
+two embeds happen inside :func:`shared.brain.write_scoped_memory`, which calls
+the two primitives independently; a memo the caller has to open would only
+help callers that had been updated to open it."""
+
+EMBED_MEMO_MAX_ENTRIES: int = 256
+"""Hard bound on memo size, evicting oldest-first.
+
+At the model's 1024-dimension output this is a few megabytes — a bound, not a
+budget. It exists so a write-heavy process cannot turn the memo into a leak."""
+
 # Providers that support response_format via gateway
 _JSON_MODE_PREFIXES = ("openai/", "gpt-")
 
@@ -177,6 +224,141 @@ class MemoryRecord:
 # ---------------------------------------------------------------------------
 
 
+def release_connection(db_session: Any) -> None:
+    """Return *db_session*'s pooled connection to the pool before an ``await``.
+
+    SQLAlchemy 2.0 autobegins a transaction on the first ``execute()`` and
+    holds the checked-out connection until commit/rollback/close. Every write
+    path in this engine opens with synchronous DB work (a quota check, project
+    resolution, space resolution) and *then* awaits an embedding, so each
+    in-flight write pinned one pooled connection for the whole duration of a
+    network call to a third party. Against the production pool
+    (``pool_size=5, max_overflow=10`` -> 15 checkouts) with a 1 s embed, the
+    16th concurrent write queued and raised ``TimeoutError``; at concurrency 40,
+    25 of 40 failed. With the connection released, 200 concurrent writes
+    completed in 2.24 s.
+
+    ``commit`` rather than ``rollback`` because at every call site the pending
+    state is work the caller intends to keep — a resolved-or-created space, a
+    metered usage row — and discarding it to free a connection would trade an
+    availability bug for a correctness one. Committing a read-only transaction
+    is free.
+
+    A caller that exposes no ``commit`` (a raw DBAPI connection, a test fake)
+    is left alone: this is an optimisation of the pooling behaviour, not a
+    contract change, and it must never be the reason a call site starts
+    failing.
+
+    A failed commit is NOT swallowed. It means the transaction is already
+    broken, and continuing on to embed and insert would only surface the same
+    failure later with less context.
+    """
+    commit = getattr(db_session, "commit", None)
+    if commit is None:
+        return
+    commit()
+
+
+def _embed_model() -> str:
+    """The embedding model this process is configured to use."""
+    return os.environ.get("MEMORY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+
+
+def _embed_timeout_s() -> float:
+    """Per-attempt embedding timeout, read at call time.
+
+    Read here rather than at import so an operator can change it without a
+    redeploy, and guarded by :func:`shared.env_config.parse_float` so a typo
+    (``KLIO_EMBED_TIMEOUT_S='10s'``) degrades to the default instead of raising
+    out of every write — the same failure ``VERIFICATION_TIMEOUT_S`` produced.
+    """
+    return parse_float(
+        os.environ.get("KLIO_EMBED_TIMEOUT_S"),
+        default=DEFAULT_EMBED_TIMEOUT_S,
+        name="KLIO_EMBED_TIMEOUT_S",
+        minimum=0.01,
+        maximum=600.0,
+    )
+
+
+#: In-flight embedding limiters, one per event loop.
+#:
+#: An ``asyncio.Semaphore`` belongs to the loop that first suspends on it, so a
+#: module-level singleton would leak waiters across loops (every process that
+#: runs more than one loop — notably the test suite — would eventually block on
+#: a dead one). Keyed by loop, and dropped when the loop closes.
+_embed_limiters: "dict[Any, asyncio.Semaphore]" = {}
+_embed_limiter_lock = threading.Lock()
+
+
+def _embed_limiter() -> "asyncio.Semaphore":
+    """The concurrency limiter for the running event loop."""
+    loop = asyncio.get_running_loop()
+    with _embed_limiter_lock:
+        limiter = _embed_limiters.get(loop)
+        if limiter is None:
+            limit = parse_int(
+                os.environ.get("KLIO_EMBED_MAX_CONCURRENCY"),
+                default=DEFAULT_EMBED_MAX_CONCURRENCY,
+                name="KLIO_EMBED_MAX_CONCURRENCY",
+                minimum=1,
+                maximum=4096,
+            )
+            limiter = asyncio.Semaphore(limit)
+            _embed_limiters[loop] = limiter
+        # Closed loops can never be used again; do not hold their limiters.
+        for dead in [loop_ for loop_ in _embed_limiters if loop_.is_closed()]:
+            del _embed_limiters[dead]
+        return limiter
+
+
+def reset_embed_concurrency_limiter() -> None:
+    """Drop cached limiters so a changed cap takes effect. For tests."""
+    with _embed_limiter_lock:
+        _embed_limiters.clear()
+
+
+#: content-key -> (vector, monotonic timestamp). See :data:`EMBED_MEMO_TTL_S`.
+_embed_memo: "OrderedDict[tuple[str, str], tuple[list[float], float]]" = OrderedDict()
+_embed_memo_lock = threading.Lock()
+
+
+def _memo_get(key: tuple[str, str]) -> Optional[list[float]]:
+    """The memoized vector for *key*, or ``None`` if absent or expired."""
+    now = time.monotonic()
+    with _embed_memo_lock:
+        entry = _embed_memo.get(key)
+        if entry is None:
+            return None
+        vector, stored_at = entry
+        if now - stored_at >= EMBED_MEMO_TTL_S:
+            del _embed_memo[key]
+            return None
+        _embed_memo.move_to_end(key)
+        return vector
+
+
+def _memo_put(key: tuple[str, str], vector: list[float]) -> None:
+    """Memoize *vector*, evicting oldest-first at :data:`EMBED_MEMO_MAX_ENTRIES`."""
+    with _embed_memo_lock:
+        _embed_memo[key] = (vector, time.monotonic())
+        _embed_memo.move_to_end(key)
+        while len(_embed_memo) > EMBED_MEMO_MAX_ENTRIES:
+            _embed_memo.popitem(last=False)
+
+
+def clear_embedding_memo() -> None:
+    """Empty the embedding memo. For tests and for operational reset."""
+    with _embed_memo_lock:
+        _embed_memo.clear()
+
+
+def embedding_memo_size() -> int:
+    """Current memo occupancy. For tests and metrics."""
+    with _embed_memo_lock:
+        return len(_embed_memo)
+
+
 async def _aembedding_call(text_input: str) -> list[float]:
     """Perform a single embedding-backend call via ``litellm.aembedding()``.
 
@@ -186,12 +368,25 @@ async def _aembedding_call(text_input: str) -> list[float]:
 
     Isolated from :func:`embed_text` so the latter can retry it with
     progressively smaller input without duplicating the litellm wiring. Raises
-    whatever the backend raises (e.g. an over-token-budget HTTP 400).
+    whatever the backend raises (e.g. an over-token-budget HTTP 400), and
+    :class:`asyncio.TimeoutError` when the call exceeds
+    :func:`_embed_timeout_s`.
+
+    Two bounds are applied here rather than in :func:`embed_text` so that every
+    attempt of the progressive-truncation retry is bounded, not just the first:
+
+    * a **timeout**, so a hung backend cannot hold the caller (and, before the
+      release below, the caller's pooled DB connection) indefinitely;
+    * a **concurrency cap**, so a burst of writes cannot become an unbounded
+      burst at the gateway. The cap is acquired *outside* the timeout, so time
+      spent queueing behind other embeds is not charged against the backend's
+      own budget — otherwise a busy process would report timeouts for calls the
+      backend never received.
 
     Returns:
         The embedding vector as a list of floats.
     """
-    model = os.environ.get("MEMORY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
+    model = _embed_model()
     api_base = os.environ.get("LITELLM_API_URL") or os.environ.get("OPENAI_API_BASE")
     api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
 
@@ -202,7 +397,10 @@ async def _aembedding_call(text_input: str) -> list[float]:
     if api_key:
         kwargs["api_key"] = api_key
 
-    response = await aembedding(**kwargs)
+    async with _embed_limiter():
+        response = await asyncio.wait_for(
+            aembedding(**kwargs), timeout=_embed_timeout_s()
+        )
     item = response.data[0]
     return item["embedding"] if isinstance(item, dict) else item.embedding
 
@@ -225,10 +423,32 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
     Truncation applies ONLY to the vector input; the caller's stored ``content``
     is never modified by this function.
 
+    Availability — three bounds, none of which existed before:
+
+    * every attempt is **timed out** (:func:`_embed_timeout_s`), so a hung
+      backend cannot hold the caller forever;
+    * in-flight calls are **capped** (:data:`DEFAULT_EMBED_MAX_CONCURRENCY`);
+    * an identical ``(model, content)`` pair is **memoized** for
+      :data:`EMBED_MEMO_TTL_S`, because a single write embeds the same string
+      twice — once to look for a duplicate, once to store it.
+
+    A timeout degrades to ``None`` exactly like any other backend error, and is
+    explicitly NOT routed into the progressive-truncation retry: shrinking the
+    input does not un-hang a backend, and retrying would turn one stall into
+    four.
+
     Returns:
         A list of floats representing the embedding, or ``None`` only when the
         embedding backend fails at every attempted size.
     """
+    # The memo is keyed on the ORIGINAL input, not the truncated candidate: two
+    # callers passing the same content must collapse to one call regardless of
+    # which truncation path each would have taken (they take the same one).
+    memo_key = (_embed_model(), text_input)
+    memoized = _memo_get(memo_key)
+    if memoized is not None:
+        return memoized
+
     # First attempt: head-truncate to the char budget (unchanged behavior).
     if text_input and len(text_input) > MAX_EMBED_CHARS:
         logger.debug(
@@ -242,7 +462,23 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
 
     while True:
         try:
-            return await _aembedding_call(candidate)
+            vector = await _aembedding_call(candidate)
+            # Only successes are memoized. Memoizing a failure would pin a
+            # transient gateway blip to that content for the whole TTL, so a
+            # retry that would have worked returns None instead.
+            _memo_put(memo_key, vector)
+            return vector
+        except asyncio.TimeoutError:
+            # A stall is not an over-length rejection. Shrinking the input does
+            # not un-hang a backend, so this must NOT fall into the truncation
+            # retry below: that would turn one stall into four calls at an
+            # already-failing backend, and would silently store a TRUNCATED
+            # vector for full content if the stall cleared mid-retry.
+            logger.warning(
+                "embed_text: embedding timed out after %.2fs; returning None",
+                _embed_timeout_s(),
+            )
+            return None
         except (litellm.ContextWindowExceededError, litellm.BadRequestError):
             # Over-length-shaped rejection: shrinking the vector input can make
             # the SAME backend accept it, so retry with harder truncation rather
@@ -574,6 +810,9 @@ async def write_memory(
         A :class:`MemoryRecord` on success, or ``None`` if embedding
         generation fails.
     """
+    # Availability: return the pooled connection BEFORE awaiting the
+    # embedding. See :func:`release_connection` for the measurements.
+    release_connection(db_session)
     embedding = await embed_text(content)
     if embedding is None:
         return None
@@ -582,8 +821,16 @@ async def write_memory(
     now = datetime.now(timezone.utc)
     meta = metadata or {}
 
-    db_session.execute(
-        text("""
+    def _insert() -> None:
+        """The blocking half: one INSERT and a commit.
+
+        Extracted so it can be handed to ``anyio.to_thread.run_sync``. It
+        cannot simply be awaited off-loop in place because ``write_memory`` is
+        ``async def`` and ``to_thread`` takes a *sync* callable — the body has
+        to be a function before it can leave the event loop.
+        """
+        db_session.execute(
+            text("""
             INSERT INTO session_memories (
                 id, session_id, org_id, agent_id, execution_id,
                 memory_type, content, embedding, confidence,
@@ -598,26 +845,33 @@ async def write_memory(
                 :user_id, :provenance
             )
         """),
-        {
-            "id": str(memory_id),
-            "session_id": session_id,
-            "org_id": org_id,
-            "agent_id": agent_id,
-            "execution_id": execution_id,
-            "memory_type": memory_type,
-            "content": content,
-            "embedding": str(embedding),
-            "confidence": confidence,
-            "sequence_number": sequence_number,
-            "metadata": json.dumps(meta),
-            "created_at": now,
-            "updated_at": now,
-            "recall_hidden": recall_hidden,
-            "user_id": user_id,
-            "provenance": provenance,
-        },
-    )
-    db_session.commit()
+            {
+                "id": str(memory_id),
+                "session_id": session_id,
+                "org_id": org_id,
+                "agent_id": agent_id,
+                "execution_id": execution_id,
+                "memory_type": memory_type,
+                "content": content,
+                "embedding": str(embedding),
+                "confidence": confidence,
+                "sequence_number": sequence_number,
+                "metadata": json.dumps(meta),
+                "created_at": now,
+                "updated_at": now,
+                "recall_hidden": recall_hidden,
+                "user_id": user_id,
+                "provenance": provenance,
+            },
+        )
+        db_session.commit()
+
+    # Threading contract (``shared.projects``): psycopg2 is blocking, so it
+    # runs off the event loop. Inline, a single ``remember`` held the loop for
+    # every one of its statements and throughput plateaued at ~12 rps no matter
+    # how much concurrency was offered; offloaded, the same workload reached
+    # 126 rps with worst-case loop lag falling from 4092ms to 1.4ms.
+    await anyio.to_thread.run_sync(_insert)
 
     return MemoryRecord(
         id=memory_id,
@@ -677,6 +931,9 @@ async def retrieve_memories(
         A list of :class:`MemoryRecord` instances, or an empty list if
         embedding generation fails.
     """
+    # Availability: return the pooled connection BEFORE awaiting the
+    # embedding. See :func:`release_connection` for the measurements.
+    release_connection(db_session)
     embedding = await embed_text(query_text)
     if embedding is None:
         return []
@@ -804,6 +1061,9 @@ async def find_similar_memory(
     if scope == "private" and not user_id:
         raise ValueError("user_id is required when scope='private'")
 
+    # Availability: return the pooled connection BEFORE awaiting the
+    # embedding. See :func:`release_connection` for the measurements.
+    release_connection(db_session)
     embedding = await embed_text(content)
     if embedding is None:
         return None
@@ -852,8 +1112,15 @@ async def find_similar_memory(
             "embedding": embedding_str,
         }
 
-    result = db_session.execute(
-        text(f"""
+    def _nearest():
+        """The blocking half: one pgvector nearest-neighbour scan.
+
+        Extracted for ``anyio.to_thread.run_sync`` — see the note in
+        :func:`write_memory`. ``to_thread`` takes a sync callable, so the body
+        has to be a function before it can leave the event loop.
+        """
+        return db_session.execute(
+            text(f"""
             SELECT id, session_id, org_id, agent_id, execution_id,
                    memory_type, content, embedding, confidence,
                    sequence_number, scope, status, superseded_by,
@@ -864,10 +1131,12 @@ async def find_similar_memory(
             ORDER BY embedding <=> :embedding
             LIMIT 1
         """),
-        params,
-    )
+            params,
+        ).fetchone()
 
-    row = result.fetchone()
+    # Threading contract (``shared.projects``): a vector scan is blocking
+    # psycopg2 I/O and must not run on the event loop.
+    row = await anyio.to_thread.run_sync(_nearest)
     if row is None:
         return None
 
@@ -1298,6 +1567,9 @@ async def retrieve_memories_scoped(
     else:
         raise ValueError(f"unknown scope: {scope!r}")
 
+    # Availability: return the pooled connection BEFORE awaiting the
+    # embedding. See :func:`release_connection` for the measurements.
+    release_connection(db_session)
     embedding = await embed_text(query_text)
     if embedding is None:
         return []

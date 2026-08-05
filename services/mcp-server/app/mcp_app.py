@@ -321,13 +321,24 @@ async def _perform_write(
         # metering error, so a counter hiccup never blocks a real write. Pass the
         # account's ``plan_overrides`` so a custom cap is honored here exactly as
         # the retention sweep honors it.
+        #
+        # Every synchronous call in this body is blocking psycopg2 I/O and is
+        # therefore offloaded with ``anyio.to_thread.run_sync``, per the
+        # threading contract stated in ``shared/projects.py`` and honoured by
+        # ``app/capture.py`` at 14 sites. Inline, one ``remember`` held the
+        # event loop for each of its round trips and throughput plateaued at
+        # ~12 rps however much concurrency was offered — the loop, not the
+        # pool, was the first ceiling. Offloaded, the same workload reached
+        # 126 rps and worst-case loop lag fell from 4092 ms to 1.4 ms.
         try:
-            over_cap = check_memory_quota(
-                db,
-                org_id,
-                get_plan_config(plan, plan_overrides),
-                "memory",
-                plan_name=plan,
+            over_cap = await anyio.to_thread.run_sync(
+                lambda: check_memory_quota(
+                    db,
+                    org_id,
+                    get_plan_config(plan, plan_overrides),
+                    "memory",
+                    plan_name=plan,
+                )
             )
         except MemoryQuotaExceeded as exc:
             return {
@@ -339,7 +350,9 @@ async def _perform_write(
 
         # Best-effort project filing from the X-Vex-Project header (read-only
         # resolve; fail open to unfiled — filing is relevance, not security).
-        header_project_id = resolve_project_from_request(request, db, org_id=org_id)
+        header_project_id = await anyio.to_thread.run_sync(
+            lambda: resolve_project_from_request(request, db, org_id=org_id)
+        )
 
         # Resolve the optional space slug to a space_id (get-or-create, keyed on
         # (org_id, slug)). The org_id comes from the resolved principal — never
@@ -351,19 +364,23 @@ async def _perform_write(
         # None, backward compatible) rather than creating a stray empty-slug space.
         stripped_space = space.strip() if space is not None else ""
         space_id: Optional[str] = (
-            brain.ensure_space(
-                db, org_id=org_id, name=stripped_space, slug=stripped_space
+            await anyio.to_thread.run_sync(
+                lambda: brain.ensure_space(
+                    db, org_id=org_id, name=stripped_space, slug=stripped_space
+                )
             )
             if stripped_space
             else None
         )
 
-        effective_scope = _explicit_write_scope(
-            db,
-            requested_scope=scope,
-            org_id=org_id,
-            user_id=user_id,
-            project_id=header_project_id,
+        effective_scope = await anyio.to_thread.run_sync(
+            lambda: _explicit_write_scope(
+                db,
+                requested_scope=scope,
+                org_id=org_id,
+                user_id=user_id,
+                project_id=header_project_id,
+            )
         )
 
         result = await brain.write_scoped_memory(
@@ -382,7 +399,9 @@ async def _perform_write(
         # Only meter an actual insert: a deduplicated write stores no new row, so
         # it must not consume the org's monthly memory allowance.
         if result.get("stored"):
-            record_usage(db, org_id, "memory", over_cap=over_cap)
+            await anyio.to_thread.run_sync(
+                lambda: record_usage(db, org_id, "memory", over_cap=over_cap)
+            )
         return result
     except Exception:
         logger.exception("brain write failed (memory_type=%s)", memory_type)
@@ -1699,13 +1718,19 @@ async def _perform_recall(
         # ``over_cap`` flag; it fails OPEN on any metering error. Pass the
         # account's ``plan_overrides`` so a custom cap is honored here exactly as
         # the retention sweep honors it.
+        #
+        # Every synchronous call below is blocking psycopg2 I/O, offloaded per
+        # the threading contract in ``shared/projects.py``. See
+        # :func:`_perform_write` for the throughput measurements.
         try:
-            recall_over_cap = check_memory_quota(
-                db,
-                org_id,
-                get_plan_config(plan, plan_overrides),
-                "recall",
-                plan_name=plan,
+            recall_over_cap = await anyio.to_thread.run_sync(
+                lambda: check_memory_quota(
+                    db,
+                    org_id,
+                    get_plan_config(plan, plan_overrides),
+                    "recall",
+                    plan_name=plan,
+                )
             )
         except MemoryQuotaExceeded as exc:
             return {
@@ -1726,7 +1751,9 @@ async def _perform_recall(
         stripped_space = space.strip() if space is not None else ""
         space_id: Optional[str] = None
         if stripped_space:
-            space_id = brain.find_space_id(db, org_id=org_id, slug=stripped_space)
+            space_id = await anyio.to_thread.run_sync(
+                lambda: brain.find_space_id(db, org_id=org_id, slug=stripped_space)
+            )
             if space_id is None:
                 return {
                     "memories": [],
@@ -1739,7 +1766,9 @@ async def _perform_recall(
         # cross-project: no project filter at all.
         project_id: Optional[str] = None
         if project is not None and project.lower() != _PROJECT_ANY:
-            project_id = brain.find_project_id(db, org_id=org_id, identifier=project)
+            project_id = await anyio.to_thread.run_sync(
+                lambda: brain.find_project_id(db, org_id=org_id, identifier=project)
+            )
             if project_id is None:
                 return {
                     "memories": [],
@@ -1752,7 +1781,9 @@ async def _perform_recall(
         # (fail-open — an unresolvable header means org-wide, matching the
         # read-path philosophy; explicit args keep strict warn-and-empty).
         if project is None:
-            project_id = resolve_project_from_request(request, db, org_id=org_id)
+            project_id = await anyio.to_thread.run_sync(
+                lambda: resolve_project_from_request(request, db, org_id=org_id)
+            )
 
         # agent_id is always forwarded; retrieve_memories_scoped ignores it
         # unless scope == "agent".
@@ -1767,33 +1798,39 @@ async def _perform_recall(
             project_id=project_id,
             limit=min(max(limit, 1), 50),
         )
-        # Best-effort recall activity log. This tool body already does its DB I/O
-        # inline (no anyio), so call the helper directly; it swallows its own
-        # errors so a logging failure can never break the recall.
-        log_recall_event(
-            db,
-            org_id=org_id,
-            agent_id=agent_id,
-            project_id=project_id,
-            query_text=(query or None),
-            result_count=len(records),
-            source="mcp",
+        # Best-effort recall activity log; it swallows its own errors so a
+        # logging failure can never break the recall. Offloaded like every
+        # other statement in this body.
+        await anyio.to_thread.run_sync(
+            lambda: log_recall_event(
+                db,
+                org_id=org_id,
+                agent_id=agent_id,
+                project_id=project_id,
+                query_text=(query or None),
+                result_count=len(records),
+                source="mcp",
+            )
         )
         # Meter the recall against the org's monthly allowance (best-effort;
         # ``record_usage`` never raises). A successful recall always counts,
         # regardless of how many records it returned.
-        record_usage(db, org_id, "recall", over_cap=recall_over_cap)
+        await anyio.to_thread.run_sync(
+            lambda: record_usage(db, org_id, "recall", over_cap=recall_over_cap)
+        )
 
         # Resolve a human-readable project label once for the entire response.
         project_label: Optional[dict[str, Any]] = None
         if project_id is not None:
-            row = db.execute(
-                text(
-                    "SELECT display_name FROM projects "
-                    "WHERE id = :id AND org_id = :org_id"
-                ),
-                {"id": project_id, "org_id": org_id},
-            ).fetchone()
+            row = await anyio.to_thread.run_sync(
+                lambda: db.execute(
+                    text(
+                        "SELECT display_name FROM projects "
+                        "WHERE id = :id AND org_id = :org_id"
+                    ),
+                    {"id": project_id, "org_id": org_id},
+                ).fetchone()
+            )
             if row is not None:
                 project_label = {"id": project_id, "name": row.display_name}
         memories = [_serialize_record(r, project_label=project_label) for r in records]

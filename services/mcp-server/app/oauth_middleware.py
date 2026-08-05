@@ -24,6 +24,7 @@ from app import config
 from app.oauth import (
     DEFAULT_OAUTH_RPM,
     GrantResolver,
+    GrantStoreUnavailable,
     OAuthIdentity,
     OAuthPrincipal,
     OAuthRateLimiter,
@@ -172,7 +173,20 @@ class OAuthLadderMiddleware:
             if identity is None:
                 await _challenge()(scope, receive, send)
                 return
-            principal = await anyio.to_thread.run_sync(_resolve_grant, identity)
+            try:
+                principal = await anyio.to_thread.run_sync(_resolve_grant, identity)
+            except GrantStoreUnavailable:
+                # The grant store is down, not the grant missing. Same shape as
+                # the JWKS branch above: retryable, never the 403 that tells a
+                # correctly-connected user to re-authorize their workspace.
+                logger.warning("oauth: grant store unavailable; returning 503")
+                response = JSONResponse(
+                    status_code=503,
+                    content={"error": "grant_store_unavailable"},
+                    headers={"Retry-After": "5"},
+                )
+                await response(scope, receive, send)
+                return
             if principal is None:
                 response = JSONResponse(
                     status_code=403,
