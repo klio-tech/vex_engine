@@ -40,6 +40,7 @@ and a float add) and are never held across user code.
 
 from __future__ import annotations
 
+import functools
 import logging
 import threading
 import time
@@ -58,6 +59,7 @@ __all__ = [
     "REGISTRY",
     "record",
     "render",
+    "tracked",
     "reset_for_test",
 ]
 
@@ -512,6 +514,48 @@ def record(fn: "Callable[..., Any]", *args: Any, **kwargs: Any) -> None:
         fn(*args, **kwargs)
     except Exception:  # pragma: no cover - exercised via the call-site tests
         _logger.debug("instrumentation call failed; continuing", exc_info=True)
+
+
+def tracked(
+    counter: "Counter", histogram: "Histogram"
+) -> "Callable[[Callable[..., Any]], Callable[..., Any]]":
+    """Decorate an async function so each call is counted and timed by outcome.
+
+    A decorator rather than an inline ``with`` block because the functions this
+    wraps are long, and re-indenting a hundred-line body to add instrumentation
+    buries the change it is meant to make obvious.
+
+    Outcome is ``ok`` or ``error``. ``quota`` is deliberately NOT inferred here:
+    the quota check happens before these functions are reached, so a quota
+    rejection never enters this wrapper, and guessing at it from an exception
+    type would be a lie in the dashboard. Quota is counted at the call site
+    that actually raises it.
+
+    Both the count and the observation happen in a ``finally``. The latency of
+    a failure is still latency, and a histogram that quietly drops slow errors
+    is exactly the one that hides an incident.
+    """
+
+    def decorate(fn: "Callable[..., Any]") -> "Callable[..., Any]":
+        @functools.wraps(fn)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            started = time.monotonic()
+            outcome = "ok"
+            try:
+                return await fn(*args, **kwargs)
+            except BaseException:
+                outcome = "error"
+                raise
+            finally:
+                record(counter.inc, outcome=outcome)
+                record(histogram.observe, time.monotonic() - started, outcome=outcome)
+
+        #: Lets a test assert a given function is instrumented without calling
+        #: it — several of these need a live database to run at all.
+        wrapper._klio_tracked = counter.name  # type: ignore[attr-defined]
+        return wrapper
+
+    return decorate
 
 
 def reset_for_test() -> None:

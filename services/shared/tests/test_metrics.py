@@ -299,6 +299,7 @@ def test_metrics_module_has_no_third_party_imports():
             roots.add(node.module.split(".")[0])
     assert roots <= {
         "collections",
+        "functools",
         "logging",
         "contextlib",
         "dataclasses",

@@ -798,6 +798,7 @@ def _row_to_record(row: tuple) -> MemoryRecord:
     )
 
 
+@metrics.tracked(metrics.MEMORY_WRITES, metrics.MEMORY_WRITE_SECONDS)
 async def write_memory(
     db_session: Any,
     session_id: str,
@@ -930,6 +931,7 @@ async def write_memory(
     )
 
 
+@metrics.tracked(metrics.MEMORY_RECALLS, metrics.MEMORY_RECALL_SECONDS)
 async def retrieve_memories(
     db_session: Any,
     session_id: str,
@@ -1444,6 +1446,7 @@ def _expand_via_graph(
     return sorted(records + extra, key=_blended, reverse=True)
 
 
+@metrics.tracked(metrics.MEMORY_RECALLS, metrics.MEMORY_RECALL_SECONDS)
 async def retrieve_memories_scoped(
     db_session: Any,
     org_id: str,

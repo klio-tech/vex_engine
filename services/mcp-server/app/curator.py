@@ -100,13 +100,14 @@ Scheduling:
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, NamedTuple, Optional
 
 from sqlalchemy import text
 
-from shared import graph_store
+from shared import graph_store, metrics
 from shared.brain import write_scoped_memory
 from shared.env_config import parse_int
 from shared.memory import (
@@ -118,6 +119,61 @@ from shared.memory import (
 )
 
 logger = logging.getLogger("agentguard.mcp.curator")
+
+
+# ── instrumentation helpers ───────────────────────────────────────────
+#
+# The curator is a background loop with no caller to notice when it stops making
+# progress, and its characteristic failure is not an exception. It is a pass
+# that reads rows, distils none of them, and holds its cursor — forever, and
+# quietly. Two ratios make that legible: rows read against rows distilled, and
+# cursor advanced against cursor held.
+#
+# These wrappers exist so the call sites below stay one line each, and so a
+# metrics fault can never propagate into the loop: every one goes through
+# ``metrics.record``, which swallows.
+
+
+def record_tick(outcome: str, duration_s: float) -> None:
+    """Record one completed curator pass and how long it took."""
+    metrics.record(metrics.CURATOR_TICKS.inc, outcome=outcome)
+    metrics.record(metrics.CURATOR_TICK_SECONDS.observe, duration_s)
+
+
+def record_progress(rows_read: int, rows_distilled: int) -> None:
+    """Record what a pass read against what it actually distilled.
+
+    Two counters rather than one ratio: a ratio cannot distinguish "read
+    nothing" from "read plenty and distilled none", and only the second is a
+    defect.
+    """
+    metrics.record(metrics.CURATOR_ROWS_READ.inc, max(0, rows_read))
+    metrics.record(metrics.CURATOR_ROWS_DISTILLED.inc, max(0, rows_distilled))
+
+
+def record_cursor(advanced: bool) -> None:
+    """Record whether the pass moved its cursor or held it.
+
+    A cursor held on every pass for an hour, with ticks still running, is a
+    stalled curator — and it is invisible in any error rate.
+    """
+    metrics.record(
+        metrics.CURATOR_CURSOR.inc, action="advanced" if advanced else "held"
+    )
+
+
+def record_entity(created: bool) -> None:
+    """Record an entity as newly created or as a reference to an existing one."""
+    metrics.record(
+        metrics.CURATOR_ENTITIES.inc,
+        disposition="created" if created else "referenced",
+    )
+
+
+def record_budget_exhausted(budget: str) -> None:
+    """Record that a pass stopped early because ``budget`` ran out."""
+    metrics.record(metrics.CURATOR_BUDGET_EXHAUSTED.inc, budget=budget)
+
 
 # RAW input memory types the curator reads. Deliberately EXCLUDES the curator's
 # own outputs ('summary'/'fact') so a tick cannot reprocess what it produced,
@@ -405,6 +461,7 @@ def _store_graph(
         if not norm or norm in entity_ids:
             continue
         if entity_budget.remaining <= 0:
+            record_budget_exhausted("entity")
             logger.warning(
                 "curator: per-tick entity cap reached for org %s; dropping %r "
                 "(and any further entities this tick)",
@@ -426,6 +483,7 @@ def _store_graph(
             # 20 of its 12 — and the `break` below then dropped not just the
             # remaining entities but every edge that pointed at one, with the
             # cursor already advanced past the rows they came from.
+            record_entity(created=bool(upsert.inserted))
             if upsert.inserted:
                 entity_budget.remaining -= 1
         except graph_store.EntityRefused as exc:
@@ -859,6 +917,11 @@ async def _synthesize_and_store(
         if new_id:
             stored += 1
             fact_row_ids[fact_idx] = new_id
+            if reconcile.remaining <= 0:
+                # Reconciliation skipped because the budget ran out. Previously
+                # silent: the fact is stored without ever being checked against
+                # what it might supersede, and nothing said so.
+                record_budget_exhausted("reconcile")
             if reconcile.remaining > 0:
                 fact_embedding = await embed_text(fact)
                 if fact_embedding is not None:
@@ -1014,6 +1077,8 @@ async def curator_tick(
         # Nothing (or too little) new: record the run without moving the cursor
         # so the next tick reconsiders the same rows once enough accumulate.
         _touch_last_run(db_session, org_id, user_id)
+        record_progress(rows_read=len(rows), rows_distilled=0)
+        record_cursor(advanced=False)
         return {
             "synthesized": 0,
             "processed": len(rows),
@@ -1080,6 +1145,8 @@ async def curator_tick(
         # Nothing before the first held row: leave BOTH cursor halves alone and
         # bump last_run_at only, exactly as the below-threshold path does.
         _touch_last_run(db_session, org_id, user_id)
+        record_progress(rows_read=len(rows), rows_distilled=0)
+        record_cursor(advanced=False)
         return {
             "synthesized": synthesized,
             "processed": 0,
@@ -1091,6 +1158,11 @@ async def curator_tick(
     # carries the composite max of the prefix the tick actually covered.
     last = rows[stop - 1]
     _advance_cursor(db_session, org_id, user_id, last.created_at, last.id, stop)
+
+    # ``stop`` is the prefix the tick actually covered; ``len(rows) - stop`` is
+    # what it read and left behind. The gap is the skip rate.
+    record_progress(rows_read=len(rows), rows_distilled=stop)
+    record_cursor(advanced=True)
 
     return {
         "synthesized": synthesized,
@@ -1178,6 +1250,7 @@ async def run_curator_once(
     synthesized_total = 0
     for org_id, user_id in pairs:
         session = session_factory()
+        tick_started = time.monotonic()
         try:
             result = await curator_tick(
                 session,
@@ -1187,7 +1260,9 @@ async def run_curator_once(
                 min_inputs=min_inputs,
             )
             synthesized_total += int(result.get("synthesized", 0))
+            record_tick("ok", time.monotonic() - tick_started)
         except Exception:
+            record_tick("error", time.monotonic() - tick_started)
             logger.warning(
                 "curator: tick failed for org %s user %s; continuing",
                 org_id,
