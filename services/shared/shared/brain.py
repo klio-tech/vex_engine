@@ -25,6 +25,47 @@ from shared.redaction import redact
 
 logger = logging.getLogger("agentguard.shared.brain")
 
+REDACTED_METADATA_KEYS = frozenset({"rationale"})
+"""Metadata keys whose values are prose and must be screened for secrets.
+
+An explicit set rather than "screen everything", because most metadata is
+structural — checksums, storage URIs, ids, counts — and those are high-entropy
+by construction. Running them through the entropy gate would corrupt real data
+to fix a leak that only free text can carry, which is a worse trade than the
+bug. A new prose-bearing field opts in here.
+"""
+
+
+def screen_metadata(
+    metadata: dict | None,
+) -> tuple[dict | None, list[str]]:
+    """Redact the prose-bearing values in *metadata*.
+
+    Returns a new dict (the caller's is never mutated) and the sorted kinds
+    that were found, so they can join the row's ``redactions`` record.
+
+    Exceptions are deliberately NOT caught here. The caller treats a redactor
+    failure as a rejected write — unscreened text is never stored — and
+    swallowing it at this level would silently reopen exactly that hole.
+    """
+    if not metadata:
+        return metadata, []
+
+    cleaned = dict(metadata)
+    kinds: set[str] = set()
+    for key in REDACTED_METADATA_KEYS:
+        value = cleaned.get(key)
+        if not isinstance(value, str):
+            # Not prose. The redactor takes text, and a non-string here is a
+            # structural value that must survive untouched.
+            continue
+        result = redact(value)
+        if result.redacted:
+            cleaned[key] = result.clean_text
+            kinds.update(f.kind for f in result.findings)
+
+    return cleaned, sorted(kinds)
+
 
 def ensure_space(
     db_session: Any,
@@ -696,12 +737,20 @@ async def write_scoped_memory(
     if os.environ.get("MEMORY_REDACTION_DISABLED") != "1":
         try:
             redaction = redact(content)
+            # Prose carried in metadata is screened too. `decide` files its
+            # caller-supplied rationale there, and that field went to storage
+            # unscreened — a secret pasted into a rationale was readable in the
+            # clear and fed to the curator's LLM as synthesis fuel.
+            metadata, metadata_kinds = screen_metadata(metadata)
         except Exception:
             logger.exception("redaction failed; rejecting write (fail closed)")
             return {"stored": False, "error": "redaction_failed"}
-        if redaction.redacted:
-            content = redaction.clean_text
-            redaction_kinds = sorted({f.kind for f in redaction.findings})
+        if redaction.redacted or metadata_kinds:
+            if redaction.redacted:
+                content = redaction.clean_text
+            redaction_kinds = sorted(
+                {f.kind for f in redaction.findings} | set(metadata_kinds)
+            )
             was_redacted = True
             metadata = dict(metadata or {})
             metadata["redactions"] = redaction_kinds
