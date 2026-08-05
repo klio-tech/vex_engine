@@ -22,10 +22,26 @@ from shared.memory import (
 )
 from shared.memory_config import is_memory_enabled
 from shared.models import IngestEvent
+from shared.redaction import redact
 
 logger = logging.getLogger("agentguard.async-worker")
 
 VERIFIED_STREAM_KEY = "executions.verified"
+
+#: Cap on any single caller-supplied field forwarded into an LLM prompt.
+#: ``event.output``/``task``/``input`` are unbounded on the wire, and the
+#: fact-extraction prompt interpolates them verbatim.
+MAX_PROMPT_INPUT_CHARS = 20_000
+
+
+def _bound_prompt_input(value: Any) -> Any:
+    """Truncate a caller-supplied value before it is interpolated into a prompt."""
+    if value is None:
+        return None
+    as_text = value if isinstance(value, str) else json.dumps(value, default=str)
+    if len(as_text) <= MAX_PROMPT_INPUT_CHARS:
+        return value
+    return as_text[:MAX_PROMPT_INPUT_CHARS] + "…[truncated]"
 
 
 def _get_db_session():
@@ -95,15 +111,37 @@ async def process_event(event: IngestEvent) -> dict[str, Any]:
             try:
                 org_id_val = org_id
                 facts = await extract_facts(
-                    output=event.output,
-                    task=event.task,
-                    input_data=event.input,
+                    output=_bound_prompt_input(event.output),
+                    task=_bound_prompt_input(event.task),
+                    input_data=_bound_prompt_input(event.input),
                 )
                 if facts:
                     db_session = _get_db_session()
                     try:
-                        for fact in facts:
-                            # Dedup: check if a similar fact already exists
+                        for raw_fact in facts:
+                            # This path calls write_memory directly, so it does
+                            # NOT go through brain.write_scoped_memory — the
+                            # only other place the redactor runs. An extracted
+                            # fact routinely quotes the transcript back, so a
+                            # credential in the transcript lands here verbatim
+                            # and is then embedded.
+                            redaction = redact(raw_fact)
+                            fact = redaction.clean_text
+                            if redaction.redacted:
+                                logger.info(
+                                    "Redacted %d secret(s) from extracted fact for %s",
+                                    len(redaction.findings),
+                                    event.execution_id,
+                                    extra={
+                                        "execution_id": event.execution_id,
+                                        "redaction_kinds": sorted(
+                                            {f.kind for f in redaction.findings}
+                                        ),
+                                    },
+                                )
+                            # Dedup: check if a similar fact already exists.
+                            # Uses the redacted text so the dedup vector cannot
+                            # be built from the raw secret either.
                             existing = await find_similar_memory(
                                 db_session=db_session,
                                 session_id=event.session_id,
