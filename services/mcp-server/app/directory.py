@@ -34,6 +34,7 @@ import os
 import threading
 from typing import Any, Optional
 
+from shared.engine_bounds import engine_bounds
 from sqlalchemy import create_engine, text
 
 from app.config import DATABASE_URL
@@ -53,13 +54,23 @@ def _engines() -> tuple[Optional[Any], Optional[Any]]:
     if not SUPABASE_DATABASE_URL:
         return None, None
     with _engine_lock:
+        # Bounded via shared.engine_bounds: these are long-lived and on the
+        # request path, so an unreachable host must fail rather than hang.
         if _supabase_engine is None:
             _supabase_engine = create_engine(
-                SUPABASE_DATABASE_URL, pool_pre_ping=True, pool_size=2, max_overflow=2
+                SUPABASE_DATABASE_URL,
+                pool_pre_ping=True,
+                pool_size=2,
+                max_overflow=2,
+                **engine_bounds(),
             )
         if _tsdb_engine is None:
             _tsdb_engine = create_engine(
-                DATABASE_URL, pool_pre_ping=True, pool_size=2, max_overflow=2
+                DATABASE_URL,
+                pool_pre_ping=True,
+                pool_size=2,
+                max_overflow=2,
+                **engine_bounds(),
             )
     return _supabase_engine, _tsdb_engine
 

@@ -28,6 +28,7 @@ from threading import Lock
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
+from shared.engine_bounds import engine_bounds
 from shared.plan_limits import PlanConfig, get_plan_config
 
 logger = logging.getLogger("agentguard.auth")
@@ -197,11 +198,16 @@ class KeyValidator:
                 f"Invalid scope {required_scope!r}; must be one of {VALID_SCOPES}"
             )
 
+        # Both engines are on the request path, so an unreachable database used
+        # to present as a hung request rather than an error: `pool_pre_ping`
+        # detects a dead connection but does not bound how long opening one may
+        # take. See :mod:`shared.engine_bounds`.
         self._engine: Engine = create_engine(
             database_url,
             pool_size=2,
             max_overflow=3,
             pool_pre_ping=True,
+            **engine_bounds(),
         )
         self._supabase_engine: Engine | None = None
         if supabase_database_url:
@@ -210,6 +216,7 @@ class KeyValidator:
                 pool_size=1,
                 max_overflow=2,
                 pool_pre_ping=True,
+                **engine_bounds(),
             )
         self._required_scope = required_scope
         self._cache_ttl_s = cache_ttl_s

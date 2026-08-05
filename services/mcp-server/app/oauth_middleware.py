@@ -71,13 +71,21 @@ def _get_resolver() -> GrantResolver:
     if _resolver is None:
         import os
 
+        from shared.engine_bounds import engine_bounds
         from sqlalchemy import create_engine
 
+        # Grant resolution runs on every Bearer request. Unbounded, a database
+        # outage here surfaced as a 30 s queue and then a 403 telling a
+        # correctly-connected user to re-authorize.
         _resolver = GrantResolver(
             supabase_engine=create_engine(
-                os.environ["SUPABASE_DATABASE_URL"], pool_pre_ping=True
+                os.environ["SUPABASE_DATABASE_URL"],
+                pool_pre_ping=True,
+                **engine_bounds(),
             ),
-            tsdb_engine=create_engine(config.DATABASE_URL, pool_pre_ping=True),
+            tsdb_engine=create_engine(
+                config.DATABASE_URL, pool_pre_ping=True, **engine_bounds()
+            ),
         )
     return _resolver
 

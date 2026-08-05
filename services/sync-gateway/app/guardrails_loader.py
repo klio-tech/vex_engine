@@ -9,6 +9,7 @@ import logging
 import os
 
 from engine.models import GuardrailRule
+from shared.engine_bounds import engine_bounds
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -26,7 +27,9 @@ _SessionLocal = None
 def _get_session() -> Session:
     global _engine, _SessionLocal
     if _engine is None:
-        _engine = create_engine(DATABASE_URL, pool_size=2, pool_pre_ping=True)
+        _engine = create_engine(
+            DATABASE_URL, pool_size=2, pool_pre_ping=True, **engine_bounds()
+        )
         _SessionLocal = sessionmaker(bind=_engine)
     return _SessionLocal()
 
