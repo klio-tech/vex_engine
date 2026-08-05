@@ -571,6 +571,14 @@ def entity_brief(
     different briefs, which is the feature. Contributors are a COUNT — the
     number of distinct attributed authors across the visible slice — never a
     list of ids or names.
+
+    Bounded to the caller's NEWEST :data:`_BRIEF_EVIDENCE_LIMIT` visible
+    memories, reordered oldest-first for presentation, with ``truncated``
+    saying whether the bound bit. The window used to run the other way
+    (``ORDER BY created_at ASC``), so past the fiftieth memory the brief
+    described the entity as it was fifty memories ago and every derived field
+    — decisions, supersessions, contributors, provenance — described that same
+    frozen slice while reading as current. Nothing said it had been capped.
     """
     norm = normalize_entity_name(entity)
     if not norm:
@@ -613,14 +621,17 @@ def entity_brief(
               AND m.status = 'active'
               AND m.recall_hidden = FALSE
               AND {ladder_sql}
-            ORDER BY m.created_at ASC
+            ORDER BY m.created_at DESC, m.id DESC
             LIMIT :limit
             """
         ),
         {
             "org_id": org_id,
             "entity_ids": entity_ids,
-            "limit": _BRIEF_EVIDENCE_LIMIT,
+            # One more than the bound, so truncation is detected exactly
+            # rather than inferred from a count that a full-but-complete
+            # entity would produce identically.
+            "limit": _BRIEF_EVIDENCE_LIMIT + 1,
             **ladder_params,
         },
     ).fetchall()
@@ -628,7 +639,14 @@ def entity_brief(
     if not evidence_rows:
         return None  # not_found — same answer as "no such entity"
 
-    memories = [_row_to_record(row) for row in evidence_rows]
+    truncated = len(evidence_rows) > _BRIEF_EVIDENCE_LIMIT
+    evidence_rows = evidence_rows[:_BRIEF_EVIDENCE_LIMIT]
+
+    # Selected newest-first, presented oldest-first. Two separate concerns:
+    # the WINDOW must track the entity as it is now, and the NARRATIVE must
+    # read forwards — the brief is a chronology and the LLM summary is built
+    # from it in order.
+    memories = [_row_to_record(row) for row in reversed(evidence_rows)]
     evidence_ids = [str(m.id) for m in memories]
 
     # Which entity row does the visible evidence actually support? (A name
@@ -723,6 +741,12 @@ def entity_brief(
         "kind": kind,
         "memories": memories,
         "evidence_count": len(memories),
+        # True when the entity has more visible evidence than the brief
+        # carries. Every derived field below — decisions, superseded,
+        # contributors, provenance — is computed from the selected slice, so
+        # without this a caller cannot tell "these are the entity's three
+        # contributors" from "these are three of them".
+        "truncated": truncated,
         "decisions": decisions,
         "superseded": superseded,
         "contributors": contributors,

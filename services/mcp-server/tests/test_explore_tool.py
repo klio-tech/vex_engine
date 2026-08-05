@@ -61,12 +61,25 @@ def _record(*, content, user_id=None, memory_type="fact", provenance="EXTRACTED"
     )
 
 
-def _brief(*, memories, contributors, decisions=None, superseded=None, provenance=None):
+def _brief(
+    *,
+    memories,
+    contributors,
+    decisions=None,
+    superseded=None,
+    provenance=None,
+    truncated=False,
+):
     return {
         "entity": "pricing",
         "kind": "concept",
         "memories": memories,
         "evidence_count": len(memories),
+        # entity_brief bounds its evidence to the newest N and reports whether
+        # the bound bit. The tool forwards it verbatim: a client cannot infer
+        # it, because a capped brief and a complete one of exactly N carry the
+        # same evidence_count.
+        "truncated": truncated,
         "decisions": decisions or [],
         "superseded": superseded or [],
         "contributors": contributors,
@@ -204,6 +217,34 @@ async def test_contributors_without_the_caller_is_teammates_only():
     with p1, p2, p3, p4, p5:
         result = await _explore_fn()(_fake_ctx(), entity="pricing")
     assert result["contributors"] == ["1 teammate"]
+
+
+async def test_truncation_is_forwarded_to_the_caller():
+    """A capped brief must say so; the client cannot work it out otherwise.
+
+    The store bounds evidence to the newest N. Every count in the payload —
+    contributors, provenance, decisions — is then computed over that window,
+    and evidence_count is identical for a capped entity and a complete one of
+    exactly N. So the flag has to travel, in both states.
+    """
+    memories = [_record(content="a", user_id=PRIYA)]
+
+    p1, p2, p3, p4, p5 = _patched(
+        _brief(memories=memories, contributors=1, truncated=True)
+    )
+    with p1, p2, p3, p4, p5:
+        capped = await _explore_fn()(_fake_ctx(), entity="pricing")
+
+    p1, p2, p3, p4, p5 = _patched(
+        _brief(memories=memories, contributors=1, truncated=False)
+    )
+    with p1, p2, p3, p4, p5:
+        whole = await _explore_fn()(_fake_ctx(), entity="pricing")
+
+    assert capped["truncated"] is True
+    assert whole["truncated"] is False, (
+        "positive control: the field is forwarded, not hardcoded"
+    )
 
 
 async def test_llm_failure_degrades_to_a_summaryless_brief():
