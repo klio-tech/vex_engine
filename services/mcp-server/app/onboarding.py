@@ -45,10 +45,18 @@ from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from sqlalchemy import text
 
-from app.auth import resolve_principal_plan
 from app.curator import RAW_MEMORY_TYPES
 from app.db import SessionLocal
-from app.identity import resolve_request_user_id
+
+# Both halves of the caller's identity come from ``app.identity``, never one
+# from here and one from ``app.auth``. ``app.identity.request_key_info``
+# memoizes the validated KeyInfo on ``request.state``, and only the identity
+# module's ``resolve_principal_plan`` writes that memo. Pairing ``app.auth``'s
+# copy with ``resolve_request_user_id`` left the memo empty, so ``init``
+# validated the key twice per request — two rate-limit tokens for one call, and
+# on the token that trips it is the SECOND call that raises, the one deciding
+# whether this request has a person behind it.
+from app.identity import resolve_principal_plan, resolve_request_user_id
 
 logger = logging.getLogger("agentguard.mcp.init")
 

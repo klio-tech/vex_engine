@@ -100,6 +100,7 @@ from sqlalchemy import text
 
 from shared import graph_store
 from shared.brain import write_scoped_memory
+from shared.env_config import parse_int
 from shared.memory import (
     _NO_CREDENTIALS_RULE,
     call_llm,
@@ -151,8 +152,23 @@ def _entity_cap() -> int:
 
     Overflow is logged and dropped, never stored: a single runaway extraction
     must not be able to hairball the org's graph in one tick.
+
+    Parsed through :func:`shared.env_config.parse_int` rather than a bare
+    ``int()``. This function runs inside every tick, and both failure modes of
+    the bare call are silent from where an operator would look: a typo raised
+    ``ValueError`` into ``run_curator_once``'s per-pair handler, which logs
+    "tick failed" and moves on — curation off for every user, no mention of the
+    variable — and a negative value was accepted, making
+    ``remaining <= 0`` true on the first entity of every tick so entities and
+    all their edges were dropped in silence. ``minimum=1`` is what closes the
+    second: a cap below one is an off switch, not a cap.
     """
-    return int(os.environ.get("CURATOR_ENTITY_CAP", "12"))
+    return parse_int(
+        os.environ.get("CURATOR_ENTITY_CAP"),
+        default=12,
+        name="CURATOR_ENTITY_CAP",
+        minimum=1,
+    )
 
 
 @dataclass
@@ -176,8 +192,18 @@ def _reconcile_budget() -> int:
     every :func:`reconcile_fact` call and decrements by ``judged`` (the number of
     attempts actually made), the total ``call_llm`` invocations for the tick is
     bounded by this value — not merely accounted after the fact.
+
+    Guarded exactly as :func:`_entity_cap` is, and for the same two reasons: a
+    malformed value must not raise into a tick, and a value below 1 disables
+    reconciliation altogether — stale contradicted facts then survive forever
+    with nothing logged.
     """
-    return int(os.environ.get("CURATOR_RECONCILE_MAX", "50"))
+    return parse_int(
+        os.environ.get("CURATOR_RECONCILE_MAX"),
+        default=50,
+        name="CURATOR_RECONCILE_MAX",
+        minimum=1,
+    )
 
 
 async def extract_graph(combined: str) -> dict[str, Any]:

@@ -164,3 +164,60 @@ def test_each_request_is_validated_on_its_own():
         "two separate requests must each be validated; a shared cache would "
         "let a revoked key ride on another request's result"
     )
+
+
+# ---------------------------------------------------------------------------
+# The same contract, through ``onboarding``'s own bound names
+# ---------------------------------------------------------------------------
+#
+# ``mcp_app`` is not the only module with tool bodies. ``app.onboarding``
+# resolves the caller with exactly the same two calls, and it kept importing
+# ``resolve_principal_plan`` from ``app.auth`` — the un-memoized copy — while
+# taking ``resolve_request_user_id`` from ``app.identity``. That pairing is
+# precisely the shape the memoization exists to remove: the auth-module
+# principal never writes the memo, so the identity call finds nothing cached
+# and validates a second time. ``init`` therefore still spent two tokens per
+# request, and on the token that trips it is the SECOND call that raises —
+# the one that decides whether the caller is a person or nobody.
+#
+# Spelled as ``onboarding``'s bound names for the same reason the block above
+# is spelled as ``mcp_app``'s: the test follows the import, so re-pointing it
+# at the un-memoized module fails here rather than in production.
+
+
+def _init_tool_call(request):
+    """Exactly what ``perform_init`` does to resolve its caller."""
+    from app import onboarding
+
+    principal = onboarding.resolve_principal_plan(request)
+    user_id = onboarding.resolve_request_user_id(request)
+    return principal, user_id
+
+
+def test_init_validates_the_key_once():
+    validator = _CountingValidator()
+    request = _request()
+
+    with patch("app.auth.get_validator", return_value=validator):
+        (org_id, agent_id, plan, _overrides), user_id = _init_tool_call(request)
+
+    assert validator.calls == 1, (
+        f"init validated the key {validator.calls} times for one request; "
+        "app.onboarding must import resolve_principal_plan from app.identity "
+        "so both questions share one validation"
+    )
+    # Positive control: one validation still answers both questions correctly.
+    assert (org_id, agent_id, plan) == ("acme", "agent-1", "free")
+    assert user_id == USER
+
+
+def test_init_is_not_rate_limited_at_half_the_configured_rpm():
+    """Two init calls must fit under a limit of two. They used to spend four."""
+    validator = _CountingValidator(rate_limit_rpm=2)
+
+    with patch("app.auth.get_validator", return_value=validator):
+        for i in range(2):
+            _, user_id = _init_tool_call(_request())
+            assert user_id == USER, f"init call {i + 1} lost its identity"
+
+    assert validator.calls == 2
