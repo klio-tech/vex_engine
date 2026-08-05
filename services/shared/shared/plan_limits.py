@@ -11,8 +11,11 @@ site at Dashboard/apps/landing/lib/pricing.ts — keep the two in sync.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, fields, replace
 from typing import Any
+
+logger = logging.getLogger("agentguard.shared.plan_limits")
 
 
 @dataclass(frozen=True)
@@ -250,17 +253,123 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
 }
 
 
-def get_plan_config(plan: str, overrides: dict[str, Any] | None = None) -> PlanConfig:
+#: Type-name -> type. ``from __future__ import annotations`` makes every
+#: ``dataclasses.Field.type`` a *string*, so the declared annotation is
+#: resolved through this table rather than by evaluating it.
+_TYPE_NAMES: dict[str, type] = {
+    "int": int,
+    "bool": bool,
+    "float": float,
+    "str": str,
+}
+
+
+def _declared_type(annotation: Any) -> type:
+    """Resolve a dataclass field annotation to a concrete type."""
+    if isinstance(annotation, type):
+        return annotation
+    return _TYPE_NAMES.get(str(annotation), object)
+
+
+#: Field name -> declared type, resolved once at import. ``PlanConfig`` is
+#: frozen and never gains fields at runtime, so this is a constant.
+_PLAN_FIELD_TYPES: dict[str, type] = {
+    f.name: _declared_type(f.type) for f in fields(PlanConfig)
+}
+
+
+def _coerce_override(name: str, value: Any) -> Any:
+    """Return *value* typed for field *name*, or raise ``ValueError``.
+
+    ``vex_plan_overrides`` is an operator-editable JSON column, so every value
+    arriving here is untrusted input at a system boundary. Two coercions are
+    real and safe; everything else is a typo and must be refused:
+
+    * ``int`` -> ``float`` for a declared float field (JSON has one number
+      type, so ``3`` for a float field is the operator writing 3.0);
+    * nothing else. In particular ``bool`` is NOT accepted for an ``int``
+      field even though ``bool`` subclasses ``int`` — ``True`` in
+      ``memories_per_month`` means a quota of 1, which is not what anybody
+      typed — and ``int`` is not accepted for a ``bool`` field.
+
+    Strings are never parsed. ``"1000"`` for ``max_rpm`` is what produced the
+    original outage, and silently coercing it would mean the column's type
+    discipline lives nowhere at all.
+    """
+    expected = _PLAN_FIELD_TYPES.get(name)
+    if expected is None:
+        raise ValueError(f"unknown field {name!r}")
+
+    if expected is bool:
+        if isinstance(value, bool):
+            return value
+        raise ValueError(f"{name} expects bool, got {type(value).__name__}")
+
+    if expected is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{name} expects int, got {type(value).__name__}")
+        return value
+
+    if expected is float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{name} expects float, got {type(value).__name__}")
+        return float(value)
+
+    if isinstance(value, expected):
+        return value
+    raise ValueError(f"{name} expects {expected.__name__}, got {type(value).__name__}")
+
+
+def get_plan_config(plan: str, overrides: Any = None) -> PlanConfig:
     """Return the PlanConfig for the given plan name.
 
     Falls back to ``"free"`` for unknown plan values.
     If *overrides* is provided (from ``accounts.vex_plan_overrides``),
-    those values are merged on top of the plan defaults.
+    the values that are **known fields of the correct type** are merged on top
+    of the plan defaults.
+
+    Degradation, not failure. This function sits on the hot path of every
+    authenticated request — ``verify_api_key`` calls it, and so does the OAuth
+    middleware — and neither caller guards against anything but ``AuthError``.
+    Before this filtering, one malformed key in one account's JSON blob raised
+    ``TypeError`` out of *every* request for that tenant, and because the
+    failure happened before the plan cache was populated it repeated
+    identically forever rather than self-healing. An override that cannot be
+    applied is therefore dropped with a WARNING naming the field, and the
+    caller gets a usable config built from the plan defaults plus whatever
+    survived. Never a tenant-wide failure over a config typo.
+
+    A non-mapping blob (a JSON list or string in the column) is ignored whole,
+    for the same reason.
     """
     base = PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
     if not overrides:
         return base
-    from dataclasses import asdict
 
-    merged = {**asdict(base), **{k: v for k, v in overrides.items() if v is not None}}
-    return PlanConfig(**merged)
+    if not isinstance(overrides, dict):
+        logger.warning(
+            "plan override for plan=%s is %s, not an object; ignoring it entirely",
+            plan,
+            type(overrides).__name__,
+        )
+        return base
+
+    accepted: dict[str, Any] = {}
+    for key, value in overrides.items():
+        # ``None`` has always meant "not set", not "set to null"; keep that.
+        if value is None:
+            continue
+        try:
+            accepted[key] = _coerce_override(key, value)
+        except ValueError as exc:
+            logger.warning(
+                "ignoring plan override %s=%r for plan=%s: %s",
+                key,
+                value,
+                plan,
+                exc,
+            )
+
+    if not accepted:
+        return base
+    return replace(base, **accepted)
