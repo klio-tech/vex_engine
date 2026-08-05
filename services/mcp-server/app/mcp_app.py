@@ -71,8 +71,6 @@ from sqlalchemy.exc import IntegrityError
 
 from app.auth import (
     PROJECT_HEADER,
-    resolve_principal,
-    resolve_principal_plan,
     resolve_project_from_request,
 )
 from app.config import (
@@ -89,7 +87,16 @@ from app.compression_cache import (
     store_original,
 )
 from app import onboarding
-from app.identity import resolve_request_user_id
+
+# All three from app.identity, not app.auth: every resolution in a request
+# shares ONE key validation, so a tool call spends one rate-limit token rather
+# than two. Fronting only some of them would leave the double count in place on
+# whichever tools used the others. See app.identity's module docstring.
+from app.identity import (
+    resolve_principal,
+    resolve_principal_plan,
+    resolve_request_user_id,
+)
 from app.recall_log import log_recall_event
 from app.session import brain_session_id
 

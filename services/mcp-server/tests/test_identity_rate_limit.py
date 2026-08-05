@@ -1,0 +1,166 @@
+"""One key validation per request, and a 429 that stays a 429.
+
+A key-path MCP tool body resolves the caller twice: once for the tenant
+principal (``resolve_principal_plan``) and once for the human
+(``resolve_request_user_id``). Both used to reach ``verify_api_key``
+independently, and ``KeyValidator.validate`` appends to the sliding-window
+rate counter on EVERY call — the entry cache short-circuits the database
+lookup, not the limiter. So each tool call spent two tokens and the effective
+rate limit was half the configured number.
+
+That is a billing-shaped bug with a visibility-shaped consequence. The second
+validation is the one that trips, and its ``429`` was swallowed into
+``user_id = None``. ``None`` is a legal identity — it means "cannot be
+attributed" — so the write proceeded, and a memory the caller asked to file
+into their project landed at ``org`` scope instead: readable by the whole
+tenant, with nothing in the response saying the caller was rate limited or
+that the scope had been widened.
+
+Both halves are tested here because fixing either alone is wrong. Re-raising
+the 429 without removing the second call makes rate limiting twice as strict
+as configured; removing the double call without re-raising leaves the
+swallowing in place for every other path that resolves an identity.
+
+The sequence under test is spelled as ``mcp_app``'s own bound names, so it
+follows the tool bodies wherever those names are imported from.
+"""
+
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import pytest
+from fastapi import HTTPException
+from shared.auth import AuthError, KeyInfo
+
+from app import mcp_app
+
+USER = "11111111-2222-3333-4444-555555555555"
+
+
+def _request(key: str = "vex_live_abc", agent: str = "agent-1"):
+    """A key-path request. No OAuth principal, so the key ladder is used."""
+    headers = {"X-Vex-Key": key, "X-Vex-Agent": agent}
+    return SimpleNamespace(
+        headers=SimpleNamespace(get=lambda k, default=None: headers.get(k, default)),
+        state=SimpleNamespace(),
+    )
+
+
+class _CountingValidator:
+    """Mimics ``KeyValidator``: every ``validate`` spends a rate-limit token."""
+
+    def __init__(self, rate_limit_rpm: int = 60, user_id: str | None = USER):
+        self.calls = 0
+        self.rate_limit_rpm = rate_limit_rpm
+        self._user_id = user_id
+
+    def validate(self, api_key, agent_id=None):
+        self.calls += 1
+        if self.calls > self.rate_limit_rpm:
+            raise AuthError(429, "Rate limit exceeded", retry_after_seconds=30)
+        return KeyInfo(
+            org_id="acme",
+            key_id="k1",
+            scopes=["memory"],
+            plan="free",
+            user_id=self._user_id,
+        )
+
+
+def _tool_call(request):
+    """Exactly what a key-path MCP tool body does to resolve its caller."""
+    principal = mcp_app.resolve_principal_plan(request)
+    user_id = mcp_app.resolve_request_user_id(request)
+    return principal, user_id
+
+
+def test_one_tool_call_validates_the_key_once():
+    validator = _CountingValidator()
+    request = _request()
+
+    with patch("app.auth.get_validator", return_value=validator):
+        (org_id, agent_id, plan, _overrides), user_id = _tool_call(request)
+
+    assert validator.calls == 1, (
+        f"the key was validated {validator.calls} times for one tool call; "
+        "every validation spends a rate-limit token, so N validations make the "
+        "effective limit rpm/N"
+    )
+    # Positive control: one validation still answers both questions correctly.
+    assert (org_id, agent_id, plan) == ("acme", "agent-1", "free")
+    assert user_id == USER
+
+
+def test_the_configured_rate_limit_is_the_effective_rate_limit():
+    """Two tool calls must fit under a limit of two. They used to spend four."""
+    validator = _CountingValidator(rate_limit_rpm=2)
+
+    with patch("app.auth.get_validator", return_value=validator):
+        for i in range(2):
+            _, user_id = _tool_call(_request())
+            assert user_id == USER, f"call {i + 1} lost the caller's identity"
+
+    assert validator.calls == 2, (
+        f"two tool calls spent {validator.calls} of the 2 rpm allowance"
+    )
+
+
+def test_a_rate_limited_request_raises_rather_than_becoming_anonymous():
+    """A 429 must surface as a 429, never as a silent widening to org scope."""
+    validator = _CountingValidator(rate_limit_rpm=0)
+    request = _request()
+
+    with patch("app.auth.get_validator", return_value=validator):
+        with pytest.raises(HTTPException) as excinfo:
+            mcp_app.resolve_request_user_id(request)
+
+    assert excinfo.value.status_code == 429, (
+        "the rate-limit refusal was converted into an unattributed caller, "
+        "which writes org-scoped instead of failing"
+    )
+
+
+def test_a_second_resolution_reuses_the_first_answer():
+    """Identity is resolved once per request even when asked for repeatedly."""
+    validator = _CountingValidator()
+    request = _request()
+
+    with patch("app.auth.get_validator", return_value=validator):
+        first = mcp_app.resolve_request_user_id(request)
+        second = mcp_app.resolve_request_user_id(request)
+        third = mcp_app.resolve_principal_plan(request)
+
+    assert first == second == USER
+    assert third[0] == "acme"
+    assert validator.calls == 1, f"{validator.calls} validations for one request"
+
+
+def test_a_key_with_no_owner_still_resolves_to_no_user():
+    """The legal ``None``: a legacy key with no ``created_by``.
+
+    This is the case the swallowing was originally justified by, and it still
+    behaves the same way — an unattributable caller writes org-scoped. What
+    changed is that a rate-limited caller is no longer disguised as one.
+    """
+    validator = _CountingValidator(user_id=None)
+    request = _request()
+
+    with patch("app.auth.get_validator", return_value=validator):
+        _, user_id = _tool_call(request)
+
+    assert user_id is None
+    assert validator.calls == 1
+
+
+def test_each_request_is_validated_on_its_own():
+    """The cache is per request, not a process-wide one that outlives it."""
+    validator = _CountingValidator()
+
+    with patch("app.auth.get_validator", return_value=validator):
+        mcp_app.resolve_request_user_id(_request())
+        mcp_app.resolve_request_user_id(_request())
+
+    assert validator.calls == 2, (
+        "two separate requests must each be validated; a shared cache would "
+        "let a revoked key ride on another request's result"
+    )
