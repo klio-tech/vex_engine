@@ -70,6 +70,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from app.auth import (
+    PROJECT_HEADER,
     resolve_principal,
     resolve_principal_plan,
     resolve_project_from_request,
@@ -147,6 +148,39 @@ SpaceParam = Annotated[
         )
     ),
 ]
+
+
+def _project_permits(
+    db: Any,
+    *,
+    org_id: str,
+    project_id: Optional[Any],
+    user_id: Optional[str],
+) -> bool:
+    """May ``user_id`` act on a row filed under ``project_id``?
+
+    The artifact tools take an ``artifact_id`` or a project name DIRECTLY, so
+    unlike recall they cannot lean on a WHERE clause to decide entitlement:
+    there is no result set to filter, only one named row. This is that decision
+    in one place, so ``artifact_get``, ``artifact_put`` (both the project it
+    files into and the artifact it supersedes) and ``forget`` cannot drift.
+
+    ``project_id`` of ``None`` — an unfiled, org-wide artifact — permits
+    everyone in the org, which is the pre-existing contract and not something
+    this gate narrows.
+
+    **Strict, with no org-admin override**, matching ``project_grant``'s rule
+    and for the same reason: these tools are LLM-reachable, so the blast radius
+    of a prompt injection has to stop at projects the caller already belongs
+    to. An unattributable caller (``user_id`` ``None``) is a member of nothing;
+    :func:`shared.projects.is_member` already answers ``False`` for that, and
+    it is a case worth stating rather than inheriting.
+    """
+    if not project_id:
+        return True
+    return projects.is_member(
+        db, org_id=org_id, project_id=str(project_id), user_id=user_id
+    )
 
 
 def _explicit_write_scope(
@@ -405,7 +439,12 @@ def _dedup_confirm(
 
 
 def _resolve_artifact_project(
-    request: Any, db: Any, *, org_id: str, project: Optional[str]
+    request: Any,
+    db: Any,
+    *,
+    org_id: str,
+    project: Optional[str],
+    user_id: Optional[str],
 ) -> tuple[Optional[str], Optional[dict[str, Any]]]:
     """Resolve where an artifact should be filed. Returns ``(project_id, error)``.
 
@@ -426,22 +465,83 @@ def _resolve_artifact_project(
 
     ``brain.find_project_id`` is read-only and org-scoped; it never creates a
     project, so a caller cannot mint tenant rows through this argument.
+
+    **Membership is required, on both paths, and its refusal is the SAME dict
+    an unknown project gets.** A project the caller is not a member of is, from
+    where they stand, a project that does not exist; a distinct ``forbidden``
+    would confirm the name is real and turn this argument into an existence
+    oracle over the org's project list. Non-membership is checked here rather
+    than at the three call sites because both resolutions — argument and header
+    — flow through this function, and the header is client-supplied too.
+
+    The header path still fails open to *unfiled* for an identifier that
+    resolves to nothing; it does NOT fail open for one that resolves to a
+    project the caller cannot write. Filing org-wide an artifact the caller
+    asked to file into a project would land the write WIDER than they were
+    told, on an immutable row that cannot be corrected in place — the defect,
+    not the remedy.
     """
     stripped = project.strip() if project is not None else ""
-    if not stripped:
-        return resolve_project_from_request(request, db, org_id=org_id), None
+    from_header = not stripped
 
-    project_id = brain.find_project_id(db, org_id=org_id, identifier=stripped)
+    project_id = (
+        resolve_project_from_request(request, db, org_id=org_id)
+        if from_header
+        else brain.find_project_id(db, org_id=org_id, identifier=stripped)
+    )
+
     if project_id is None:
-        return None, {
-            "stored": False,
-            "error": "unknown_project",
-            "detail": (
-                f"unknown project: {stripped}. Omit `project` to file this "
-                "artifact org-wide, or create the project first."
-            ),
-        }
+        if from_header:
+            # No header, or one naming nothing: unfiled, as before.
+            return None, None
+        return None, _unknown_project_error(stripped)
+
+    if not _project_permits(db, org_id=org_id, project_id=project_id, user_id=user_id):
+        label = stripped or request.headers.get(PROJECT_HEADER) or ""
+        return None, _unknown_project_error(label)
+
     return project_id, None
+
+
+def _supersede_permitted(
+    db: Any, *, org_id: str, artifact_id: str, user_id: Optional[str]
+) -> bool:
+    """May ``user_id`` retire the artifact named by ``supersedes``?
+
+    An unknown id, another org's id, and a project artifact the caller is not a
+    member of all answer ``False``, so the caller cannot tell them apart. A
+    malformed id makes the ``::uuid`` cast raise; the transaction is rolled
+    back and the answer is ``False`` for the same reason — it names nothing
+    this caller may retire.
+    """
+    try:
+        target = artifacts.get_artifact(db, org_id=org_id, artifact_id=artifact_id)
+    except Exception:
+        db.rollback()
+        logger.debug("supersedes=%s is not a usable artifact id", artifact_id)
+        return False
+    if target is None:
+        return False
+    return _project_permits(
+        db, org_id=org_id, project_id=target["project_id"], user_id=user_id
+    )
+
+
+def _unknown_project_error(label: str) -> dict[str, Any]:
+    """The single refusal shape for "no such project, as far as you know".
+
+    Shared by the genuinely-unknown identifier and the one the caller is not a
+    member of, so the two are byte-identical on the wire.
+    """
+    named = f"unknown project: {label}. " if label else "unknown project. "
+    return {
+        "stored": False,
+        "error": "unknown_project",
+        "detail": (
+            f"{named}Omit `project` to file this artifact org-wide, or create "
+            "the project first."
+        ),
+    }
 
 
 async def _perform_artifact_put(
@@ -497,6 +597,14 @@ async def _perform_artifact_put(
     Blocking boto3 calls in this coroutine run through
     ``anyio.to_thread.run_sync``: hashing a multi-GB object inline would stall
     the event loop for the entire transfer.
+
+    **Three project boundaries, not one.** Every branch can touch a project the
+    caller may not belong to, and each is gated by :func:`_project_permits`:
+    the project the artifact is FILED into (via
+    :func:`_resolve_artifact_project`), the pending row a CONFIRM finishes
+    (created under a project by whoever requested the upload — an artifact id
+    is not a secret, so a second caller must not be able to complete it), and
+    the artifact a ``supersedes`` RETIRES.
     """
     request = ctx.request_context.request
     if request is None:
@@ -516,6 +624,7 @@ async def _perform_artifact_put(
 
     cfg = get_plan_config(plan, plan_overrides)
     session_id = brain_session_id(request, org_id, agent_id)
+    user_id = resolve_request_user_id(request)
 
     # Enforced here rather than in the schema so the confirm branch — which
     # takes both from its pending row — is not forced to repeat them. An
@@ -537,6 +646,17 @@ async def _perform_artifact_put(
 
     db = SessionLocal()
     try:
+        # ``supersedes`` RETIRES an existing artifact, so it is a write to a row
+        # the caller named rather than one they own. Checked here — before any
+        # branch creates a row, uploads bytes or charges quota — because a
+        # refusal that arrives after the replacement is durable has already
+        # done half the job. A target the caller may not touch reads exactly
+        # like an id that was never issued.
+        if supersedes and not _supersede_permitted(
+            db, org_id=org_id, artifact_id=supersedes, user_id=user_id
+        ):
+            return {"stored": False, "error": "not_found"}
+
         if content is not None:
             body = content.encode("utf-8")
 
@@ -594,7 +714,7 @@ async def _perform_artifact_put(
             # loop silently fills the org's space list with junk it never asked
             # for. Resolve what can fail before creating anything durable.
             project_id, project_error = _resolve_artifact_project(
-                request, db, org_id=org_id, project=project
+                request, db, org_id=org_id, project=project, user_id=user_id
             )
             if project_error is not None:
                 return project_error
@@ -692,6 +812,15 @@ async def _perform_artifact_put(
             row = artifacts.get_artifact(db, org_id=org_id, artifact_id=artifact_id)
             if row is None or row["status"] != "pending":
                 # A cross-org id reads as not-found, never as a permission error.
+                return {"stored": False, "error": "not_found"}
+
+            # The pending row carries the project chosen when the upload was
+            # REQUESTED, possibly by someone else: an artifact id travels in
+            # tool results and logs, so confirming one is not proof of standing
+            # in its project. Same refusal as an id that does not exist.
+            if not _project_permits(
+                db, org_id=org_id, project_id=row["project_id"], user_id=user_id
+            ):
                 return {"stored": False, "error": "not_found"}
 
             s3 = artifact_storage.get_artifact_s3_client()
@@ -946,7 +1075,7 @@ async def _perform_artifact_put(
         # inline branch above: never create a space row for a write that is
         # about to be rejected.
         project_id, project_error = _resolve_artifact_project(
-            request, db, org_id=org_id, project=project
+            request, db, org_id=org_id, project=project, user_id=user_id
         )
         if project_error is not None:
             return project_error
@@ -1051,10 +1180,23 @@ async def _perform_artifact_get(
     except HTTPException as exc:
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
+    user_id = resolve_request_user_id(request)
+
     db = SessionLocal()
     try:
         row = artifacts.get_artifact(db, org_id=org_id, artifact_id=artifact_id)
         if row is None or row["status"] not in ("active", "superseded"):
+            return {"error": "not_found"}
+
+        # An artifact filed under a project is FENCED by it, not merely ranked
+        # by it. The card is already invisible to a non-member (the recall SQL
+        # sees to that), but the id is not a secret — it appears in results,
+        # logs and prior conversation — and this tool takes it directly. The
+        # refusal is byte-identical to the one above so it cannot be used to
+        # confirm that an id names something real.
+        if not _project_permits(
+            db, org_id=org_id, project_id=row["project_id"], user_id=user_id
+        ):
             return {"error": "not_found"}
 
         head = {
@@ -1869,6 +2011,10 @@ async def _perform_forget(ctx: Context, *, memory_id: str) -> dict[str, Any]:
     except HTTPException as exc:
         return {"forgotten": False, "error": "unauthorized", "detail": str(exc.detail)}
 
+    # Resolved once, before the session opens: both arms below need it, and the
+    # project arm must not decide entitlement from a value fetched later.
+    user_id = resolve_request_user_id(request)
+
     db = SessionLocal()
     try:
         # An id may name an artifact or a memory. Try the artifact first: a hit
@@ -1879,9 +2025,21 @@ async def _perform_forget(ctx: Context, *, memory_id: str) -> dict[str, Any]:
         # raise and leaves the transaction aborted, which would break the memory
         # path below. Roll back before falling through.
         try:
-            if artifacts.retract(db, org_id=org_id, artifact_id=memory_id):
-                _hide_card_for_artifact(db, org_id=org_id, artifact_id=memory_id)
-                return {"forgotten": True, "kind": "artifact", "id": memory_id}
+            row = artifacts.get_artifact(db, org_id=org_id, artifact_id=memory_id)
+            if row is not None:
+                # Deletion is the loudest write there is, and forget takes a
+                # bare id. A non-member is told the same thing they would be
+                # told about an id that was never issued — and, critically, the
+                # function returns here rather than falling through to the
+                # memory arm, which would otherwise answer a second time and
+                # reveal that the id resolved to an artifact.
+                if not _project_permits(
+                    db, org_id=org_id, project_id=row["project_id"], user_id=user_id
+                ):
+                    return {"forgotten": False, "error": "not_found"}
+                if artifacts.retract(db, org_id=org_id, artifact_id=memory_id):
+                    _hide_card_for_artifact(db, org_id=org_id, artifact_id=memory_id)
+                    return {"forgotten": True, "kind": "artifact", "id": memory_id}
         except Exception:
             db.rollback()
             logger.debug("forget: %s is not an artifact id, trying memory", memory_id)
@@ -1894,7 +2052,7 @@ async def _perform_forget(ctx: Context, *, memory_id: str) -> dict[str, Any]:
             agent_id=agent_id,
             memory_id=memory_id,
             via="mcp",
-            user_id=resolve_request_user_id(request),
+            user_id=user_id,
         )
     except Exception:
         logger.exception("brain forget failed")

@@ -48,6 +48,13 @@ def seams():
         patch("app.mcp_app.artifacts") as af,
         patch("app.mcp_app.brain") as brain,
         patch("app.mcp_app.resolve_project_from_request", return_value=None),
+        # Project membership is a real boundary with its own real-Postgres
+        # suite (``test_artifact_membership.py``). These tests are about
+        # storage mechanics and patch every dependency away, so the fixture
+        # rows carry placeholder project ids that no ``project_members`` table
+        # could ever answer for. Grant membership here so a storage assertion
+        # cannot fail for an authorization reason it never meant to exercise.
+        patch("app.mcp_app.projects.is_member", return_value=True),
     ):
         af.INLINE_MAX_BYTES = 65_536
         af.human_size.return_value = "3 B"
@@ -513,6 +520,7 @@ async def test_get_returns_inline_text(storage):
         "storage_uri": None,
         "version": 1,
         "size_bytes": 5,
+        "project_id": None,
     }
 
     result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
@@ -534,6 +542,7 @@ async def test_get_pages_long_text_and_reports_more(storage):
         "storage_uri": None,
         "version": 1,
         "size_bytes": 15,
+        "project_id": None,
     }
 
     first = await _tool("artifact_get")(_ctx(), artifact_id="a1")
@@ -557,6 +566,7 @@ async def test_get_text_on_a_binary_points_at_url_mode(storage):
         "storage_uri": "s3://klio-artifacts/acme/a1/v1",
         "version": 1,
         "size_bytes": 2048,
+        "project_id": None,
     }
 
     result = await _tool("artifact_get")(_ctx(), artifact_id="a1", mode="text")
@@ -579,6 +589,7 @@ async def test_get_url_returns_a_short_lived_signed_url(storage):
         "storage_uri": "s3://klio-artifacts/acme/a1/v1",
         "version": 1,
         "size_bytes": 2048,
+        "project_id": None,
     }
 
     result = await _tool("artifact_get")(_ctx(), artifact_id="a1", mode="url")
@@ -606,6 +617,7 @@ async def test_get_on_a_retracted_artifact_reads_as_not_found(storage):
         "storage_uri": None,
         "version": 1,
         "size_bytes": 4,
+        "project_id": None,
     }
     result = await _tool("artifact_get")(_ctx(), artifact_id="a1")
     assert result["error"] == "not_found"
@@ -644,6 +656,7 @@ def _s3_text_row(**overrides):
         "storage_uri": "s3://klio-artifacts/acme/a1/v1",
         "version": 1,
         "size_bytes": 13,
+        "project_id": None,
     }
     row.update(overrides)
     return row
@@ -749,6 +762,7 @@ async def test_get_url_runs_its_s3_calls_off_the_event_loop(storage):
         "storage_uri": None,
         "version": 1,
         "size_bytes": 5,
+        "project_id": None,
     }
     threads = []
 
@@ -781,6 +795,7 @@ async def test_get_text_on_s3_read_failure_returns_internal_error_not_a_crash(st
         "storage_uri": "s3://klio-artifacts/acme/a1/v1",
         "version": 1,
         "size_bytes": 100,
+        "project_id": None,
     }
     storage.storage.get_text_page.side_effect = RuntimeError("s3 unavailable")
 
