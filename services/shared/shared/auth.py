@@ -42,6 +42,75 @@ VALID_SCOPES = frozenset({"ingest", "verify", "read", "memory"})
 RELIABILITY_SCOPES = frozenset({"ingest", "verify", "read"})
 
 
+# --- agent_id, the one unbounded client string on the write path ------
+#
+# ``agent_id`` is client input: it comes verbatim from the ``X-Vex-Agent``
+# header, or on the OAuth path is derived from ``clientInfo.name``, which the
+# client also supplies. It ends up in ``session_memories.agent_id``, declared
+# ``String(128)`` since migration 001. Nothing bounded it. Executed against
+# Postgres 16:
+#
+#   X-Vex-Agent header, 500 chars           -> agent_id len 500
+#   OAuth slug path, clientInfo.name 500 ch -> agent_id len 515  (the wrapper
+#                                              "oauth:<user8>/" adds 15)
+#   INSERT -> (psycopg2.errors.StringDataRightTruncation)
+#             value too long for type character varying(128)
+#
+# So an over-long header did not degrade, it turned every write into a 500.
+
+#: Matches ``session_memories.agent_id``, the narrowest column this value
+#: reaches. ``agents.agent_id`` and ``tool_calls.agent_id`` are also 128.
+MAX_AGENT_ID_LEN = 128
+
+#: Hex characters of SHA-256 kept when an over-long id has to be shortened.
+#: Truncating alone would merge two distinct principals into one — and two
+#: agents sharing an ``agent_id`` share an ``agent``-scoped memory bucket,
+#: which is worse than the error it replaces. 12 hex chars is 48 bits; these
+#: are not adversarial-collision-resistant identifiers, they are a
+#: disambiguator on a value that is already tenant-scoped by ``org_id``.
+_AGENT_ID_DIGEST_LEN = 12
+
+_AGENT_ID_SEPARATOR = "~"
+
+
+def normalize_agent_id(value: str | None, *, default: str) -> str:
+    """Bound a client-supplied ``agent_id`` to what the column can hold.
+
+    Args:
+        value: The raw ``X-Vex-Agent`` header or derived OAuth agent id.
+        default: The agent principal to use when the value is absent or blank.
+
+    Returns:
+        ``value`` stripped, unchanged when it already fits; otherwise a
+        deterministic ``<prefix>~<sha256-prefix>`` of at most
+        :data:`MAX_AGENT_ID_LEN` characters. Absent or blank yields ``default``.
+
+    Deterministic on purpose: dedup and agent-scoped recall both key on this
+    string, so the same header must map to the same principal on every request
+    and across restarts.
+    """
+    if value is None:
+        return default
+
+    cleaned = value.strip()
+    if not cleaned:
+        return default
+
+    if len(cleaned) <= MAX_AGENT_ID_LEN:
+        return cleaned
+
+    digest = hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:_AGENT_ID_DIGEST_LEN]
+    keep = MAX_AGENT_ID_LEN - len(_AGENT_ID_SEPARATOR) - _AGENT_ID_DIGEST_LEN
+    truncated = f"{cleaned[:keep]}{_AGENT_ID_SEPARATOR}{digest}"
+    logger.warning(
+        "agent_id of %d characters exceeds the %d-character column; bounded to %r",
+        len(cleaned),
+        MAX_AGENT_ID_LEN,
+        truncated,
+    )
+    return truncated
+
+
 def _is_uuid(value: str | None) -> bool:
     """Return True when ``value`` is a well-formed UUID string.
 
