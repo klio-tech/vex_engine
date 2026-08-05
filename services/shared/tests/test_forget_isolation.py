@@ -32,7 +32,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from shared import projects
-from shared.memory import retract_memory
+from shared.memory import retract_memory, supersede_memory
 from shared.testing import database_url, requires_db
 
 DB_URL = database_url()
@@ -428,3 +428,42 @@ def test_a_project_row_with_no_project_id_is_not_retractable_by_anyone(db):
 
     assert refused == {"forgotten": False, "error": "not_found"}, refused
     assert _status(db, memory_id) == "active"
+
+
+# ── supersede_memory's tenancy argument ───────────────────────────────
+#
+# ``supersede_memory`` had no tenancy argument at all: its UPDATE was keyed on
+# ``id`` alone. Both current callers derive their ids from org-scoped queries,
+# so nothing was reachable through it — but it is the only write in the memory
+# layer with no ``org_id`` in its WHERE, and "the caller happens to be careful"
+# is not a boundary. One new caller passing an id from anywhere else silently
+# retires another tenant's memory.
+
+
+def test_supersede_requires_the_owning_org(db):
+    org = _org(db)
+    other = _org(db)
+    old_id = _seed(db, org_id=org, content="the old fact")
+    new_id = _seed(db, org_id=org, content="the new fact")
+
+    # The attacker's org names a memory that is not theirs.
+    supersede_memory(db, uuid.UUID(old_id), uuid.UUID(new_id), org_id=other)
+
+    assert _status(db, old_id) == "active", (
+        "a foreign org retired a memory it does not own"
+    )
+
+    # Positive control: the owning org supersedes the identical pair.
+    supersede_memory(db, uuid.UUID(old_id), uuid.UUID(new_id), org_id=org)
+    assert _status(db, old_id) == "superseded"
+    row = db.execute(
+        text("SELECT superseded_by FROM session_memories WHERE id = :i"),
+        {"i": old_id},
+    ).fetchone()
+    assert str(row.superseded_by) == new_id
+
+
+def test_supersede_will_not_run_without_an_org():
+    """The argument is mandatory: there is no 'apply to every tenant' call."""
+    with pytest.raises(TypeError):
+        supersede_memory(object(), uuid.uuid4(), uuid.uuid4())

@@ -123,7 +123,12 @@ async def process_event(event: IngestEvent) -> dict[str, Any]:
                             )
                             # If similar fact found and new one was written, supersede old
                             if existing and new_record:
-                                supersede_memory(db_session, existing.id, new_record.id)
+                                supersede_memory(
+                                    db_session,
+                                    existing.id,
+                                    new_record.id,
+                                    org_id=org_id_val,
+                                )
                     finally:
                         db_session.close()
             except Exception:

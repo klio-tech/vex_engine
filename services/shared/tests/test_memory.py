@@ -550,9 +550,14 @@ def test_supersede_memory():
     old_id = uuid.uuid4()
     new_id = uuid.uuid4()
 
-    supersede_memory(db_session, old_id, new_id)
+    supersede_memory(db_session, old_id, new_id, org_id="org-1")
 
     db_session.execute.assert_called_once()
+    # The tenancy predicate and its bound value, together: a WHERE naming
+    # :org_id with nothing bound to it would silently match every tenant.
+    sql, params = db_session.execute.call_args.args
+    assert "org_id = :org_id" in str(sql)
+    assert params["org_id"] == "org-1"
     db_session.commit.assert_called_once()
 
 

@@ -742,8 +742,10 @@ async def test_reconcile_supersedes_direct_contradiction(monkeypatch):
 
     superseded = []
 
-    def _fake_supersede(db, old_id, new_id):
-        superseded.append((old_id, new_id))
+    def _fake_supersede(db, old_id, new_id, *, org_id):
+        # org_id is mandatory on the real primitive; a fake that accepted a
+        # call without it would let the tenancy argument be dropped silently.
+        superseded.append((old_id, new_id, org_id))
 
     async def _fake_judge(prompt, system=None):
         return {"contradicts": True}
@@ -777,7 +779,7 @@ async def test_reconcile_supersedes_direct_contradiction(monkeypatch):
         max_judgments=5,
     )
     assert sup_count == 1 and judged == 1
-    assert superseded == [(old_id, new_id)]
+    assert superseded == [(old_id, new_id, "org-1")]
 
 
 async def test_reconcile_related_but_not_contradicting_is_untouched(monkeypatch):
@@ -785,7 +787,9 @@ async def test_reconcile_related_but_not_contradicting_is_untouched(monkeypatch)
 
     superseded = []
     monkeypatch.setattr(
-        curator_mod, "supersede_memory", lambda db, o, n: superseded.append((o, n))
+        curator_mod,
+        "supersede_memory",
+        lambda db, o, n, *, org_id: superseded.append((o, n, org_id)),
     )
 
     async def _fake_judge(prompt, system=None):

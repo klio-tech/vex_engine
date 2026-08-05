@@ -840,11 +840,24 @@ def supersede_memory(
     db_session: Any,
     old_memory_id: uuid.UUID,
     new_memory_id: uuid.UUID,
+    *,
+    org_id: str,
 ) -> None:
-    """Mark an old memory as superseded by a newer one.
+    """Mark an old memory as superseded by a newer one, within one tenant.
 
     Sets ``status = 'superseded'`` and ``superseded_by = new_memory_id``
     on the old memory row.
+
+    ``org_id`` is mandatory. This was the one write in the memory layer whose
+    WHERE named only an ``id``, which made it the only one whose correctness
+    depended entirely on where its caller got that id. Both current callers
+    (the curator's reconcile pass and the async worker's fact writer) derive
+    theirs from org-scoped queries, so nothing was reachable through it — but
+    "every caller so far has been careful" is not a boundary, and a keyword
+    with no default means the next caller cannot omit it by accident.
+
+    A mismatched ``org_id`` updates nothing and raises nothing: the row is not
+    this tenant's, which is the same non-event as an id that does not exist.
     """
     db_session.execute(
         text("""
@@ -853,10 +866,12 @@ def supersede_memory(
                 superseded_by = :new_memory_id,
                 updated_at = NOW()
             WHERE id = :old_memory_id
+              AND org_id = :org_id
         """),
         {
             "old_memory_id": str(old_memory_id),
             "new_memory_id": str(new_memory_id),
+            "org_id": org_id,
         },
     )
     db_session.commit()
