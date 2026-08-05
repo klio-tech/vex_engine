@@ -305,6 +305,20 @@ def record_grant_audit(
         )
         db_session.commit()
     except Exception:
+        # The grant has already committed; this append has not. Roll back so
+        # the caller's session is usable for the rest of the request —
+        # otherwise the audit failure, which is explicitly not allowed to undo
+        # the grant, takes down the response that reports it instead.
+        try:
+            db_session.rollback()
+        except Exception:
+            logger.warning(
+                "rollback after a failed grant audit write also failed; "
+                "org=%s project=%s",
+                org_id,
+                project_id,
+                exc_info=True,
+            )
         logger.error(
             "project grant audit write FAILED; grant stands. "
             "org=%s project=%s granted_to=%s granted_by=%s role=%s surface=%s",

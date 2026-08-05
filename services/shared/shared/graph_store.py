@@ -318,6 +318,15 @@ def _alarm_on_degree(db: Any, *, org_id: str, entity_id: str) -> None:
             )
     except Exception:
         # The alarm is telemetry; it must never fail the write that fired it.
+        # It must equally never leave the session aborted: this runs at the
+        # tail of every ``add_edge``, and the curator draws its next edge on
+        # the same session — so one failed degree probe would otherwise cost
+        # the rest of the tick's graph. The edge itself already committed
+        # above, so there is nothing in flight for the rollback to discard.
+        try:
+            db.rollback()
+        except Exception:
+            logger.warning("rollback after a failed degree check failed", exc_info=True)
         logger.warning("god-entity degree check failed", exc_info=True)
 
 

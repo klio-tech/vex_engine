@@ -342,6 +342,30 @@ def _project_display_name(git_remote: Optional[str], repo_root: Optional[str]) -
     return "project"
 
 
+def _rollback(db: Any, what: str, org_id: str) -> None:
+    """Clear an aborted transaction so the request's session stays usable.
+
+    Project resolution is best-effort by design — a miss files the write
+    unfiled rather than failing it. But Postgres aborts the whole transaction
+    on the first failed statement, so swallowing the error without a ROLLBACK
+    leaves the very session the capture or recall is about to run on refusing
+    every statement. The degradation the ``except`` promises is "unfiled", not
+    "the request dies two statements later for an unrelated-looking reason".
+
+    Guarded in turn: a session too broken to roll back must not convert a
+    best-effort path into a raising one.
+    """
+    try:
+        db.rollback()
+    except Exception:
+        logger.warning(
+            "capture: rollback after a failed %s also failed for org %s",
+            what,
+            org_id,
+            exc_info=True,
+        )
+
+
 def _ensure_project_id(
     db: Any, *, org_id: str, git_remote: Optional[str], repo_root: Optional[str]
 ) -> Optional[str]:
@@ -362,6 +386,7 @@ def _ensure_project_id(
             repo_root_path=repo_root,
         )
     except Exception:
+        _rollback(db, "ensure_project", org_id)
         logger.warning(
             "capture: ensure_project failed for org %s; writing unfiled",
             org_id,
@@ -385,6 +410,7 @@ def _find_project_id(
     try:
         return brain.find_project_id(db, org_id=org_id, identifier=git_remote)
     except Exception:
+        _rollback(db, "find_project_id", org_id)
         logger.warning(
             "capture: find_project_id failed for org %s; recalling org-wide",
             org_id,
