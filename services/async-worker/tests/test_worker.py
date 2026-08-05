@@ -457,3 +457,82 @@ async def test_process_event_fact_extraction_failure_does_not_break_verification
     # Should still return the verified result despite fact extraction failure
     assert result["action"] == "pass"
     assert result["confidence"] == "0.95"
+
+
+# --- Redaction on the direct write_memory path ---------------------------
+#
+# `brain.write_scoped_memory` redacts. This worker does not go through it — it
+# calls `write_memory` directly and imported no redactor at all, so an
+# LLM-extracted fact quoting a credential from the transcript was stored
+# verbatim.
+
+
+async def _process_capturing_write(facts, event_output="hello"):
+    """Run process_event with stubbed facts; return the write_memory mock."""
+    import os
+
+    event = IngestEvent(
+        execution_id="exec-redact",
+        agent_id="test-bot",
+        output=event_output,
+        session_id="sess-redact",
+        metadata={"org_id": "test-org"},
+    )
+    mock_result = VerificationResult(confidence=0.95, action="pass", checks={})
+
+    with (
+        patch.dict(os.environ, {"MEMORY_ENABLED": "true"}),
+        patch("app.worker.verify", new_callable=AsyncMock, return_value=mock_result),
+        patch(
+            "app.worker.extract_facts", new_callable=AsyncMock, return_value=facts
+        ) as mock_extract,
+        patch(
+            "app.worker.write_memory", new_callable=AsyncMock, return_value=None
+        ) as mock_write,
+        patch(
+            "app.worker.find_similar_memory", new_callable=AsyncMock, return_value=None
+        ),
+        patch("app.worker._get_db_session") as mock_db,
+    ):
+        mock_db.return_value.close = lambda: None
+        await process_event(event)
+    return mock_write, mock_extract
+
+
+@pytest.mark.asyncio
+async def test_extracted_facts_are_redacted_before_write():
+    """A secret quoted back by the extractor must not reach write_memory."""
+    mock_write, _ = await _process_capturing_write(
+        ["The database password is DATABASE_PASSWORD=Sup3rS3cretP@ss"]
+    )
+
+    mock_write.assert_called_once()
+    stored = mock_write.call_args.kwargs["content"]
+    assert "Sup3rS3cretP@ss" not in stored
+    assert "[REDACTED:" in stored
+
+
+@pytest.mark.asyncio
+async def test_clean_facts_are_stored_byte_identical():
+    """Positive control: redaction must not mangle ordinary facts."""
+    facts = ["User is in NYC", "Order is #45821"]
+    mock_write, _ = await _process_capturing_write(facts)
+
+    assert mock_write.call_count == 2
+    stored = [c.kwargs["content"] for c in mock_write.call_args_list]
+    assert stored == facts
+
+
+@pytest.mark.asyncio
+async def test_fact_extraction_prompt_input_is_bounded():
+    """event.output is caller-controlled and went into the LLM prompt uncapped."""
+    from app import worker as worker_module
+
+    huge = "A" * 500_000
+    _, mock_extract = await _process_capturing_write([], event_output=huge)
+
+    mock_extract.assert_called_once()
+    kwargs = mock_extract.call_args.kwargs
+    assert len(str(kwargs["output"])) <= worker_module.MAX_PROMPT_INPUT_CHARS + 64, (
+        "output was not bounded"
+    )

@@ -13,6 +13,8 @@ from typing import Any, Optional
 
 from litellm import acompletion
 
+from shared.env_config import parse_float
+
 logger = logging.getLogger("agentguard.verification-engine.llm")
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
@@ -63,7 +65,18 @@ async def call_llm(
         Parsed JSON dict from the LLM response, or None on timeout/error.
     """
     model = os.environ.get("VERIFICATION_MODEL", DEFAULT_MODEL)
-    timeout_s = float(os.environ.get("VERIFICATION_TIMEOUT_S", DEFAULT_TIMEOUT_S))
+    # The second of the two ``VERIFICATION_TIMEOUT_S`` sites (the other is
+    # ``shared/memory.py``). Guarded for the same reason: the bare ``float()``
+    # sat above the ``try`` that makes LLM failure return ``None``, so
+    # ``VERIFICATION_TIMEOUT_S='10s'`` raised out of every ``call_llm``
+    # rather than degrading.
+    timeout_s = parse_float(
+        os.environ.get("VERIFICATION_TIMEOUT_S"),
+        default=DEFAULT_TIMEOUT_S,
+        name="VERIFICATION_TIMEOUT_S",
+        minimum=0.1,
+        maximum=600.0,
+    )
 
     messages = []
     if system:

@@ -6,17 +6,24 @@ development defaults that match the other Vex services.
 
 import os
 
+from shared.env_config import parse_bool
+
 DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://agentguard:agentguard_dev@localhost:5432/agentguard",
 )
 
 
-def _parse_bool(value: str | None, *, default: bool) -> bool:
-    """Parse a truthy/falsy env string, falling back to ``default``."""
-    if value is None:
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "on")
+def _parse_bool(value: str | None, *, default: bool, name: str = "") -> bool:
+    """Parse a truthy/falsy env string, falling back to ``default``.
+
+    Delegates to :func:`shared.env_config.parse_bool` so there is one set of
+    accepted tokens across the engine. The local implementation this replaces
+    returned ``False`` — not ``default`` — for anything outside the truthy set,
+    which contradicted its own docstring: ``KLIO_FEATURE=treu`` disabled a
+    feature whose default was on, silently.
+    """
+    return parse_bool(value, default=default, name=name)
 
 
 def _parse_csv(value: str | None) -> list[str]:
@@ -56,6 +63,7 @@ def _parse_int(value: str | None, *, default: int, minimum: int) -> int:
 MCP_DNS_REBINDING_PROTECTION = _parse_bool(
     os.environ.get("MCP_DNS_REBINDING_PROTECTION"),
     default=False,
+    name="MCP_DNS_REBINDING_PROTECTION",
 )
 
 # Comma-separated allow-lists, only consulted when protection is on.
@@ -72,7 +80,9 @@ MCP_ALLOWED_ORIGINS = _parse_csv(os.environ.get("MCP_ALLOWED_ORIGINS"))
 # the single-service Railway deployment self-contained (no external cron) and is
 # safe for a single replica; multi-replica deployments should disable it here
 # and drive ``run_curator_once`` from one external scheduler instead.
-CURATOR_ENABLED = _parse_bool(os.environ.get("CURATOR_ENABLED"), default=True)
+CURATOR_ENABLED = _parse_bool(
+    os.environ.get("CURATOR_ENABLED"), default=True, name="CURATOR_ENABLED"
+)
 
 # Seconds between curator passes.  Floored at 60s so a misconfiguration can't
 # spin the loop; defaults to 15 minutes.
@@ -90,7 +100,9 @@ CURATOR_INTERVAL_SECONDS = _parse_int(
 # kill switch: if it ever misbehaves, on-call can disable it with an env var
 # instead of a code change and redeploy. Defaults to enabled so behaviour is
 # unchanged out of the box.
-ARTIFACT_GC_ENABLED = _parse_bool(os.environ.get("ARTIFACT_GC_ENABLED"), default=True)
+ARTIFACT_GC_ENABLED = _parse_bool(
+    os.environ.get("ARTIFACT_GC_ENABLED"), default=True, name="ARTIFACT_GC_ENABLED"
+)
 
 
 # --- MCP OAuth (engine = resource server; Supabase = authorization server) ---
@@ -98,7 +110,19 @@ ARTIFACT_GC_ENABLED = _parse_bool(os.environ.get("ARTIFACT_GC_ENABLED"), default
 # Master switch. Off (default) preserves today's behavior exactly: Bearer
 # tokens are ignored and unauthenticated MCP requests reach the tools (which
 # return their own unauthorized result dicts).
-MCP_OAUTH_ENABLED: bool = os.environ.get("MCP_OAUTH_ENABLED", "0") == "1"
+#
+# This used to be a bare ``== "1"``, which is the one instance of that shape
+# with a security surface. Executed: ``MCP_OAUTH_ENABLED=true`` evaluated to
+# ``False``. Two things went wrong at once — the operator asked for OAuth and
+# did not get it, and ``main.py`` gates its "required OAuth config is missing"
+# startup check on this same flag, so a deployment that set ``true`` without
+# ``SUPABASE_AUTH_ISSUER`` started clean and served unauthenticated MCP
+# requests with no signal anywhere.
+MCP_OAUTH_ENABLED: bool = _parse_bool(
+    os.environ.get("MCP_OAUTH_ENABLED"),
+    default=False,
+    name="MCP_OAUTH_ENABLED",
+)
 
 # The Supabase project's auth issuer, e.g. "https://<ref>.supabase.co/auth/v1".
 # Used as the JWT `iss` check, the JWKS base (<issuer>/.well-known/jwks.json),

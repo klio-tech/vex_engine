@@ -100,7 +100,17 @@ def promote_memory(
 
     # provenance is deliberately absent from the SET list. Not defaulted, not
     # recomputed — untouched. See rule 3 in the module docstring.
-    db_session.execute(
+    #
+    # ``scope = 'private' AND status = 'active'`` repeats the two conditions the
+    # SELECT above already checked, and it is not redundant: under READ
+    # COMMITTED this UPDATE re-reads the latest committed row, so anything that
+    # commits between the two statements is invisible to the check and visible
+    # to the write. Without the guard, a concurrent ``share(to='project')``
+    # followed by this ``share(to='org')`` leaves the row at ``org`` and tells
+    # the caller it landed at ``project`` — the exact project→org downgrade the
+    # ``already_shared`` refusal exists to prevent, executed silently. The
+    # guard makes the check and the write agree on one version of the row.
+    result = db_session.execute(
         text(
             """
             UPDATE session_memories
@@ -113,7 +123,11 @@ def promote_memory(
                                'shared_from', 'private'
                            ),
                 updated_at = NOW()
-            WHERE id = :id AND org_id = :org_id AND user_id = :user_id
+            WHERE id = :id
+              AND org_id = :org_id
+              AND user_id = :user_id
+              AND scope = 'private'
+              AND status = 'active'
             """
         ),
         {
@@ -124,6 +138,34 @@ def promote_memory(
             "via": via,
         },
     )
+    if result.rowcount == 0:
+        # The row stopped being a promotable private memory between the SELECT
+        # and here. Nothing was written — that is the point — so report the
+        # refusal the guard just enforced rather than a success that did not
+        # happen. The scope is re-read best-effort so the answer names where
+        # the row actually is now.
+        db_session.commit()
+        current = db_session.execute(
+            text(
+                "SELECT scope FROM session_memories "
+                "WHERE id = :id AND org_id = :org_id LIMIT 1"
+            ),
+            {"id": str(parsed), "org_id": org_id},
+        ).fetchone()
+        logger.info(
+            "promotion of memory %s to %s by user %s lost a race; row is now "
+            "scope=%s and was left untouched",
+            parsed,
+            to,
+            user_id,
+            None if current is None else current.scope,
+        )
+        return {
+            "shared": False,
+            "error": "already_shared",
+            "scope": row.scope if current is None else current.scope,
+        }
+
     db_session.commit()
     logger.info(
         "memory %s promoted from private to %s by user %s via %s",

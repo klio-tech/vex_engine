@@ -49,6 +49,7 @@ DB I/O — the established house pattern across the memory substrate (see
 threads here.
 """
 
+import hashlib
 import logging
 from typing import Any, Literal, Optional
 
@@ -127,7 +128,16 @@ _MAX_RECALL_LIMIT = 50
 # (:mod:`app.session`), the suffix groups a client's writes so dedup works
 # across calls; it is NOT an authorization input (tenancy is enforced by org_id
 # / agent_id on every query).
+#
+# It is, however, a PRIVACY input, because a dedup hit hands the matching row's
+# id back to the caller. See :func:`_capture_session_id` for why the principal
+# is part of the key and not just the client's string.
 _CAPTURE_SESSION_PREFIX = "klio-hook"
+
+#: ``session_memories.session_id`` is ``VARCHAR(256)`` (migration 017). One
+#: segment of the derived id is client-controlled, so the result is bounded
+#: here rather than left to fail at the column.
+_MAX_SESSION_ID_CHARS = 256
 
 
 # ---------------------------------------------------------------------------
@@ -261,15 +271,56 @@ def _hook_write_scope(
     return declared_scope, None
 
 
-def _capture_session_id(org_id: str, agent_id: str, session_id: Optional[str]) -> str:
+def _capture_session_id(
+    org_id: str,
+    agent_id: str,
+    session_id: Optional[str],
+    *,
+    user_id: Optional[str] = None,
+) -> str:
     """Derive a stable dedup-grouping session id for a passive capture.
 
-    Uses the client-supplied ``session_id`` when present (groups a single
-    Claude Code session's writes), else falls back to ``<org_id>:<agent_id>`` so
-    dedup stays stable per principal rather than scattering across calls.
+    The client-supplied ``session_id`` groups a single Claude Code session's
+    writes; the principal segment in front of it decides WHOSE bucket that is.
+
+    **Why the principal has to be in the key.** A dedup hit returns the matching
+    row's id and memory_type to the caller. ``find_similar_memory`` narrows the
+    window to ``user_id = :user_id`` for ``scope='private'`` for exactly that
+    reason, but every other scope falls back to the historical session window —
+    ``session_id AND org_id AND status``, with no ``scope`` and no ``user_id``
+    predicate. This value used to be ``klio-hook:<client string>``, so an
+    unattributable caller (whose writes land at ``org`` scope, and who
+    therefore gets the wide window) could name the bucket an attributed user's
+    captures land in, submit a guess, and learn from the response whether that
+    person had already stored near-identical text — and receive the id of their
+    private row. The key is the only thing that ever separated them.
+
+    ``user_id`` first, then ``agent_id``, mirroring the identity ladder: an
+    attributed caller's bucket follows the PERSON across agents, and an
+    unattributable one is namespaced by the agent principal it does have. The
+    two can never collide because the marker (``u`` / ``a``) distinguishes them
+    even if a user id and an agent id were somehow equal.
+
+    The result is bounded: ``session_memories.session_id`` is ``VARCHAR(256)``
+    and the client controls one segment, so an over-long id is folded into a
+    digest of itself rather than truncated. Truncation would merge two of one
+    principal's sessions — harmless — but hashing keeps them distinct for no
+    extra cost, and the principal segment is never at risk either way.
+
+    Changing this key regroups dedup buckets once: a capture that would have
+    deduped against a pre-existing row under the old key is stored instead.
+    That is a one-off duplicate, not a loss.
     """
-    suffix = session_id if session_id else f"{org_id}:{agent_id}"
-    return f"{_CAPTURE_SESSION_PREFIX}:{suffix}"
+    principal = f"u:{user_id}" if user_id else f"a:{agent_id}"
+    suffix = session_id if session_id else "default"
+    candidate = f"{_CAPTURE_SESSION_PREFIX}:{org_id}:{principal}:{suffix}"
+    if len(candidate) <= _MAX_SESSION_ID_CHARS:
+        return candidate
+
+    digest = hashlib.sha256(suffix.encode("utf-8")).hexdigest()[:32]
+    return f"{_CAPTURE_SESSION_PREFIX}:{org_id}:{principal}:h:{digest}"[
+        :_MAX_SESSION_ID_CHARS
+    ]
 
 
 def _project_display_name(git_remote: Optional[str], repo_root: Optional[str]) -> str:
@@ -350,11 +401,13 @@ def _combine_messages(messages: list[TranscriptMessage]) -> str:
     a very long session does not blow up the LLM call.
 
     Secrets and PII are redacted via :func:`shared.redaction.redact` BEFORE
-    the text is sent to an external LLM for fact extraction/summarisation —
-    secrets never leave the infrastructure via the mining path.
-    :func:`shared.brain.write_scoped_memory` re-screens whatever comes back
-    (defense in depth), so a redaction failure here can fail open to the
-    chokepoint guarantee.
+    the text is sent to an external LLM for fact extraction/summarisation.
+
+    This call is the ONLY thing standing between a transcript and the LLM
+    vendor. :func:`shared.brain.write_scoped_memory` re-screens whatever comes
+    back, but that protects *storage*, not *egress* — it cannot un-send a
+    request. So if redaction fails here the raw transcript is sent to the
+    vendor and the chokepoint does not cover it.
     """
     parts: list[str] = []
     for m in messages:
@@ -367,10 +420,13 @@ def _combine_messages(messages: list[TranscriptMessage]) -> str:
     if len(combined) > _MAX_TRANSCRIPT_CHARS:
         combined = combined[-_MAX_TRANSCRIPT_CHARS:]
     # Redact BEFORE this text is sent to the external LLM for fact
-    # extraction/summarisation — secrets never leave the infrastructure via
-    # the mining path. write_scoped_memory re-screens whatever comes back
-    # (defense in depth), so a redaction failure here can fail open to the
-    # chokepoint guarantee.
+    # extraction/summarisation. This is the only egress guard on the mining
+    # path: write_scoped_memory re-screens what comes back, but that is a
+    # storage guarantee, not an egress one, and it cannot un-send a request.
+    # The except below therefore does NOT fail safe — it proceeds with the
+    # unredacted transcript. Left as-is deliberately (availability over
+    # egress) and called out here so the trade-off is visible rather than
+    # implied by a comment claiming secrets never leave.
     try:
         combined = redact(combined).clean_text
     except Exception:
@@ -529,7 +585,9 @@ async def capture_event(
             agent_id=agent_id,
             content=req.content,
             memory_type=memory_type,
-            session_id=_capture_session_id(org_id, agent_id, req.session_id),
+            session_id=_capture_session_id(
+                org_id, agent_id, req.session_id, user_id=user_id
+            ),
             project_id=project_id,
             metadata=metadata,
             scope=scope,
@@ -582,7 +640,9 @@ async def capture_transcript(
                 db, org_id=org_id, git_remote=req.git_remote, repo_root=req.repo_root
             )
         )
-        session_id = _capture_session_id(org_id, agent_id, req.session_id)
+        session_id = _capture_session_id(
+            org_id, agent_id, req.session_id, user_id=user_id
+        )
         base_meta = {"source": "hook-transcript"}
         stored = 0
         over_cap = await anyio.to_thread.run_sync(
