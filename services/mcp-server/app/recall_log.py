@@ -37,6 +37,19 @@ def log_recall_event(
         try:
             query_text = redact(query_text).clean_text
         except Exception:
+            # Control flow is unchanged and deliberate: unscreened text is
+            # never persisted, so the column becomes NULL and the insert goes
+            # ahead. What was missing was any trace of it — a redactor that
+            # starts failing made every row's query_text NULL, which reads as
+            # "nobody searched anything" rather than "the redactor is broken".
+            # The failing text is NOT logged: it is precisely the string that
+            # could not be screened.
+            logger.warning(
+                "redact() failed for a recall query in org %s; storing NULL "
+                "query_text (content withheld — it is unscreened)",
+                org_id,
+                exc_info=True,
+            )
             query_text = None  # best-effort log; never store unscreened
     try:
         db.execute(

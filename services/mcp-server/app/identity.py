@@ -268,6 +268,17 @@ def _oauth_principal(request: Request) -> Optional[Any]:
         return None
     try:
         from app.oauth import OAuthPrincipal  # noqa: PLC0415
-    except Exception:  # pragma: no cover - import guard only
+    except Exception:
+        # Unchanged outcome: an unimportable ``app.oauth`` means no principal
+        # can be recognised, and unattributed is the right answer. But this was
+        # the last swallow in the module that left no trace, and its symptom —
+        # every OAuth caller silently degrading to unattributed — is otherwise
+        # indistinguishable from nobody using OAuth. DEBUG rather than WARNING
+        # because on the healthy path this branch is never reached at all.
+        logger.debug(
+            "app.oauth could not be imported; treating the request as having "
+            "no OAuth principal",
+            exc_info=True,
+        )
         return None
     return candidate if isinstance(candidate, OAuthPrincipal) else None
