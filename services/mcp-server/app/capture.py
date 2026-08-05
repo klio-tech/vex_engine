@@ -64,6 +64,7 @@ from shared.memory import (
     retract_memory,
     retrieve_memories_scoped,
 )
+from shared import metrics
 from shared.redaction import redact
 from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
@@ -77,6 +78,29 @@ from app.recall_log import log_recall_event
 logger = logging.getLogger("agentguard.mcp.capture")
 
 router = APIRouter(prefix="/capture", tags=["capture"])
+
+
+# ── instrumentation helpers ───────────────────────────────────────────
+#
+# Thin wrappers so each call site is one line, and so a metrics fault can never
+# propagate into a capture. Both go through ``metrics.record``, which swallows.
+
+
+def record_capture(outcome: str) -> None:
+    """Record one capture attempt by outcome."""
+    metrics.record(metrics.CAPTURE_EVENTS.inc, outcome=outcome)
+
+
+def record_redaction(hit: bool) -> None:
+    """Record that the redactor found and removed something.
+
+    Hits, not calls. A count of calls is a count of captures, which is already
+    measured; what nobody can otherwise see is how much sensitive material is
+    actually flowing through — and a hit rate that drops to zero is how a
+    silently broken redactor presents.
+    """
+    if hit:
+        metrics.record(metrics.CAPTURE_REDACTIONS.inc)
 
 
 def _check_memory_quota_402(
@@ -454,8 +478,11 @@ def _combine_messages(messages: list[TranscriptMessage]) -> str:
     # egress) and called out here so the trade-off is visible rather than
     # implied by a comment claiming secrets never leave.
     try:
-        combined = redact(combined).clean_text
+        screened = redact(combined).clean_text
+        record_redaction(hit=screened != combined)
+        combined = screened
     except Exception:
+        record_capture("error")
         logger.warning("capture: transcript redaction failed; relying on chokepoint")
     return combined
 
@@ -624,10 +651,15 @@ async def capture_event(
             await anyio.to_thread.run_sync(
                 lambda: record_usage(db, org_id, "memory", over_cap=over_cap)
             )
+        # ``rejected`` is not a failure — a dedup or a policy refusal is the
+        # system working. It is counted apart from ``error`` so a rise in one
+        # is never mistaken for the other.
+        record_capture("accepted" if result.get("stored") else "rejected")
         return result
     except HTTPException:
         raise
     except Exception:
+        record_capture("error")
         logger.exception("capture event failed (memory_type=%s)", memory_type)
         return {"stored": False, "error": "capture_failed"}
     finally:
@@ -657,6 +689,7 @@ async def capture_transcript(
     scope, user_id = _hook_write_scope(request, key_info, "org")
     combined = _combine_messages(req.messages)
     if not combined:
+        record_capture("rejected")
         return {"stored": 0, "facts": 0, "summary": False, "reason": "empty_transcript"}
 
     db = SessionLocal()
@@ -727,10 +760,12 @@ async def capture_transcript(
                     lambda: record_usage(db, org_id, "memory", over_cap=over_cap)
                 )
 
+        record_capture("accepted" if stored else "rejected")
         return {"stored": stored, "facts": len(facts), "summary": bool(summary)}
     except HTTPException:
         raise
     except Exception:
+        record_capture("error")
         logger.exception("capture transcript failed")
         return {"stored": 0, "error": "capture_failed"}
     finally:

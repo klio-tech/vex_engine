@@ -14,6 +14,8 @@ from fastapi import Depends, FastAPI
 from app import config, oauth_middleware
 from app.auth import shutdown_validator, verify_api_key
 from app.capture import router as capture_router
+from app.observability import log_remote_write_state
+from app.observability import router as observability_router
 from app.db import SessionLocal
 from app.mcp_app import build_mcp_server
 from app.scheduler import (
@@ -58,6 +60,7 @@ async def lifespan(app: FastAPI):
     needs no external cron; each sleeps before its first pass, so entering
     and promptly exiting this context never triggers a real pass.
     """
+    log_remote_write_state()
     start_curator(app)
     start_artifact_gc(app, SessionLocal)
     try:
@@ -90,6 +93,17 @@ def create_app() -> FastAPI:
 
     @app.get("/healthz")
     def healthz():
+        """Liveness. Deliberately touches nothing.
+
+        This answers "is the process alive?", not "can it serve?". It must
+        never query the database: a liveness probe that follows a dependency
+        down makes the orchestrator restart every replica in a loop while the
+        dependency — not the process — is what is broken.
+
+        The readiness question lives at ``/readyz`` (see
+        :mod:`app.observability`), which does reach the database, and which is
+        what should go red during a database outage.
+        """
         return {"status": "ok"}
 
     @app.get("/verify")
@@ -146,6 +160,11 @@ def create_app() -> FastAPI:
     # Registered BEFORE the root MCP mount so its ``/capture/*`` routes take
     # precedence over the catch-all mount below.
     app.include_router(capture_router)
+
+    # ``/readyz`` and ``/metrics``. Registered before the root MCP mount for the
+    # same reason as the capture routes: the mount is a catch-all and would
+    # otherwise swallow them.
+    app.include_router(observability_router)
 
     # Mount the MCP Streamable-HTTP ASGI app at the application root.
     # ``/healthz`` / ``/verify`` / ``/capture/*`` are registered above, so they

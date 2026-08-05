@@ -65,6 +65,7 @@ from shared.memory import (
 )
 from shared.plan_limits import get_plan_config
 from shared.promotion import promote_memory
+from shared import metrics
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -341,6 +342,12 @@ async def _perform_write(
                 )
             )
         except MemoryQuotaExceeded as exc:
+            # A write refused by the plan's memory quota. Counted as
+            # ``quota`` rather than ``error``: a plan limit being reached is a
+            # product signal, not an operational one, and an alert rule must be
+            # able to tell the two apart.
+            metrics.record(metrics.MEMORY_WRITES.inc, outcome="quota")
+
             return {
                 "stored": False,
                 "error": "quota_exceeded",
@@ -1733,6 +1740,12 @@ async def _perform_recall(
                 )
             )
         except MemoryQuotaExceeded as exc:
+            # A recall refused by the plan's recall quota. Counted as
+            # ``quota`` rather than ``error``: a plan limit being reached is a
+            # product signal, not an operational one, and an alert rule must be
+            # able to tell the two apart.
+            metrics.record(metrics.MEMORY_RECALLS.inc, outcome="quota")
+
             return {
                 "error": "quota_exceeded",
                 "detail": exc.message,
@@ -2294,6 +2307,12 @@ async def _perform_explore(ctx: Context, *, entity: str) -> dict[str, Any]:
                 plan_name=plan,
             )
         except MemoryQuotaExceeded as exc:
+            # A recall refused by the plan's recall quota. Counted as
+            # ``quota`` rather than ``error``: a plan limit being reached is a
+            # product signal, not an operational one, and an alert rule must be
+            # able to tell the two apart.
+            metrics.record(metrics.MEMORY_RECALLS.inc, outcome="quota")
+
             return {
                 "error": "quota_exceeded",
                 "detail": exc.message,

@@ -34,9 +34,12 @@ never be the reason a service cannot boot.
 
 import logging
 import os
+import time
 
+from shared import metrics
 from shared.env_config import parse_float, parse_int
 from sqlalchemy import create_engine, event
+from sqlalchemy.exc import TimeoutError as SATimeoutError
 from sqlalchemy.orm import sessionmaker
 
 from app.config import DATABASE_URL
@@ -157,6 +160,85 @@ def _apply_statement_timeout(dbapi_connection, _connection_record) -> None:
             exc_info=True,
         )
 
+
+# ── pool instrumentation ──────────────────────────────────────────────
+#
+# Pool exhaustion is the failure that presents as "everything is slow": nothing
+# errors, callers simply queue for a connection that never frees up. It is
+# invisible in request-level metrics, and the bounds added above make it *fail*
+# rather than hang without making it *visible*. These three listeners make it
+# legible — depth, wait time, and give-ups.
+
+#: Where a checkout's start time is stashed. On the connection record, so it
+#: survives the trip through the pool and cannot collide across threads the way
+#: a module-level dict would.
+_CHECKOUT_STARTED_ATTR = "_klio_checkout_started"
+
+
+def _on_checkout(_dbapi_connection, connection_record, _connection_proxy) -> None:
+    """Raise the in-use gauge and record how long the checkout waited."""
+    metrics.record(metrics.DB_POOL_IN_USE.inc)
+    started = getattr(connection_record, _CHECKOUT_STARTED_ATTR, None)
+    metrics.record(
+        metrics.DB_POOL_WAIT_SECONDS.observe,
+        0.0 if started is None else max(0.0, time.monotonic() - started),
+    )
+    setattr(connection_record, _CHECKOUT_STARTED_ATTR, time.monotonic())
+
+
+def _on_checkin(_dbapi_connection, _connection_record) -> None:
+    """Lower the in-use gauge when a connection returns to the pool."""
+    metrics.record(metrics.DB_POOL_IN_USE.dec)
+
+
+def instrument_pool(target_engine) -> None:
+    """Attach the pool listeners to ``target_engine``.
+
+    A function rather than decorators so a test can instrument a throwaway
+    engine and assert on the arithmetic, instead of asserting against the real
+    engine's live pool.
+    """
+    event.listen(target_engine, "checkout", _on_checkout)
+    event.listen(target_engine, "checkin", _on_checkin)
+
+
+def _raw_connect(target_engine):
+    """The raw ``engine.connect()``, isolated so a test can make it fail.
+
+    Distinguishing "the pool is exhausted" from "the database refused us" is
+    the whole point of :func:`checkout_connection`, and the only way to exercise
+    both branches is to control what connecting does.
+    """
+    return target_engine.connect()
+
+
+def checkout_connection(target_engine=None):
+    """Check out a connection, classifying a failure before re-raising it.
+
+    Two failures look similar from a stack trace and mean opposite things:
+
+    * ``TimeoutError`` — the pool is full. Every connection is in use and this
+      caller queued past ``pool_timeout``. The fix is capacity or slower queries.
+    * anything else (``OperationalError``, typically) — the database refused
+      the connection. Nothing is exhausted; nothing can connect at all. This is
+      the shape of the 2026-08-04 outage, where a transaction pooler rejected
+      an unrecognised startup parameter on every single connection.
+
+    Folding them into one counter would have shown "pool pressure" during an
+    incident where the pool was entirely idle.
+    """
+    chosen = engine if target_engine is None else target_engine
+    try:
+        return _raw_connect(chosen)
+    except SATimeoutError:
+        metrics.record(metrics.DB_POOL_TIMEOUTS.inc)
+        raise
+    except Exception:
+        metrics.record(metrics.DB_CONNECT_FAILURES.inc)
+        raise
+
+
+instrument_pool(engine)
 
 SessionLocal = sessionmaker(bind=engine)
 
