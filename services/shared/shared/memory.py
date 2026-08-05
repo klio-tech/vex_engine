@@ -19,6 +19,11 @@ import litellm
 from litellm import acompletion, aembedding
 from sqlalchemy import text
 
+# Project ACLs. Safe at module scope: ``projects`` imports nothing from this
+# module (recall inlines its membership subquery rather than calling back
+# here), so there is no cycle to break with a deferred import.
+from shared import projects
+
 logger = logging.getLogger("agentguard.shared.memory")
 
 # ---------------------------------------------------------------------------
@@ -871,9 +876,26 @@ def retract_memory(
     Authorization ladder (org_id always enforced):
       * unknown / cross-org id → not_found (indistinguishable by design)
       * scope='private' row owned by another user → **not_found**
+      * scope='project' row in a project the caller is not a member of →
+        **not_found**
       * scope='agent' row owned by another agent → forbidden
       * otherwise → status='retracted' + audit metadata; recall never
         returns non-'active' rows, so the memory disappears immediately.
+
+    The project arm answers ``not_found`` rather than ``forbidden`` for the
+    same reason the private arm does, and it must: membership is precisely what
+    hides a project row's existence, so an answer that confirmed the id
+    resolves to something real would disclose what the boundary exists to
+    withhold. It is **strict, with no org-admin override**, matching
+    ``project_grant``.
+
+    Only ``scope='project'`` is fenced. A ``project_id`` on an ``org``-scoped
+    row RANKS it, it does not fence it — ``_explicit_write_scope`` deliberately
+    files a non-member's write that way, and reading membership off
+    ``project_id`` alone would make those rows unforgettable by the very people
+    who wrote them. A ``scope='project'`` row with a NULL ``project_id`` (no
+    constraint ties the two columns) fails closed: :func:`shared.projects.is_member`
+    cannot vouch for a project that is not named, so neither can this.
 
     Why a private row answers ``not_found`` and not ``forbidden``: ``forbidden``
     confirms the row exists. Someone who guessed or was shown a memory id would
@@ -903,7 +925,7 @@ def retract_memory(
     row = db_session.execute(
         text(
             """
-            SELECT scope, agent_id, user_id FROM session_memories
+            SELECT scope, agent_id, user_id, project_id FROM session_memories
             WHERE id = :id AND org_id = :org_id
             LIMIT 1
             """
@@ -913,6 +935,16 @@ def retract_memory(
     if row is None:
         return {"forgotten": False, "error": "not_found"}
     if row.scope == "private" and (not user_id or row.user_id != user_id):
+        return {"forgotten": False, "error": "not_found"}
+    if row.scope == "project" and not (
+        row.project_id
+        and projects.is_member(
+            db_session,
+            org_id=org_id,
+            project_id=str(row.project_id),
+            user_id=user_id,
+        )
+    ):
         return {"forgotten": False, "error": "not_found"}
     if row.scope == "agent" and row.agent_id != agent_id:
         return {"forgotten": False, "error": "forbidden"}

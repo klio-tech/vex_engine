@@ -31,6 +31,7 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy import create_engine, text
 
+from shared import projects
 from shared.memory import retract_memory
 from shared.testing import database_url, requires_db
 
@@ -62,8 +63,24 @@ def db():
         try:
             for org_id in orgs:
                 conn.execute(
+                    text(
+                        """
+                        DELETE FROM project_members WHERE project_id IN (
+                            SELECT id FROM projects WHERE org_id = :o)
+                        """
+                    ),
+                    {"o": org_id},
+                )
+                conn.execute(
+                    text("DELETE FROM project_grant_audit WHERE org_id = :o"),
+                    {"o": org_id},
+                )
+                conn.execute(
                     text("DELETE FROM session_memories WHERE org_id = :o"),
                     {"o": org_id},
+                )
+                conn.execute(
+                    text("DELETE FROM projects WHERE org_id = :o"), {"o": org_id}
                 )
             conn.commit()
         finally:
@@ -85,6 +102,7 @@ def _seed(
     scope: str = "org",
     user_id: str | None = None,
     agent_id: str = AGENT,
+    project_id: str | None = None,
 ) -> str:
     memory_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
@@ -98,7 +116,7 @@ def _seed(
             ) VALUES (
                 :id, :session_id, :org_id, :agent_id, NULL,
                 'fact', :content, :embedding, :scope, 'active',
-                :user_id, 'EXTRACTED', NULL, '{}'::jsonb,
+                :user_id, 'EXTRACTED', :project_id, '{}'::jsonb,
                 :created_at, :updated_at
             )
         """),
@@ -111,6 +129,7 @@ def _seed(
             "embedding": FIXED_EMBEDDING_LITERAL,
             "scope": scope,
             "user_id": user_id,
+            "project_id": project_id,
             "created_at": now,
             "updated_at": now,
         },
@@ -258,4 +277,154 @@ def test_a_foreign_org_cannot_retract_a_memory_it_can_name_exactly(db):
     )
 
     assert result["forgotten"] is False
+    assert _status(db, memory_id) == "active"
+
+
+# ── the project arm ───────────────────────────────────────────────────
+#
+# ``retract_memory``'s ladder had a private arm and an agent arm and nothing
+# for ``scope='project'``. A project row was therefore retractable by ANY
+# caller in the org who held its id — including someone the recall SQL would
+# never have shown it to, because the id is not the secret; membership is.
+#
+# The refusal is ``not_found``, matching the private arm rather than the agent
+# arm's ``forbidden``: a project row's existence is exactly what membership
+# hides, so confirming it would be the disclosure. Each attack below is paired
+# with a member performing the identical retraction.
+
+DEV = "99999999-8888-7777-6666-555555555555"
+
+
+def _project(db, *, org_id: str, name: str = "apollo") -> str:
+    project_id = str(uuid.uuid4())
+    db.execute(
+        text(
+            """
+            INSERT INTO projects (id, org_id, git_remote, display_name)
+            VALUES (:id, :org_id, :remote, :name)
+            """
+        ),
+        {
+            "id": project_id,
+            "org_id": org_id,
+            "remote": f"git@example.com:{uuid.uuid4().hex[:8]}.git",
+            "name": name,
+        },
+    )
+    db.commit()
+    return project_id
+
+
+def test_a_non_member_cannot_retract_a_project_memory(db):
+    org = _org(db)
+    project = _project(db, org_id=org)
+    assert projects.add_member(
+        db, org_id=org, project_id=project, user_id=PRIYA, granted_by=None
+    )
+    db.commit()
+    memory_id = _seed(db, org_id=org, scope="project", project_id=project)
+
+    refused = retract_memory(
+        db,
+        org_id=org,
+        agent_id=AGENT,
+        memory_id=memory_id,
+        via="mcp",
+        user_id=DEV,
+    )
+
+    assert refused == {"forgotten": False, "error": "not_found"}, refused
+    assert _status(db, memory_id) == "active", "refused, then retracted anyway"
+
+    # Positive control: the member retracts the identical row.
+    allowed = retract_memory(
+        db,
+        org_id=org,
+        agent_id=AGENT,
+        memory_id=memory_id,
+        via="mcp",
+        user_id=PRIYA,
+    )
+    assert allowed["forgotten"] is True, allowed
+    assert _status(db, memory_id) == "retracted"
+
+
+def test_an_unattributed_caller_cannot_retract_a_project_memory(db):
+    """``user_id=None`` is not a member of anything, and not a wildcard."""
+    org = _org(db)
+    project = _project(db, org_id=org)
+    assert projects.add_member(
+        db, org_id=org, project_id=project, user_id=PRIYA, granted_by=None
+    )
+    db.commit()
+    memory_id = _seed(db, org_id=org, scope="project", project_id=project)
+
+    refused = retract_memory(
+        db, org_id=org, agent_id=AGENT, memory_id=memory_id, via="mcp", user_id=None
+    )
+
+    assert refused == {"forgotten": False, "error": "not_found"}, refused
+    assert _status(db, memory_id) == "active"
+
+    allowed = retract_memory(
+        db, org_id=org, agent_id=AGENT, memory_id=memory_id, via="mcp", user_id=PRIYA
+    )
+    assert allowed["forgotten"] is True, "positive control failed"
+
+
+def test_the_project_refusal_is_identical_to_an_unknown_id(db):
+    """No existence oracle: the two answers are the same object."""
+    org = _org(db)
+    project = _project(db, org_id=org)
+    memory_id = _seed(db, org_id=org, scope="project", project_id=project)
+
+    real = retract_memory(
+        db, org_id=org, agent_id=AGENT, memory_id=memory_id, via="mcp", user_id=DEV
+    )
+    invented = retract_memory(
+        db,
+        org_id=org,
+        agent_id=AGENT,
+        memory_id=str(uuid.uuid4()),
+        via="mcp",
+        user_id=DEV,
+    )
+    assert real == invented == {"forgotten": False, "error": "not_found"}
+
+
+def test_an_org_row_that_merely_names_a_project_is_not_fenced_by_it(db):
+    """``project_id`` on an ``org``-scoped row RANKS; it does not FENCE.
+
+    ``_explicit_write_scope`` deliberately files non-members' writes under a
+    project at ``scope='org'``. Reading membership off ``project_id`` alone
+    would make those rows unforgettable by the very people who wrote them.
+    """
+    org = _org(db)
+    project = _project(db, org_id=org)
+    memory_id = _seed(db, org_id=org, scope="org", project_id=project)
+
+    result = retract_memory(
+        db, org_id=org, agent_id=AGENT, memory_id=memory_id, via="mcp", user_id=DEV
+    )
+
+    assert result["forgotten"] is True, result
+    assert _status(db, memory_id) == "retracted"
+
+
+def test_a_project_row_with_no_project_id_is_not_retractable_by_anyone(db):
+    """Fail closed. A fenced scope with no fence is not an open gate.
+
+    No such row should exist, but ``scope`` and ``project_id`` are separate
+    columns with no constraint tying them together, so the code has to answer
+    for the combination. ``is_member`` cannot vouch for a NULL project, so
+    neither can this.
+    """
+    org = _org(db)
+    memory_id = _seed(db, org_id=org, scope="project", project_id=None)
+
+    refused = retract_memory(
+        db, org_id=org, agent_id=AGENT, memory_id=memory_id, via="mcp", user_id=PRIYA
+    )
+
+    assert refused == {"forgotten": False, "error": "not_found"}, refused
     assert _status(db, memory_id) == "active"
