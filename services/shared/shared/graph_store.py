@@ -29,7 +29,7 @@ the tree for violations. A later engine swap reimplements this one file.
 
 import logging
 import uuid
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from sqlalchemy import text
 
@@ -154,6 +154,22 @@ def normalize_entity_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+class EntityUpsert(NamedTuple):
+    """What :func:`add_entity` did: the entity's id, and whether it is new.
+
+    ``inserted`` exists because callers that budget entity CREATION cannot
+    infer it from the id. The curator's per-tick cap is such a caller, and
+    without this flag it charged the budget for every *reference*: a tick
+    mentioning one entity twenty times spent twenty of its twelve, hit the cap,
+    and dropped everything after — including every edge pointing at an entity
+    that never got created. The cap is on new rows; only ``inserted`` says
+    which those were.
+    """
+
+    id: str
+    inserted: bool
+
+
 def add_entity(
     db: Any,
     *,
@@ -161,8 +177,14 @@ def add_entity(
     name: str,
     kind: str,
     embedding: Optional[list[float]] = None,
-) -> str:
-    """Upsert an entity on ``(org_id, norm_name, kind)``; return its id.
+) -> EntityUpsert:
+    """Upsert an entity on ``(org_id, norm_name, kind)``; return id + insert flag.
+
+    ``inserted`` comes from ``(xmax = 0)`` on the ``RETURNING`` clause — the
+    standard Postgres test for "this upsert took the INSERT arm". A row's
+    ``xmax`` is zero when no transaction has updated it, which for a row
+    emerging from ``INSERT ... ON CONFLICT DO UPDATE`` is true exactly when the
+    conflict did not fire.
 
     Race-safe ``INSERT ... ON CONFLICT ... RETURNING`` against the
     ``uq_entities_org_norm_name_kind`` arbiter, same idiom as
@@ -199,7 +221,7 @@ def add_entity(
             ON CONFLICT (org_id, norm_name, kind)
             DO UPDATE SET
                 embedding = COALESCE(entities.embedding, EXCLUDED.embedding)
-            RETURNING id
+            RETURNING id, (xmax = 0) AS inserted
             """
         ),
         {
@@ -212,7 +234,7 @@ def add_entity(
         },
     ).fetchone()
     db.commit()
-    return str(row.id)
+    return EntityUpsert(str(row.id), bool(row.inserted))
 
 
 def add_edge(

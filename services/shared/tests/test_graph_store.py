@@ -122,10 +122,12 @@ def _seed(
 
 def test_add_entity_upserts_on_normalized_name(db):
     org = _org(db)
-    first = graph_store.add_entity(db, org_id=org, name="Auth Service", kind="system")
+    first = graph_store.add_entity(
+        db, org_id=org, name="Auth Service", kind="system"
+    ).id
     second = graph_store.add_entity(
         db, org_id=org, name="  auth   SERVICE ", kind="system"
-    )
+    ).id
     assert first == second, "case/whitespace variants must converge on one row"
 
     row = db.execute(
@@ -138,10 +140,41 @@ def test_add_entity_upserts_on_normalized_name(db):
     assert row.name == "Auth Service"
 
 
+def test_add_entity_reports_whether_it_inserted_or_hit(db):
+    """``inserted`` must come from the row, not from a constant.
+
+    This is the flag the curator's per-tick entity cap is spent on. If it were
+    hardcoded ``True`` the cap would still be charged for every reference —
+    the exact defect — and if it were hardcoded ``False`` the god-entity guard
+    would never fire at all. Only real Postgres can tell the difference:
+    ``(xmax = 0)`` is a property of the row the upsert produced.
+    """
+    org = _org(db)
+    first = graph_store.add_entity(db, org_id=org, name="Auth Service", kind="system")
+    assert first.inserted is True, "the first upsert of a name creates the row"
+
+    second = graph_store.add_entity(
+        db, org_id=org, name="  auth   SERVICE ", kind="system"
+    )
+    assert second.id == first.id, "control: the second call did resolve the same row"
+    assert second.inserted is False, (
+        "the second upsert took the CONFLICT arm and created nothing; "
+        "reporting it as an insert is what emptied the curator's entity budget "
+        "on references"
+    )
+
+    # A different kind is a different entity, so that one IS an insert again —
+    # proving the flag tracks the row rather than the call ordinal.
+    other_kind = graph_store.add_entity(
+        db, org_id=org, name="Auth Service", kind="concept"
+    )
+    assert other_kind.inserted is True
+
+
 def test_add_entity_same_name_different_kind_is_a_different_entity(db):
     org = _org(db)
-    a = graph_store.add_entity(db, org_id=org, name="mercury", kind="system")
-    b = graph_store.add_entity(db, org_id=org, name="mercury", kind="person")
+    a = graph_store.add_entity(db, org_id=org, name="mercury", kind="system").id
+    b = graph_store.add_entity(db, org_id=org, name="mercury", kind="person").id
     assert a != b
 
 
@@ -179,7 +212,7 @@ def test_add_entity_refuses_blank_and_oversized_names(db):
 def test_add_edge_defaults_to_inferred_and_dedups(db):
     org = _org(db)
     src = _seed(db, org_id=org, content="we chose postgres")
-    entity = graph_store.add_entity(db, org_id=org, name="postgres", kind="tool")
+    entity = graph_store.add_entity(db, org_id=org, name="postgres", kind="tool").id
 
     first = graph_store.add_edge(
         db, org_id=org, src_id=src, dst_kind="entity", dst_id=entity, relation="about"
@@ -332,7 +365,7 @@ def test_sweep_removes_edges_to_forgotten_memories_only(db):
 def test_sweep_removes_edges_whose_entity_vanished(db):
     org = _org(db)
     src = _seed(db, org_id=org, content="m")
-    entity = graph_store.add_entity(db, org_id=org, name="ghost-svc", kind="system")
+    entity = graph_store.add_entity(db, org_id=org, name="ghost-svc", kind="system").id
     graph_store.add_edge(
         db, org_id=org, src_id=src, dst_kind="entity", dst_id=entity, relation="about"
     )
@@ -490,7 +523,7 @@ def _age_entity(db, entity_id: str, *, days: int = 30) -> None:
 def test_sweep_collects_an_entity_whose_every_evidencing_memory_is_gone(db):
     org = _org(db)
     mem = _seed(db, org_id=org, content="the billing service is flaky")
-    ent = graph_store.add_entity(db, org_id=org, name="billing", kind="system")
+    ent = graph_store.add_entity(db, org_id=org, name="billing", kind="system").id
     graph_store.add_edge(
         db, org_id=org, src_id=mem, dst_kind="entity", dst_id=ent, relation="about"
     )
@@ -525,7 +558,7 @@ def test_sweep_spares_an_entity_evidenced_by_a_memory_the_caller_cannot_see(db):
         scope="private",
         user_id=PRIYA,
     )
-    ent = graph_store.add_entity(db, org_id=org, name="billing", kind="system")
+    ent = graph_store.add_entity(db, org_id=org, name="billing", kind="system").id
     graph_store.add_edge(
         db,
         org_id=org,
@@ -543,8 +576,12 @@ def test_sweep_spares_an_entity_evidenced_by_a_memory_the_caller_cannot_see(db):
 def test_sweep_never_reaches_into_another_org(db):
     org_a = _org(db)
     org_b = _org(db)
-    orphan_a = graph_store.add_entity(db, org_id=org_a, name="billing", kind="system")
-    orphan_b = graph_store.add_entity(db, org_id=org_b, name="billing", kind="system")
+    orphan_a = graph_store.add_entity(
+        db, org_id=org_a, name="billing", kind="system"
+    ).id
+    orphan_b = graph_store.add_entity(
+        db, org_id=org_b, name="billing", kind="system"
+    ).id
     _age_entity(db, orphan_a)
     _age_entity(db, orphan_b)
 
@@ -563,7 +600,7 @@ def test_sweep_spares_an_entity_that_is_merely_new(db):
     the sweep only collects entities older than its grace window.
     """
     org = _org(db)
-    fresh = graph_store.add_entity(db, org_id=org, name="brand-new", kind="concept")
+    fresh = graph_store.add_entity(db, org_id=org, name="brand-new", kind="concept").id
 
     assert graph_store.sweep_orphan_entities(db, org_id=org) == 0
     assert fresh in _entity_ids(db, org_id=org)
@@ -577,8 +614,8 @@ def test_sweep_leaves_evidenced_siblings_untouched(db):
     """Exactness: the sweep removes the orphan and ONLY the orphan."""
     org = _org(db)
     mem = _seed(db, org_id=org, content="auth service owns login")
-    kept = graph_store.add_entity(db, org_id=org, name="auth", kind="system")
-    orphan = graph_store.add_entity(db, org_id=org, name="ghost", kind="concept")
+    kept = graph_store.add_entity(db, org_id=org, name="auth", kind="system").id
+    orphan = graph_store.add_entity(db, org_id=org, name="ghost", kind="concept").id
     graph_store.add_edge(
         db, org_id=org, src_id=mem, dst_kind="entity", dst_id=kept, relation="about"
     )

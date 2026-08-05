@@ -385,10 +385,20 @@ def _store_graph(
             break
         savepoint = _begin_savepoint(db_session)
         try:
-            entity_ids[norm] = graph_store.add_entity(
+            upsert = graph_store.add_entity(
                 db_session, org_id=org_id, name=name, kind=kind
             )
-            entity_budget.remaining -= 1
+            entity_ids[norm] = upsert.id
+            # Charge the budget for CREATION only. The cap exists to stop one
+            # runaway extraction hairballing the org's graph in a single tick;
+            # resolving a name to an entity that already exists creates
+            # nothing, so it costs nothing. Charging for hits made a 50-row
+            # batch across four partitions at ~5 entities each spend roughly
+            # 20 of its 12 — and the `break` below then dropped not just the
+            # remaining entities but every edge that pointed at one, with the
+            # cursor already advanced past the rows they came from.
+            if upsert.inserted:
+                entity_budget.remaining -= 1
         except graph_store.EntityRefused as exc:
             _undo_failed_item(db_session, savepoint, "add_entity", org_id)
             logger.info("curator: entity refused for org %s: %s", org_id, exc)

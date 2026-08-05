@@ -244,7 +244,9 @@ def test_walk_through_a_shared_entity_is_filtered(db):
     private one is the sibling. The entity is org-level by design; the
     sibling's visibility must still be the MEMORY's, not the entity's."""
     org = _org(db)
-    entity = graph_store.add_entity(db, org_id=org, name="auth service", kind="system")
+    entity = graph_store.add_entity(
+        db, org_id=org, name="auth service", kind="system"
+    ).id
     entry = _seed(db, org_id=org, content="auth service uses jwt")
     secret = _seed(
         db,
@@ -434,7 +436,7 @@ def test_entity_evidenced_only_privately_is_not_found_for_everyone_else(db):
     other_org = _org(db)
     entity = graph_store.add_entity(
         db, org_id=org, name="project-mercury", kind="concept"
-    )
+    ).id
     secret = _seed(
         db,
         org_id=org,
@@ -488,7 +490,7 @@ def test_two_teammates_see_different_briefs_of_the_same_entity(db):
     """Priya's private memory about an ORG entity: absent from Dev's brief,
     present in Priya's. Different briefs is the feature, not a bug."""
     org = _org(db)
-    entity = graph_store.add_entity(db, org_id=org, name="billing", kind="system")
+    entity = graph_store.add_entity(db, org_id=org, name="billing", kind="system").id
     shared = _seed(
         db, org_id=org, content="billing moved to stripe", memory_type="decision"
     )
@@ -538,7 +540,9 @@ def test_brief_contributors_are_counts_never_ids(db):
     """The brief may say HOW MANY people evidenced an entity, never WHO
     (beyond the caller's own visible slice's contents)."""
     org = _org(db)
-    entity = graph_store.add_entity(db, org_id=org, name="onboarding", kind="concept")
+    entity = graph_store.add_entity(
+        db, org_id=org, name="onboarding", kind="concept"
+    ).id
     m1 = _seed(db, org_id=org, content="onboarding flow shipped", user_id=PRIYA)
     m2 = _seed(db, org_id=org, content="onboarding drop-off is 40%", user_id=DEV)
     for m in (m1, m2):
@@ -559,7 +563,9 @@ def test_brief_contributors_are_counts_never_ids(db):
 def test_cross_org_caller_never_resolves_another_orgs_entity(db):
     org_a = _org(db)
     org_b = _org(db)
-    entity = graph_store.add_entity(db, org_id=org_a, name="skunkworks", kind="concept")
+    entity = graph_store.add_entity(
+        db, org_id=org_a, name="skunkworks", kind="concept"
+    ).id
     evidence = _seed(db, org_id=org_a, content="skunkworks is greenlit")
     _edge(
         db,
@@ -656,8 +662,8 @@ def test_entity_walk_pins_the_destination_org_filter(db):
     a_mem = _seed(db, org_id=org_a, content="org A billing note")
     b_mem = _seed(db, org_id=org_b, content="org B billing secret")
 
-    a_ent = graph_store.add_entity(db, org_id=org_a, name="billing", kind="concept")
-    b_ent = graph_store.add_entity(db, org_id=org_b, name="billing", kind="concept")
+    a_ent = graph_store.add_entity(db, org_id=org_a, name="billing", kind="concept").id
+    b_ent = graph_store.add_entity(db, org_id=org_b, name="billing", kind="concept").id
     assert a_ent != b_ent, "entities must not be shared across tenants"
 
     graph_store.add_edge(
@@ -720,7 +726,7 @@ def test_neighbors_destination_filter_holds_without_the_join_guard(db):
 
 def _superseded_pair(db, *, org, entity_name, old_content, new_content, **seed_kw):
     """Seed old <-supersedes- new, both evidencing one entity. Returns ids."""
-    entity = graph_store.add_entity(db, org_id=org, name=entity_name, kind="concept")
+    entity = graph_store.add_entity(db, org_id=org, name=entity_name, kind="concept").id
     new_id = _seed(db, org_id=org, content=new_content, **seed_kw)
     old_id = _seed(
         db,
@@ -830,7 +836,7 @@ def test_a_retracted_memory_is_never_served_as_old_content(db):
     org = _org(db)
     entity = graph_store.add_entity(
         db, org_id=org, name="deploy target", kind="concept"
-    )
+    ).id
     new_id = _seed(db, org_id=org, content="we deploy to fly.io now")
     dead_id = _seed(
         db, org_id=org, content="RETRACTED-MARKER heroku creds", status="retracted"
@@ -864,7 +870,9 @@ def test_a_hidden_raw_capture_is_never_served_as_old_content(db):
     """H1, half two continued: ``recall_hidden`` rows are curator fuel that no
     read path may return. The superseded query omitted the predicate."""
     org = _org(db)
-    entity = graph_store.add_entity(db, org_id=org, name="oncall rota", kind="concept")
+    entity = graph_store.add_entity(
+        db, org_id=org, name="oncall rota", kind="concept"
+    ).id
     new_id = _seed(db, org_id=org, content="priya is on call this week")
     hidden_id = _seed(
         db,
@@ -1001,7 +1009,7 @@ def test_neighbors_never_returns_a_hidden_raw_capture(db):
 def test_entity_brief_never_admits_a_hidden_raw_capture(db):
     """Pins ``m.recall_hidden = FALSE`` in ``entity_brief``'s evidence query."""
     org = _org(db)
-    entity = graph_store.add_entity(db, org_id=org, name="checkout", kind="system")
+    entity = graph_store.add_entity(db, org_id=org, name="checkout", kind="system").id
     hidden = _seed(
         db, org_id=org, content="HIDDEN-EVIDENCE raw checkout log", recall_hidden=True
     )
@@ -1022,7 +1030,9 @@ def test_entity_brief_never_admits_a_hidden_raw_capture(db):
 def test_entity_brief_is_not_found_when_only_hidden_evidence_exists(db):
     """The stronger form: hidden evidence must not even prove the name."""
     org = _org(db)
-    entity = graph_store.add_entity(db, org_id=org, name="shadow-topic", kind="concept")
+    entity = graph_store.add_entity(
+        db, org_id=org, name="shadow-topic", kind="concept"
+    ).id
     hidden = _seed(db, org_id=org, content="raw capture only", recall_hidden=True)
     _edge(
         db,
@@ -1112,7 +1122,7 @@ def test_entity_brief_agent_arm_admits_only_the_callers_agent(db):
     org = _org(db)
     entity = graph_store.add_entity(
         db, org_id=org, name="migration plan", kind="concept"
-    )
+    ).id
     mine = _seed(
         db,
         org_id=org,
