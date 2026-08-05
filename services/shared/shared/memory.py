@@ -602,12 +602,28 @@ async def retrieve_memories(
 
     Performs two queries:
 
-    1. Semantic search across all active memories for the session,
+    1. Semantic search across the session's active session-scoped memories,
        ordered by cosine distance (``embedding <=> :embedding``).
     2. Fetches the last *include_summaries* summaries by
        ``sequence_number`` for recency context.
 
     Results are deduplicated by ``id`` and returned as a combined list.
+
+    Both queries carry ``scope = 'session' AND recall_hidden = FALSE``, and
+    both need them. ``session_id`` is **not** a trust boundary: the
+    sync-gateway verification path passes ``event.session_id`` straight off
+    the wire, and the reserved ``klio-brain:<org_id>:<agent_id>`` buckets are
+    derived from a client-declared ``X-Vex-Agent`` header. Any authenticated
+    caller in an org can therefore name any bucket in that org. Without the
+    scope predicate a named bucket returns another user's ``scope='private'``
+    rows, and without the ``recall_hidden`` predicate it returns curator fuel
+    that is deliberately withheld from every recall surface — and whatever
+    this function returns is forwarded to the consistency LLM.
+
+    Session-scoped reads are the *only* thing this function serves. Reads at
+    ``private``/``agent``/``project``/``org`` scope belong to
+    :func:`retrieve_memories_scoped`, which decides entitlement from the
+    authenticated principal rather than from a client-supplied string.
 
     Returns:
         A list of :class:`MemoryRecord` instances, or an empty list if
@@ -630,6 +646,8 @@ async def retrieve_memories(
             WHERE session_id = :session_id
               AND org_id = :org_id
               AND status = 'active'
+              AND scope = 'session'
+              AND recall_hidden = FALSE
             ORDER BY embedding <=> :embedding
             LIMIT :limit
         """),
@@ -654,6 +672,8 @@ async def retrieve_memories(
               AND org_id = :org_id
               AND memory_type = 'summary'
               AND status = 'active'
+              AND scope = 'session'
+              AND recall_hidden = FALSE
             ORDER BY sequence_number DESC
             LIMIT :limit
         """),

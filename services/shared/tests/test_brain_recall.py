@@ -442,6 +442,13 @@ async def test_existing_retrieve_memories_unchanged(db_session):
 
     Regression guard proving the additive change did not break the existing
     session-scoped read path: a session's row is found by semantic search.
+
+    The seed is explicitly ``scope='session'``. It used to rely on
+    ``_seed_memory``'s ``scope='org'`` default, which passed only because
+    ``retrieve_memories`` had no scope predicate at all — the disclosure bug
+    this file's sibling suite (``test_session_retrieval_isolation.py``) now
+    pins shut. An org-scoped row reachable through a client-supplied
+    ``session_id`` is the defect, not the contract.
     """
     org_id = _track(db_session, _unique_org())
     session_id = f"sess-{uuid.uuid4().hex[:8]}"
@@ -450,6 +457,7 @@ async def test_existing_retrieve_memories_unchanged(db_session):
         org_id=org_id,
         session_id=session_id,
         content="session-scoped fact",
+        scope="session",
         memory_type="fact",
     )
 
