@@ -330,8 +330,21 @@ async def extract_graph(combined: str) -> dict[str, Any]:
         return empty
 
     facts_raw = result.get("facts", [])
+    # Invalid elements are REPLACED, never removed. ``src`` on an edge is an
+    # index into this list, so the list's positions are part of the wire
+    # contract: compacting it slides every later fact down a slot while the
+    # edges keep pointing at the old numbers, and an edge that meant fact 2
+    # silently becomes an edge to fact 1. That is not a dropped edge — those
+    # are safe and happen all over this pipeline — it is an edge drawn to the
+    # WRONG memory, stamped INFERRED and indistinguishable from a correct one.
+    #
+    # The replacement is an empty string, which is falsy: the fact loop in
+    # ``_synthesize_and_store`` skips it, so no memory is written, its index
+    # never enters ``fact_row_ids``, and any edge naming it takes the existing
+    # missing-src branch and is skipped. The numbering survives; nothing is
+    # invented to fill it.
     facts = (
-        [f for f in facts_raw if isinstance(f, str)]
+        [f if isinstance(f, str) else "" for f in facts_raw]
         if isinstance(facts_raw, list)
         else []
     )
