@@ -29,7 +29,7 @@ the tree for violations. A later engine swap reimplements this one file.
 
 import logging
 import uuid
-from typing import Any, Optional
+from typing import Any, NamedTuple, Optional
 
 from sqlalchemy import text
 
@@ -154,6 +154,22 @@ def normalize_entity_name(name: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+class EntityUpsert(NamedTuple):
+    """What :func:`add_entity` did: the entity's id, and whether it is new.
+
+    ``inserted`` exists because callers that budget entity CREATION cannot
+    infer it from the id. The curator's per-tick cap is such a caller, and
+    without this flag it charged the budget for every *reference*: a tick
+    mentioning one entity twenty times spent twenty of its twelve, hit the cap,
+    and dropped everything after — including every edge pointing at an entity
+    that never got created. The cap is on new rows; only ``inserted`` says
+    which those were.
+    """
+
+    id: str
+    inserted: bool
+
+
 def add_entity(
     db: Any,
     *,
@@ -161,8 +177,14 @@ def add_entity(
     name: str,
     kind: str,
     embedding: Optional[list[float]] = None,
-) -> str:
-    """Upsert an entity on ``(org_id, norm_name, kind)``; return its id.
+) -> EntityUpsert:
+    """Upsert an entity on ``(org_id, norm_name, kind)``; return id + insert flag.
+
+    ``inserted`` comes from ``(xmax = 0)`` on the ``RETURNING`` clause — the
+    standard Postgres test for "this upsert took the INSERT arm". A row's
+    ``xmax`` is zero when no transaction has updated it, which for a row
+    emerging from ``INSERT ... ON CONFLICT DO UPDATE`` is true exactly when the
+    conflict did not fire.
 
     Race-safe ``INSERT ... ON CONFLICT ... RETURNING`` against the
     ``uq_entities_org_norm_name_kind`` arbiter, same idiom as
@@ -199,7 +221,7 @@ def add_entity(
             ON CONFLICT (org_id, norm_name, kind)
             DO UPDATE SET
                 embedding = COALESCE(entities.embedding, EXCLUDED.embedding)
-            RETURNING id
+            RETURNING id, (xmax = 0) AS inserted
             """
         ),
         {
@@ -212,7 +234,7 @@ def add_entity(
         },
     ).fetchone()
     db.commit()
-    return str(row.id)
+    return EntityUpsert(str(row.id), bool(row.inserted))
 
 
 def add_edge(
@@ -318,6 +340,15 @@ def _alarm_on_degree(db: Any, *, org_id: str, entity_id: str) -> None:
             )
     except Exception:
         # The alarm is telemetry; it must never fail the write that fired it.
+        # It must equally never leave the session aborted: this runs at the
+        # tail of every ``add_edge``, and the curator draws its next edge on
+        # the same session — so one failed degree probe would otherwise cost
+        # the rest of the tick's graph. The edge itself already committed
+        # above, so there is nothing in flight for the rollback to discard.
+        try:
+            db.rollback()
+        except Exception:
+            logger.warning("rollback after a failed degree check failed", exc_info=True)
         logger.warning("god-entity degree check failed", exc_info=True)
 
 
@@ -540,6 +571,14 @@ def entity_brief(
     different briefs, which is the feature. Contributors are a COUNT — the
     number of distinct attributed authors across the visible slice — never a
     list of ids or names.
+
+    Bounded to the caller's NEWEST :data:`_BRIEF_EVIDENCE_LIMIT` visible
+    memories, reordered oldest-first for presentation, with ``truncated``
+    saying whether the bound bit. The window used to run the other way
+    (``ORDER BY created_at ASC``), so past the fiftieth memory the brief
+    described the entity as it was fifty memories ago and every derived field
+    — decisions, supersessions, contributors, provenance — described that same
+    frozen slice while reading as current. Nothing said it had been capped.
     """
     norm = normalize_entity_name(entity)
     if not norm:
@@ -582,14 +621,17 @@ def entity_brief(
               AND m.status = 'active'
               AND m.recall_hidden = FALSE
               AND {ladder_sql}
-            ORDER BY m.created_at ASC
+            ORDER BY m.created_at DESC, m.id DESC
             LIMIT :limit
             """
         ),
         {
             "org_id": org_id,
             "entity_ids": entity_ids,
-            "limit": _BRIEF_EVIDENCE_LIMIT,
+            # One more than the bound, so truncation is detected exactly
+            # rather than inferred from a count that a full-but-complete
+            # entity would produce identically.
+            "limit": _BRIEF_EVIDENCE_LIMIT + 1,
             **ladder_params,
         },
     ).fetchall()
@@ -597,7 +639,14 @@ def entity_brief(
     if not evidence_rows:
         return None  # not_found — same answer as "no such entity"
 
-    memories = [_row_to_record(row) for row in evidence_rows]
+    truncated = len(evidence_rows) > _BRIEF_EVIDENCE_LIMIT
+    evidence_rows = evidence_rows[:_BRIEF_EVIDENCE_LIMIT]
+
+    # Selected newest-first, presented oldest-first. Two separate concerns:
+    # the WINDOW must track the entity as it is now, and the NARRATIVE must
+    # read forwards — the brief is a chronology and the LLM summary is built
+    # from it in order.
+    memories = [_row_to_record(row) for row in reversed(evidence_rows)]
     evidence_ids = [str(m.id) for m in memories]
 
     # Which entity row does the visible evidence actually support? (A name
@@ -692,6 +741,12 @@ def entity_brief(
         "kind": kind,
         "memories": memories,
         "evidence_count": len(memories),
+        # True when the entity has more visible evidence than the brief
+        # carries. Every derived field below — decisions, superseded,
+        # contributors, provenance — is computed from the selected slice, so
+        # without this a caller cannot tell "these are the entity's three
+        # contributors" from "these are three of them".
+        "truncated": truncated,
         "decisions": decisions,
         "superseded": superseded,
         "contributors": contributors,

@@ -83,10 +83,20 @@ def test_recall_metric_uses_recall_limit():
 
 
 def test_check_fails_open_on_db_error():
+    """Fail-open only. This mock CANNOT see the transaction half of the bug.
+
+    A ``MagicMock`` has no transaction state: it answers the statement after a
+    raised one exactly as happily as the first, so this test passed identically
+    with and without the ``rollback()`` that the real defect needed. The
+    ``rollback`` assertion below is the cheap half of the guard; the real one
+    is ``tests/test_rollback_on_swallowed_error.py``, which poisons a live
+    Postgres connection and then asks whether the caller can still use it.
+    """
     db = MagicMock()
     db.execute.side_effect = RuntimeError("db down")
     over = check_memory_quota(db, "org-1", get_plan_config("free"), "memory")
     assert over is False
+    db.rollback.assert_called_once()
 
 
 def test_record_usage_upserts_memory():

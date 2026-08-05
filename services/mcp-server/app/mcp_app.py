@@ -2303,6 +2303,12 @@ async def _perform_explore(ctx: Context, *, entity: str) -> dict[str, Any]:
             "contributors": _contributor_labels(brief, user_id),
             "provenance": brief["provenance"],
             "evidence_count": brief["evidence_count"],
+            # The entity has more visible evidence than this brief covers, so
+            # every count above describes a bounded window of the newest
+            # memories rather than the entity's whole history. Surfaced
+            # because a client cannot infer it: a capped brief and a complete
+            # one of exactly the limit report the same evidence_count.
+            "truncated": brief["truncated"],
         }
     except Exception:
         logger.exception("explore failed")

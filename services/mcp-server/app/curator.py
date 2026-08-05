@@ -76,6 +76,14 @@ Cursor / idempotency:
     nothing new synthesises nothing and leaves *both* cursor halves untouched
     (only ``last_run_at`` is bumped), so re-runs are idempotent.
 
+    The cursor advances only over rows the tick actually distilled. A batch is
+    partitioned by ``(space_id, project_id)`` and a partition below the
+    threshold — or one that qualified but stored nothing, because every write
+    failed — is deferred, so the cursor stops before the earliest such row
+    rather than at the batch's end. Advancing past a row the curator never
+    read back is not a skip: nothing looks behind the cursor, and
+    ``scripts/run_retention.py`` deletes RAW observations on a 7-day TTL.
+
 Async / DB I/O note:
     :func:`curator_tick` is ``async def`` yet performs inline *synchronous*
     psycopg2 DB I/O via ``db_session.execute(...)``. This matches the house
@@ -100,6 +108,7 @@ from sqlalchemy import text
 
 from shared import graph_store
 from shared.brain import write_scoped_memory
+from shared.env_config import parse_int
 from shared.memory import (
     _NO_CREDENTIALS_RULE,
     call_llm,
@@ -151,17 +160,48 @@ def _entity_cap() -> int:
 
     Overflow is logged and dropped, never stored: a single runaway extraction
     must not be able to hairball the org's graph in one tick.
+
+    Parsed through :func:`shared.env_config.parse_int` rather than a bare
+    ``int()``. This function runs inside every tick, and both failure modes of
+    the bare call are silent from where an operator would look: a typo raised
+    ``ValueError`` into ``run_curator_once``'s per-pair handler, which logs
+    "tick failed" and moves on — curation off for every user, no mention of the
+    variable — and a negative value was accepted, making
+    ``remaining <= 0`` true on the first entity of every tick so entities and
+    all their edges were dropped in silence. ``minimum=1`` is what closes the
+    second: a cap below one is an off switch, not a cap.
     """
-    return int(os.environ.get("CURATOR_ENTITY_CAP", "12"))
+    return parse_int(
+        os.environ.get("CURATOR_ENTITY_CAP"),
+        default=12,
+        name="CURATOR_ENTITY_CAP",
+        minimum=1,
+    )
 
 
 @dataclass
 class EntityBudget:
     """The per-TICK entity allowance, threaded through per-partition synthesis.
 
-    Deliberately mutable (like the reconcile budget integer this module already
-    threads): the whole point is that partitions within one tick draw down a
-    single shared allowance rather than each getting a fresh one.
+    Deliberately mutable: the whole point is that partitions within one tick
+    draw down a single shared allowance rather than each getting a fresh one.
+    """
+
+    remaining: int
+
+
+@dataclass
+class ReconcileBudget:
+    """The per-TICK LLM-judge allowance, threaded exactly like :class:`EntityBudget`.
+
+    It has to be an object rather than a local integer because the spend
+    happens one partition at a time and the cap is documented per tick.
+    ``_synthesize_and_store`` used to read ``CURATOR_RECONCILE_MAX`` itself,
+    and it runs once per ``(space_id, project_id)`` partition — so every
+    partition received the full allowance and a documented ceiling of 50
+    judge calls was really 50 *per partition*. A 50-row batch can partition 16
+    ways, which is 800 LLM calls against a knob whose only job is bounding
+    spend.
     """
 
     remaining: int
@@ -176,8 +216,71 @@ def _reconcile_budget() -> int:
     every :func:`reconcile_fact` call and decrements by ``judged`` (the number of
     attempts actually made), the total ``call_llm`` invocations for the tick is
     bounded by this value — not merely accounted after the fact.
+
+    Guarded exactly as :func:`_entity_cap` is, and for the same two reasons: a
+    malformed value must not raise into a tick, and a value below 1 disables
+    reconciliation altogether — stale contradicted facts then survive forever
+    with nothing logged.
     """
-    return int(os.environ.get("CURATOR_RECONCILE_MAX", "50"))
+    return parse_int(
+        os.environ.get("CURATOR_RECONCILE_MAX"),
+        default=50,
+        name="CURATOR_RECONCILE_MAX",
+        minimum=1,
+    )
+
+
+def _begin_savepoint(db_session: Any) -> Any:
+    """Open a SAVEPOINT around one item of a batch, or ``None`` if unsupported.
+
+    The curator's three swallowing handlers differ from the seven elsewhere in
+    the engine: they sit INSIDE a loop whose earlier iterations may still be in
+    flight. A bare ``db_session.rollback()`` there clears the aborted
+    transaction — which is necessary — but it also discards every uncommitted
+    write the batch has made so far, turning one bad fact into the loss of a
+    whole partition. ``ROLLBACK TO SAVEPOINT`` undoes exactly the failed item.
+
+    Returns ``None`` when the session seam has no ``begin_nested`` (a plain
+    test stub). Callers fall back to a bare rollback, which is the pre-existing
+    behaviour and still better than leaving the transaction aborted.
+    """
+    try:
+        return db_session.begin_nested()
+    except Exception:
+        logger.debug("curator: session does not support savepoints", exc_info=True)
+        return None
+
+
+def _undo_failed_item(db_session: Any, savepoint: Any, what: str, org_id: str) -> None:
+    """Undo one failed item, keeping the rest of the batch's work.
+
+    Falls back to a full rollback when there is no live savepoint to return
+    to. That happens legitimately: the write helpers commit internally, and a
+    commit releases the savepoint, so a failure *after* an inner commit has no
+    savepoint left. It is also the case for a session seam with no
+    ``begin_nested``. Either way the transaction must be cleared — an aborted
+    one refuses every remaining statement of the tick, cursor upsert included.
+    """
+    try:
+        if savepoint is not None and savepoint.is_active:
+            savepoint.rollback()
+            return
+    except Exception:
+        logger.warning(
+            "curator: savepoint rollback after a failed %s failed for org %s",
+            what,
+            org_id,
+            exc_info=True,
+        )
+    try:
+        db_session.rollback()
+    except Exception:
+        logger.warning(
+            "curator: rollback after a failed %s also failed for org %s",
+            what,
+            org_id,
+            exc_info=True,
+        )
 
 
 async def extract_graph(combined: str) -> dict[str, Any]:
@@ -227,8 +330,21 @@ async def extract_graph(combined: str) -> dict[str, Any]:
         return empty
 
     facts_raw = result.get("facts", [])
+    # Invalid elements are REPLACED, never removed. ``src`` on an edge is an
+    # index into this list, so the list's positions are part of the wire
+    # contract: compacting it slides every later fact down a slot while the
+    # edges keep pointing at the old numbers, and an edge that meant fact 2
+    # silently becomes an edge to fact 1. That is not a dropped edge — those
+    # are safe and happen all over this pipeline — it is an edge drawn to the
+    # WRONG memory, stamped INFERRED and indistinguishable from a correct one.
+    #
+    # The replacement is an empty string, which is falsy: the fact loop in
+    # ``_synthesize_and_store`` skips it, so no memory is written, its index
+    # never enters ``fact_row_ids``, and any edge naming it takes the existing
+    # missing-src branch and is skipped. The numbering survives; nothing is
+    # invented to fill it.
     facts = (
-        [f for f in facts_raw if isinstance(f, str)]
+        [f if isinstance(f, str) else "" for f in facts_raw]
         if isinstance(facts_raw, list)
         else []
     )
@@ -296,14 +412,27 @@ def _store_graph(
                 norm,
             )
             break
+        savepoint = _begin_savepoint(db_session)
         try:
-            entity_ids[norm] = graph_store.add_entity(
+            upsert = graph_store.add_entity(
                 db_session, org_id=org_id, name=name, kind=kind
             )
-            entity_budget.remaining -= 1
+            entity_ids[norm] = upsert.id
+            # Charge the budget for CREATION only. The cap exists to stop one
+            # runaway extraction hairballing the org's graph in a single tick;
+            # resolving a name to an entity that already exists creates
+            # nothing, so it costs nothing. Charging for hits made a 50-row
+            # batch across four partitions at ~5 entities each spend roughly
+            # 20 of its 12 — and the `break` below then dropped not just the
+            # remaining entities but every edge that pointed at one, with the
+            # cursor already advanced past the rows they came from.
+            if upsert.inserted:
+                entity_budget.remaining -= 1
         except graph_store.EntityRefused as exc:
+            _undo_failed_item(db_session, savepoint, "add_entity", org_id)
             logger.info("curator: entity refused for org %s: %s", org_id, exc)
         except Exception:
+            _undo_failed_item(db_session, savepoint, "add_entity", org_id)
             logger.warning(
                 "curator: add_entity failed for org %s (%r); skipping",
                 org_id,
@@ -319,6 +448,7 @@ def _store_graph(
         )
         if src_row_id is None or entity_id is None:
             continue  # deduped fact, refused/capped entity, or bad index
+        savepoint = _begin_savepoint(db_session)
         try:
             graph_store.add_edge(
                 db_session,
@@ -331,6 +461,7 @@ def _store_graph(
             )
             drawn += 1
         except Exception:
+            _undo_failed_item(db_session, savepoint, "add_edge", org_id)
             logger.warning(
                 "curator: add_edge failed for org %s; skipping",
                 org_id,
@@ -632,6 +763,7 @@ async def _synthesize_and_store(
     space_id: Optional[str] = None,
     project_id: Optional[str] = None,
     entity_budget: Optional[EntityBudget] = None,
+    reconcile_budget: Optional[ReconcileBudget] = None,
 ) -> int:
     """Run the LLM synthesis over ``combined`` and store the results.
 
@@ -643,11 +775,21 @@ async def _synthesize_and_store(
     Since phase 2 of the knowledge graph the fact pass is the extended
     :func:`extract_graph` (same single LLM call): entities and edges ride
     along and are stored through the GraphStore seam AFTER the facts land, so
-    every edge src is a real stored row. ``entity_budget`` is the shared
-    per-tick allowance; a caller that omits it (direct test invocation) gets
-    a fresh one at the configured cap.
+    every edge src is a real stored row.
+
+    ``entity_budget`` and ``reconcile_budget`` are the tick's shared
+    allowances, drawn down across every partition. Both are objects rather
+    than integers precisely so the drawdown is visible to the caller: a
+    partition-local integer is a partition-local cap, which is what
+    ``reconcile_budget`` silently was. A caller that omits either (a direct
+    test invocation) gets a fresh one at the configured value.
     """
     budget = entity_budget if entity_budget is not None else EntityBudget(_entity_cap())
+    reconcile = (
+        reconcile_budget
+        if reconcile_budget is not None
+        else ReconcileBudget(_reconcile_budget())
+    )
     # The session id carries user_id so the dedup window (which is keyed on
     # session_id for shared writes) cannot straddle two people.
     session_id = f"{agent_id}:{org_id}:{user_id}"
@@ -699,7 +841,6 @@ async def _synthesize_and_store(
     # their edges are skipped rather than attached to somebody else's row.
     fact_row_ids: dict[int, str] = {}
 
-    reconcile_budget = _reconcile_budget()
     for fact_idx, fact in enumerate(facts):
         if not fact:
             continue
@@ -718,7 +859,7 @@ async def _synthesize_and_store(
         if new_id:
             stored += 1
             fact_row_ids[fact_idx] = new_id
-            if reconcile_budget > 0:
+            if reconcile.remaining > 0:
                 fact_embedding = await embed_text(fact)
                 if fact_embedding is not None:
                     superseded, judged = await reconcile_fact(
@@ -728,9 +869,9 @@ async def _synthesize_and_store(
                         new_fact_id=new_id,
                         new_fact_content=fact,
                         embedding=fact_embedding,
-                        max_judgments=reconcile_budget,
+                        max_judgments=reconcile.remaining,
                     )
-                    reconcile_budget -= max(judged, 1)
+                    reconcile.remaining -= max(judged, 1)
 
     # --- the graph itself -------------------------------------------------
     try:
@@ -779,6 +920,7 @@ async def _store_one(
     write never aborts the tick. Callers treat a non-None return as a new
     stored row (truthiness preserved for counting).
     """
+    savepoint = _begin_savepoint(db_session)
     try:
         result = await write_scoped_memory(
             db_session,
@@ -795,6 +937,11 @@ async def _store_one(
             provenance="INFERRED",
         )
     except Exception:
+        # Undo only this row. The failure is usually a SQL error, which aborts
+        # the transaction — leaving it aborted would take down the rest of the
+        # tick INCLUDING the cursor upsert, which is precisely what used to
+        # hide the abandonment defect that ``curator_tick`` now fixes.
+        _undo_failed_item(db_session, savepoint, "write_scoped_memory", org_id)
         logger.warning(
             "curator: write_scoped_memory raised for org %s (%s); skipping",
             org_id,
@@ -838,9 +985,19 @@ async def curator_tick(
     Returns:
         On the no-op path:
             ``{"synthesized": 0, "processed": <n>, "reason": "below_threshold"}``
+        When the cursor could not move at all (the batch's first row belongs to
+        a partition that was skipped or produced nothing):
+            ``{"synthesized": <n>, "processed": 0, "cursor": None,
+            "reason": "cursor_held"}``
         On the synthesis path:
-            ``{"synthesized": <newly stored>, "processed": <n>,
-            "cursor": <new last_processed_at ISO string>}``
+            ``{"synthesized": <newly stored>, "processed": <rows the cursor
+            now covers>, "cursor": <new last_processed_at ISO string>}``
+
+        ``processed`` counts the rows the cursor advanced OVER, not the rows
+        read. The two differ exactly when some of the batch was held back, and
+        the smaller number is the honest one: a held row has not been
+        processed, and ``brain_curator_state.processed_count`` must not claim
+        it has.
 
     Raises:
         ValueError: If ``user_id`` is empty. There is no "curate the org"
@@ -874,13 +1031,30 @@ async def curator_tick(
     # ONE entity allowance for the whole tick, drawn down across partitions —
     # the cap is per tick, not per partition.
     entity_budget = EntityBudget(_entity_cap())
+    # ONE judge allowance for the whole tick, for the same reason: the
+    # documented cap is per tick, and reading it per partition multiplied the
+    # operator's number by the partition count.
+    reconcile_budget = ReconcileBudget(_reconcile_budget())
+    # Rows this tick did NOT distil. The cursor must stop before the earliest
+    # of them; see :func:`_cursor_stop`.
+    held: list[Any] = []
     for (space_id, project_id), part_rows in partitions.items():
         # Per-partition threshold: a project needs real signal before it gets a
-        # distilled fact. Sub-threshold rows stay recallable as raw observations.
+        # distilled fact. A partition below it is deferred, NOT dropped — its
+        # rows are held back from the cursor so a later tick reconsiders them
+        # once enough accumulate.
+        #
+        # They do not simply "stay recallable" in the meantime, which is what
+        # this comment used to claim: nearly every RAW row is a passive capture
+        # with recall_hidden=TRUE, invisible to recall by construction, and
+        # scripts/run_retention.py deletes RAW observations on a 7-day TTL.
+        # Advancing past a skipped row does not demote it to raw material; it
+        # destroys it on a one-week fuse.
         if len(part_rows) < min_inputs:
+            held.extend(part_rows)
             continue
         combined = "\n".join(r.content for r in part_rows if r.content)
-        synthesized += await _synthesize_and_store(
+        stored = await _synthesize_and_store(
             db_session,
             org_id=org_id,
             user_id=user_id,
@@ -890,19 +1064,66 @@ async def curator_tick(
             space_id=space_id,
             project_id=project_id,
             entity_budget=entity_budget,
+            reconcile_budget=reconcile_budget,
         )
+        synthesized += stored
+        if stored == 0:
+            # The partition qualified but nothing was written: every write
+            # failed, or the LLM produced nothing. ``_store_one`` swallows its
+            # exceptions, so this is the ONLY place that failure is visible.
+            # Hold the rows rather than advance over a partition that produced
+            # no distillate at all.
+            held.append(part_rows[0])
 
-    # Rows are ordered (created_at ASC, id ASC), so the LAST row carries the
-    # batch's composite max — the correct new keyset cursor.
-    batch_max_at = rows[-1].created_at
-    batch_max_id = rows[-1].id
-    _advance_cursor(db_session, org_id, user_id, batch_max_at, batch_max_id, len(rows))
+    stop = _cursor_stop(rows, held)
+    if stop == 0:
+        # Nothing before the first held row: leave BOTH cursor halves alone and
+        # bump last_run_at only, exactly as the below-threshold path does.
+        _touch_last_run(db_session, org_id, user_id)
+        return {
+            "synthesized": synthesized,
+            "processed": 0,
+            "cursor": None,
+            "reason": "cursor_held",
+        }
+
+    # Rows are ordered (created_at ASC, id ASC), so the row at ``stop - 1``
+    # carries the composite max of the prefix the tick actually covered.
+    last = rows[stop - 1]
+    _advance_cursor(db_session, org_id, user_id, last.created_at, last.id, stop)
 
     return {
         "synthesized": synthesized,
-        "processed": len(rows),
-        "cursor": batch_max_at.isoformat(),
+        "processed": stop,
+        "cursor": last.created_at.isoformat(),
     }
+
+
+def _cursor_stop(rows: list[Any], held: list[Any]) -> int:
+    """How far into ``rows`` the cursor may advance: an exclusive index.
+
+    The batch is ordered ``(created_at ASC, id ASC)`` and the cursor is a
+    single point on that order, so the only rows it can safely pass are the
+    unbroken prefix ending before the FIRST row this tick did not distil.
+    Anything past that point would be skipped permanently: the read query only
+    ever looks ahead of the cursor, and ``scripts/run_retention.py`` deletes
+    RAW observations after 7 days.
+
+    ``len(rows)`` when nothing was held (the ordinary case — advance over the
+    whole batch); ``0`` when the very first row was held, in which case the
+    caller must leave the cursor untouched.
+
+    Note this deliberately re-processes a qualifying partition whose rows sit
+    *after* a held one. Re-synthesis is absorbed by dedup and costs one LLM
+    call; the alternative costs rows.
+    """
+    if not held:
+        return len(rows)
+    held_ids = {r.id for r in held}
+    for index, row in enumerate(rows):
+        if row.id in held_ids:
+            return index
+    return len(rows)
 
 
 async def run_curator_once(

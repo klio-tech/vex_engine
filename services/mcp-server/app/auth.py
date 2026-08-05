@@ -94,6 +94,20 @@ def resolve_project_from_request(
     try:
         return brain.find_project_id(db, org_id=org_id, identifier=identifier)
     except Exception:
+        # This resolver runs on EVERY MCP request that carries the header, on
+        # the session the tool body then does its real work with. Failing open
+        # to org-wide is the documented degradation; leaving the transaction
+        # aborted is not — it fails the tool for a reason that has nothing to
+        # do with projects, on the widest path in the service.
+        try:
+            db.rollback()
+        except Exception:
+            logger.warning(
+                "rollback after a failed X-Vex-Project resolution also failed "
+                "for org %s",
+                org_id,
+                exc_info=True,
+            )
         logger.warning(
             "X-Vex-Project resolution failed for org %s; org-wide",
             org_id,

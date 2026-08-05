@@ -45,10 +45,18 @@ from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from sqlalchemy import text
 
-from app.auth import resolve_principal_plan
 from app.curator import RAW_MEMORY_TYPES
 from app.db import SessionLocal
-from app.identity import resolve_request_user_id
+
+# Both halves of the caller's identity come from ``app.identity``, never one
+# from here and one from ``app.auth``. ``app.identity.request_key_info``
+# memoizes the validated KeyInfo on ``request.state``, and only the identity
+# module's ``resolve_principal_plan`` writes that memo. Pairing ``app.auth``'s
+# copy with ``resolve_request_user_id`` left the memo empty, so ``init``
+# validated the key twice per request — two rate-limit tokens for one call, and
+# on the token that trips it is the SECOND call that raises, the one deciding
+# whether this request has a person behind it.
+from app.identity import resolve_principal_plan, resolve_request_user_id
 
 logger = logging.getLogger("agentguard.mcp.init")
 
@@ -364,6 +372,17 @@ def _resolve_project_id(
     try:
         return brain.find_project_id(db, org_id=org_id, identifier=git_remote.strip())
     except Exception:
+        # Roll back before degrading. The lookup runs on the same session the
+        # run's memories are about to be written on; leaving the transaction
+        # aborted turns "filed unfiled" into "stored nothing at all".
+        try:
+            db.rollback()
+        except Exception:
+            logger.warning(
+                "init: rollback after a failed find_project_id also failed for org %s",
+                org_id,
+                exc_info=True,
+            )
         logger.warning(
             "init: find_project_id failed for org %s; filing unfiled",
             org_id,

@@ -89,6 +89,23 @@ def get_counters(db: Any, org_id: str) -> Counters:
     )
 
 
+def _safe_rollback(db: Any, org_id: str) -> None:
+    """Clear an aborted transaction so the caller's session stays usable.
+
+    The rollback itself is guarded: this only ever runs inside a handler that
+    has already decided to degrade, and a session so broken that even ROLLBACK
+    fails must not turn a best-effort path into a raising one.
+    """
+    try:
+        db.rollback()
+    except Exception:
+        logger.warning(
+            "rollback after a swallowed metering error failed for org %s",
+            org_id,
+            exc_info=True,
+        )
+
+
 def check_memory_quota(
     db: Any, org_id: str, plan_config: PlanConfig, kind: Kind, plan_name: str = "free"
 ) -> bool:
@@ -113,6 +130,14 @@ def check_memory_quota(
     try:
         counters = get_counters(db, org_id)
     except Exception:
+        # Roll back before failing open. Postgres aborts the whole transaction
+        # on the first failed statement, so swallowing the error without a
+        # ROLLBACK hands the caller a session that refuses everything — and
+        # this check runs BEFORE the memory write, on the same session. The
+        # caller would then be told their memory was not stored, because of a
+        # fault in metering they never asked about. ``record_usage`` below has
+        # always done this; this call site is its sibling, twenty lines up.
+        _safe_rollback(db, org_id)
         logger.warning(
             "memory quota read failed for org %s; allowing", org_id, exc_info=True
         )
