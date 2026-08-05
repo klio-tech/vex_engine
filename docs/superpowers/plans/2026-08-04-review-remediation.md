@@ -4,8 +4,12 @@
 > (`docs/superpowers/specs/2026-08-04-review-remediation-design.md`) is the contract. Where this plan
 > and the spec disagree, the spec wins. Read the spec before writing anything.
 
-**Baseline:** `main` @ `218e0c5`. **Baselines that must not drop:** shared `593 passed, 1 skipped`;
+**Baseline:** `main` @ `218e0c5`. **Baselines that must not drop:** shared `603 passed, 1 skipped`;
 mcp-server `442 passed, 9 skipped`; migrations `64 passed`.
+
+> Corrected 2026-08-04: the shared figure was first written as 593, which predated a
+> commit already on `main`. Re-measured at `337ddb7` against a freshly migrated
+> database: **603**. Measure your branch against 603.
 
 ## Waves
 
