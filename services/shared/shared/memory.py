@@ -21,6 +21,11 @@ from sqlalchemy import text
 
 from shared.env_config import parse_float
 
+# Project ACLs. Safe at module scope: ``projects`` imports nothing from this
+# module (recall inlines its membership subquery rather than calling back
+# here), so there is no cycle to break with a deferred import.
+from shared import projects
+
 logger = logging.getLogger("agentguard.shared.memory")
 
 # ---------------------------------------------------------------------------
@@ -374,6 +379,35 @@ async def call_llm(
 # Summary & fact extraction
 # ---------------------------------------------------------------------------
 
+#: Per-field cap on caller-supplied text interpolated into an LLM prompt.
+#: Matches ``MAX_PROMPT_INPUT_CHARS`` in ``sync-gateway`` and ``async-worker``,
+#: which bound the same values at their own call sites. Keeping the number
+#: identical means the two layers agree rather than compounding.
+MAX_PROMPT_INPUT_CHARS = 20_000
+
+
+def _bounded_prompt_input(value: Any) -> str:
+    """``value`` as text, capped at :data:`MAX_PROMPT_INPUT_CHARS`.
+
+    ``output`` and ``input_data`` are whatever an agent turn produced — an
+    unbounded blob as far as this module is concerned. Interpolated raw, a
+    40 MB tool result becomes a 40 MB request to the vendor: a cost and latency
+    fault that surfaces as a timeout indistinguishable from an LLM outage.
+
+    The bound lives here rather than only at the call sites so it holds for
+    every caller, including the ones that have not been written yet. The
+    call-site caps in ``sync-gateway``/``async-worker`` stay — truncating twice
+    at the same limit is a no-op, and the earlier cut also bounds what those
+    services carry in memory.
+
+    The marker is visible in the prompt on purpose: a model that receives a cut
+    transcript should be able to tell that it was cut.
+    """
+    as_text = value if isinstance(value, str) else str(value)
+    if len(as_text) <= MAX_PROMPT_INPUT_CHARS:
+        return as_text
+    return as_text[:MAX_PROMPT_INPUT_CHARS] + "…[truncated]"
+
 
 async def generate_summary(
     output: Any,
@@ -385,11 +419,11 @@ async def generate_summary(
     Returns:
         The summary string, or ``None`` if the LLM call fails.
     """
-    parts = [f"Output: {output}"]
+    parts = [f"Output: {_bounded_prompt_input(output)}"]
     if task:
-        parts.append(f"Task: {task}")
+        parts.append(f"Task: {_bounded_prompt_input(task)}")
     if input_data:
-        parts.append(f"Input: {input_data}")
+        parts.append(f"Input: {_bounded_prompt_input(input_data)}")
 
     prompt = (
         "Summarize the following agent turn in 1-2 concise sentences. "
@@ -417,11 +451,11 @@ async def extract_facts(
     Returns:
         A list of fact strings, or an empty list if the LLM call fails.
     """
-    parts = [f"Output: {output}"]
+    parts = [f"Output: {_bounded_prompt_input(output)}"]
     if task:
-        parts.append(f"Task: {task}")
+        parts.append(f"Task: {_bounded_prompt_input(task)}")
     if input_data:
-        parts.append(f"Input: {input_data}")
+        parts.append(f"Input: {_bounded_prompt_input(input_data)}")
 
     prompt = (
         "Extract discrete, verifiable facts from the following agent turn. "
@@ -616,12 +650,28 @@ async def retrieve_memories(
 
     Performs two queries:
 
-    1. Semantic search across all active memories for the session,
+    1. Semantic search across the session's active session-scoped memories,
        ordered by cosine distance (``embedding <=> :embedding``).
     2. Fetches the last *include_summaries* summaries by
        ``sequence_number`` for recency context.
 
     Results are deduplicated by ``id`` and returned as a combined list.
+
+    Both queries carry ``scope = 'session' AND recall_hidden = FALSE``, and
+    both need them. ``session_id`` is **not** a trust boundary: the
+    sync-gateway verification path passes ``event.session_id`` straight off
+    the wire, and the reserved ``klio-brain:<org_id>:<agent_id>`` buckets are
+    derived from a client-declared ``X-Vex-Agent`` header. Any authenticated
+    caller in an org can therefore name any bucket in that org. Without the
+    scope predicate a named bucket returns another user's ``scope='private'``
+    rows, and without the ``recall_hidden`` predicate it returns curator fuel
+    that is deliberately withheld from every recall surface — and whatever
+    this function returns is forwarded to the consistency LLM.
+
+    Session-scoped reads are the *only* thing this function serves. Reads at
+    ``private``/``agent``/``project``/``org`` scope belong to
+    :func:`retrieve_memories_scoped`, which decides entitlement from the
+    authenticated principal rather than from a client-supplied string.
 
     Returns:
         A list of :class:`MemoryRecord` instances, or an empty list if
@@ -644,6 +694,8 @@ async def retrieve_memories(
             WHERE session_id = :session_id
               AND org_id = :org_id
               AND status = 'active'
+              AND scope = 'session'
+              AND recall_hidden = FALSE
             ORDER BY embedding <=> :embedding
             LIMIT :limit
         """),
@@ -668,6 +720,8 @@ async def retrieve_memories(
               AND org_id = :org_id
               AND memory_type = 'summary'
               AND status = 'active'
+              AND scope = 'session'
+              AND recall_hidden = FALSE
             ORDER BY sequence_number DESC
             LIMIT :limit
         """),
@@ -829,11 +883,24 @@ def supersede_memory(
     db_session: Any,
     old_memory_id: uuid.UUID,
     new_memory_id: uuid.UUID,
+    *,
+    org_id: str,
 ) -> None:
-    """Mark an old memory as superseded by a newer one.
+    """Mark an old memory as superseded by a newer one, within one tenant.
 
     Sets ``status = 'superseded'`` and ``superseded_by = new_memory_id``
     on the old memory row.
+
+    ``org_id`` is mandatory. This was the one write in the memory layer whose
+    WHERE named only an ``id``, which made it the only one whose correctness
+    depended entirely on where its caller got that id. Both current callers
+    (the curator's reconcile pass and the async worker's fact writer) derive
+    theirs from org-scoped queries, so nothing was reachable through it — but
+    "every caller so far has been careful" is not a boundary, and a keyword
+    with no default means the next caller cannot omit it by accident.
+
+    A mismatched ``org_id`` updates nothing and raises nothing: the row is not
+    this tenant's, which is the same non-event as an id that does not exist.
     """
     db_session.execute(
         text("""
@@ -842,10 +909,12 @@ def supersede_memory(
                 superseded_by = :new_memory_id,
                 updated_at = NOW()
             WHERE id = :old_memory_id
+              AND org_id = :org_id
         """),
         {
             "old_memory_id": str(old_memory_id),
             "new_memory_id": str(new_memory_id),
+            "org_id": org_id,
         },
     )
     db_session.commit()
@@ -865,9 +934,26 @@ def retract_memory(
     Authorization ladder (org_id always enforced):
       * unknown / cross-org id → not_found (indistinguishable by design)
       * scope='private' row owned by another user → **not_found**
+      * scope='project' row in a project the caller is not a member of →
+        **not_found**
       * scope='agent' row owned by another agent → forbidden
       * otherwise → status='retracted' + audit metadata; recall never
         returns non-'active' rows, so the memory disappears immediately.
+
+    The project arm answers ``not_found`` rather than ``forbidden`` for the
+    same reason the private arm does, and it must: membership is precisely what
+    hides a project row's existence, so an answer that confirmed the id
+    resolves to something real would disclose what the boundary exists to
+    withhold. It is **strict, with no org-admin override**, matching
+    ``project_grant``.
+
+    Only ``scope='project'`` is fenced. A ``project_id`` on an ``org``-scoped
+    row RANKS it, it does not fence it — ``_explicit_write_scope`` deliberately
+    files a non-member's write that way, and reading membership off
+    ``project_id`` alone would make those rows unforgettable by the very people
+    who wrote them. A ``scope='project'`` row with a NULL ``project_id`` (no
+    constraint ties the two columns) fails closed: :func:`shared.projects.is_member`
+    cannot vouch for a project that is not named, so neither can this.
 
     Why a private row answers ``not_found`` and not ``forbidden``: ``forbidden``
     confirms the row exists. Someone who guessed or was shown a memory id would
@@ -897,7 +983,7 @@ def retract_memory(
     row = db_session.execute(
         text(
             """
-            SELECT scope, agent_id, user_id FROM session_memories
+            SELECT scope, agent_id, user_id, project_id FROM session_memories
             WHERE id = :id AND org_id = :org_id
             LIMIT 1
             """
@@ -907,6 +993,16 @@ def retract_memory(
     if row is None:
         return {"forgotten": False, "error": "not_found"}
     if row.scope == "private" and (not user_id or row.user_id != user_id):
+        return {"forgotten": False, "error": "not_found"}
+    if row.scope == "project" and not (
+        row.project_id
+        and projects.is_member(
+            db_session,
+            org_id=org_id,
+            project_id=str(row.project_id),
+            user_id=user_id,
+        )
+    ):
         return {"forgotten": False, "error": "not_found"}
     if row.scope == "agent" and row.agent_id != agent_id:
         return {"forgotten": False, "error": "forbidden"}

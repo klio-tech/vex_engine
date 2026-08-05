@@ -414,7 +414,7 @@ async def reconcile_fact(
             logger.warning("reconcile: judge raised; skipping pair", exc_info=True)
             continue
         if verdict and verdict.get("contradicts") is True:
-            supersede_memory(db_session, row.id, new_fact_id)
+            supersede_memory(db_session, row.id, new_fact_id, org_id=org_id)
             superseded += 1
             # Record the judgment it just made as a supersedes edge (spec:
             # "it already makes the judgment; today it only flips status").
