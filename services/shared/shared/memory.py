@@ -24,6 +24,7 @@ import litellm
 from litellm import acompletion, aembedding
 from sqlalchemy import text
 
+from shared import metrics
 from shared.env_config import parse_float, parse_int
 
 # Project ACLs. Safe at module scope: ``projects`` imports nothing from this
@@ -397,10 +398,41 @@ async def _aembedding_call(text_input: str) -> list[float]:
     if api_key:
         kwargs["api_key"] = api_key
 
-    async with _embed_limiter():
-        response = await asyncio.wait_for(
-            aembedding(**kwargs), timeout=_embed_timeout_s()
-        )
+    limiter = _embed_limiter()
+    # Read the cap's state *before* awaiting it. A limiter that is already at
+    # zero means this call is about to queue, and that is the saturation signal
+    # — the difference between "the backend is slow" and "we are waiting behind
+    # our own limit", which look identical in a latency histogram alone.
+    if limiter.locked():
+        metrics.record(metrics.EMBEDDING_CONCURRENCY_SATURATED.inc)
+
+    async with limiter:
+        started = time.monotonic()
+        metrics.record(metrics.EMBEDDING_IN_FLIGHT.inc)
+        try:
+            response = await asyncio.wait_for(
+                aembedding(**kwargs), timeout=_embed_timeout_s()
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            # Counted apart from ``error`` deliberately: a timeout means the
+            # backend is slow, an error means it is wrong, and the two call
+            # for different responses.
+            metrics.record(metrics.EMBEDDING_CALLS.inc, outcome="timeout")
+            raise
+        except Exception:
+            metrics.record(metrics.EMBEDDING_CALLS.inc, outcome="error")
+            raise
+        else:
+            metrics.record(metrics.EMBEDDING_CALLS.inc, outcome="ok")
+        finally:
+            # Both in a ``finally``: the latency of a failure is still latency,
+            # and a gauge that is not released on the error path ratchets up
+            # until it reads as permanent saturation.
+            metrics.record(metrics.EMBEDDING_IN_FLIGHT.dec)
+            metrics.record(
+                metrics.EMBEDDING_SECONDS.observe, time.monotonic() - started
+            )
+
     item = response.data[0]
     return item["embedding"] if isinstance(item, dict) else item.embedding
 
@@ -447,7 +479,13 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
     memo_key = (_embed_model(), text_input)
     memoized = _memo_get(memo_key)
     if memoized is not None:
+        # A single write embeds the same string twice — once to probe for a
+        # duplicate, once to store it — so the steady-state hit rate should sit
+        # near 50%. A rate far below that means the memo has stopped working
+        # and every write is paying the backend twice again.
+        metrics.record(metrics.EMBEDDING_MEMO.inc, result="hit")
         return memoized
+    metrics.record(metrics.EMBEDDING_MEMO.inc, result="miss")
 
     # First attempt: head-truncate to the char budget (unchanged behavior).
     if text_input and len(text_input) > MAX_EMBED_CHARS:

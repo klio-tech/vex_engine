@@ -40,11 +40,14 @@ and a float add) and are never held across user code.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Mapping, Optional, Sequence
+from typing import Any, Callable, Iterator, Mapping, Optional, Sequence
+
+_logger = logging.getLogger(__name__)
 
 __all__ = [
     "Counter",
@@ -53,6 +56,7 @@ __all__ = [
     "Registry",
     "UnboundedLabelError",
     "REGISTRY",
+    "record",
     "render",
     "reset_for_test",
 ]
@@ -490,6 +494,24 @@ REGISTRY = Registry()
 def render() -> str:
     """Render the process-wide registry. What ``/metrics`` returns."""
     return REGISTRY.render()
+
+
+def record(fn: "Callable[..., Any]", *args: Any, **kwargs: Any) -> None:
+    """Perform one instrumentation call, swallowing anything it raises.
+
+    Every call site goes through this. Instrumentation is the least important
+    thing in any code path it sits in, and a metrics bug that takes down a
+    write is strictly worse than having no metrics at all — so a failure here
+    is logged at DEBUG and dropped.
+
+    The strictness of the primitives is not weakened by this: a bad label still
+    raises, and the unit tests call the primitives directly, so a mistake is
+    caught in the suite rather than swallowed in production.
+    """
+    try:
+        fn(*args, **kwargs)
+    except Exception:  # pragma: no cover - exercised via the call-site tests
+        _logger.debug("instrumentation call failed; continuing", exc_info=True)
 
 
 def reset_for_test() -> None:

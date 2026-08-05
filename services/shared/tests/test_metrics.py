@@ -255,6 +255,7 @@ def test_default_registry_renders(registry):
         "klio_db_pool_checkouts_in_use",
         "klio_db_pool_checkout_wait_seconds",
         "klio_db_pool_timeouts_total",
+        "klio_db_connect_failures_total",
         "klio_curator_ticks_total",
         "klio_curator_rows_read_total",
         "klio_curator_rows_distilled_total",
@@ -298,6 +299,7 @@ def test_metrics_module_has_no_third_party_imports():
             roots.add(node.module.split(".")[0])
     assert roots <= {
         "collections",
+        "logging",
         "contextlib",
         "dataclasses",
         "math",
