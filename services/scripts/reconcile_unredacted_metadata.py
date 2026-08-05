@@ -57,6 +57,10 @@ from typing import Any, Iterator, Optional, Sequence
 
 from sqlalchemy import create_engine, text
 
+# Both the sibling module and the shared package must resolve whether this is
+# run as ``python -m scripts.<name>`` from ``services/`` (which puts
+# ``services/`` on the path, not ``services/scripts/``) or executed directly.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
 
 import reconcile_common as common  # noqa: E402

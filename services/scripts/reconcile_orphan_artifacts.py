@@ -73,8 +73,13 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from botocore.exceptions import BotoCoreError, ClientError
 from sqlalchemy import create_engine, text
 
+# Both the sibling module and the shared package must resolve whether this is
+# run as ``python -m scripts.<name>`` from ``services/`` (which puts
+# ``services/`` on the path, not ``services/scripts/``) or executed directly.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
 
 import reconcile_common as common  # noqa: E402
@@ -421,6 +426,20 @@ def main() -> None:
     except common.ConfirmationError as exc:
         logger.error("REFUSED: %s", exc)
         sys.exit(2)
+    except (BotoCoreError, ClientError) as exc:
+        # Reported as one line rather than an unhandled traceback. A botocore
+        # traceback carries the full request URL and, on some failures, the
+        # signed query string — which is a bearer credential for one object.
+        # It also reads as a bug in this script rather than as what it is:
+        # the bucket is not reachable with the configured settings.
+        logger.error(
+            "could not read the artifact bucket %r: %s. Check the "
+            "KLIO_ARTIFACT_S3_* / S3_* settings for this environment. "
+            "Nothing was read and nothing was deleted.",
+            ARTIFACT_BUCKET,
+            type(exc).__name__,
+        )
+        sys.exit(3)
     finally:
         engine.dispose()
 
