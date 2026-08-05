@@ -194,12 +194,16 @@ def test_credit_card_luhn_invalid_not_redacted():
 
 
 def test_credential_assignment_low_entropy_not_redacted():
-    """Low-entropy credential values must not be masked (L232 branch).
+    """Low-entropy credential values must not be masked (entropy-gate branch).
 
-    "password=aaaaaaaaaaaa" has near-zero entropy (all same char) and must
-    not trigger the credential_assignment detector.
+    This test used to assert on ``password=aaaaaaaaaaaa``. That is no longer
+    the contract: a ``password`` key name now bypasses the entropy gate
+    unconditionally, because the gate was letting real passwords
+    (``Passw0rdPassw0rd``, 2.7500 bits) through. The gate itself still exists
+    for key names that can carry prose-shaped values, which is what this
+    exercises.
     """
-    result = redact("password=aaaaaaaaaaaa")
+    result = redact("token=aaaaaaaaaaaa")
     assert result.redacted is False
 
 
@@ -207,11 +211,164 @@ def test_credential_assignment_short_high_entropy_redacted():
     """Short (8-11 char) but high-entropy credential values must be masked (L203 branch).
 
     The short-value path requires entropy >= 2.5 bits; "xK8#mP2!" has high
-    character diversity for 8 chars.
+    character diversity for 8 chars. The key name is ``token`` and not
+    ``secret`` on purpose — a ``secret`` key now bypasses the gate, which
+    would leave this branch uncovered.
     """
-    result = redact("secret=xK8#mP2!")
+    result = redact("token=xK8#mP2!")
     assert result.redacted is True
     assert "credential_assignment" in {f.kind for f in result.findings}
+
+
+# ---- gap 1: word-boundary failure on underscored key names ----------------
+#
+# ``\b(password|...|access[_-]?key)`` cannot match ``AWS_SECRET_ACCESS_KEY``:
+# the character before ``SECRET`` is ``_``, which is a word character, so
+# there is no word boundary there. Every SCREAMING_SNAKE_CASE env var — the
+# single most common shape a real credential is written in — was invisible.
+
+
+UNDERSCORED_KEY_ASSIGNMENTS = [
+    "AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+    "DATABASE_PASSWORD=Sup3rS3cretP@ss",
+]
+
+
+@pytest.mark.parametrize("content", UNDERSCORED_KEY_ASSIGNMENTS)
+def test_underscored_key_name_is_redacted(content):
+    result = redact(content)
+    assert result.redacted is True, f"not redacted: {content!r}"
+    secret = content.split("=", 1)[1]
+    assert secret not in result.clean_text
+
+
+def test_underscored_key_positive_control_is_not_vacuous():
+    """The fixture strings really do carry the key name and a secret value.
+
+    Without this, a redactor that redacted *everything* would pass the tests
+    above and a redactor that saw an empty value would too.
+    """
+    for content in UNDERSCORED_KEY_ASSIGNMENTS:
+        key, _, value = content.partition("=")
+        assert key.endswith(("KEY", "PASSWORD"))
+        assert len(value) >= 12
+    # And ordinary underscored prose must still survive untouched.
+    benign = "MEMORY_EMBEDDING_MODEL=text-embedding-3-small"
+    assert redact(benign).redacted is False
+
+
+# ---- gap 2: the closing quote breaks the ``\s*[:=]`` follow ----------------
+#
+# In ``{"password": "s3cretV4lue!"}`` the key name is *quoted*, so the char
+# after ``password`` is ``"`` and the required ``\s*[:=]`` never matches.
+# JSON and Python dict literals are exactly how an agent transcript quotes a
+# config blob.
+
+
+QUOTED_KEY_ASSIGNMENTS = [
+    ('{"password": "s3cretV4lue!"}', "s3cretV4lue!"),
+    ("{'api_key': 'AbCd3fGh1jKlM'}", "AbCd3fGh1jKlM"),
+]
+
+
+@pytest.mark.parametrize("content,secret", QUOTED_KEY_ASSIGNMENTS)
+def test_quoted_key_name_is_redacted(content, secret):
+    result = redact(content)
+    assert result.redacted is True, f"not redacted: {content!r}"
+    assert secret not in result.clean_text
+    assert "credential_assignment" in {f.kind for f in result.findings}
+
+
+def test_quoted_key_redaction_preserves_the_surrounding_literal():
+    """Only the value is masked — the JSON stays parseable in shape."""
+    result = redact('{"password": "s3cretV4lue!"}')
+    assert result.clean_text.startswith('{"password": "[REDACTED:')
+    assert result.clean_text.endswith('"}')
+
+
+# ---- gap 3: empty username in a connection string -------------------------
+#
+# ``[^\s:/@]+:([^\s@]+)@`` requires at least one non-colon character before
+# the password colon, so ``redis://:hunter2secret@host`` — the canonical
+# Redis AUTH URL, which has no username at all — could not match.
+
+
+def test_connection_string_with_empty_username_is_redacted():
+    result = redact("redis://:hunter2secret@host:6379")
+    assert result.redacted is True
+    assert "hunter2secret" not in result.clean_text
+    assert "connection_string" in {f.kind for f in result.findings}
+
+
+def test_empty_username_connection_string_positive_control():
+    """A passwordless URL of the same shape must still be left alone."""
+    assert redact("redis://host:6379/0").redacted is False
+
+
+# ---- gap 4: the entropy gate is strictest where secrets get longer --------
+#
+# At length >= 12 the gate demands 3.0 bits. Real passwords do not clear it:
+# ``Passw0rdPassw0rd`` measures 2.7500 and ``hunter2hunter2`` 2.8074. The
+# gate exists to stop prose, but on an explicit ``password``/``secret`` key
+# name there is no prose to protect — the key name has already told us what
+# the value is.
+
+
+LOW_ENTROPY_PASSWORDS = [
+    "password=Passw0rdPassw0rd",
+    "password: hunter2hunter2",
+    "passwd=correcthorsebattery",
+    "pwd = mydogsnameisrex1",
+    "secret: mysupersecretvalue",
+]
+
+
+@pytest.mark.parametrize("content", LOW_ENTROPY_PASSWORDS)
+def test_password_key_redacts_regardless_of_entropy(content):
+    result = redact(content)
+    assert result.redacted is True, f"not redacted: {content!r}"
+    assert "credential_assignment" in {f.kind for f in result.findings}
+
+
+def test_low_entropy_password_control_measures_below_the_gate():
+    """Positive control: these values genuinely fail the 3.0-bit gate.
+
+    If they cleared it on their own the tests above would prove nothing about
+    the key-name bypass.
+    """
+    assert _shannon_entropy("Passw0rdPassw0rd") < 3.0
+    assert _shannon_entropy("hunter2hunter2") < 3.0
+
+
+def test_entropy_gate_still_applies_to_non_password_key_names():
+    """The bypass is scoped. ``token``/``api_key`` keep the entropy gate, so
+    prose-shaped values assigned to them are not mangled."""
+    result = redact("token=aaaaaaaaaaaaaaaa")
+    assert result.redacted is False
+
+
+# ---- gap 5: there is no AWS secret-value pattern at all -------------------
+#
+# The catalog carried ``aws_access_key_id`` (AKIA/ASIA) only. The 40-char
+# secret access key that pairs with it had no pattern, so a bare secret with
+# no ``KEY=`` prefix passed straight through.
+
+
+def test_bare_aws_secret_access_key_is_redacted():
+    result = redact(
+        "the pair is AKIAIOSFODNN7EXAMPLE and wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+    )
+    assert result.redacted is True
+    kinds = {f.kind for f in result.findings}
+    assert "aws_secret_access_key" in kinds
+    assert "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY" not in result.clean_text
+
+
+def test_aws_secret_pattern_does_not_eat_ordinary_long_tokens():
+    """Positive control on the false-positive side: a 40-char base64-ish
+    string that is not adjacent to AWS context must survive."""
+    # A git tree hash and a long path are both 40-ish chars of [A-Za-z0-9/+].
+    assert redact("commit 5bfab80d528255fb2342c9395f2c3bf1e817f145").redacted is False
 
 
 def test_already_masked_placeholder_not_re_redacted():

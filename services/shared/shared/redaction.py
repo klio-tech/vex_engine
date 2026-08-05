@@ -36,6 +36,16 @@ _PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
     ("stripe_webhook_secret", re.compile(r"\bwhsec_[A-Za-z0-9]{20,}\b")),
     # --- AWS ------------------------------------------------------------------
     ("aws_access_key_id", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+    # The 40-char secret that pairs with the access key id above. It has no
+    # prefix to anchor on, so the regex matches the *shape* (exactly 40 chars
+    # of the base64 alphabet, not embedded in a longer run of them) and
+    # _aws_secret_guard rejects anything that is not mixed-case-plus-digit with
+    # a base64-only character. That guard is what keeps 40-char lowercase hex —
+    # a git tree hash — out of the net.
+    (
+        "aws_secret_access_key",
+        re.compile(r"(?<![A-Za-z0-9/+=])[A-Za-z0-9/+=]{40}(?![A-Za-z0-9/+=])"),
+    ),
     # --- GitHub ---------------------------------------------------------------
     (
         "github_token",
@@ -76,22 +86,45 @@ _PATTERNS: tuple[tuple[str, re.Pattern], ...] = (
     # and the LAST "@" of the authority.  The optional first sub-group allows an
     # email address as the username (e.g. Cloud SQL IAM auth, MongoDB Atlas):
     #   mongodb://jane.doe@example.com:p4ssw0rdXYZ@host:27017/db
+    # The host segment is ``*`` and not ``+`` on purpose: a Redis AUTH URL has
+    # no username at all (``redis://:password@host``), and requiring one
+    # non-colon character there made the single most common password-carrying
+    # URL shape unmatchable.
     (
         "connection_string",
         re.compile(
-            r"(?:\b[a-z][a-z0-9+.\-]*://)(?:[^\s/@]+@)?[^\s:/@]+:([^\s@]+)@[^\s]+"
+            r"(?:\b[a-z][a-z0-9+.\-]*://)(?:[^\s/@]+@)?[^\s:/@]*:([^\s@]+)@[^\s]+"
         ),
     ),
     # --- HTTP Bearer token ---------------------------------------------------
     # Capture group 1 = the token value.
     ("bearer_token", re.compile(r"(?i)\bBearer\s+([A-Za-z0-9\-._~+/]{16,}=*)")),
     # --- Generic credential assignment (entropy-gated) -----------------------
-    # Capture group 1 = key name, group 2 = value.
+    # Capture group 1 = the WHOLE key token, group 2 = value.
+    #
+    # Two things here look redundant and are not:
+    #
+    # * The key group captures the entire identifier and merely *contains* one
+    #   of the sensitive words. A bare ``\b(secret|...)`` cannot match
+    #   ``AWS_SECRET_ACCESS_KEY``: ``_`` is a word character, so there is no
+    #   word boundary before ``SECRET``, and even at a boundary the required
+    #   ``\s*[:=]`` would land on ``_``. SCREAMING_SNAKE_CASE is the single
+    #   most common shape a real credential is written in.
+    # * The optional quotes around the key name are what let a JSON or Python
+    #   dict literal match. In ``{"password": "..."}`` the character after the
+    #   key is a closing quote, which broke the ``\s*[:=]`` follow outright.
     (
         "credential_assignment",
         re.compile(
-            r"(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)"
-            r"\s*[:=]\s*[\"']?([^\s\"',;]{8,})[\"']?"
+            r"(?i)(?<![A-Za-z0-9_])[\"']?"
+            r"([A-Za-z0-9_.\-]*"
+            r"(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key)"
+            r"[A-Za-z0-9_.\-]*)"
+            # The value class must NOT exclude ``]``: an already-placed
+            # ``[REDACTED:...]`` placeholder ends in one, and stopping short of
+            # it would hide the placeholder from the idempotency guard and
+            # re-redact on every pass.
+            r"[\"']?\s*[:=]\s*[\"']?([^\s\"',;]{8,})[\"']?"
         ),
     ),
     # --- PII ------------------------------------------------------------------
@@ -123,6 +156,17 @@ _PLACEHOLDER_RE = re.compile(r"\[REDACTED:[a-z_]+:[0-9a-f]{4}\]")
 # meet the stricter ≥ 3.0 bar (long low-entropy strings are usually prose).
 _ENTROPY_THRESHOLD = 3.0
 _MIN_VALUE_LEN_FOR_ENTROPY = 12
+
+# Key names whose value is a password by definition, so the entropy gate is
+# skipped entirely for them.
+#
+# The gate exists to stop prose-shaped values from being mangled, and it is
+# strictest (3.0 bits at length >= 12) exactly where real passwords live:
+# ``Passw0rdPassw0rd`` measures 2.7500 and ``hunter2hunter2`` 2.8074, so both
+# passed straight through. On these key names there is no prose to protect —
+# the key has already declared what the value is. Every other key name
+# (``token``, ``api_key``, ``access_key``) keeps the gate.
+_ALWAYS_REDACT_KEY_WORDS: tuple[str, ...] = ("password", "passwd", "pwd", "secret")
 
 
 # ---------------------------------------------------------------------------
@@ -193,16 +237,43 @@ def _credit_card_guard(match: re.Match) -> bool:
     return _luhn_valid(digits)
 
 
-def _credential_assignment_guard(secret: str) -> bool:
-    """Return True when *secret* has sufficient entropy to be a real credential.
+def _key_name_is_unconditional(key_name: str) -> bool:
+    """Return True when *key_name* names a value that is a secret by definition."""
+    lowered = key_name.lower()
+    return any(word in lowered for word in _ALWAYS_REDACT_KEY_WORDS)
 
-    Short values (8–11 chars) require entropy ≥ 2.5 bits; longer values
-    require entropy ≥ _ENTROPY_THRESHOLD (3.0 bits).
+
+def _credential_assignment_guard(key_name: str, secret: str) -> bool:
+    """Return True when this assignment should be masked.
+
+    ``password``/``passwd``/``pwd``/``secret`` key names bypass the entropy
+    gate entirely — see :data:`_ALWAYS_REDACT_KEY_WORDS`. Everywhere else the
+    gate holds: short values (8–11 chars) require entropy ≥ 2.5 bits; longer
+    values require entropy ≥ _ENTROPY_THRESHOLD (3.0 bits).
     """
+    if _key_name_is_unconditional(key_name):
+        return True
     entropy = _shannon_entropy(secret)
     if len(secret) >= _MIN_VALUE_LEN_FOR_ENTROPY:
         return entropy >= _ENTROPY_THRESHOLD
     return entropy >= 2.5
+
+
+def _aws_secret_guard(secret: str) -> bool:
+    """Return True when a 40-char base64-alphabet run looks like an AWS secret.
+
+    The regex can only match the shape, which 40-char lowercase hex (a git
+    tree hash) also satisfies. A real AWS secret access key is generated from
+    the full base64 alphabet, so requiring an upper, a lower, a digit and at
+    least one ``/``, ``+`` or ``=`` separates it from hashes and from ordinary
+    identifiers without needing surrounding context.
+    """
+    return (
+        any(c.isupper() for c in secret)
+        and any(c.islower() for c in secret)
+        and any(c.isdigit() for c in secret)
+        and any(c in "/+=" for c in secret)
+    )
 
 
 def _normalize_secret_for_fingerprint(kind: str, secret: str) -> str:
@@ -230,7 +301,12 @@ def _should_redact_match(kind: str, match: re.Match, secret: str) -> bool:
     if kind == "credit_card" and not _credit_card_guard(match):
         return False
 
-    if kind == "credential_assignment" and not _credential_assignment_guard(secret):
+    if kind == "credential_assignment" and not _credential_assignment_guard(
+        match.group(1), secret
+    ):
+        return False
+
+    if kind == "aws_secret_access_key" and not _aws_secret_guard(secret):
         return False
 
     return True
