@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import litellm
 import pytest
+import shared.memory as memory_module
 from shared.memory import (
     DEDUP_THRESHOLD,
     DEFAULT_EMBEDDING_MODEL,
@@ -737,3 +738,77 @@ async def test_generate_summary_prompt_forbids_credentials(monkeypatch):
     monkeypatch.setattr(memory_mod, "call_llm", _fake_call_llm)
     await memory_mod.generate_summary("some output")
     assert "Never reproduce credentials" in seen["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# Prompt input bounds
+# ---------------------------------------------------------------------------
+#
+# ``generate_summary`` and ``extract_facts`` interpolate caller-supplied
+# ``output`` / ``task`` / ``input_data`` straight into a prompt. WP-B bounded
+# them at the two call sites it owned (sync-gateway, async-worker); every other
+# caller — the capture transcript path, and anything added later — is still
+# unbounded. An agent turn that returns a 40MB blob otherwise becomes a 40MB
+# request to the vendor: a cost and latency fault, and a timeout that looks
+# like an LLM outage. The bound belongs in the function so it holds for all
+# callers, not only the careful ones.
+
+
+@pytest.mark.asyncio
+async def test_generate_summary_bounds_every_interpolated_field():
+    from shared.memory import MAX_PROMPT_INPUT_CHARS
+
+    captured = {}
+
+    async def _fake_llm(prompt, system=None):
+        captured["prompt"] = prompt
+        return {"summary": "ok"}
+
+    huge = "x" * (MAX_PROMPT_INPUT_CHARS * 3)
+    with patch("shared.memory.call_llm", new=_fake_llm):
+        await memory_module.generate_summary(huge, task=huge, input_data=huge)
+
+    # Three bounded fields plus a fixed instruction preamble.
+    assert len(captured["prompt"]) < 3 * MAX_PROMPT_INPUT_CHARS + 2_000, (
+        f"prompt was {len(captured['prompt'])} chars"
+    )
+    assert "[truncated]" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_extract_facts_bounds_every_interpolated_field():
+    from shared.memory import MAX_PROMPT_INPUT_CHARS
+
+    captured = {}
+
+    async def _fake_llm(prompt, system=None):
+        captured["prompt"] = prompt
+        return {"facts": []}
+
+    huge = "y" * (MAX_PROMPT_INPUT_CHARS * 3)
+    with patch("shared.memory.call_llm", new=_fake_llm):
+        await memory_module.extract_facts(huge, task=huge, input_data=huge)
+
+    assert len(captured["prompt"]) < 3 * MAX_PROMPT_INPUT_CHARS + 2_000, (
+        f"prompt was {len(captured['prompt'])} chars"
+    )
+    assert "[truncated]" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_ordinary_input_is_passed_through_untouched():
+    """Positive control: the bound must not edit normal turns."""
+    captured = {}
+
+    async def _fake_llm(prompt, system=None):
+        captured["prompt"] = prompt
+        return {"summary": "ok"}
+
+    with patch("shared.memory.call_llm", new=_fake_llm):
+        await memory_module.generate_summary(
+            "wrote the migration", task="ship phase 2", input_data={"n": 1}
+        )
+
+    assert "wrote the migration" in captured["prompt"]
+    assert "ship phase 2" in captured["prompt"]
+    assert "[truncated]" not in captured["prompt"]

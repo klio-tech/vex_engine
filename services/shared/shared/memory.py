@@ -365,6 +365,35 @@ async def call_llm(
 # Summary & fact extraction
 # ---------------------------------------------------------------------------
 
+#: Per-field cap on caller-supplied text interpolated into an LLM prompt.
+#: Matches ``MAX_PROMPT_INPUT_CHARS`` in ``sync-gateway`` and ``async-worker``,
+#: which bound the same values at their own call sites. Keeping the number
+#: identical means the two layers agree rather than compounding.
+MAX_PROMPT_INPUT_CHARS = 20_000
+
+
+def _bounded_prompt_input(value: Any) -> str:
+    """``value`` as text, capped at :data:`MAX_PROMPT_INPUT_CHARS`.
+
+    ``output`` and ``input_data`` are whatever an agent turn produced — an
+    unbounded blob as far as this module is concerned. Interpolated raw, a
+    40 MB tool result becomes a 40 MB request to the vendor: a cost and latency
+    fault that surfaces as a timeout indistinguishable from an LLM outage.
+
+    The bound lives here rather than only at the call sites so it holds for
+    every caller, including the ones that have not been written yet. The
+    call-site caps in ``sync-gateway``/``async-worker`` stay — truncating twice
+    at the same limit is a no-op, and the earlier cut also bounds what those
+    services carry in memory.
+
+    The marker is visible in the prompt on purpose: a model that receives a cut
+    transcript should be able to tell that it was cut.
+    """
+    as_text = value if isinstance(value, str) else str(value)
+    if len(as_text) <= MAX_PROMPT_INPUT_CHARS:
+        return as_text
+    return as_text[:MAX_PROMPT_INPUT_CHARS] + "…[truncated]"
+
 
 async def generate_summary(
     output: Any,
@@ -376,11 +405,11 @@ async def generate_summary(
     Returns:
         The summary string, or ``None`` if the LLM call fails.
     """
-    parts = [f"Output: {output}"]
+    parts = [f"Output: {_bounded_prompt_input(output)}"]
     if task:
-        parts.append(f"Task: {task}")
+        parts.append(f"Task: {_bounded_prompt_input(task)}")
     if input_data:
-        parts.append(f"Input: {input_data}")
+        parts.append(f"Input: {_bounded_prompt_input(input_data)}")
 
     prompt = (
         "Summarize the following agent turn in 1-2 concise sentences. "
@@ -408,11 +437,11 @@ async def extract_facts(
     Returns:
         A list of fact strings, or an empty list if the LLM call fails.
     """
-    parts = [f"Output: {output}"]
+    parts = [f"Output: {_bounded_prompt_input(output)}"]
     if task:
-        parts.append(f"Task: {task}")
+        parts.append(f"Task: {_bounded_prompt_input(task)}")
     if input_data:
-        parts.append(f"Input: {input_data}")
+        parts.append(f"Input: {_bounded_prompt_input(input_data)}")
 
     prompt = (
         "Extract discrete, verifiable facts from the following agent turn. "
