@@ -43,6 +43,7 @@ from shared.compression.protect import (
     protect,
     restore,
 )
+from shared.env_config import parse_bool
 
 logger = logging.getLogger("klio.compression.prose")
 
@@ -143,7 +144,17 @@ def _resolve_weights() -> Optional[tuple[str, str]]:
 
     model_id = _env("KLIO_PROSE_MODEL_ID", DEFAULT_MODEL_ID)
     onnx_file = _env("KLIO_PROSE_ONNX_FILE", DEFAULT_ONNX_FILE)
-    allow_download = os.environ.get("KLIO_PROSE_ALLOW_DOWNLOAD") == "1"
+    # Guarded: the bare ``== "1"`` here accepted exactly one spelling, so an
+    # operator who set ``KLIO_PROSE_ALLOW_DOWNLOAD=true`` out of band to warm
+    # the weights got ``local_files_only=True`` and the "weights are not
+    # available locally" warning below, with nothing pointing at the flag.
+    # The default stays off — a download on a request path is the thing this
+    # flag exists to prevent.
+    allow_download = parse_bool(
+        os.environ.get("KLIO_PROSE_ALLOW_DOWNLOAD"),
+        default=False,
+        name="KLIO_PROSE_ALLOW_DOWNLOAD",
+    )
 
     try:
         onnx_path = hf_hub_download(

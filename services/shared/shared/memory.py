@@ -19,6 +19,8 @@ import litellm
 from litellm import acompletion, aembedding
 from sqlalchemy import text
 
+from shared.env_config import parse_float
+
 logger = logging.getLogger("agentguard.shared.memory")
 
 # ---------------------------------------------------------------------------
@@ -321,7 +323,19 @@ async def call_llm(
         Parsed JSON dict, or ``None`` on timeout / error.
     """
     model = os.environ.get("VERIFICATION_MODEL", DEFAULT_LLM_MODEL)
-    timeout_s = float(os.environ.get("VERIFICATION_TIMEOUT_S", DEFAULT_LLM_TIMEOUT_S))
+    # Guarded, because the bare ``float()`` that used to be here sat ABOVE the
+    # ``try`` below whose whole job is to make LLM failure degrade to ``None``.
+    # Executed: ``VERIFICATION_TIMEOUT_S='10s'`` raised
+    # ``ValueError: could not convert string to float: '10s'`` out of every
+    # ``call_llm``. The identical defect exists at
+    # ``verification-engine/engine/llm_client.py``; both are fixed.
+    timeout_s = parse_float(
+        os.environ.get("VERIFICATION_TIMEOUT_S"),
+        default=DEFAULT_LLM_TIMEOUT_S,
+        name="VERIFICATION_TIMEOUT_S",
+        minimum=0.1,
+        maximum=600.0,
+    )
 
     messages: list[dict[str, str]] = []
     if system:
