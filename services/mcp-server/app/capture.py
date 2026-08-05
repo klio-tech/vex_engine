@@ -350,11 +350,13 @@ def _combine_messages(messages: list[TranscriptMessage]) -> str:
     a very long session does not blow up the LLM call.
 
     Secrets and PII are redacted via :func:`shared.redaction.redact` BEFORE
-    the text is sent to an external LLM for fact extraction/summarisation —
-    secrets never leave the infrastructure via the mining path.
-    :func:`shared.brain.write_scoped_memory` re-screens whatever comes back
-    (defense in depth), so a redaction failure here can fail open to the
-    chokepoint guarantee.
+    the text is sent to an external LLM for fact extraction/summarisation.
+
+    This call is the ONLY thing standing between a transcript and the LLM
+    vendor. :func:`shared.brain.write_scoped_memory` re-screens whatever comes
+    back, but that protects *storage*, not *egress* — it cannot un-send a
+    request. So if redaction fails here the raw transcript is sent to the
+    vendor and the chokepoint does not cover it.
     """
     parts: list[str] = []
     for m in messages:
@@ -367,10 +369,13 @@ def _combine_messages(messages: list[TranscriptMessage]) -> str:
     if len(combined) > _MAX_TRANSCRIPT_CHARS:
         combined = combined[-_MAX_TRANSCRIPT_CHARS:]
     # Redact BEFORE this text is sent to the external LLM for fact
-    # extraction/summarisation — secrets never leave the infrastructure via
-    # the mining path. write_scoped_memory re-screens whatever comes back
-    # (defense in depth), so a redaction failure here can fail open to the
-    # chokepoint guarantee.
+    # extraction/summarisation. This is the only egress guard on the mining
+    # path: write_scoped_memory re-screens what comes back, but that is a
+    # storage guarantee, not an egress one, and it cannot un-send a request.
+    # The except below therefore does NOT fail safe — it proceeds with the
+    # unredacted transcript. Left as-is deliberately (availability over
+    # egress) and called out here so the trade-off is visible rather than
+    # implied by a comment claiming secrets never leave.
     try:
         combined = redact(combined).clean_text
     except Exception:

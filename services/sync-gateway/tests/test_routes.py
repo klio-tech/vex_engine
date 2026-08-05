@@ -5,6 +5,7 @@ import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from app import routes as routes_module
 from app.auth import verify_api_key, verify_ingest_key
 from app.main import create_app
 from engine.models import CheckResult, VerificationResult
@@ -1068,3 +1069,157 @@ async def test_verify_skips_memories_when_no_session_id(client, mock_redis):
 
     assert response.status_code == 200
     mock_retrieve.assert_not_called()
+
+
+# --- Redaction on the direct write_memory path ---------------------------
+#
+# `brain.write_scoped_memory` redacts. This route does not go through it — it
+# calls `write_memory` directly, and until now imported no redactor at all, so
+# an LLM-generated summary of a transcript containing a credential was stored
+# verbatim.
+
+SECRET_IN_SUMMARY = (
+    "The agent connected using DATABASE_PASSWORD=Sup3rS3cretP@ss and succeeded."
+)
+
+
+async def _post_verify_capturing_write(client, summary, event_output="hello"):
+    """Drive /v1/verify with a stubbed summary; return the write_memory mock."""
+    import asyncio as _asyncio
+    import os
+
+    mock_result = VerificationResult(
+        confidence=0.95,
+        action="pass",
+        checks={"schema": CheckResult(check_type="schema", score=1.0, passed=True)},
+    )
+
+    with (
+        patch.dict(os.environ, {"MEMORY_ENABLED": "true"}),
+        patch("app.routes.retrieve_memories", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "app.routes.generate_summary", new_callable=AsyncMock, return_value=summary
+        ),
+        patch(
+            "app.routes.write_memory", new_callable=AsyncMock, return_value=None
+        ) as mock_write,
+        patch(
+            "app.routes.run_verification",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        ),
+        patch("app.routes._get_db_session"),
+    ):
+        response = await client.post(
+            "/v1/verify",
+            json={
+                "agent_id": "test-bot",
+                "output": event_output,
+                "session_id": "sess-redact",
+            },
+            headers={"X-Vex-Key": "test-key"},
+        )
+        assert response.status_code == 200
+        # The summary write is a fire-and-forget task; let it run.
+        for _ in range(10):
+            await _asyncio.sleep(0)
+    return mock_write
+
+
+@pytest.mark.asyncio
+async def test_summary_is_redacted_before_write(client, mock_redis):
+    """A secret in the LLM summary must not reach write_memory."""
+    mock_write = await _post_verify_capturing_write(client, SECRET_IN_SUMMARY)
+
+    mock_write.assert_called_once()
+    stored = mock_write.call_args.kwargs["content"]
+    assert "Sup3rS3cretP@ss" not in stored
+    assert "[REDACTED:" in stored
+
+
+@pytest.mark.asyncio
+async def test_clean_summary_is_stored_byte_identical(client, mock_redis):
+    """Positive control: redaction must not mangle an ordinary summary.
+
+    Without this, a route that stored the empty string would pass the test
+    above.
+    """
+    clean = "The agent looked up the order status and reported it to the user."
+    mock_write = await _post_verify_capturing_write(client, clean)
+
+    mock_write.assert_called_once()
+    assert mock_write.call_args.kwargs["content"] == clean
+
+
+@pytest.mark.asyncio
+async def test_summary_prompt_input_is_bounded(client, mock_redis):
+    """event.output is caller-controlled and went into the LLM prompt uncapped."""
+    import os
+
+    huge = "A" * 500_000
+    mock_result = VerificationResult(
+        confidence=0.95,
+        action="pass",
+        checks={"schema": CheckResult(check_type="schema", score=1.0, passed=True)},
+    )
+
+    with (
+        patch.dict(os.environ, {"MEMORY_ENABLED": "true"}),
+        patch("app.routes.retrieve_memories", new_callable=AsyncMock, return_value=[]),
+        patch(
+            "app.routes.generate_summary", new_callable=AsyncMock, return_value=None
+        ) as mock_summary,
+        patch("app.routes.write_memory", new_callable=AsyncMock, return_value=None),
+        patch(
+            "app.routes.run_verification",
+            new_callable=AsyncMock,
+            return_value=mock_result,
+        ),
+        patch("app.routes._get_db_session"),
+    ):
+        import asyncio as _asyncio
+
+        response = await client.post(
+            "/v1/verify",
+            json={
+                "agent_id": "test-bot",
+                "output": huge,
+                "task": huge,
+                "input": huge,
+                "session_id": "sess-huge",
+            },
+            headers={"X-Vex-Key": "test-key"},
+        )
+        assert response.status_code == 200
+        for _ in range(10):
+            await _asyncio.sleep(0)
+
+    mock_summary.assert_called_once()
+    kwargs = mock_summary.call_args.kwargs
+    for field in ("output", "task", "input_data"):
+        assert len(str(kwargs[field])) <= routes_module.MAX_PROMPT_INPUT_CHARS + 64, (
+            f"{field} was not bounded"
+        )
+
+
+# --- Module-scope config parsing -----------------------------------------
+
+
+def test_timeout_parser_falls_back_on_a_malformed_value():
+    """A bad GATEWAY_TIMEOUT_S must not be an import-time crash.
+
+    The bare `float(os.environ[...])` at module scope raised ValueError during
+    import, with a message that never named the variable, so the service died
+    with no way to tell which setting was wrong.
+    """
+    assert routes_module._parse_timeout("nonsense", 2.0, "GATEWAY_TIMEOUT_S") == 2.0
+    assert routes_module._parse_timeout("", 2.0, "GATEWAY_TIMEOUT_S") == 2.0
+    assert routes_module._parse_timeout(None, 2.0, "GATEWAY_TIMEOUT_S") == 2.0
+    # Non-positive values are meaningless as a timeout and fall back too.
+    assert routes_module._parse_timeout("0", 2.0, "GATEWAY_TIMEOUT_S") == 2.0
+    assert routes_module._parse_timeout("-5", 2.0, "GATEWAY_TIMEOUT_S") == 2.0
+
+
+def test_timeout_parser_accepts_a_good_value():
+    """Positive control: a valid override is still honoured."""
+    assert routes_module._parse_timeout("7.5", 2.0, "GATEWAY_TIMEOUT_S") == 7.5

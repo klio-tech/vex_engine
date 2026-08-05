@@ -34,6 +34,7 @@ from shared.models import (
     VerifyResponse,
 )
 from shared.plan_limits import get_plan_config
+from shared.redaction import redact
 
 from app.auth import verify_api_key, verify_ingest_key
 from app.guardrails_loader import load_guardrails
@@ -42,9 +43,54 @@ logger = logging.getLogger("agentguard.sync-gateway")
 
 VERIFIED_STREAM_KEY = "executions.verified"
 RAW_STREAM_KEY = "executions.raw"
-GATEWAY_TIMEOUT_S = float(os.environ.get("GATEWAY_TIMEOUT_S", "2.0"))
-CORRECTION_TIMEOUT_S = float(os.environ.get("CORRECTION_TIMEOUT_S", "10.0"))
+
+
+def _parse_timeout(raw: Optional[str], default: float, name: str) -> float:
+    """Parse a timeout from the environment, falling back on anything unusable.
+
+    A bare ``float(os.environ.get(...))`` at module scope turns one malformed
+    value into an import-time crash, and ``ValueError: could not convert
+    string to float: 'nonsense'`` never names the variable — the service dies
+    with no way to tell which setting is wrong. Non-positive values are
+    rejected as well: they are meaningless as a timeout and would make every
+    request fail instantly.
+    """
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("%s=%r is not a number; falling back to %s", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("%s=%r must be positive; falling back to %s", name, raw, default)
+        return default
+    return value
+
+
+GATEWAY_TIMEOUT_S = _parse_timeout(
+    os.environ.get("GATEWAY_TIMEOUT_S"), 2.0, "GATEWAY_TIMEOUT_S"
+)
+CORRECTION_TIMEOUT_S = _parse_timeout(
+    os.environ.get("CORRECTION_TIMEOUT_S"), 10.0, "CORRECTION_TIMEOUT_S"
+)
 MAX_CORRECTION_ATTEMPTS = 2
+
+#: Cap on any single caller-supplied field forwarded into an LLM prompt.
+#: ``event.output``/``task``/``input`` are unbounded on the wire, and the
+#: summarisation prompt interpolates them verbatim.
+MAX_PROMPT_INPUT_CHARS = 20_000
+
+
+def _bound_prompt_input(value: Any) -> Any:
+    """Truncate a caller-supplied value before it is interpolated into a prompt."""
+    if value is None:
+        return None
+    as_text = value if isinstance(value, str) else json.dumps(value, default=str)
+    if len(as_text) <= MAX_PROMPT_INPUT_CHARS:
+        return value
+    return as_text[:MAX_PROMPT_INPUT_CHARS] + "…[truncated]"
+
 
 router = APIRouter()
 
@@ -354,11 +400,29 @@ async def verify_endpoint(
         async def _write_summary():
             try:
                 summary = await generate_summary(
-                    output=_summary_output,
-                    task=event.task,
-                    input_data=event.input,
+                    output=_bound_prompt_input(_summary_output),
+                    task=_bound_prompt_input(event.task),
+                    input_data=_bound_prompt_input(event.input),
                 )
                 if summary:
+                    # This path calls write_memory directly, so it does NOT go
+                    # through brain.write_scoped_memory — the only other place
+                    # the redactor runs. Without this the LLM's summary of a
+                    # transcript containing a credential is stored verbatim,
+                    # and then embedded.
+                    redaction = redact(summary)
+                    if redaction.redacted:
+                        logger.info(
+                            "Redacted %d secret(s) from session summary for %s",
+                            len(redaction.findings),
+                            event.execution_id,
+                            extra={
+                                "execution_id": event.execution_id,
+                                "redaction_kinds": sorted(
+                                    {f.kind for f in redaction.findings}
+                                ),
+                            },
+                        )
                     db_sess = _get_db_session()
                     await write_memory(
                         db_session=db_sess,
@@ -367,7 +431,7 @@ async def verify_endpoint(
                         agent_id=event.agent_id,
                         execution_id=event.execution_id,
                         memory_type="summary",
-                        content=summary,
+                        content=redaction.clean_text,
                         confidence=response.confidence,
                         sequence_number=event.sequence_number,
                     )
