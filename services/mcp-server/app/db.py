@@ -16,7 +16,12 @@ was any limit on how long something would wait:
 * ``connect_timeout`` — how long opening a new connection waits. Left unset, an
   unreachable host is bounded only by the OS TCP timeout, which is minutes.
 * ``statement_timeout`` — server-side, so one pathological query cannot hold
-  its connection (and the worker thread running it) indefinitely.
+  its connection (and the worker thread running it) indefinitely. Applied as a
+  ``SET`` on connect rather than as a libpq startup parameter: a PgBouncer
+  transaction pooler (which is what Neon's pooled endpoint is) refuses any
+  connection carrying an unrecognised startup parameter, so the startup-option
+  form took production down while passing every test against a direct local
+  Postgres.
 
 ``pool_pre_ping`` addresses none of these: it detects a connection that is
 *dead*, not one that is *slow*, and slow is the failure mode that exhausts a
@@ -27,13 +32,16 @@ the default with a WARNING rather than preventing import — a timeout must
 never be the reason a service cannot boot.
 """
 
+import logging
 import os
 
 from shared.env_config import parse_float, parse_int
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
 from app.config import DATABASE_URL
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_POOL_TIMEOUT_S = 10.0
 """Seconds a caller may queue for a pooled connection.
@@ -92,11 +100,19 @@ STATEMENT_TIMEOUT_MS = statement_timeout_ms()
 
 CONNECT_ARGS = {
     "connect_timeout": CONNECT_TIMEOUT_S,
-    # libpq forwards ``options`` to the backend, so this is the *server*
-    # enforcing the cap rather than the client hoping to.
-    "options": f"-c statement_timeout={STATEMENT_TIMEOUT_MS}",
 }
 """The libpq arguments handed to every new connection.
+
+``statement_timeout`` is deliberately NOT here. libpq would forward it as a
+startup parameter (``options: -c statement_timeout=...``), and a PgBouncer
+transaction pooler rejects unknown startup parameters outright:
+
+    ERROR: unsupported startup parameter in options: statement_timeout
+
+We run against Neon's *pooled* endpoint, so setting it that way refused every
+connection in production while passing every test against a direct local
+Postgres. A bound that takes the database down is worse than no bound; it is
+applied as an ordinary ``SET`` below instead, which the pooler accepts.
 
 Named rather than inlined because SQLAlchemy does not expose an engine's
 ``connect_args`` for inspection, and these are exactly the settings that most
@@ -111,6 +127,37 @@ engine = create_engine(
     pool_timeout=POOL_TIMEOUT_S,
     connect_args=CONNECT_ARGS,
 )
+
+
+@event.listens_for(engine, "connect")
+def _apply_statement_timeout(dbapi_connection, _connection_record) -> None:
+    """Bound each statement server-side, without a startup parameter.
+
+    Issued as a plain ``SET`` on the fresh connection because that is what a
+    transaction pooler tolerates. Two consequences worth stating:
+
+    * On a direct connection this is session-wide and behaves exactly like the
+      startup parameter it replaces.
+    * Through a transaction pooler the setting lives on the *server* connection
+      the pooler hands out, so it is best-effort rather than guaranteed for
+      every client transaction. That is the strongest bound available on this
+      topology, and it is strictly better than none.
+
+    A failure here is logged and swallowed. This is a safety margin, and it
+    must never become the reason a connection — and therefore a request — is
+    refused. That is the exact failure this function exists to undo.
+    """
+    try:
+        with dbapi_connection.cursor() as cursor:
+            cursor.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
+    except Exception:
+        logger.warning(
+            "could not apply statement_timeout=%s; continuing without it",
+            STATEMENT_TIMEOUT_MS,
+            exc_info=True,
+        )
+
+
 SessionLocal = sessionmaker(bind=engine)
 
 

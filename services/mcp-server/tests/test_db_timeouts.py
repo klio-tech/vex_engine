@@ -39,8 +39,28 @@ def test_connecting_to_an_unreachable_host_is_bounded():
 
 
 def test_a_pathological_query_is_bounded():
-    assert f"statement_timeout={db.STATEMENT_TIMEOUT_MS}" in db.CONNECT_ARGS["options"]
     assert 0 < db.STATEMENT_TIMEOUT_MS <= 300_000
+
+
+def test_the_statement_timeout_is_never_a_startup_parameter():
+    """Regression guard for a production outage.
+
+    Passing ``options: -c statement_timeout=...`` makes libpq send it as a
+    *startup* parameter. A PgBouncer transaction pooler — which is what Neon's
+    pooled endpoint is, and what production connects to — refuses the whole
+    connection:
+
+        ERROR: unsupported startup parameter in options: statement_timeout
+
+    Every request failed while every test passed, because the tests run against
+    a direct local Postgres that accepts it. The timeout is applied as a plain
+    ``SET`` on connect instead; this test pins the form, not just the value, so
+    the convenient-looking version cannot come back.
+    """
+    assert "options" not in db.CONNECT_ARGS, (
+        "statement_timeout must not be a libpq startup parameter: a pooled "
+        "endpoint rejects the connection outright"
+    )
 
 
 @requires_db("the statement timeout is applied by the server, not just declared")
