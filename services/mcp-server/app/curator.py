@@ -183,9 +183,25 @@ def _entity_cap() -> int:
 class EntityBudget:
     """The per-TICK entity allowance, threaded through per-partition synthesis.
 
-    Deliberately mutable (like the reconcile budget integer this module already
-    threads): the whole point is that partitions within one tick draw down a
-    single shared allowance rather than each getting a fresh one.
+    Deliberately mutable: the whole point is that partitions within one tick
+    draw down a single shared allowance rather than each getting a fresh one.
+    """
+
+    remaining: int
+
+
+@dataclass
+class ReconcileBudget:
+    """The per-TICK LLM-judge allowance, threaded exactly like :class:`EntityBudget`.
+
+    It has to be an object rather than a local integer because the spend
+    happens one partition at a time and the cap is documented per tick.
+    ``_synthesize_and_store`` used to read ``CURATOR_RECONCILE_MAX`` itself,
+    and it runs once per ``(space_id, project_id)`` partition — so every
+    partition received the full allowance and a documented ceiling of 50
+    judge calls was really 50 *per partition*. A 50-row batch can partition 16
+    ways, which is 800 LLM calls against a knob whose only job is bounding
+    spend.
     """
 
     remaining: int
@@ -734,6 +750,7 @@ async def _synthesize_and_store(
     space_id: Optional[str] = None,
     project_id: Optional[str] = None,
     entity_budget: Optional[EntityBudget] = None,
+    reconcile_budget: Optional[ReconcileBudget] = None,
 ) -> int:
     """Run the LLM synthesis over ``combined`` and store the results.
 
@@ -745,11 +762,21 @@ async def _synthesize_and_store(
     Since phase 2 of the knowledge graph the fact pass is the extended
     :func:`extract_graph` (same single LLM call): entities and edges ride
     along and are stored through the GraphStore seam AFTER the facts land, so
-    every edge src is a real stored row. ``entity_budget`` is the shared
-    per-tick allowance; a caller that omits it (direct test invocation) gets
-    a fresh one at the configured cap.
+    every edge src is a real stored row.
+
+    ``entity_budget`` and ``reconcile_budget`` are the tick's shared
+    allowances, drawn down across every partition. Both are objects rather
+    than integers precisely so the drawdown is visible to the caller: a
+    partition-local integer is a partition-local cap, which is what
+    ``reconcile_budget`` silently was. A caller that omits either (a direct
+    test invocation) gets a fresh one at the configured value.
     """
     budget = entity_budget if entity_budget is not None else EntityBudget(_entity_cap())
+    reconcile = (
+        reconcile_budget
+        if reconcile_budget is not None
+        else ReconcileBudget(_reconcile_budget())
+    )
     # The session id carries user_id so the dedup window (which is keyed on
     # session_id for shared writes) cannot straddle two people.
     session_id = f"{agent_id}:{org_id}:{user_id}"
@@ -801,7 +828,6 @@ async def _synthesize_and_store(
     # their edges are skipped rather than attached to somebody else's row.
     fact_row_ids: dict[int, str] = {}
 
-    reconcile_budget = _reconcile_budget()
     for fact_idx, fact in enumerate(facts):
         if not fact:
             continue
@@ -820,7 +846,7 @@ async def _synthesize_and_store(
         if new_id:
             stored += 1
             fact_row_ids[fact_idx] = new_id
-            if reconcile_budget > 0:
+            if reconcile.remaining > 0:
                 fact_embedding = await embed_text(fact)
                 if fact_embedding is not None:
                     superseded, judged = await reconcile_fact(
@@ -830,9 +856,9 @@ async def _synthesize_and_store(
                         new_fact_id=new_id,
                         new_fact_content=fact,
                         embedding=fact_embedding,
-                        max_judgments=reconcile_budget,
+                        max_judgments=reconcile.remaining,
                     )
-                    reconcile_budget -= max(judged, 1)
+                    reconcile.remaining -= max(judged, 1)
 
     # --- the graph itself -------------------------------------------------
     try:
@@ -992,6 +1018,10 @@ async def curator_tick(
     # ONE entity allowance for the whole tick, drawn down across partitions —
     # the cap is per tick, not per partition.
     entity_budget = EntityBudget(_entity_cap())
+    # ONE judge allowance for the whole tick, for the same reason: the
+    # documented cap is per tick, and reading it per partition multiplied the
+    # operator's number by the partition count.
+    reconcile_budget = ReconcileBudget(_reconcile_budget())
     # Rows this tick did NOT distil. The cursor must stop before the earliest
     # of them; see :func:`_cursor_stop`.
     held: list[Any] = []
@@ -1021,6 +1051,7 @@ async def curator_tick(
             space_id=space_id,
             project_id=project_id,
             entity_budget=entity_budget,
+            reconcile_budget=reconcile_budget,
         )
         synthesized += stored
         if stored == 0:
