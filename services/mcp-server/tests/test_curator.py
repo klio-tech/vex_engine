@@ -690,10 +690,18 @@ async def test_null_project_partition_stays_org_wide():
 async def test_subthreshold_partition_is_not_distilled():
     """When the batch total >= min_inputs but a single project's partition is
     below it, that partition is skipped (no writes) while a qualifying one runs.
-    The cursor still advances over the whole batch."""
+    The cursor stops BEFORE the skipped partition's first row.
+
+    This assertion is the inverted form of what it used to be. The test
+    previously pinned "the cursor still advances over the whole batch", which
+    is the defect: nothing looks behind the cursor and run_retention.py deletes
+    RAW observations after 7 days, so proj-B's two rows were destroyed on a
+    one-week fuse without ever being read. Deferring them is the contract; the
+    dedicated coverage is tests/test_curator_cursor_abandonment.py.
+    """
     rows = (
         [_row(i, f"a{i}", project_id="proj-A") for i in range(1, 4)]  # 3 -> distilled
-        + [_row(i, f"b{i}", project_id="proj-B") for i in range(4, 6)]  # 2 -> skipped
+        + [_row(i, f"b{i}", project_id="proj-B") for i in range(4, 6)]  # 2 -> deferred
     )
     session = _make_session(cursor=None, rows=rows)
     gen, ext, wsm = _patch_curator(summary="s", facts=["f1"])
@@ -703,11 +711,14 @@ async def test_subthreshold_partition_is_not_distilled():
 
     written_projects = {c.kwargs["project_id"] for c in mock_write.await_args_list}
     assert written_projects == {"proj-A"}  # proj-B skipped
-    assert result["processed"] == 5  # whole batch counted
-    # Cursor advanced to the whole batch's max (created_at, id) = last row.
+    # Only the three rows the cursor advanced over count as processed; the two
+    # held ones have not been, and processed_count must not claim they were.
+    assert result["processed"] == 3
+    # Cursor advanced to the LAST DISTILLED row, not the batch's last row.
     advance_params = session.execute.call_args_list[2].args[1]
-    assert advance_params["last_processed_at"] == rows[-1].created_at
-    assert advance_params["last_processed_id"] == rows[-1].id
+    assert advance_params["last_processed_at"] == rows[2].created_at
+    assert advance_params["last_processed_id"] == rows[2].id
+    assert advance_params["processed_delta"] == 3
 
 
 @pytest.mark.asyncio

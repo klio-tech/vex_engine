@@ -76,6 +76,14 @@ Cursor / idempotency:
     nothing new synthesises nothing and leaves *both* cursor halves untouched
     (only ``last_run_at`` is bumped), so re-runs are idempotent.
 
+    The cursor advances only over rows the tick actually distilled. A batch is
+    partitioned by ``(space_id, project_id)`` and a partition below the
+    threshold — or one that qualified but stored nothing, because every write
+    failed — is deferred, so the cursor stops before the earliest such row
+    rather than at the batch's end. Advancing past a row the curator never
+    read back is not a skip: nothing looks behind the cursor, and
+    ``scripts/run_retention.py`` deletes RAW observations on a 7-day TTL.
+
 Async / DB I/O note:
     :func:`curator_tick` is ``async def`` yet performs inline *synchronous*
     psycopg2 DB I/O via ``db_session.execute(...)``. This matches the house
@@ -206,6 +214,59 @@ def _reconcile_budget() -> int:
     )
 
 
+def _begin_savepoint(db_session: Any) -> Any:
+    """Open a SAVEPOINT around one item of a batch, or ``None`` if unsupported.
+
+    The curator's three swallowing handlers differ from the seven elsewhere in
+    the engine: they sit INSIDE a loop whose earlier iterations may still be in
+    flight. A bare ``db_session.rollback()`` there clears the aborted
+    transaction — which is necessary — but it also discards every uncommitted
+    write the batch has made so far, turning one bad fact into the loss of a
+    whole partition. ``ROLLBACK TO SAVEPOINT`` undoes exactly the failed item.
+
+    Returns ``None`` when the session seam has no ``begin_nested`` (a plain
+    test stub). Callers fall back to a bare rollback, which is the pre-existing
+    behaviour and still better than leaving the transaction aborted.
+    """
+    try:
+        return db_session.begin_nested()
+    except Exception:
+        logger.debug("curator: session does not support savepoints", exc_info=True)
+        return None
+
+
+def _undo_failed_item(db_session: Any, savepoint: Any, what: str, org_id: str) -> None:
+    """Undo one failed item, keeping the rest of the batch's work.
+
+    Falls back to a full rollback when there is no live savepoint to return
+    to. That happens legitimately: the write helpers commit internally, and a
+    commit releases the savepoint, so a failure *after* an inner commit has no
+    savepoint left. It is also the case for a session seam with no
+    ``begin_nested``. Either way the transaction must be cleared — an aborted
+    one refuses every remaining statement of the tick, cursor upsert included.
+    """
+    try:
+        if savepoint is not None and savepoint.is_active:
+            savepoint.rollback()
+            return
+    except Exception:
+        logger.warning(
+            "curator: savepoint rollback after a failed %s failed for org %s",
+            what,
+            org_id,
+            exc_info=True,
+        )
+    try:
+        db_session.rollback()
+    except Exception:
+        logger.warning(
+            "curator: rollback after a failed %s also failed for org %s",
+            what,
+            org_id,
+            exc_info=True,
+        )
+
+
 async def extract_graph(combined: str) -> dict[str, Any]:
     """One extended LLM pass: facts PLUS the entities and edges they evidence.
 
@@ -322,14 +383,17 @@ def _store_graph(
                 norm,
             )
             break
+        savepoint = _begin_savepoint(db_session)
         try:
             entity_ids[norm] = graph_store.add_entity(
                 db_session, org_id=org_id, name=name, kind=kind
             )
             entity_budget.remaining -= 1
         except graph_store.EntityRefused as exc:
+            _undo_failed_item(db_session, savepoint, "add_entity", org_id)
             logger.info("curator: entity refused for org %s: %s", org_id, exc)
         except Exception:
+            _undo_failed_item(db_session, savepoint, "add_entity", org_id)
             logger.warning(
                 "curator: add_entity failed for org %s (%r); skipping",
                 org_id,
@@ -345,6 +409,7 @@ def _store_graph(
         )
         if src_row_id is None or entity_id is None:
             continue  # deduped fact, refused/capped entity, or bad index
+        savepoint = _begin_savepoint(db_session)
         try:
             graph_store.add_edge(
                 db_session,
@@ -357,6 +422,7 @@ def _store_graph(
             )
             drawn += 1
         except Exception:
+            _undo_failed_item(db_session, savepoint, "add_edge", org_id)
             logger.warning(
                 "curator: add_edge failed for org %s; skipping",
                 org_id,
@@ -805,6 +871,7 @@ async def _store_one(
     write never aborts the tick. Callers treat a non-None return as a new
     stored row (truthiness preserved for counting).
     """
+    savepoint = _begin_savepoint(db_session)
     try:
         result = await write_scoped_memory(
             db_session,
@@ -821,6 +888,11 @@ async def _store_one(
             provenance="INFERRED",
         )
     except Exception:
+        # Undo only this row. The failure is usually a SQL error, which aborts
+        # the transaction — leaving it aborted would take down the rest of the
+        # tick INCLUDING the cursor upsert, which is precisely what used to
+        # hide the abandonment defect that ``curator_tick`` now fixes.
+        _undo_failed_item(db_session, savepoint, "write_scoped_memory", org_id)
         logger.warning(
             "curator: write_scoped_memory raised for org %s (%s); skipping",
             org_id,
@@ -864,9 +936,19 @@ async def curator_tick(
     Returns:
         On the no-op path:
             ``{"synthesized": 0, "processed": <n>, "reason": "below_threshold"}``
+        When the cursor could not move at all (the batch's first row belongs to
+        a partition that was skipped or produced nothing):
+            ``{"synthesized": <n>, "processed": 0, "cursor": None,
+            "reason": "cursor_held"}``
         On the synthesis path:
-            ``{"synthesized": <newly stored>, "processed": <n>,
-            "cursor": <new last_processed_at ISO string>}``
+            ``{"synthesized": <newly stored>, "processed": <rows the cursor
+            now covers>, "cursor": <new last_processed_at ISO string>}``
+
+        ``processed`` counts the rows the cursor advanced OVER, not the rows
+        read. The two differ exactly when some of the batch was held back, and
+        the smaller number is the honest one: a held row has not been
+        processed, and ``brain_curator_state.processed_count`` must not claim
+        it has.
 
     Raises:
         ValueError: If ``user_id`` is empty. There is no "curate the org"
@@ -900,13 +982,26 @@ async def curator_tick(
     # ONE entity allowance for the whole tick, drawn down across partitions —
     # the cap is per tick, not per partition.
     entity_budget = EntityBudget(_entity_cap())
+    # Rows this tick did NOT distil. The cursor must stop before the earliest
+    # of them; see :func:`_cursor_stop`.
+    held: list[Any] = []
     for (space_id, project_id), part_rows in partitions.items():
         # Per-partition threshold: a project needs real signal before it gets a
-        # distilled fact. Sub-threshold rows stay recallable as raw observations.
+        # distilled fact. A partition below it is deferred, NOT dropped — its
+        # rows are held back from the cursor so a later tick reconsiders them
+        # once enough accumulate.
+        #
+        # They do not simply "stay recallable" in the meantime, which is what
+        # this comment used to claim: nearly every RAW row is a passive capture
+        # with recall_hidden=TRUE, invisible to recall by construction, and
+        # scripts/run_retention.py deletes RAW observations on a 7-day TTL.
+        # Advancing past a skipped row does not demote it to raw material; it
+        # destroys it on a one-week fuse.
         if len(part_rows) < min_inputs:
+            held.extend(part_rows)
             continue
         combined = "\n".join(r.content for r in part_rows if r.content)
-        synthesized += await _synthesize_and_store(
+        stored = await _synthesize_and_store(
             db_session,
             org_id=org_id,
             user_id=user_id,
@@ -917,18 +1012,64 @@ async def curator_tick(
             project_id=project_id,
             entity_budget=entity_budget,
         )
+        synthesized += stored
+        if stored == 0:
+            # The partition qualified but nothing was written: every write
+            # failed, or the LLM produced nothing. ``_store_one`` swallows its
+            # exceptions, so this is the ONLY place that failure is visible.
+            # Hold the rows rather than advance over a partition that produced
+            # no distillate at all.
+            held.append(part_rows[0])
 
-    # Rows are ordered (created_at ASC, id ASC), so the LAST row carries the
-    # batch's composite max — the correct new keyset cursor.
-    batch_max_at = rows[-1].created_at
-    batch_max_id = rows[-1].id
-    _advance_cursor(db_session, org_id, user_id, batch_max_at, batch_max_id, len(rows))
+    stop = _cursor_stop(rows, held)
+    if stop == 0:
+        # Nothing before the first held row: leave BOTH cursor halves alone and
+        # bump last_run_at only, exactly as the below-threshold path does.
+        _touch_last_run(db_session, org_id, user_id)
+        return {
+            "synthesized": synthesized,
+            "processed": 0,
+            "cursor": None,
+            "reason": "cursor_held",
+        }
+
+    # Rows are ordered (created_at ASC, id ASC), so the row at ``stop - 1``
+    # carries the composite max of the prefix the tick actually covered.
+    last = rows[stop - 1]
+    _advance_cursor(db_session, org_id, user_id, last.created_at, last.id, stop)
 
     return {
         "synthesized": synthesized,
-        "processed": len(rows),
-        "cursor": batch_max_at.isoformat(),
+        "processed": stop,
+        "cursor": last.created_at.isoformat(),
     }
+
+
+def _cursor_stop(rows: list[Any], held: list[Any]) -> int:
+    """How far into ``rows`` the cursor may advance: an exclusive index.
+
+    The batch is ordered ``(created_at ASC, id ASC)`` and the cursor is a
+    single point on that order, so the only rows it can safely pass are the
+    unbroken prefix ending before the FIRST row this tick did not distil.
+    Anything past that point would be skipped permanently: the read query only
+    ever looks ahead of the cursor, and ``scripts/run_retention.py`` deletes
+    RAW observations after 7 days.
+
+    ``len(rows)`` when nothing was held (the ordinary case — advance over the
+    whole batch); ``0`` when the very first row was held, in which case the
+    caller must leave the cursor untouched.
+
+    Note this deliberately re-processes a qualifying partition whose rows sit
+    *after* a held one. Re-synthesis is absorbed by dedup and costs one LLM
+    call; the alternative costs rows.
+    """
+    if not held:
+        return len(rows)
+    held_ids = {r.id for r in held}
+    for index, row in enumerate(rows):
+        if row.id in held_ids:
+            return index
+    return len(rows)
 
 
 async def run_curator_once(
