@@ -44,6 +44,16 @@ rank, so when the lexical arm contributes nothing the fused order is
 switch off, lexical failure — every one of those lands on the old behaviour by
 construction rather than by care.
 
+**What the default weight can and cannot do.** At ``KLIO_LEXICAL_WEIGHT=0.5``
+and ``k=60`` a row present only in the lexical arm scores ``0.5/61 = 0.0082``,
+while any row the vector arm returned scores at least ``1/(60 + pool)``. So at
+the default the arm **reorders the vector candidate pool** — promoting a row
+the dense ranking buried — rather than introducing rows from outside it. That
+is the demonstrated case: the row containing the literal sat sixth of six and
+now comes first. Raising the weight toward 1.0 lets a lexical-only row survive
+the final truncation as well. Both behaviours are tested; the trade is stated
+here so nobody has to rediscover it from the arithmetic.
+
 Dependencies are stdlib plus :mod:`shared.env_config` (itself stdlib-only) so
 that the migrations image, which installs neither SQLAlchemy models nor
 litellm, can import this module for the one constant it needs.
