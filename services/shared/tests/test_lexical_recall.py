@@ -661,3 +661,48 @@ async def test_the_two_tier_fill_reports_one_recall_not_two(db, clean_metrics):
         for outcome in metrics.LEXICAL_OUTCOMES
     )
     assert total == 1.0
+
+
+# ── fusion is fusion, not concatenation ───────────────────────────────────
+
+#: Lexically the strongest match (the literal three times) but only weakly
+#: topical, so the dense arm buries it.
+LEX_STRONG = (
+    "Railway deploy note: KLIO_METRICS_TOKEN KLIO_METRICS_TOKEN "
+    "KLIO_METRICS_TOKEN was rotated on Tuesday by the platform team and the "
+    "new secret is in the manager."
+)
+#: Contains the literal once, and is exactly what the dense arm rewards.
+VEC_STRONG = "Metrics endpoints need a token, see KLIO_METRICS_TOKEN."
+
+
+@pytest.mark.asyncio
+async def test_both_arms_are_fused_rather_than_concatenated(db):
+    """When both arms return rows, the order must be the FUSED order.
+
+    Two rows contain the literal. One wins the lexical arm outright (the
+    literal three times) but sits deep in the dense ranking; the other is the
+    dense arm's leader and only lexical rank 2. RRF prefers the second —
+    1/61 + 0.5/62 beats 1/(60+n) + 0.5/61 for any n past the first few — so
+    asserting on it distinguishes real fusion from returning the lexical arm's
+    rows first and the vector arm's rows after, which agrees with fusion on
+    every corpus where only one row matches lexically.
+    """
+    org = _org(db)
+    lex_strong = _seed(db, org_id=org, content=LEX_STRONG)
+    vec_strong = _seed(db, org_id=org, content=VEC_STRONG)
+    for content in corpus.DISTRACTOR_CONTENTS:
+        _seed(db, org_id=org, content=content)
+
+    with _embed_as(corpus.LITERAL):
+        results = await retrieve_memories_scoped(db, org, corpus.LITERAL, limit=5)
+
+    ids = [str(r.id) for r in results]
+    assert ids[0] == vec_strong, (
+        "the lexical arm's leader was returned first, so the arms were "
+        "concatenated rather than fused; order was: "
+        + " | ".join(r.content[:40] for r in results)
+    )
+    assert ids[1] == lex_strong, (
+        "the lexical arm's leader should still have been promoted to second"
+    )
