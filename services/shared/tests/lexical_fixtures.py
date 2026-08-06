@@ -28,8 +28,9 @@ contains the literal — falls out of the geometry, and is the same complaint
 the design doc cites from a production system. If the model were tuned to
 produce a desired answer it would need a notion of "the answer"; it has none.
 
-The lexical arm, by contrast, sees ``KLIO_METRICS_TOKEN`` as the conjunction
-``klio & metric & token``, and ``klio`` appears in exactly one row.
+The lexical arm, by contrast, sees ``KLIO_METRICS_TOKEN`` as the phrase
+``'klio' <-> 'metric' <-> 'token'`` — adjacent, in order — and only one row
+contains it.
 """
 
 from __future__ import annotations
@@ -169,8 +170,8 @@ def cosine(left: list[float], right: list[float]) -> float:
 
 # ── the corpus ────────────────────────────────────────────────────────────
 
-#: The rare literal. Postgres tokenises it as ``klio & metric & token``, and
-#: ``klio`` appears in no other row below.
+#: The rare literal. Postgres turns it into the phrase query
+#: ``'klio' <-> 'metric' <-> 'token'``, and ``klio`` appears in no other row.
 LITERAL = "KLIO_METRICS_TOKEN"
 
 #: The one row that contains the literal. Long and only incidentally topical,
