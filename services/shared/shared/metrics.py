@@ -660,6 +660,51 @@ MEMORY_RECALL_RESULTS = REGISTRY.counter(
     labels={"scope": SCOPES},
 )
 
+# ── the lexical recall arm ────────────────────────────────────────────
+#
+# The feature exists on a hypothesis — that dense retrieval misses rare
+# literals often enough to be worth a second query. These four series are how
+# that hypothesis gets checked against production rather than re-argued.
+
+#: Why the lexical arm did not run. A closed set, listed here so the label is
+#: bounded by construction rather than by the discipline of the call sites.
+LEXICAL_SKIP_REASONS: tuple[str, ...] = (
+    "disabled",
+    "zero_weight",
+    "empty_query",
+    "probe_failed",
+)
+
+#: What running it produced. ``empty`` is separated from ``rows`` because a
+#: lexical arm that matches nothing is the normal case for a paraphrase query
+#: and must not read as a failure.
+LEXICAL_OUTCOMES: tuple[str, ...] = ("rows", "empty", "error")
+
+LEXICAL_ARM_SKIPPED = REGISTRY.counter(
+    "klio_lexical_arm_skipped_total",
+    "Recalls where the lexical arm did not run, by reason.",
+    labels={"reason": LEXICAL_SKIP_REASONS},
+)
+
+LEXICAL_ARM_QUERIES = REGISTRY.counter(
+    "klio_lexical_arm_queries_total",
+    "Recalls where the lexical arm ran, by outcome.",
+    labels={"outcome": LEXICAL_OUTCOMES},
+)
+
+LEXICAL_ARM_CONTRIBUTED = REGISTRY.counter(
+    "klio_lexical_arm_contributed_total",
+    "Recalls where the lexical arm returned at least one row the vector arm "
+    "did not. THE number that says whether this feature earns its place: rows "
+    "both arms already agreed on cost a query and change nothing, and without "
+    "this series the only available verdict is that it feels better.",
+)
+
+LEXICAL_ARM_SECONDS = REGISTRY.histogram(
+    "klio_lexical_arm_seconds",
+    "Time spent in the lexical query, summed over a recall's fetches.",
+)
+
 TOOL_CALLS = REGISTRY.counter(
     "klio_tool_calls_total",
     "MCP tool invocations, by tool and outcome.",

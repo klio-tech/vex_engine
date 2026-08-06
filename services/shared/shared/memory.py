@@ -24,7 +24,7 @@ import litellm
 from litellm import acompletion, aembedding
 from sqlalchemy import text
 
-from shared import metrics
+from shared import lexical, metrics
 from shared.env_config import parse_float, parse_int
 
 # Project ACLs. Safe at module scope: ``projects`` imports nothing from this
@@ -105,6 +105,17 @@ SQL inside :func:`shared.graph_store.neighbors`; this cap only bounds volume.
 
 VIA_GRAPH: str = "graph"
 """Value of :attr:`MemoryRecord.via` on a row that arrived by graph expansion."""
+
+VIA_LEXICAL: str = "lexical"
+"""Value of :attr:`MemoryRecord.via` on a row only the lexical arm returned.
+
+Same reasoning as :data:`VIA_GRAPH`. A lexical-only row has no cosine score to
+report, and inventing one would misrepresent why it is present — so its
+``relevance`` is ``None`` and this positive marker is what tells a caller the
+row came from an exact-token match rather than a semantic one. A row BOTH arms
+returned keeps its cosine ``relevance`` and no marker: it was a semantic match
+that lexical merely agreed with.
+"""
 
 # Stage-C blended re-rank weights (spec: recall learns to walk). Similarity
 # dominates; recency and edge-connectedness are equal minority signals. The
@@ -1446,6 +1457,73 @@ def _expand_via_graph(
     return sorted(records + extra, key=_blended, reverse=True)
 
 
+#: The bind name the lexical arm's tsquery uses, in the shared params dict.
+_LEXICAL_QUERY_PARAM = "lexical_query"
+
+
+def _lexical_skip_reason(
+    db_session: Any, query_text: str, weight: float
+) -> Optional[str]:
+    """Why the lexical arm should not run, or ``None`` to run it.
+
+    The empty-tsquery case cannot be decided in Python: whether ``the a of
+    and`` reduces to nothing is a property of the ``english`` configuration's
+    stopword list, and ``websearch_to_tsquery`` is the only thing that knows
+    it. So it is asked, once per recall, with a statement that touches no
+    table. That is one sub-millisecond round trip on a path that has just
+    awaited an embedding over the network — and it buys skipping up to two
+    index scans that cannot match, plus a truthful skip reason in the metrics
+    instead of a silent no-op.
+    """
+    if not lexical.lexical_enabled():
+        return "disabled"
+    if weight == 0.0:
+        # Explicitly ``== 0.0`` and not ``not weight``: the operator's zero is
+        # a decision, and this is the site where treating it as absence would
+        # turn the kill switch back on.
+        return "zero_weight"
+
+    probe = f"SELECT {lexical.fts_query_expression(_LEXICAL_QUERY_PARAM)}::text = ''"
+    try:
+        empty = db_session.execute(
+            text(probe), {_LEXICAL_QUERY_PARAM: query_text}
+        ).scalar()
+    except Exception:
+        logger.warning("lexical tsquery probe failed; skipping the arm", exc_info=True)
+        try:
+            db_session.rollback()
+        except Exception:
+            logger.warning(
+                "rollback after a failed tsquery probe failed", exc_info=True
+            )
+        return "probe_failed"
+
+    return "empty_query" if empty else None
+
+
+def _report_lexical(skip_reason: Optional[str], stats: dict, state: dict) -> None:
+    """Emit the arm's four series once per recall, not once per fetch.
+
+    The two-tier project fill calls the arm twice; counting per fetch would
+    make "recalls where lexical contributed" un-interpretable against a recall
+    rate.
+    """
+    if skip_reason is not None:
+        metrics.record(metrics.LEXICAL_ARM_SKIPPED.inc, reason=skip_reason)
+        return
+
+    if stats["errors"]:
+        outcome = "error"
+    elif stats["rows"]:
+        outcome = "rows"
+    else:
+        outcome = "empty"
+    metrics.record(metrics.LEXICAL_ARM_QUERIES.inc, outcome=outcome)
+    metrics.record(metrics.LEXICAL_ARM_SECONDS.observe, state["seconds"])
+    if stats["novel"]:
+        metrics.record(metrics.LEXICAL_ARM_CONTRIBUTED.inc)
+
+
 @metrics.tracked(metrics.MEMORY_RECALLS, metrics.MEMORY_RECALL_SECONDS)
 async def retrieve_memories_scoped(
     db_session: Any,
@@ -1682,6 +1760,27 @@ async def retrieve_memories_scoped(
     # ``row[:-1]`` rather than at fixed indices, so appending a column here
     # (user_id and provenance were appended in phase 2) does not silently
     # shift what ``relevance`` reads.
+    #
+    # The outer LIMIT is ``:vector_limit`` rather than ``:limit``, and the two
+    # differ ONLY when the lexical arm is live. This is the one place the
+    # vector statement changed, and it had to:
+    #
+    #   RRF at the configured weights makes a lexical-only row score
+    #   0.5/(60+1) = 0.0082, while ANY vector row scores at least
+    #   1/(60+limit). For every realistic limit that is larger, so a row the
+    #   vector arm did not return could never displace one it did — the whole
+    #   feature would be inert. Truncating the vector arm to ``limit`` BEFORE
+    #   fusion is what caused that: the row containing the literal was cut
+    #   before fusion could see it. Fusing the candidate pool instead and
+    #   truncating AFTER lets the two signals agree: the target scores
+    #   1/(60+6) + 0.5/(60+1) = 0.0233 against the best distractor's 0.0164.
+    #
+    # Fusing candidates and truncating afterwards is also the ordinary shape
+    # of RRF; truncating each arm first is what is unusual. The single-arm
+    # invariant is unaffected: with the lexical arm empty the fused order is
+    # the vector order, and taking its first ``limit`` rows is byte-for-byte
+    # what ``LIMIT :limit`` returned before. When the arm is off,
+    # ``vector_limit`` IS ``limit`` and the statement is unchanged.
     select_sql = """
         SELECT * FROM (
             SELECT id, session_id, org_id, agent_id, execution_id,
@@ -1700,20 +1799,150 @@ async def retrieve_memories_scoped(
                       0, 1 - EXTRACT(EPOCH FROM (NOW() - created_at))
                              / (30 * 86400)
                     ))) DESC
-        LIMIT :limit
+        LIMIT :vector_limit
     """
+
+    # ---- the lexical arm --------------------------------------------------
+    # Same shape, same {where}, same params, same candidate-pool bound. The
+    # ONLY predicate this query adds is the full-text match itself: the
+    # tenancy, scope, status and recall_hidden clauses are the identical
+    # ``base_clauses`` list object the vector arm builds its WHERE from, so a
+    # predicate cannot be present on one arm and missing on the other. That is
+    # not stylistic. The Wave 1 defect was exactly this shape — a second query
+    # path that filtered on session and org but not on scope or recall_hidden,
+    # while the boundary held correctly everywhere else in this file.
+    #
+    # ``ts_rank`` is selected as the last column so the row layout matches the
+    # vector arm's (record columns, then one score), but the value is NOT
+    # written into ``relevance``: ts_rank is unbounded and corpus-dependent
+    # while ``relevance`` is documented as a cosine similarity in [0, 1].
+    # Lexical-only rows carry ``relevance=None`` and ``via=VIA_LEXICAL``,
+    # exactly as graph-expanded rows do.
+    lexical_sql = """
+        SELECT id, session_id, org_id, agent_id, execution_id,
+               memory_type, content, embedding, confidence,
+               sequence_number, scope, status, superseded_by,
+               metadata, created_at, updated_at, space_id, project_id,
+               user_id, provenance,
+               ts_rank({document}, {query}) AS lexical_rank
+        FROM session_memories
+        WHERE {where}
+          AND {document} @@ {query}
+        ORDER BY ts_rank({document}, {query}) DESC, id
+        LIMIT :candidate_pool
+    """.replace("{document}", lexical.fts_document_expression()).replace(
+        "{query}", lexical.fts_query_expression(_LEXICAL_QUERY_PARAM)
+    )
+
+    # One shared params dict, one shared bound value. The vector statement
+    # never mentions :lexical_query; binding it there is harmless and keeps
+    # the two arms provably parameterised from the same place.
+    params[_LEXICAL_QUERY_PARAM] = query_text
+
+    lexical_weight = lexical.lexical_weight()
+    fusion_k = lexical.rrf_k()
+    skip_reason = _lexical_skip_reason(db_session, query_text, lexical_weight)
+    # Mutable because a lexical failure mid-recall must not be retried on the
+    # tier-2 fetch: the failed statement has already aborted the transaction.
+    lexical_state = {"live": skip_reason is None, "seconds": 0.0}
+    stats = {"rows": 0, "novel": 0, "errors": 0}
+
+    def _to_records(rows: list, *, via: Optional[str], scored: bool) -> list:
+        out = []
+        for row in rows:
+            # relevance is the LAST selected column; everything before it is
+            # the record. blended_score is not selected — it only drives the
+            # ORDER BY.
+            record = _row_to_record(row[:-1])
+            relevance = row[-1] if scored else None
+            record.relevance = (
+                round(float(relevance), 3) if relevance is not None else None
+            )
+            record.via = via
+            out.append(record)
+        return out
+
+    def _fetch_lexical(where_sql: str, merged: dict[str, Any]) -> list:
+        """The lexical rows, or ``[]`` if the arm is off or has failed.
+
+        Failure containment mirrors :func:`_expand_via_graph`: log, roll the
+        session back so the aborted transaction cannot poison every later
+        statement, and let the caller carry on with the vector rows alone.
+        """
+        if not lexical_state["live"]:
+            return []
+        started = time.monotonic()
+        try:
+            return db_session.execute(
+                text(lexical_sql.format(where=where_sql)), merged
+            ).fetchall()
+        except Exception:
+            logger.warning(
+                "recall lexical arm failed; returning vector results alone",
+                exc_info=True,
+            )
+            stats["errors"] += 1
+            lexical_state["live"] = False
+            try:
+                db_session.rollback()
+            except Exception:
+                logger.warning(
+                    "rollback after a failed lexical query also failed",
+                    exc_info=True,
+                )
+            return []
+        finally:
+            lexical_state["seconds"] += time.monotonic() - started
 
     def _fetch(extra_clause: str, extra_params: dict[str, Any]) -> list:
         where_sql = "\n              AND ".join(base_clauses + [extra_clause])
-        return db_session.execute(
-            text(select_sql.format(where=where_sql)),
-            {**params, **extra_params},
+        merged = {**params, **extra_params}
+        # The vector arm reads deeper than ``limit`` only when there is a
+        # second arm to fuse against; otherwise it stops exactly where it
+        # always did.
+        merged["vector_limit"] = (
+            merged["candidate_pool"] if lexical_state["live"] else merged["limit"]
+        )
+        vector_rows = db_session.execute(
+            text(select_sql.format(where=where_sql)), merged
         ).fetchall()
+
+        lexical_rows = _fetch_lexical(where_sql, merged)
+        if not lexical_rows:
+            # Not merely an optimisation: this is the pre-change result,
+            # row-for-row, whenever lexical contributes nothing. The slice is
+            # what ``LIMIT :limit`` did before, applied to the same order.
+            return _to_records(vector_rows[: merged["limit"]], via=None, scored=True)
+
+        by_id = {str(row[0]): row for row in vector_rows}
+        vector_ids = [str(row[0]) for row in vector_rows]
+        lexical_ids = [str(row[0]) for row in lexical_rows]
+        lexical_only = {row_id: row for row_id, row in zip(lexical_ids, lexical_rows)}
+
+        stats["rows"] += 1
+        if any(row_id not in by_id for row_id in lexical_ids):
+            stats["novel"] += 1
+
+        fused_ids = lexical.reciprocal_rank_fusion(
+            [(lexical.VECTOR_WEIGHT, vector_ids), (lexical_weight, lexical_ids)],
+            k=fusion_k,
+        )[: merged["limit"]]
+
+        records = []
+        for row_id in fused_ids:
+            if row_id in by_id:
+                records.extend(_to_records([by_id[row_id]], via=None, scored=True))
+            else:
+                records.extend(
+                    _to_records([lexical_only[row_id]], via=VIA_LEXICAL, scored=False)
+                )
+        return records
 
     if project_id is not None:
         # Two-tier: same-project rows fill first; remaining slots come from
         # unfiled (org-level) rows. Rows filed under OTHER projects never
-        # surface.
+        # surface. Fusion happens INSIDE _fetch, so both tiers see both arms
+        # and the tier semantics are structurally unchanged.
         tier1 = _fetch("project_id = :project_id", {"project_id": project_id})
         remaining = limit - len(tier1)
         tier2 = []
@@ -1724,18 +1953,11 @@ async def retrieve_memories_scoped(
                 "project_id IS NULL",
                 {"limit": remaining, "candidate_pool": remaining * 4},
             )
-        rows = list(tier1) + list(tier2)
+        records = list(tier1) + list(tier2)
     else:
-        rows = _fetch("TRUE", {})
+        records = _fetch("TRUE", {})
 
-    records = []
-    for row in rows:
-        # relevance is the LAST selected column; everything before it is the
-        # record. blended_score is not selected — it only drives ORDER BY.
-        relevance = row[-1]
-        record = _row_to_record(row[:-1])
-        record.relevance = round(float(relevance), 3) if relevance is not None else None
-        records.append(record)
+    _report_lexical(skip_reason, stats, lexical_state)
 
     # Stage B+C (knowledge graph): one-hop, ladder-scoped expansion around the
     # vector entry points, then the blended re-rank. Adds at most

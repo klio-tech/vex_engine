@@ -54,6 +54,22 @@ def _executed_statements(db_session: MagicMock) -> list[tuple[str, dict]]:
     return statements
 
 
+def _row_statements(db_session: MagicMock) -> list[tuple[str, dict]]:
+    """The statements that can actually return a memory.
+
+    Recall also issues a one-line ``websearch_to_tsquery`` probe that reads no
+    table, to decide whether the lexical arm has anything to search for. The
+    counts below are about how many ways rows can reach the caller, so the
+    probe is filtered out by the only property that matters here: it does not
+    name the table.
+    """
+    return [
+        (sql, params)
+        for sql, params in _executed_statements(db_session)
+        if "session_memories" in sql
+    ]
+
+
 # ---------------------------------------------------------------------------
 # (a) retrieve_memories is still session-scoped (regression pin)
 # ---------------------------------------------------------------------------
@@ -152,7 +168,7 @@ async def test_retrieve_memories_scoped_org_excludes_session_rows():
             scope="org",
         )
 
-    statements = _executed_statements(db_session)
+    statements = _row_statements(db_session)
     assert len(statements) == 1, "org-scope recall should execute exactly one query"
     sql, params = statements[0]
 
@@ -199,7 +215,7 @@ async def test_retrieve_memories_scoped_agent_ladder():
             agent_id="agent-7",
         )
 
-    statements = _executed_statements(db_session)
+    statements = _row_statements(db_session)
     assert len(statements) == 1
     sql, params = statements[0]
 
