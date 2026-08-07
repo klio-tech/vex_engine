@@ -43,9 +43,21 @@ Generate it with `openssl rand -hex 32`. Scrapers send it as
 
 **With the variable unset, `/metrics` returns 404 to everyone.** This fails
 closed on purpose. The alternative is serving openly until someone remembers to
-set it, which makes the safe state opt-in and the default state a silent leak. A
-denied caller gets a 404 rather than a 401, so it cannot even confirm the
-endpoint exists.
+set it, which makes the safe state opt-in and the default state a silent leak.
+
+**With the variable set, a denied caller gets 401** and a
+`WWW-Authenticate: Bearer` challenge. The two answers are deliberately
+different: no token configured means the endpoint cannot serve anybody, while a
+token configured and not presented is an ordinary authentication failure.
+
+That distinction was learned the hard way. The endpoint originally answered 404
+in both cases, so a prober could not confirm it existed. Grafana Cloud's hosted
+scraper checks that a public endpoint is genuinely protected before it will
+scrape, and it reads a 404 as "authentication is misconfigured" rather than
+"correctly denied", so the integration could not be connected at all. The
+concealment was worth little, because `/metrics` is a conventional path an
+attacker assumes is there and the token is what protects the data. A control
+that cannot be operated is not a control.
 
 ### Grafana Cloud remote_write, optional and inert when unset
 

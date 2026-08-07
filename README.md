@@ -54,9 +54,10 @@ Point the platform's **liveness** check at `/healthz` and its **readiness** chec
 across every replica.
 
 `/metrics` requires `KLIO_METRICS_TOKEN`. With that unset it returns 404 to everyone,
-so metrics stay dark until someone deliberately turns them on. See
+so metrics stay dark until someone deliberately turns them on. With it set, a caller
+without the token gets 401 and a `WWW-Authenticate: Bearer` challenge. See
 [docs/observability/grafana-cloud.md](docs/observability/grafana-cloud.md) for the
-full configuration and the metrics that are collected.
+full configuration, why those two answers differ, and the metrics that are collected.
 
 ## Database constraints
 
