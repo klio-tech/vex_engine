@@ -251,9 +251,23 @@ def serve_metrics(request: Request) -> Response:
     second, private interface to bind to, so "bind-local" would be a comment
     rather than a control.
 
-    **404, not 401.** A denied caller learns nothing, not even that the endpoint
-    exists. There is no ``WWW-Authenticate`` challenge: this endpoint is for a
-    scraper holding a pre-shared token, not for a browser to negotiate with.
+    **401 when the gate is armed, 404 when it is not.** Those answer different
+    questions, and a caller is entitled to tell them apart:
+
+    * No token configured means the endpoint cannot serve anyone, so 404 is the
+      truthful answer and the fail-closed behaviour above is preserved.
+    * A token configured but not presented is an ordinary authentication
+      failure, answered with 401 and a ``WWW-Authenticate: Bearer`` challenge.
+
+    This revises an earlier decision to answer 404 in both cases, taken so a
+    prober could not confirm the endpoint existed. Two things made that the
+    wrong trade. The concealment bought very little, because ``/metrics`` is a
+    conventional path an attacker assumes is there and the token, not the status
+    code, is what protects the data. The cost was concrete: Grafana Cloud's
+    hosted scraper checks that a public endpoint is genuinely protected before
+    it will scrape, and a 404 reads to it as "authentication is misconfigured"
+    rather than "correctly denied", so the endpoint could not be connected at
+    all. A control that cannot be operated is not a control.
     """
     if not _token_accepted(request.headers.get("authorization")):
         if _configured_token() is None:
@@ -261,7 +275,12 @@ def serve_metrics(request: Request) -> Response:
                 "%s is not set; /metrics is closed. Set it to enable scraping.",
                 METRICS_TOKEN_ENV,
             )
-        return PlainTextResponse("Not Found", status_code=404)
+            return PlainTextResponse("Not Found", status_code=404)
+        return PlainTextResponse(
+            "Unauthorized",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Bearer realm="klio-metrics"'},
+        )
     return PlainTextResponse(
         metrics.render(),
         media_type="text/plain; version=0.0.4; charset=utf-8",

@@ -250,13 +250,13 @@ def test_readyz_increments_its_own_metric(obs_client, monkeypatch):
 
 def test_metrics_requires_a_token(obs_client, monkeypatch):
     monkeypatch.setenv(METRICS_TOKEN_ENV, "s3cret")
-    assert obs_client.get("/metrics").status_code == 404
+    assert obs_client.get("/metrics").status_code == 401
 
 
 def test_metrics_rejects_the_wrong_token(obs_client, monkeypatch):
     monkeypatch.setenv(METRICS_TOKEN_ENV, "s3cret")
     r = obs_client.get("/metrics", headers={"Authorization": "Bearer wrong"})
-    assert r.status_code == 404
+    assert r.status_code == 401
 
 
 def test_metrics_serves_the_exposition_with_the_right_token(obs_client, monkeypatch):
@@ -286,10 +286,27 @@ def test_metrics_rejects_an_empty_token_configuration(obs_client, monkeypatch):
     assert r.status_code == 404
 
 
-def test_metrics_404_is_indistinguishable_from_an_absent_route(obs_client, monkeypatch):
-    """404 rather than 401/403 so an unauthenticated prober cannot even confirm
-    the endpoint exists."""
+def test_an_armed_gate_answers_401_with_a_challenge(obs_client, monkeypatch):
+    """A configured-but-unauthenticated caller gets a standard 401.
+
+    This replaces an earlier assertion that the denial was a 404 indistinguish-
+    able from an absent route. The concealment was worth little (``/metrics`` is
+    a conventional path) and it cost the ability to connect Grafana Cloud's
+    hosted scraper, which verifies an endpoint is genuinely protected before
+    scraping and reads a 404 as misconfigured auth rather than a clean refusal.
+    """
     monkeypatch.setenv(METRICS_TOKEN_ENV, "s3cret")
+    denied = obs_client.get("/metrics")
+    assert denied.status_code == 401
+    assert denied.headers["www-authenticate"].lower().startswith("bearer")
+
+
+def test_an_unarmed_gate_still_answers_404_without_a_challenge(obs_client, monkeypatch):
+    """The distinction that makes the 401 safe: no token configured is not an
+    authentication failure, it is an endpoint that cannot serve anyone. Offering
+    a challenge there would invite a caller to retry against a gate that can
+    never open."""
+    monkeypatch.delenv(METRICS_TOKEN_ENV, raising=False)
     denied = obs_client.get("/metrics")
     assert denied.status_code == 404
     assert "www-authenticate" not in {k.lower() for k in denied.headers}
