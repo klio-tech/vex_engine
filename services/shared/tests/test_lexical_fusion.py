@@ -204,9 +204,10 @@ def test_the_default_weight_lets_a_lexical_only_row_survive_truncation():
     lexical-only row loses and is truncated away, so the arm can only reorder
     what the dense arm already found.
 
-    Shipped at 0.5 first. Against production, ``pool_pre_ping`` matched 17
-    active rows in the caller's own org and not one of them reached the results.
-    A unit test is the cheap way to keep that from coming back.
+    Shipped at 0.5 first, which put a lexical-only row below the worst dense
+    candidate and truncated it away. A unit test is the cheap way to keep that
+    from coming back, because the failure is silent: the arm still runs, still
+    matches, and simply never changes what the caller sees.
     """
     k = lexical.rrf_k()
     pool = 40  # limit 10 * the candidate-pool multiplier of 4

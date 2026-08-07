@@ -119,13 +119,24 @@ to the worst dense candidate and could never survive the final truncation. The
 arm could reorder the dense pool but never add to it, which is the one thing it
 exists to do.
 
-That is not theoretical. Against production, ``pool_pre_ping`` matched 17 active
-rows in the caller's own org and none of them reached the results.
+The claim is arithmetic and is asserted directly by
+``test_the_default_weight_lets_a_lexical_only_row_survive_truncation``, and the
+end-to-end consequence is covered by
+``test_a_lexical_only_row_is_marked_and_carries_no_fake_relevance``, which only
+reaches its branch at a weight near 1.0.
 
 At 1.0 a lexical rank-1 row ties the dense arm's own leader, so a row the dense
 arm missed entirely can surface. The single-arm invariant is untouched: when the
 lexical arm returns nothing the fused order is still identical to the dense
 order, because that property depends on there being one list, not on the weights.
+
+A correction worth keeping, because it is an easy mistake to repeat. This change
+was first justified with a production query for ``pool_pre_ping`` that matched 18
+rows, none of which reached the results. That was misread. Every one of those
+rows is ``recall_hidden = TRUE`` — curator fuel, deliberately excluded from
+recall — so no visible row matched at all and the observation said nothing about
+weights. Rows excluded by the visibility predicates are not evidence about
+ranking.
 """
 
 DEFAULT_RRF_K = 60
