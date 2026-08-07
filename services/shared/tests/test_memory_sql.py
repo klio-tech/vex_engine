@@ -49,7 +49,14 @@ async def test_recall_sql_excludes_hidden_and_inactive(monkeypatch):
 
 async def _run_recall_sql_capture(monkeypatch, **kwargs):
     """Helper: run retrieve_memories_scoped with a fake DB that captures SQL
-    and the bound params for each execute call."""
+    and the bound params for each execute call.
+
+    ``captured["sqls"]`` holds every statement; ``captured["vector"]`` and
+    ``captured["lexical"]`` hold the two arms, selected by content rather than
+    by position. Position would be a brittle way to name a query — recall also
+    issues a tsquery probe that touches no table, and the two arms interleave
+    across the project fill's two tiers.
+    """
     captured = {"sqls": []}
 
     async def _embed(_):
@@ -65,9 +72,23 @@ async def _run_recall_sql_capture(monkeypatch, **kwargs):
                 def fetchall(self_inner):
                     return []
 
+                def scalar(self_inner):
+                    # A non-empty tsquery, so the lexical arm runs and its SQL
+                    # is captured alongside the vector arm's.
+                    return False
+
             return R()
 
+        def rollback(self):
+            pass
+
     await memory_mod.retrieve_memories_scoped(_DB(), "org-1", "q", **kwargs)
+    captured["vector"] = [
+        item for item in captured["sqls"] if "embedding <=> :embedding" in item[0]
+    ]
+    captured["lexical"] = [
+        item for item in captured["sqls"] if "websearch_to_tsquery" in item[0]
+    ]
     return captured
 
 
@@ -79,7 +100,7 @@ async def test_blended_score_in_order_by(monkeypatch):
     - outer ORDER BY with 0.85/0.15 blended score
     The old ``blended_score`` alias must NOT appear as a selected column."""
     captured = await _run_recall_sql_capture(monkeypatch)
-    sql = captured["sqls"][0][0]
+    sql = captured["vector"][0][0]
     # Inner ANN-accelerated pass
     assert "ORDER BY embedding <=> :embedding" in sql
     assert "LIMIT :candidate_pool" in sql
@@ -88,7 +109,7 @@ async def test_blended_score_in_order_by(monkeypatch):
     # blended_score must NOT be a selected column alias
     assert "blended_score" not in sql
     # params must include candidate_pool
-    params = captured["sqls"][0][1]
+    params = captured["vector"][0][1]
     assert "candidate_pool" in params
 
 
@@ -99,14 +120,68 @@ async def test_project_recall_is_two_tier(monkeypatch):
     Rows from OTHER projects must never appear.
     Tier-2 params must override both limit and candidate_pool."""
     captured = await _run_recall_sql_capture(monkeypatch, project_id="proj-1")
-    tier1_sql, tier1_params = captured["sqls"][0]
+    tier1_sql, tier1_params = captured["vector"][0]
     assert "project_id = :project_id" in tier1_sql
     assert "project_id IS NULL" not in tier1_sql
-    tier2_sql, tier2_params = captured["sqls"][1]
+    tier2_sql, tier2_params = captured["vector"][1]
     assert "project_id IS NULL" in tier2_sql
     # tier-2 must supply its own limit and candidate_pool for the fill count
     assert "limit" in tier2_params
     assert "candidate_pool" in tier2_params
+
+
+@pytest.mark.asyncio
+async def test_lexical_arm_carries_the_identical_tenancy_predicates(monkeypatch):
+    """The whole safety argument for the second query path, as a string
+    comparison.
+
+    The lexical arm is built from the same ``base_clauses`` list and the same
+    ``params`` dict as the vector arm, so its WHERE must differ from the
+    vector arm's by NOTHING except the full-text match it adds. Compared as
+    the actual clause set rather than by spot-checking a few predicates: a
+    spot check passes a query that silently dropped the one clause nobody
+    thought to name.
+    """
+    captured = await _run_recall_sql_capture(monkeypatch, user_id="u-1")
+    vector_sql = captured["vector"][0][0]
+    lexical_sql = captured["lexical"][-1][0]
+
+    where_body = (
+        vector_sql.split("WHERE ", 1)[1].split("ORDER BY embedding", 1)[0].strip()
+    )
+
+    assert where_body, "could not extract the vector arm's WHERE body"
+    assert where_body in lexical_sql, (
+        "the lexical arm's WHERE is not the vector arm's, verbatim:\n"
+        f"vector:\n{where_body}\n\nlexical:\n{lexical_sql}"
+    )
+    assert "recall_hidden = FALSE" in lexical_sql
+    assert "org_id = :org_id" in lexical_sql
+    assert "project_members" in lexical_sql, (
+        "the lexical arm lost the project-membership subquery"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lexical_arm_is_bounded_by_the_same_candidate_pool(monkeypatch):
+    captured = await _run_recall_sql_capture(monkeypatch)
+    lexical_sql, lexical_params = captured["lexical"][-1]
+
+    assert "LIMIT :candidate_pool" in lexical_sql
+    assert lexical_params["candidate_pool"] == lexical_params["limit"] * 4
+
+
+@pytest.mark.asyncio
+async def test_the_project_fill_wraps_both_arms(monkeypatch):
+    """Tier semantics are structurally unchanged: each tier runs both arms
+    with that tier's own project predicate, rather than one arm being fused
+    across tiers after the fact."""
+    captured = await _run_recall_sql_capture(monkeypatch, project_id="proj-1")
+
+    lexical_sqls = [sql for sql, _ in captured["lexical"] if "session_memories" in sql]
+    assert len(lexical_sqls) == 2
+    assert "project_id = :project_id" in lexical_sqls[0]
+    assert "project_id IS NULL" in lexical_sqls[1]
 
 
 @pytest.mark.asyncio

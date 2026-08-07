@@ -30,10 +30,21 @@ symmetric across query and document, so the split costs nothing. Stemming is a
 pure gain on the prose half of the corpus, where `decision` should match
 `decisions`. `simple` would buy nothing and lose that.
 
-Note the consequence to document: an identifier matches as a **conjunction of its
-parts**, not as an opaque string. `KLIO_METRICS_TOKEN` requires `klio & metric &
-token`, which is precise enough that it matched only the row containing the
-literal and not a topically similar row about observability.
+Note the consequence to document: an identifier matches as a **phrase over its
+parts**, not as an opaque string. Corrected during implementation — the plan
+said "conjunction", and re-measuring on pg16 shows `websearch_to_tsquery` emits
+the *adjacency* operator, not `&`:
+
+```
+websearch_to_tsquery('english','KLIO_METRICS_TOKEN') -> 'klio' <-> 'metric' <-> 'token'
+websearch_to_tsquery('english','pool_pre_ping')      -> 'pool' <-> 'pre' <-> 'ping'
+```
+
+This is stricter than a conjunction and strictly better for the purpose: the
+parts must appear adjacent and in order, so `to_tsvector('english', 'klio and
+metric and token separately')` does **not** match, while a row containing the
+literal does. Nothing in the design depends on which operator it is — only on
+the query and the document being tokenised the same way, which they are.
 
 ### The oversized-content hazard is real, and reproduced
 
