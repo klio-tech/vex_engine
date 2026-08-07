@@ -44,15 +44,15 @@ rank, so when the lexical arm contributes nothing the fused order is
 switch off, lexical failure — every one of those lands on the old behaviour by
 construction rather than by care.
 
-**What the default weight can and cannot do.** At ``KLIO_LEXICAL_WEIGHT=0.5``
-and ``k=60`` a row present only in the lexical arm scores ``0.5/61 = 0.0082``,
-while any row the vector arm returned scores at least ``1/(60 + pool)``. So at
-the default the arm **reorders the vector candidate pool** — promoting a row
-the dense ranking buried — rather than introducing rows from outside it. That
-is the demonstrated case: the row containing the literal sat sixth of six and
-now comes first. Raising the weight toward 1.0 lets a lexical-only row survive
-the final truncation as well. Both behaviours are tested; the trade is stated
-here so nobody has to rediscover it from the arithmetic.
+**What the weight controls.** The arm does two distinct things, and the weight
+decides whether it does both. It always **reorders the dense candidate pool**,
+promoting a row the dense ranking buried: that is the demonstrated case, where
+the row containing the literal sat sixth of six and now comes first. Whether it
+can also **introduce a row from outside that pool** depends on arithmetic. A
+lexical-only row scores ``weight/(k + 1)`` against a dense floor of
+``1/(k + pool)``, so below roughly 1.0 it loses to the worst dense candidate and
+is truncated away. ``DEFAULT_LEXICAL_WEIGHT`` explains why the default is 1.0
+and what measuring 0.5 against production showed. Both behaviours are tested.
 
 Dependencies are stdlib plus :mod:`shared.env_config` (itself stdlib-only) so
 that the migrations image, which installs neither SQLAlchemy models nor
@@ -109,7 +109,25 @@ ENABLED_ENV = "KLIO_LEXICAL_RECALL_ENABLED"
 WEIGHT_ENV = "KLIO_LEXICAL_WEIGHT"
 RRF_K_ENV = "KLIO_RRF_K"
 
-DEFAULT_LEXICAL_WEIGHT = 0.5
+DEFAULT_LEXICAL_WEIGHT = 1.0
+"""Equal to the dense arm's weight, which is the conventional RRF choice.
+
+Set to 0.5 first, and measured against production before shipping. At 0.5 a row
+present only in the lexical arm scores ``0.5/61 = 0.0082`` while *every* row the
+dense arm returned scores at least ``1/(60 + pool)``, so a lexical-only row lost
+to the worst dense candidate and could never survive the final truncation. The
+arm could reorder the dense pool but never add to it, which is the one thing it
+exists to do.
+
+That is not theoretical. Against production, ``pool_pre_ping`` matched 17 active
+rows in the caller's own org and none of them reached the results.
+
+At 1.0 a lexical rank-1 row ties the dense arm's own leader, so a row the dense
+arm missed entirely can surface. The single-arm invariant is untouched: when the
+lexical arm returns nothing the fused order is still identical to the dense
+order, because that property depends on there being one list, not on the weights.
+"""
+
 DEFAULT_RRF_K = 60
 
 

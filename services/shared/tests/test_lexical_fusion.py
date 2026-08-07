@@ -137,7 +137,7 @@ def test_defaults(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
     assert lexical.lexical_enabled() is True
-    assert lexical.lexical_weight() == 0.5
+    assert lexical.lexical_weight() == 1.0
     assert lexical.rrf_k() == 60
 
 
@@ -161,7 +161,7 @@ def test_malformed_values_degrade_to_the_defaults(monkeypatch):
     monkeypatch.setenv(lexical.RRF_K_ENV, "sixty")
 
     assert lexical.lexical_enabled() is True
-    assert lexical.lexical_weight() == 0.5
+    assert lexical.lexical_weight() == 1.0
     assert lexical.rrf_k() == 60
 
 
@@ -169,13 +169,13 @@ def test_out_of_range_values_degrade_to_the_defaults(monkeypatch):
     monkeypatch.setenv(lexical.WEIGHT_ENV, "9")
     monkeypatch.setenv(lexical.RRF_K_ENV, "0")
 
-    assert lexical.lexical_weight() == 0.5
+    assert lexical.lexical_weight() == 1.0
     assert lexical.rrf_k() == 60
 
     monkeypatch.setenv(lexical.WEIGHT_ENV, "-1")
     monkeypatch.setenv(lexical.RRF_K_ENV, "10000")
 
-    assert lexical.lexical_weight() == 0.5
+    assert lexical.lexical_weight() == 1.0
     assert lexical.rrf_k() == 60
 
 
@@ -193,3 +193,29 @@ def test_config_is_read_per_call_not_frozen_at_import(monkeypatch):
 
     monkeypatch.setenv(lexical.ENABLED_ENV, "1")
     assert lexical.lexical_enabled() is True
+
+
+def test_the_default_weight_lets_a_lexical_only_row_survive_truncation():
+    """Pins the default against silently regressing into a no-op.
+
+    The arm exists to surface a row the dense arm missed. Whether it can is
+    arithmetic, not intent: a lexical-only row scores ``weight/(k + 1)`` and the
+    worst dense candidate scores ``1/(k + pool)``. Below roughly 1.0 the
+    lexical-only row loses and is truncated away, so the arm can only reorder
+    what the dense arm already found.
+
+    Shipped at 0.5 first. Against production, ``pool_pre_ping`` matched 17
+    active rows in the caller's own org and not one of them reached the results.
+    A unit test is the cheap way to keep that from coming back.
+    """
+    k = lexical.rrf_k()
+    pool = 40  # limit 10 * the candidate-pool multiplier of 4
+
+    lexical_only = lexical.lexical_weight() / (k + 1)
+    worst_dense = lexical.VECTOR_WEIGHT / (k + pool)
+
+    assert lexical_only > worst_dense, (
+        f"a lexical-only row scores {lexical_only:.5f} against a dense floor of "
+        f"{worst_dense:.5f}, so it cannot survive truncation: at this weight the "
+        "arm can only reorder the dense pool, never add to it"
+    )
