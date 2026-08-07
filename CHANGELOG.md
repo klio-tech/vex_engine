@@ -6,6 +6,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **A lexical arm on recall, fused with the dense arm by reciprocal rank fusion.**
+  Recall was vector-only: no `tsvector`, no GIN index anywhere in the engine.
+  Embeddings are weakest on exactly the queries agents make most, where the target
+  is a rare literal rather than a paraphrase. Against a seeded corpus the dense arm
+  ranked the row containing `KLIO_METRICS_TOKEN` sixth of six, so `limit=5` dropped
+  it entirely. That failure reproduces under six different embedding seeds, so it is
+  a property of the geometry rather than of one fixture.
+
+  RRF rather than a weighted blend of the two scores: cosine is bounded in [0, 1]
+  and `ts_rank` is unbounded and corpus-dependent, so a fixed normalisation drifts
+  as the corpus grows and shows up as a ranking regression nobody can date. Because
+  RRF over a single ranked list is strictly decreasing in rank, an empty lexical arm
+  leaves the fused order **identical** to the previous behaviour. An empty query, a
+  stopword-only query, the kill switch, and a lexical failure all land there by
+  construction.
+
+  The lexical arm does not compose its own `WHERE`. It is handed the same
+  `where_sql` string and the same params the dense arm uses, so a tenancy predicate
+  cannot be present on one arm and missing from the other. Mutating the shared
+  clauses away fails twelve tests, including cross-org leakage.
+
+  Configuration through the guarded parsers: `KLIO_LEXICAL_RECALL_ENABLED`,
+  `KLIO_LEXICAL_WEIGHT` (default 1.0), `KLIO_RRF_K` (default 60). A weight of `0.0`
+  is honoured as "off" rather than treated as falsy and replaced by the default.
+
+- **Migration 037**: a GIN index on `to_tsvector('english', left(content, 100000))`.
+  The bound is load bearing. `content` is unbounded `Text` and the existing
+  truncation applies only to embedding input, so an unbounded expression index turns
+  the first write of a large memory into `string is too long for tsvector`. That
+  is reproduced, and it would have meant that adding search broke writing. Built on
+  production in 7 seconds over 51,421 rows; no rows currently exceed the bound.
+
+- **Lexical metrics**: arm skipped by reason, queries by outcome, latency, and rows
+  the lexical arm returned that the dense arm did not. The last is the number that
+  says whether the arm earns its place, and it is measured before truncation so it
+  stays meaningful at any weight.
+
+### Fixed
+
+- **`recall`'s tool description omitted `private` from its `scope` enum.** The
+  engine has accepted `Literal["org", "agent", "private"]` since private scope
+  shipped, but the description agents read advertised only `org` and `agent`, so
+  private scope was undiscoverable through `recall`.
+
 ### Security
 
 - **Session retrieval leaked private and hidden memories across users.**

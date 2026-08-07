@@ -2802,8 +2802,11 @@ def _register_tools(mcp: FastMCP) -> None:
         description=(
             "Retrieve relevant memories for the current org/team. "
             "Args: query (required); optional scope ('org' default | "
-            "'agent'), space, project, limit. Set the X-Vex-Agent header to "
-            "scope by agent. "
+            "'agent' | 'private'), space, project, limit. Set the X-Vex-Agent "
+            "header to scope by agent. "
+            "Search combines meaning and exact wording, so a rare literal — an "
+            "identifier, an error string, a flag name — can be quoted verbatim "
+            "and a paraphrase still works. "
             "`limit` bounds the search matches only: up to "
             f"{GRAPH_EXPANSION_CAP} connected memories are added on top, so "
             "`count` can exceed `limit`. "
