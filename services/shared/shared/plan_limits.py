@@ -1,12 +1,34 @@
-"""Plan-level limits for Vex pricing tiers.
+"""Plan-level limits for Vex and Klio pricing tiers.
 
-These constants define the quotas, rate limits, and feature flags
-for each plan. The ``PLAN_LIMITS`` dict is keyed by the ``plan``
-column value in the ``organizations`` table.
+These constants define the quotas, rate limits, and feature flags for each plan.
+The ``PLAN_LIMITS`` dict is keyed by the ``plan`` column value in the
+``organizations`` table.
+
+**One ladder, two products.** An org has a single ``plan`` value, and each tier
+carries both Vex's fields (observations, verifications, corrections, alerts) and
+Klio's memory fields. They are not separate ladders and must not be split into
+two: the plan column is what billing writes, and there is one of it.
+
+* Vex is sold on ``starter`` / ``pro`` / ``team`` and is currently hidden from
+  the marketing site rather than withdrawn. Its fields stay exactly as they are.
+* Klio is sold on ``free`` (one person) and ``team`` ($20 per seat), with
+  Platform handled as a sales conversation rather than a self-serve tier.
 
 The memory-tier fields (memories_per_month / recalls_per_month /
-memory_retention_days / memory_sync_enabled) are mirrored on the marketing
-site at Dashboard/apps/landing/lib/pricing.ts — keep the two in sync.
+memory_retention_days / memory_sync_enabled / artifact_*) are mirrored on the
+marketing site at Dashboard/apps/landing/lib/pricing.ts — keep the two in sync.
+That mirror had drifted: the site promised Free unlimited memories and retention
+forever while this file gave 1,000 per month and a one-day window, so anyone who
+signed up on the published terms lost their history after a day.
+
+``-1`` means unlimited, for quotas and for retention. For retention that is only
+safe because two guards exist: ``run_retention.py`` skips the sweep for a
+non-positive value, and migration 038 makes both SQL functions return early.
+Without those, ``-1`` reads as ``NOW() + 1 day`` and deletes the org's entire
+history. Do not remove either guard while any tier declares -1.
+
+``memory_sync_enabled`` currently gates nothing in code. It is declarative, so
+it exists to keep this file honest against the published table.
 """
 
 from __future__ import annotations
@@ -138,10 +160,13 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         max_experiments=1,
         max_datasets=1,
         max_dataset_items=20,
-        memories_per_month=1_000,
-        recalls_per_month=10_000,
-        memory_retention_days=1,
-        memory_sync_enabled=False,
+        # Klio Free, as published: unlimited memories, retention forever.
+        # -1 is the unlimited sentinel; migration 038 and run_retention.py both
+        # treat a non-positive retention as "keep forever".
+        memories_per_month=-1,
+        recalls_per_month=-1,
+        memory_retention_days=-1,
+        memory_sync_enabled=True,
         artifact_max_file_bytes=10 * 1024 * 1024,
         artifact_storage_bytes=100 * 1024 * 1024,
     ),
@@ -201,9 +226,11 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         max_experiments=-1,
         max_datasets=-1,
         max_dataset_items=-1,
-        memories_per_month=1_500_000,
-        recalls_per_month=10_000_000,
-        memory_retention_days=90,
+        # Klio Team, as published: unlimited memories, retention forever,
+        # 5 GB artifact pool. Vex's fields on this tier are untouched.
+        memories_per_month=-1,
+        recalls_per_month=-1,
+        memory_retention_days=-1,
         memory_sync_enabled=True,
         artifact_max_file_bytes=50 * 1024 * 1024,
         artifact_storage_bytes=5 * 1024 * 1024 * 1024,

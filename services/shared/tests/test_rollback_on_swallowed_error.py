@@ -44,8 +44,21 @@ from sqlalchemy import create_engine, text
 
 from shared import graph_store, projects
 from shared.plan_limits import get_plan_config
+
 from shared.testing import database_url, requires_db
 from shared.usage import check_memory_quota
+
+
+def _metered_plan():
+    """A plan with a FINITE memory cap.
+
+    Klio's `free` and `team` tiers are unlimited (-1), and check_memory_quota
+    returns before touching the database on an unlimited plan. Using `free` here
+    would make these tests pass without ever reaching the query whose rollback
+    behaviour is the thing under test.
+    """
+    return get_plan_config("free", {"memories_per_month": 1_000})
+
 
 DB_URL = database_url()
 
@@ -154,7 +167,7 @@ def test_check_memory_quota_leaves_the_session_usable(db):
     db.created_org_ids.add(org_id)
     _poison(db)
 
-    over = check_memory_quota(db, org_id, get_plan_config("free"), "memory")
+    over = check_memory_quota(db, org_id, _metered_plan(), "memory")
 
     assert over is False, "fails open: a metering fault never blocks the write"
     assert _session_is_usable(db), (
@@ -175,12 +188,12 @@ def test_check_memory_quota_still_reads_real_counters(db):
             VALUES (:o, date_trunc('month', now())::date, :n, 0)
             """
         ),
-        {"o": org_id, "n": get_plan_config("free").memories_per_month},
+        {"o": org_id, "n": _metered_plan().memories_per_month},
     )
     db.commit()
 
     with pytest.raises(Exception) as exc:
-        check_memory_quota(db, org_id, get_plan_config("free"), "memory")
+        check_memory_quota(db, org_id, _metered_plan(), "memory")
     assert "limit reached" in str(exc.value), (
         "the quota check must be reading the counter row it was given"
     )

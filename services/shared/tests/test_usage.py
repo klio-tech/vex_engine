@@ -36,20 +36,36 @@ def test_current_period_is_first_of_month():
 
 def test_under_cap_allows_no_overage():
     db = _db_with_counters(memories=10, recalls=0)
-    over = check_memory_quota(db, "org-1", get_plan_config("free"), "memory")
+    over = check_memory_quota(db, "org-1", get_plan_config("starter"), "memory")
     assert over is False
 
 
-def test_at_cap_free_raises():
-    db = _db_with_counters(memories=1_000, recalls=0)
+def test_the_klio_tiers_never_block():
+    """Free and Team are published as unlimited, so no counter blocks them.
+
+    This is the assertion that would fail if someone reintroduced metering on a
+    tier the pricing page sells as unlimited.
+    """
+    db = _db_with_counters(memories=99_999_999, recalls=99_999_999)
+    for tier in ("free", "team"):
+        for metric in ("memory", "recall"):
+            assert (
+                check_memory_quota(db, "org-1", get_plan_config(tier), metric) is False
+            ), f"{tier} blocked on {metric} but is sold as unlimited"
+
+
+def test_at_cap_metered_plan_raises():
+    """Klio's free and team tiers are unlimited, so a metered plan is needed to
+    exercise blocking at all. `starter` is a Vex tier and still metered."""
+    db = _db_with_counters(memories=25_000, recalls=0)
     with pytest.raises(MemoryQuotaExceeded) as exc:
         check_memory_quota(
-            db, "org-1", get_plan_config("free"), "memory", plan_name="free"
+            db, "org-1", get_plan_config("starter"), "memory", plan_name="starter"
         )
     assert exc.value.metric == "memory"
-    assert exc.value.limit == 1_000
+    assert exc.value.limit == 25_000
     # The block carries the machine-readable upgrade target one tier up.
-    assert exc.value.suggested_plan == "starter"
+    assert exc.value.suggested_plan == "pro"
 
 
 def test_override_cap_is_enforced():
@@ -77,9 +93,11 @@ def test_unlimited_never_blocks():
 
 
 def test_recall_metric_uses_recall_limit():
-    db = _db_with_counters(memories=0, recalls=10_000)
+    """Reads recalls_per_month rather than memories_per_month. Uses a metered
+    plan because the Klio tiers no longer cap either."""
+    db = _db_with_counters(memories=0, recalls=100_000)
     with pytest.raises(MemoryQuotaExceeded):
-        check_memory_quota(db, "org-1", get_plan_config("free"), "recall")
+        check_memory_quota(db, "org-1", get_plan_config("starter"), "recall")
 
 
 def test_check_fails_open_on_db_error():
@@ -94,7 +112,10 @@ def test_check_fails_open_on_db_error():
     """
     db = MagicMock()
     db.execute.side_effect = RuntimeError("db down")
-    over = check_memory_quota(db, "org-1", get_plan_config("free"), "memory")
+    # A METERED plan, deliberately. On an unlimited tier the function returns
+    # before it ever queries, so `free` would make this pass without the
+    # database being touched and the fail-open path never running.
+    over = check_memory_quota(db, "org-1", get_plan_config("starter"), "memory")
     assert over is False
     db.rollback.assert_called_once()
 

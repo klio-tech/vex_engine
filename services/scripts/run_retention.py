@@ -247,26 +247,56 @@ def main() -> None:
                     continue
 
                 org_id = org_row[0]
-                tsdb_conn.execute(
-                    text("SELECT enforce_plan_retention(:org_id, :days)"),
-                    {"org_id": org_id, "days": config.retention_days},
-                )
-                logger.info(
-                    "Enforced %d-day retention for org=%s plan=%s",
-                    config.retention_days,
-                    org_id,
-                    plan,
-                )
-                tsdb_conn.execute(
-                    text("SELECT enforce_memory_retention(:org_id, :days)"),
-                    {"org_id": org_id, "days": config.memory_retention_days},
-                )
-                logger.info(
-                    "Enforced %d-day MEMORY retention for org=%s plan=%s",
-                    config.memory_retention_days,
-                    org_id,
-                    plan,
-                )
+
+                # A non-positive day count means "keep forever" — it is the
+                # -1 convention every other quota field on PlanConfig uses, and
+                # Klio's Free and Team tiers are published as "retention
+                # forever". Passed through, it is the most destructive value
+                # available: NOW() - ('-1 days')::interval lands in the FUTURE,
+                # so every row matches and the org's whole history goes. Zero is
+                # the same story with the cutoff at NOW().
+                #
+                # Migration 038 guards both SQL functions too. This check is
+                # here as well because skipping the round trip is clearer than
+                # relying on the callee to decline, and because a reader of this
+                # loop should not have to go and check.
+                if config.retention_days > 0:
+                    tsdb_conn.execute(
+                        text("SELECT enforce_plan_retention(:org_id, :days)"),
+                        {"org_id": org_id, "days": config.retention_days},
+                    )
+                    logger.info(
+                        "Enforced %d-day retention for org=%s plan=%s",
+                        config.retention_days,
+                        org_id,
+                        plan,
+                    )
+                else:
+                    logger.info(
+                        "Execution retention is unlimited for org=%s plan=%s; "
+                        "skipping the sweep",
+                        org_id,
+                        plan,
+                    )
+
+                if config.memory_retention_days > 0:
+                    tsdb_conn.execute(
+                        text("SELECT enforce_memory_retention(:org_id, :days)"),
+                        {"org_id": org_id, "days": config.memory_retention_days},
+                    )
+                    logger.info(
+                        "Enforced %d-day MEMORY retention for org=%s plan=%s",
+                        config.memory_retention_days,
+                        org_id,
+                        plan,
+                    )
+                else:
+                    logger.info(
+                        "Memory retention is unlimited for org=%s plan=%s; "
+                        "skipping the sweep",
+                        org_id,
+                        plan,
+                    )
 
                 # Retention deletes from session_memories only. Everything the
                 # memory row anchored has to be collected here, each sweep

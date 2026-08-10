@@ -138,7 +138,7 @@ def test_sweeps_orphan_graph_edges_for_every_org():
             result = MagicMock()
             result.fetchall.return_value = [
                 ("acct-a", "pro", None),
-                ("acct-b", "free", None),
+                ("acct-b", "starter", None),
             ]
             result.fetchone.return_value = (f"org-{len(seen_orgs)}",)
             return result
@@ -187,7 +187,7 @@ def test_a_failed_sweep_never_aborts_the_retention_run():
             result = MagicMock()
             result.fetchall.return_value = [
                 ("acct-a", "pro", None),
-                ("acct-b", "free", None),
+                ("acct-b", "starter", None),
             ]
             result.fetchone.return_value = (f"org-{len(retention_calls)}",)
             return result
@@ -249,7 +249,7 @@ class _MultiOrgConn:
         result = MagicMock()
         result.fetchall.return_value = [
             ("acct-a", "pro", None),
-            ("acct-b", "free", None),
+            ("acct-b", "starter", None),
         ]
         # Only the org lookup hands out the next org id; every other statement
         # (retention, sweeps) must not advance the counter or the recorded
