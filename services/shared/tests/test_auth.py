@@ -1041,3 +1041,64 @@ def test_cached_key_user_id_defaults_to_none_for_legacy_entries():
         revoked=False,
     )
     assert entry.user_id is None
+
+
+# ---------------------------------------------------------------------------
+# Key-path identity — the producer, end to end.
+#
+# The tests above construct KeyInfo/_CachedKey directly; they prove the
+# dataclasses can carry a user_id but not that the DB-backed path actually
+# populates one. These two exercise the real ``_query_db`` -> ``validate``
+# pipeline against a JSONB ``api_keys`` element, which is where the field
+# would silently stay None if the SELECT ever stopped reading ``created_by``.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_populates_user_id_from_the_jsonb_key_entry():
+    """The full producer path: JSONB ``created_by`` reaches ``KeyInfo.user_id``.
+
+    ``_make_key_entry`` stamps every fixture with ``created_by: "user-001"``
+    (see the docstring above it), so this is the byte-for-byte end-to-end
+    check that ``_query_db`` selects the field out of the element and
+    ``validate`` carries it through onto the returned ``KeyInfo`` rather than
+    leaving it stuck on the internal ``_CachedKey``.
+    """
+    entry, raw_key, _ = _make_key_entry()
+    validator, engine = _build_validator(required_scope="verify")
+    _mock_db_query(engine, _make_db_row([entry]))
+
+    result = validator.validate(raw_key)
+
+    assert result.user_id == "user-001"
+
+
+def test_validate_leaves_user_id_none_for_a_key_entry_with_no_created_by():
+    """Back-compat contract: a key entry predating ``created_by`` must not
+    crash the lookup and must resolve to an unattributed (service) key.
+
+    Unlike the legacy-entry unit tests above, this builds the JSONB element
+    by hand with no ``created_by`` key at all (not even ``None``), which is
+    what a pre-existing production row actually looks like, and drives it
+    through ``validate`` rather than constructing ``_CachedKey`` directly.
+    """
+    raw_key = "ag_live_legacykey1234567890abcdefg"
+    key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    entry = {
+        "id": "key-legacy",
+        "prefix": raw_key[:12],
+        "key_hash": key_hash,
+        "name": "Legacy Key",
+        "scopes": ["ingest", "verify", "read"],
+        "rate_limit_rpm": 1000,
+        "expires_at": None,
+        "created_at": "2025-01-01T00:00:00Z",
+        "last_used_at": None,
+        "revoked": False,
+        # deliberately no "created_by" key
+    }
+    validator, engine = _build_validator(required_scope="verify")
+    _mock_db_query(engine, _make_db_row([entry]))
+
+    result = validator.validate(raw_key)
+
+    assert result.user_id is None
