@@ -51,6 +51,8 @@ those callers over is a follow-up.
 from __future__ import annotations
 
 import logging
+
+from app.headers import agent_header
 from typing import Any, Optional
 
 from fastapi import HTTPException, Request
@@ -245,13 +247,11 @@ def resolve_principal_plan(request: Request) -> tuple[str, str, str, Optional[di
 
     principal = _oauth_principal_from(request)
     if principal is not None:
-        agent_id = request.headers.get("X-Vex-Agent") or _oauth_agent_id(
-            request, principal
-        )
+        agent_id = agent_header(request) or _oauth_agent_id(request, principal)
         return principal.org_id, agent_id, principal.plan, principal.plan_overrides
 
     key_info = request_key_info(request)
-    agent_id = request.headers.get("X-Vex-Agent") or DEFAULT_AGENT_ID
+    agent_id = agent_header(request) or DEFAULT_AGENT_ID
     return key_info.org_id, agent_id, key_info.plan, key_info.plan_overrides
 
 

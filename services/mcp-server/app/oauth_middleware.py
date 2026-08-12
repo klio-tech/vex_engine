@@ -13,6 +13,8 @@ clients is byte-for-byte unchanged.
 """
 
 import logging
+
+from app.headers import key_header
 from typing import Any, Optional
 
 import anyio
@@ -232,7 +234,7 @@ class OAuthLadderMiddleware:
             await self._app(scope, receive, send)
             return
 
-        if request.headers.get("X-Vex-Key") or request.headers.get("X-AgentGuard-Key"):
+        if key_header(request):
             await self._app(scope, receive, send)
             return
 

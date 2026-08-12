@@ -52,6 +52,7 @@ from fastapi import Depends, HTTPException, Request
 from shared import brain
 from shared.auth import AuthError, KeyInfo, KeyValidator, normalize_agent_id
 
+from app.headers import agent_header, key_header
 from app.config import DATABASE_URL
 
 logger = logging.getLogger("agentguard.mcp.auth")
@@ -210,9 +211,7 @@ def verify_api_key(request: Request) -> KeyInfo:
             the key's rate limit is exceeded (with a ``Retry-After``
             header).
     """
-    api_key = request.headers.get("X-Vex-Key") or request.headers.get(
-        "X-AgentGuard-Key"
-    )
+    api_key = key_header(request)
     if not api_key:
         raise HTTPException(status_code=401, detail="Missing X-Vex-Key header")
 
@@ -260,14 +259,12 @@ def resolve_principal(request: Request) -> tuple[str, str]:
     principal = _oauth_principal_from(request)
     if principal is not None:
         agent_id = normalize_agent_id(
-            request.headers.get("X-Vex-Agent") or _oauth_agent_id(request, principal),
+            agent_header(request) or _oauth_agent_id(request, principal),
             default=DEFAULT_AGENT_ID,
         )
         return principal.org_id, agent_id
     key_info = verify_api_key(request)
-    agent_id = normalize_agent_id(
-        request.headers.get("X-Vex-Agent"), default=DEFAULT_AGENT_ID
-    )
+    agent_id = normalize_agent_id(agent_header(request), default=DEFAULT_AGENT_ID)
     return key_info.org_id, agent_id
 
 
@@ -292,14 +289,12 @@ def resolve_principal_plan(request: Request) -> tuple[str, str, str, dict | None
     principal = _oauth_principal_from(request)
     if principal is not None:
         agent_id = normalize_agent_id(
-            request.headers.get("X-Vex-Agent") or _oauth_agent_id(request, principal),
+            agent_header(request) or _oauth_agent_id(request, principal),
             default=DEFAULT_AGENT_ID,
         )
         return principal.org_id, agent_id, principal.plan, principal.plan_overrides
     key_info = verify_api_key(request)
-    agent_id = normalize_agent_id(
-        request.headers.get("X-Vex-Agent"), default=DEFAULT_AGENT_ID
-    )
+    agent_id = normalize_agent_id(agent_header(request), default=DEFAULT_AGENT_ID)
     return key_info.org_id, agent_id, key_info.plan, key_info.plan_overrides
 
 
@@ -333,7 +328,5 @@ def resolve_principal_dep(
         HTTPException: Propagated from :func:`verify_api_key` on any
             authentication failure (401/403/429).
     """
-    agent_id = normalize_agent_id(
-        request.headers.get("X-Vex-Agent"), default=DEFAULT_AGENT_ID
-    )
+    agent_id = normalize_agent_id(agent_header(request), default=DEFAULT_AGENT_ID)
     return key_info.org_id, agent_id
