@@ -2374,12 +2374,26 @@ async def _perform_explore(ctx: Context, *, entity: str) -> dict[str, Any]:
 
 
 def _serialize_project(p: dict[str, Any]) -> dict[str, Any]:
-    """JSON-safe projection of a :func:`shared.projects.list_projects` row."""
+    """JSON-safe projection of a :func:`shared.projects.list_projects` row.
+
+    Deliberately omits ``repo_root_path``: it is the local filesystem path of
+    whichever machine auto-created the project (see ``brain.ensure_project``'s
+    upsert-on-write), not something any other org member needs to see. It is
+    *input* to project resolution/creation — a caller may still pass a path in
+    to look a project up or create one — but it never needs to be echoed back
+    as output, and doing so leaked every member's directory names (job
+    search, personal, health folders) to the whole org. ``git_remote`` stays:
+    unlike a local path, it is a deliberately shared identifier.
+
+    The key is omitted rather than set to ``null`` so a client keying off
+    ``"repo_root_path" in project`` sees it is genuinely absent, not merely
+    empty — and so this response shape does not imply every project has (or
+    ever had) a value for a field the org should not see regardless.
+    """
     return {
         "id": p["id"],
         "name": p["display_name"],
         "git_remote": p["git_remote"],
-        "repo_root_path": p["repo_root_path"],
         "member_count": p["member_count"],
         "last_seen_at": (
             p["last_seen_at"].isoformat() if p.get("last_seen_at") else None
