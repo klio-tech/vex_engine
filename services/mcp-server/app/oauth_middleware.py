@@ -126,7 +126,7 @@ def protected_resource_metadata() -> dict[str, Any]:
         # Memory access is authorized by the oauth_grants row + client_id, NOT
         # by an OAuth scope string, so `openid` is sufficient here.
         "scopes_supported": ["openid"],
-        "resource_documentation": "https://klio.tech/docs/mcp",
+        "resource_documentation": "https://docs.klio.tech/quickstart",
     }
 
 
