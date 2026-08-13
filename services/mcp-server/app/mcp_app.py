@@ -2476,6 +2476,7 @@ async def _perform_project_create(
             display_name=stripped,
             git_remote=git_remote,
             repo_root_path=repo_root_path,
+            created_by=user_id,
         )
         existing = projects.member_count(db, org_id=org_id, project_id=project_id)
         already_member = projects.is_member(
@@ -2544,7 +2545,15 @@ async def _perform_project_create(
 
 
 async def _perform_project_list(ctx: Context) -> dict[str, Any]:
-    """List the org's projects. Names and member COUNTS only — never contents."""
+    """List the caller's projects. Names and member COUNTS only — never contents.
+
+    Members-only (ruling 2026-08-12): a project the caller does not belong to
+    is not in this list at all, same as ``project_members``/``project_grant``
+    treat a project the caller is outside of as unknown rather than merely
+    forbidden. An unattributed caller (no resolvable user id) sees nothing —
+    :func:`shared.projects.list_projects` fails closed rather than falling
+    back to the org's full project set.
+    """
     request = ctx.request_context.request
     if request is None:
         return {"error": "unauthorized", "detail": "no request context"}
@@ -2556,9 +2565,11 @@ async def _perform_project_list(ctx: Context) -> dict[str, Any]:
     except HTTPException as exc:
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
+    user_id = resolve_request_user_id(request)
+
     db = SessionLocal()
     try:
-        rows = projects.list_projects(db, org_id=org_id)
+        rows = projects.list_projects(db, org_id=org_id, user_id=user_id)
         return {
             "projects": [_serialize_project(p) for p in rows],
             "count": len(rows),
@@ -2689,6 +2700,22 @@ async def _perform_project_grant(
     try:
         project_id = brain.find_project_id(db, org_id=org_id, identifier=project)
         if project_id is None:
+            return {
+                "granted": False,
+                "error": "not_found",
+                "detail": f"unknown project: {project}",
+            }
+
+        # A caller who is not even a MEMBER gets the identical shape a
+        # genuinely missing project gets — matching _perform_project_members.
+        # "forbidden" would confirm the project's name is real to someone
+        # outside its boundary, turning `project` into an existence oracle
+        # over the org's project list. A member who merely isn't an admin
+        # (the case just below) already knows the project exists — they are
+        # standing inside it — so "forbidden" costs them no new information.
+        if not projects.is_member(
+            db, org_id=org_id, project_id=project_id, user_id=caller
+        ):
             return {
                 "granted": False,
                 "error": "not_found",

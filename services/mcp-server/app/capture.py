@@ -391,13 +391,25 @@ def _rollback(db: Any, what: str, org_id: str) -> None:
 
 
 def _ensure_project_id(
-    db: Any, *, org_id: str, git_remote: Optional[str], repo_root: Optional[str]
+    db: Any,
+    *,
+    org_id: str,
+    git_remote: Optional[str],
+    repo_root: Optional[str],
+    user_id: Optional[str] = None,
 ) -> Optional[str]:
     """Best-effort get-or-create of the project for a write; never raises.
 
     Returns the project id when ``git_remote`` or ``repo_root`` is supplied and
     resolution succeeds, else ``None`` (the write proceeds unfiled).  Any error
     is logged and swallowed so capture never fails because of project tagging.
+
+    ``user_id`` is forwarded as ``created_by``: this is the auto-create path
+    (a hook capture, not the explicit ``project_create`` tool), so it is the
+    ONLY place a freshly-created project gets an admin seated at all. An
+    unattributed hook (``user_id=None``) still files the write under the
+    project — best-effort project tagging is unaffected — it just seats
+    nobody, matching ``ensure_project``'s contract.
     """
     if not git_remote and not repo_root:
         return None
@@ -408,6 +420,7 @@ def _ensure_project_id(
             display_name=_project_display_name(git_remote, repo_root),
             git_remote=git_remote,
             repo_root_path=repo_root,
+            created_by=user_id,
         )
     except Exception:
         _rollback(db, "ensure_project", org_id)
@@ -621,7 +634,11 @@ async def capture_event(
         # event loop per its documented threading contract (shared.brain).
         project_id = await anyio.to_thread.run_sync(
             lambda: _ensure_project_id(
-                db, org_id=org_id, git_remote=req.git_remote, repo_root=req.repo_root
+                db,
+                org_id=org_id,
+                git_remote=req.git_remote,
+                repo_root=req.repo_root,
+                user_id=user_id,
             )
         )
         over_cap = await anyio.to_thread.run_sync(
@@ -696,7 +713,11 @@ async def capture_transcript(
     try:
         project_id = await anyio.to_thread.run_sync(
             lambda: _ensure_project_id(
-                db, org_id=org_id, git_remote=req.git_remote, repo_root=req.repo_root
+                db,
+                org_id=org_id,
+                git_remote=req.git_remote,
+                repo_root=req.repo_root,
+                user_id=user_id,
             )
         )
         session_id = _capture_session_id(

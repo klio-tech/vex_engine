@@ -368,8 +368,10 @@ class _FakeSession:
         self.executed_sql.append(sql)
         if "FROM spaces" in sql:
             return _FakeResult(fetchone_value=(1,) if self.space_owned else None)
-        # The only other statement ensure_project issues is the INSERT.
-        return _FakeResult(one_value=SimpleNamespace(id="proj-fixed-id"))
+        # The project INSERT ... RETURNING id, (xmax = 0) AS inserted. `inserted`
+        # is always True here: this fake only ever simulates the insert branch,
+        # never the ON CONFLICT DO UPDATE hit path.
+        return _FakeResult(one_value=SimpleNamespace(id="proj-fixed-id", inserted=True))
 
     def commit(self):
         self.committed = True

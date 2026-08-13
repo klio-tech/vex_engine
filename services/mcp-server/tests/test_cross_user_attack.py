@@ -213,7 +213,14 @@ async def test_sharing_to_a_project_requires_membership_of_it():
 @pytest.mark.asyncio
 async def test_a_non_admin_cannot_grant_even_to_themselves():
     """Belonging to the org is not standing. Neither is belonging to the
-    project. Only administering it is."""
+    project. Only administering it is.
+
+    ``is_member`` is patched True: this caller DOES belong to the project
+    (that is the whole point of the test — membership without admin is not
+    enough), so the refusal must be the informative ``forbidden``, not the
+    existence-hiding ``not_found`` a genuine non-member gets (see
+    ``test_a_non_member_cannot_grant_even_if_they_can_name_the_project``).
+    """
     add_member = MagicMock()
     request = _request(oauth_principal=_principal(DEV))
 
@@ -221,6 +228,7 @@ async def test_a_non_admin_cannot_grant_even_to_themselves():
         patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
+        patch("app.mcp_app.projects.is_member", return_value=True),
         patch("app.mcp_app.projects.is_admin", return_value=False),
         patch("app.mcp_app.projects.add_member", add_member),
         patch("app.mcp_app.resolve_org_member_by_email", return_value=DEV),
@@ -230,6 +238,40 @@ async def test_a_non_admin_cannot_grant_even_to_themselves():
         )
 
     assert result["error"] == "forbidden"
+    add_member.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_non_member_cannot_grant_even_if_they_can_name_the_project():
+    """A caller who is not even a member gets `not_found`, not `forbidden`.
+
+    `forbidden` would confirm the project's name is real to someone standing
+    entirely outside it — the same existence-oracle problem `not_found` on
+    `project_members` already guards against (see
+    ``test_a_non_member_gets_not_found_for_a_project_member_list``).
+    ``is_admin`` is deliberately left unmocked / unreachable here: the
+    membership gate must short-circuit before administration is even asked
+    about.
+    """
+    add_member = MagicMock()
+    is_admin = MagicMock(return_value=False)
+    request = _request(oauth_principal=_principal(DEV))
+
+    with (
+        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
+        patch("app.mcp_app.projects.is_member", return_value=False),
+        patch("app.mcp_app.projects.is_admin", is_admin),
+        patch("app.mcp_app.projects.add_member", add_member),
+        patch("app.mcp_app.resolve_org_member_by_email", return_value=DEV),
+    ):
+        result = await mcp_app._perform_project_grant(
+            _ctx(request), project="apollo", user="dev@oppla.ai", role="admin"
+        )
+
+    assert result["error"] == "not_found"
+    assert "unknown project" in result["detail"]
     add_member.assert_not_called()
 
 
@@ -267,6 +309,7 @@ async def test_an_email_outside_the_org_cannot_be_granted():
         patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
+        patch("app.mcp_app.projects.is_member", return_value=True),
         patch("app.mcp_app.projects.is_admin", return_value=True),
         patch("app.mcp_app.resolve_org_member_by_email", return_value=None),
         patch("app.mcp_app.projects.add_member", add_member),
@@ -290,6 +333,7 @@ async def test_a_successful_grant_is_audited_with_who_what_and_surface():
         patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
+        patch("app.mcp_app.projects.is_member", return_value=True),
         patch("app.mcp_app.projects.is_admin", return_value=True),
         patch("app.mcp_app.resolve_org_member_by_email", return_value=PRIYA),
         patch("app.mcp_app.projects.add_member", return_value=True),

@@ -13,6 +13,14 @@ resolution (``project_create``, and lookup by path) but is never echoed back.
 These tests pin that boundary and guard the two things it must not break:
 resolution by path, and the rest of the response shape (``git_remote``,
 ``display_name``, ``member_count``).
+
+Projects are members-only (migration 039, 2026-08-12 ruling): ``project_list``
+now requires the caller to be a member of a project before it appears at all.
+These tests are about serialization, not that separate boundary — see
+``test_project_list_membership.py`` for the membership boundary itself — so
+every seeded project below explicitly adds PRIYA (the caller throughout this
+file) as a member. Without that, every one of these tests would see an empty
+list and assert nothing about the thing they exist to check.
 """
 
 import uuid
@@ -173,20 +181,22 @@ async def test_project_list_omits_repo_root_path_for_every_project(db):
     project's dict.
     """
     org = _org(db)
-    _seed_project(
+    p1 = _seed_project(
         db,
         org_id=org,
         display_name="astrology",
         git_remote=None,
         repo_root_path="/Users/dev/Me/Astrology",
     )
-    _seed_project(
+    p2 = _seed_project(
         db,
         org_id=org,
         display_name="klio",
         git_remote="git@example.com:acme/klio.git",
         repo_root_path="/Users/dev/Hive/klio",
     )
+    projects.add_member(db, org_id=org, project_id=p1, user_id=PRIYA, granted_by=None)
+    projects.add_member(db, org_id=org, project_id=p2, user_id=PRIYA, granted_by=None)
 
     result = await _list(db, org)
 
@@ -204,20 +214,22 @@ async def test_project_list_omits_the_key_entirely_rather_than_nulling_it(db):
     paths on file.
     """
     org = _org(db)
-    _seed_project(
+    p1 = _seed_project(
         db,
         org_id=org,
         display_name="path-only",
         git_remote=None,
         repo_root_path="/Users/dev/Personal/notes",
     )
-    _seed_project(
+    p2 = _seed_project(
         db,
         org_id=org,
         display_name="remote-only",
         git_remote="git@example.com:acme/remote-only.git",
         repo_root_path=None,
     )
+    projects.add_member(db, org_id=org, project_id=p1, user_id=PRIYA, granted_by=None)
+    projects.add_member(db, org_id=org, project_id=p2, user_id=PRIYA, granted_by=None)
 
     result = await _list(db, org)
 
@@ -241,12 +253,15 @@ async def test_git_remote_and_name_still_present(db):
     """
     org = _org(db)
     remote = "git@example.com:acme/klio.git"
-    _seed_project(
+    project_id = _seed_project(
         db,
         org_id=org,
         display_name="Klio",
         git_remote=remote,
         repo_root_path="/Users/dev/Hive/klio",
+    )
+    projects.add_member(
+        db, org_id=org, project_id=project_id, user_id=PRIYA, granted_by=None
     )
 
     result = await _list(db, org)
@@ -264,34 +279,44 @@ async def test_member_counts_are_still_correct(db):
     Mutation caught: hardcoding or dropping ``member_count`` in
     ``_serialize_project`` makes this fail — it asserts the actual number of
     rows added, not just that the key exists.
+
+    Both projects must have PRIYA (the caller throughout this file) as a
+    member, since listing is now members-only — a project she does not
+    belong to would not appear in ``result["projects"]`` at all, which is a
+    different thing this test is not about (see
+    ``test_project_list_membership.py``). "staffed" vs "solo" gives two
+    different counts so a hardcoded return value still fails the assertion.
     """
     org = _org(db)
-    project_id = _seed_project(
+    staffed_id = _seed_project(
         db,
         org_id=org,
         display_name="staffed",
         git_remote="git@example.com:acme/staffed.git",
         repo_root_path=None,
     )
-    empty_id = _seed_project(
+    solo_id = _seed_project(
         db,
         org_id=org,
-        display_name="empty",
-        git_remote="git@example.com:acme/empty.git",
+        display_name="solo",
+        git_remote="git@example.com:acme/solo.git",
         repo_root_path=None,
     )
     projects.add_member(
-        db, org_id=org, project_id=project_id, user_id=PRIYA, granted_by=None
+        db, org_id=org, project_id=staffed_id, user_id=PRIYA, granted_by=None
     )
     projects.add_member(
-        db, org_id=org, project_id=project_id, user_id=DEV, granted_by=None
+        db, org_id=org, project_id=staffed_id, user_id=DEV, granted_by=None
+    )
+    projects.add_member(
+        db, org_id=org, project_id=solo_id, user_id=PRIYA, granted_by=None
     )
 
     result = await _list(db, org)
 
     counts = {p["id"]: p["member_count"] for p in result["projects"]}
-    assert counts[project_id] == 2
-    assert counts[empty_id] == 0
+    assert counts[staffed_id] == 2
+    assert counts[solo_id] == 1
 
 
 @pytest.mark.asyncio

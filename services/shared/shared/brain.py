@@ -134,6 +134,7 @@ def ensure_project(
     git_remote: Optional[str] = None,
     repo_root_path: Optional[str] = None,
     space_id: Optional[str] = None,
+    created_by: Optional[str] = None,
 ) -> str:
     """Get-or-create a project for an org, bumping ``last_seen_at`` on a hit.
 
@@ -168,6 +169,26 @@ def ensure_project(
         caller could file a project under another tenant's space. A cross-org
         ``space_id`` is rejected with ``ValueError``.
 
+    Membership note (migration 039 — "projects are visible only to their
+    members"):
+        ``created_by`` is written on INSERT only, first-writer-wins — the same
+        shape ``rename_project``'s docstring describes for ``display_name``,
+        for the same reason. The ``ON CONFLICT ... DO UPDATE`` touches only
+        ``last_seen_at``, so a teammate who later writes into the same repo
+        never reassigns ownership merely by working there.
+
+        When this call is the one that actually inserts the row (detected via
+        Postgres's ``xmax = 0`` idiom — true for a freshly inserted row,
+        false when ``DO UPDATE`` fired on a conflict) AND ``created_by`` is
+        supplied, the creator is also seated as the project's first
+        ``project_members`` admin, in the same transaction. Without this,
+        every auto-created project would go on having zero members — exactly
+        the state that made org-wide listing look "necessary" in the first
+        place, since a members-only listing would otherwise hide a project
+        from the very person who just created it. An unattributed write
+        (``created_by=None``, e.g. an API key with no resolvable user) creates
+        no membership; there is nobody to seat.
+
     Args:
         db_session: A synchronous SQLAlchemy session/connection exposing
             ``.execute()`` and ``.commit()``.
@@ -177,6 +198,9 @@ def ensure_project(
         repo_root_path: Filesystem repo root; dedup key when no remote.
         space_id: Optional space the project belongs to (used only on insert).
             When provided, must belong to ``org_id``.
+        created_by: The resolved user id of the caller whose write is causing
+            this project to exist, if known. Used only on INSERT (first
+            writer wins) and only when the project is actually new.
 
     Returns:
         The project id as a string.
@@ -218,14 +242,14 @@ def ensure_project(
                 """
                 INSERT INTO projects (
                     id, org_id, space_id, git_remote, repo_root_path,
-                    display_name
+                    display_name, created_by
                 ) VALUES (
                     :id, :org_id, :space_id, :git_remote, :repo_root_path,
-                    :display_name
+                    :display_name, :created_by
                 )
                 ON CONFLICT (org_id, git_remote) WHERE git_remote IS NOT NULL
                   DO UPDATE SET last_seen_at = NOW()
-                RETURNING id
+                RETURNING id, (xmax = 0) AS inserted
                 """
             ),
             {
@@ -235,6 +259,7 @@ def ensure_project(
                 "git_remote": git_remote,
                 "repo_root_path": repo_root_path,
                 "display_name": display_name,
+                "created_by": created_by,
             },
         ).one()
     else:
@@ -243,15 +268,15 @@ def ensure_project(
                 """
                 INSERT INTO projects (
                     id, org_id, space_id, git_remote, repo_root_path,
-                    display_name
+                    display_name, created_by
                 ) VALUES (
                     :id, :org_id, :space_id, NULL, :repo_root_path,
-                    :display_name
+                    :display_name, :created_by
                 )
                 ON CONFLICT (org_id, repo_root_path)
                   WHERE git_remote IS NULL AND repo_root_path IS NOT NULL
                   DO UPDATE SET last_seen_at = NOW()
-                RETURNING id
+                RETURNING id, (xmax = 0) AS inserted
                 """
             ),
             {
@@ -260,11 +285,31 @@ def ensure_project(
                 "space_id": space_id,
                 "repo_root_path": repo_root_path,
                 "display_name": display_name,
+                "created_by": created_by,
             },
         ).one()
 
+    project_id = str(row.id)
+
+    # Seat the creator as the project's first admin — but only for the write
+    # that actually brought the row into existence. ``row.inserted`` is false
+    # on every hit-path call (the ON CONFLICT DO UPDATE branch), so a second
+    # writer in the same repo never becomes a member merely by writing there;
+    # only the insert itself does, and only once.
+    if row.inserted and created_by:
+        db_session.execute(
+            text(
+                """
+                INSERT INTO project_members (project_id, user_id, role, granted_by)
+                VALUES (:project_id, :user_id, 'admin', :user_id)
+                ON CONFLICT (project_id, user_id) DO NOTHING
+                """
+            ),
+            {"project_id": project_id, "user_id": created_by},
+        )
+
     db_session.commit()
-    return str(row.id)
+    return project_id
 
 
 def rename_project(

@@ -223,15 +223,35 @@ def list_members(
     ]
 
 
-def list_projects(db_session: Any, *, org_id: str) -> list[dict]:
-    """Every project in the org, newest-seen first, with each one's role for
-    nobody in particular.
+def list_projects(
+    db_session: Any, *, org_id: str, user_id: Optional[str]
+) -> list[dict]:
+    """Projects ``user_id`` is a member of, newest-seen first.
 
-    Listing projects is not a disclosure of their CONTENTS: an org member can
-    already see project names through recall's project labels and through
-    ``ensure_project``'s auto-creation. Membership, which IS the boundary, is
-    reported per project by :func:`list_members`.
+    **Ruling, 2026-08-12 ("projects are visible only to their members"):** a
+    project a caller does not belong to must not appear here at all — not
+    with contents hidden, not even as a name. The previous contract (every
+    project in the org, unconditionally) rested on "listing is not a
+    disclosure of CONTENTS", which is true as far as it goes but did not
+    survive contact with two things it did not anticipate: projects are
+    auto-created from any write that carries a git remote or repo root, and
+    the resulting project names and counts were themselves visible to every
+    key holder in the org whether they had ever touched the project or not.
+
+    ``user_id=None`` (an unattributed caller — a key with no resolvable
+    person behind it) returns an empty list, not the org's full project set
+    and not an error. There is no principal here to check membership for, and
+    "we don't know who you are" must fail CLOSED for a listing that is now a
+    boundary, not open wide because the check couldn't run. This mirrors
+    :func:`is_member`, which already treats a missing ``user_id`` as "member
+    of nothing".
+
+    No org-admin bypass: the ruling is explicit that there is none in the
+    engine. An org admin who wants to see a project must be a member of it,
+    same as anyone else.
     """
+    if not user_id:
+        return []
     rows = db_session.execute(
         text(
             """
@@ -241,10 +261,14 @@ def list_projects(db_session: Any, *, org_id: str) -> list[dict]:
                      WHERE m.project_id = p.id) AS member_count
             FROM projects p
             WHERE p.org_id = :org_id
+              AND EXISTS (
+                SELECT 1 FROM project_members pm
+                WHERE pm.project_id = p.id AND pm.user_id = :user_id
+              )
             ORDER BY p.last_seen_at DESC NULLS LAST, p.created_at DESC, p.id ASC
             """
         ),
-        {"org_id": org_id},
+        {"org_id": org_id, "user_id": user_id},
     ).fetchall()
     return [
         {
