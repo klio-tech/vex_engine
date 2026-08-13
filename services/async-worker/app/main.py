@@ -12,11 +12,15 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 import redis.asyncio as aioredis
+from sqlalchemy import create_engine
 from shared.models import IngestEvent
 from shared.redis_config import REDIS_CLIENT_OPTIONS
 
+from app import config
+from app.ownership_sweep import run_ownership_sweep
 from app.worker import VERIFIED_STREAM_KEY, process_event
 
 logger = logging.getLogger("agentguard.async-worker")
@@ -24,6 +28,38 @@ logger = logging.getLogger("agentguard.async-worker")
 STREAM_KEY = "executions.raw"
 CONSUMER_GROUP = "verification-workers"
 CONSUMER_NAME = os.environ.get("CONSUMER_NAME", "async-worker-1")
+
+
+def _run_ownership_sweep_tick(engine, supabase_engine) -> None:
+    """One blocking sweep pass — run via ``asyncio.to_thread`` so real
+    Postgres/Supabase I/O never wedges the event loop this consumer needs for
+    the stream read on every other tick.
+    """
+    result = run_ownership_sweep(
+        engine,
+        supabase_engine=supabase_engine,
+        dry_run=config.OWNERSHIP_SWEEP_DRY_RUN,
+        max_transfers=config.OWNERSHIP_SWEEP_MAX_TRANSFERS_PER_RUN,
+    )
+    logger.info(
+        "ownership sweep pass complete: dry_run=%s orgs_considered=%d "
+        "transfers=%d removals=%d cap_tripped=%s "
+        "orgs_skipped_lookup_failed=%d orgs_skipped_empty_membership=%d "
+        "projects_left_alone_owner_unresolved=%d",
+        result.dry_run,
+        result.orgs_considered,
+        result.transfer_count,
+        len(result.removals),
+        result.cap_tripped,
+        len(result.orgs_skipped_lookup_failed),
+        len(result.orgs_skipped_empty_membership),
+        len(result.projects_left_alone_owner_unresolved),
+    )
+    if result.cap_tripped:
+        logger.critical(
+            "ownership sweep: transfer cap tripped this pass — see the "
+            "preceding CRITICAL log line for which org/project stopped it"
+        )
 
 
 async def run() -> None:
@@ -44,6 +80,35 @@ async def run() -> None:
 
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
     redis_client = aioredis.from_url(redis_url, **REDIS_CLIENT_OPTIONS)
+
+    # --- project-ownership-transfer sweep: engines built once, reused every
+    # tick, matching the module docstring's "one engine for a whole run"
+    # convention. ``sweep_engine`` stays None when the sweep is disabled so a
+    # deployment that never wants it never opens the connection at all.
+    sweep_engine = (
+        create_engine(config.DATABASE_URL) if config.OWNERSHIP_SWEEP_ENABLED else None
+    )
+    supabase_engine = (
+        create_engine(config.SUPABASE_DATABASE_URL)
+        if config.OWNERSHIP_SWEEP_ENABLED and config.SUPABASE_DATABASE_URL
+        else None
+    )
+    if config.OWNERSHIP_SWEEP_ENABLED:
+        logger.info(
+            "ownership sweep enabled: interval=%ss dry_run=%s max_transfers=%d "
+            "supabase_configured=%s",
+            config.OWNERSHIP_SWEEP_INTERVAL_SECONDS,
+            config.OWNERSHIP_SWEEP_DRY_RUN,
+            config.OWNERSHIP_SWEEP_MAX_TRANSFERS_PER_RUN,
+            supabase_engine is not None,
+        )
+    else:
+        logger.info("ownership sweep disabled (OWNERSHIP_SWEEP_ENABLED=0)")
+    # Sleep-before-tick, mirroring app/scheduler.py's curator loop in
+    # mcp-server: a short-lived process (a quick restart) never runs a real
+    # pass, and the first real pass on a fresh deploy waits a full interval
+    # rather than firing immediately on startup.
+    next_sweep_at = time.monotonic() + config.OWNERSHIP_SWEEP_INTERVAL_SECONDS
 
     # Create consumer group; ignore error if it already exists.
     try:
@@ -74,6 +139,24 @@ async def run() -> None:
                 count=10,
                 block=5000,
             )
+
+            # Checked every iteration — including the idle ones, which is the
+            # common case at ``block=5000`` — so the sweep's cadence does not
+            # depend on stream traffic. A failed pass is logged and swallowed
+            # exactly like a failed curation tick in mcp-server's scheduler:
+            # one bad pass must not take down the message consumer sharing
+            # this loop.
+            if sweep_engine is not None and time.monotonic() >= next_sweep_at:
+                next_sweep_at = (
+                    time.monotonic() + config.OWNERSHIP_SWEEP_INTERVAL_SECONDS
+                )
+                try:
+                    await asyncio.to_thread(
+                        _run_ownership_sweep_tick, sweep_engine, supabase_engine
+                    )
+                except Exception:
+                    logger.error("ownership sweep pass failed", exc_info=True)
+
             if not messages:
                 continue
 

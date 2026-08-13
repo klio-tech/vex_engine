@@ -40,6 +40,14 @@ ROLE_ADMIN = "admin"
 # "which surface" in the spec's who/what/when/which-surface is answerable.
 SURFACE_MCP = "mcp"
 SURFACE_DASHBOARD = "dashboard"
+#: The project-ownership-transfer sweep (``services/async-worker/app/
+#: ownership_sweep.py``) — not a human-triggered surface, but audit rows it
+#: writes need a "which surface" answer the same as any other.
+SURFACE_SWEEP = "sweep"
+
+# The two verbs ``project_grant_audit.action`` accepts (migration 033).
+ACTION_GRANT = "grant"
+ACTION_REVOKE = "revoke"
 
 
 def _owned_project_id(
@@ -294,8 +302,18 @@ def record_grant_audit(
     granted_by: Optional[str],
     role: str,
     surface: str,
+    action: str = ACTION_GRANT,
 ) -> None:
     """Append one immutable row describing an ACL change.
+
+    ``action`` defaults to ``'grant'`` (migration 033's column default, and
+    the only verb every pre-existing call site ever wrote) so this stays a
+    source-compatible addition — every caller that predates the ``action``
+    parameter keeps writing exactly the row it always wrote. Pass
+    ``ACTION_REVOKE`` to record a member's access being taken away instead of
+    given; ``role`` should then be the role the member actually held at the
+    moment of removal (migration 033's documented contract), not a role they
+    are receiving.
 
     Best-effort by construction: the grant itself has already committed by the
     time this runs, and losing the log must not undo an access change the
@@ -303,16 +321,18 @@ def record_grant_audit(
     same who/what/when/surface fields — so the record survives even when the
     table does not.
     """
+    if action not in (ACTION_GRANT, ACTION_REVOKE):
+        raise ValueError(f"unsupported action: {action!r}")
     try:
         db_session.execute(
             text(
                 """
                 INSERT INTO project_grant_audit (
                     id, org_id, project_id, granted_to, granted_to_email,
-                    granted_by, role, surface
+                    granted_by, role, surface, action
                 ) VALUES (
                     :id, :org_id, :project_id, :granted_to, :granted_to_email,
-                    :granted_by, :role, :surface
+                    :granted_by, :role, :surface, :action
                 )
                 """
             ),
@@ -325,6 +345,7 @@ def record_grant_audit(
                 "granted_by": granted_by,
                 "role": role,
                 "surface": surface,
+                "action": action,
             },
         )
         db_session.commit()
