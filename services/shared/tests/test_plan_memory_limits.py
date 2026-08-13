@@ -16,19 +16,28 @@ from shared.plan_limits import PLAN_LIMITS, PlanConfig, get_plan_config
 #: The tiers Klio is sold on. Vex is sold on starter/pro/team.
 KLIO_TIERS = ("free", "team")
 
+#: Klio tiers whose published retention is still "forever" (-1) after the
+#: 2026-08-13 repricing. Free moved to a real 30-day window; only team is
+#: still unlimited here.
+KLIO_FOREVER_RETENTION_TIERS = ("team",)
+
 
 @pytest.mark.parametrize("tier", KLIO_TIERS)
-def test_klio_tiers_are_unlimited_and_kept_forever(tier):
-    """Both published Klio tiers say "Memories: Unlimited, retention: Forever"."""
+def test_klio_tiers_are_unlimited_writes_with_no_recall_cap(tier):
+    """Both published Klio tiers say "Memories: Unlimited" and have no recall cap.
+
+    Retention is no longer identical across the two tiers as of the
+    2026-08-13 repricing — see test_free_retention_is_30_days and
+    test_team_retention_is_forever below — so it is asserted separately.
+    """
     p = PLAN_LIMITS[tier]
 
     assert p.memories_per_month == -1, f"{tier} is sold as unlimited memories"
     assert p.recalls_per_month == -1, f"{tier} is sold without a recall cap"
-    assert p.memory_retention_days == -1, f"{tier} is sold as retention forever"
     assert p.memory_sync_enabled is True
 
 
-@pytest.mark.parametrize("tier", KLIO_TIERS)
+@pytest.mark.parametrize("tier", KLIO_FOREVER_RETENTION_TIERS)
 def test_unlimited_retention_is_only_safe_because_it_is_guarded(tier):
     """A -1 retention is load bearing on two guards, and this says so.
 
@@ -55,6 +64,39 @@ def test_unlimited_retention_is_only_safe_because_it_is_guarded(tier):
     )
 
 
+def test_free_retention_is_30_days():
+    """2026-08-13 repricing: free moved off "forever" onto a real 30-day
+    window — the primary upgrade lever. This is new territory: it is the
+    first positive (sweep-activating) value Free has ever declared, so the
+    -1 guards in run_retention.py / migration 038 do not apply to it. See the
+    plan_limits module docstring's "2026-08-13 repricing" note."""
+    assert PLAN_LIMITS["free"].memory_retention_days == 30
+
+
+def test_team_retention_is_forever():
+    assert PLAN_LIMITS["team"].memory_retention_days == -1
+
+
+def test_enterprise_retention_is_forever_not_worse_than_free():
+    """Regression guard: enterprise.memory_retention_days was 365, which made
+    the top tier's retention WORSE than free and team (both forever) while
+    the retention sweep genuinely deletes. Fixed to -1 in the same change
+    that gave free a real 30-day window."""
+    assert PLAN_LIMITS["enterprise"].memory_retention_days == -1
+
+
+def test_grandfathering_override_beats_a_free_orgs_30_day_default():
+    """Existing Free orgs are grandfathered onto unlimited retention via
+    ``vex_plan_overrides`` rather than the engine deleting their history the
+    day this change ships. This is the mechanism test: an override of -1 must
+    win over Free's new 30-day default."""
+    cfg = get_plan_config("free", {"memory_retention_days": -1})
+    assert cfg.memory_retention_days == -1
+    # Everything else about free stays free — the override is surgical.
+    assert cfg.max_projects == 3
+    assert cfg.max_users == 1
+
+
 def test_free_artifact_allowance_matches_the_published_table():
     p = PLAN_LIMITS["free"]
     assert p.artifact_storage_bytes == 100 * 1024 * 1024
@@ -64,11 +106,10 @@ def test_free_artifact_allowance_matches_the_published_table():
 def test_team_artifact_allowance_matches_the_published_table():
     p = PLAN_LIMITS["team"]
     assert p.artifact_storage_bytes == 5 * 1024 * 1024 * 1024
-    # The site advertises 1,000 RPM. The engine is deliberately more generous
-    # here because `team` is also a Vex tier and lowering it would take capacity
-    # away from an existing Vex subscriber. Over-delivering is safe; the
-    # assertion is that we never fall BELOW what is advertised.
-    assert p.max_rpm >= 1_000
+    # 2026-08-13 repricing closed the drift: the site has always advertised
+    # 1,000 RPM and the engine used to over-deliver at 5,000. Now both agree
+    # exactly, so this is an equality, not a floor.
+    assert p.max_rpm == 1_000
 
 
 def test_vex_tiers_are_untouched():
