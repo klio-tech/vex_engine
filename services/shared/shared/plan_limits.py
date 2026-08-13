@@ -29,6 +29,23 @@ history. Do not remove either guard while any tier declares -1.
 
 ``memory_sync_enabled`` currently gates nothing in code. It is declarative, so
 it exists to keep this file honest against the published table.
+
+**2026-08-13 repricing.** ``free.memory_retention_days`` moved from ``-1`` to
+``30`` — a positive value, which is new territory: this is the first tier to
+ever activate the retention sweep for real, rather than relying on the -1
+guards above to make it a no-op. The guards protect ``-1``; they do nothing
+for ``30``, so a real free-tier org will really lose memories older than 30
+days the first time ``run_retention.py`` runs against it. Existing orgs are
+grandfathered onto ``memory_retention_days: -1`` via ``vex_plan_overrides``
+(a data operation, done separately from this file) so nobody's existing
+history is deleted by this change landing. ``enterprise.memory_retention_days``
+also moved, from ``365`` to ``-1``: it was previously *worse* than free and
+team (both sold as forever) despite being the top tier — a bug, not a choice.
+``team.max_rpm`` moved from ``5_000`` to ``1_000`` to match what the site has
+always advertised. ``max_projects`` / ``max_users`` / ``extractions_per_month``
+/ ``intelligence_enabled`` are new fields, added additively with defaults so
+existing direct ``PlanConfig(...)`` constructors elsewhere in the codebase
+keep building unchanged.
 """
 
 from __future__ import annotations
@@ -144,6 +161,42 @@ class PlanConfig:
     artifact_max_file_bytes: int = 10 * 1024 * 1024
     artifact_storage_bytes: int = 100 * 1024 * 1024
 
+    # Klio pricing (2026-08-13) — added additively, with defaults, so the
+    # existing direct `PlanConfig(...)` constructors in ingestion-api and
+    # sync-gateway (which predate these fields) keep building without being
+    # touched. Mirror at Dashboard/apps/landing/lib/pricing.ts (keep in sync).
+
+    # Max projects: the number of distinct projects an org may create.
+    # -1 means unlimited. "Just you" vs "everyone you invite" is enforced by
+    # max_users below; this is the secondary lever — real developers work
+    # across many repos, so a low ceiling is confining for sustained use
+    # without blocking evaluation.
+    max_projects: int = -1
+
+    # Max users: the number of distinct members an org may have. -1 means
+    # unlimited. Before this field existed nothing in the engine limited org
+    # membership at all, so "Just you" was decoration — a ten-person team
+    # could sit on Free forever. This is the field that makes the seat model
+    # real.
+    max_users: int = -1
+
+    # Extractions per month: a fair-use ceiling on LLM extraction runs,
+    # pooled across the org (per-seat allowances multiply into the pool, they
+    # are not enforced per user). -1 means unlimited. This bounds a runaway
+    # account, not typical usage — sized at several multiples of a typical
+    # user's monthly writes. Past the ceiling, degrade: keep storing the
+    # memory verbatim and skip LLM extraction on it. Never refuse the write;
+    # a write that fails is a broken product, a write that stores plainly
+    # without enrichment is a nudge to upgrade.
+    extractions_per_month: int = -1
+
+    # Intelligence layer: gates hybrid lexical search, the knowledge graph,
+    # the curator, and compression. When False, an org gets plain vector
+    # store-and-retrieve only — no reasoning over what was stored. This is
+    # the paid value story: the intelligence layer is also the actual COGS,
+    # so it is the honest place to draw the free/paid line.
+    intelligence_enabled: bool = True
+
 
 PLAN_LIMITS: dict[str, PlanConfig] = {
     "free": PlanConfig(
@@ -160,15 +213,21 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         max_experiments=1,
         max_datasets=1,
         max_dataset_items=20,
-        # Klio Free, as published: unlimited memories, retention forever.
-        # -1 is the unlimited sentinel; migration 038 and run_retention.py both
-        # treat a non-positive retention as "keep forever".
+        # Klio Free (2026-08-13 repricing): unlimited memories, but a real
+        # 30-day retention window instead of forever — this is the primary
+        # upgrade lever and the first time the retention sweep runs for real
+        # on this tier. See the module docstring's -1 guard note before ever
+        # changing this back to a non-positive value casually.
         memories_per_month=-1,
         recalls_per_month=-1,
-        memory_retention_days=-1,
+        memory_retention_days=30,
         memory_sync_enabled=True,
         artifact_max_file_bytes=10 * 1024 * 1024,
         artifact_storage_bytes=100 * 1024 * 1024,
+        max_projects=3,
+        max_users=1,
+        extractions_per_month=3_000,
+        intelligence_enabled=False,
     ),
     "starter": PlanConfig(
         observations_per_month=25_000,
@@ -216,7 +275,11 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         observations_per_month=1_500_000,
         verifications_per_month=150_000,
         corrections_per_month=-1,
-        max_rpm=5_000,
+        # 1,000 RPM (2026-08-13 repricing), down from 5,000. This is a fair-
+        # use ceiling, not a Vex regression: it was previously more generous
+        # than published, and the site (apps/landing/lib/pricing.ts) has
+        # always said 1,000 — this closes that drift rather than opening one.
+        max_rpm=1_000,
         max_agents=-1,
         corrections_enabled=True,
         webhook_alerts=True,
@@ -234,6 +297,10 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         memory_sync_enabled=True,
         artifact_max_file_bytes=50 * 1024 * 1024,
         artifact_storage_bytes=5 * 1024 * 1024 * 1024,
+        max_projects=-1,
+        max_users=-1,
+        extractions_per_month=10_000,
+        intelligence_enabled=True,
     ),
     "max": PlanConfig(
         observations_per_month=1_500_000,
@@ -272,7 +339,13 @@ PLAN_LIMITS: dict[str, PlanConfig] = {
         max_dataset_items=-1,
         memories_per_month=-1,
         recalls_per_month=-1,
-        memory_retention_days=365,
+        # Bug fix (2026-08-13): this was 365, which made enterprise memory
+        # retention WORSE than free and team (both -1 / forever) while the
+        # retention sweep genuinely deletes. A year is not "forever," so the
+        # first enterprise customer to cross it would have silently lost
+        # history against a plan that is supposed to be the most generous
+        # tier. -1 matches what enterprise is actually sold as.
+        memory_retention_days=-1,
         memory_sync_enabled=True,
         artifact_max_file_bytes=1024 * 1024 * 1024,
         artifact_storage_bytes=1024 * 1024 * 1024 * 1024,
