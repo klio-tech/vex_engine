@@ -156,7 +156,7 @@ def _add_member(db, *, project_id: str, user_id: str) -> None:
     db.execute(
         text(
             "INSERT INTO project_members (project_id, user_id, role) "
-            "VALUES (:p, :u, 'member')"
+            "VALUES (:p, :u, 'write')"
         ),
         {"p": project_id, "u": user_id},
     )

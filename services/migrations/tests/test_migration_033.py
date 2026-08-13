@@ -44,7 +44,7 @@ def _insert(conn, **overrides):
         "granted_to": "user-a",
         "granted_to_email": "a@example.com",
         "granted_by": "user-b",
-        "role": "member",
+        "role": "admin",
         "surface": "mcp",
     }
     params.update(overrides)
@@ -103,8 +103,8 @@ def test_an_unknown_verb_is_rejected(conn):
     conn.rollback()
 
 
-def test_032_role_constraint_is_untouched(conn):
-    """033 adds a verb; it does not widen what `role` accepts."""
+def test_unknown_role_is_rejected(conn):
+    """Role remains a closed set. 040 widened the names; `owner` is still out."""
     with pytest.raises(IntegrityError):
         _insert(conn, role="owner")
     conn.rollback()
@@ -115,5 +115,5 @@ def test_032_role_constraint_is_untouched(conn):
             "WHERE conname = 'ck_project_grant_audit_role'"
         )
     ).scalar()
-    assert definition is not None, "032's role CHECK must still exist"
-    assert "'member'" in definition and "'admin'" in definition
+    assert definition is not None
+    assert "'admin'" in definition
