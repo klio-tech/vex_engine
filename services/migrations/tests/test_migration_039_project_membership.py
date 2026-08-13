@@ -31,6 +31,35 @@ Mutations this file is built to catch, and the test that catches each:
 * The downgrade drops more than the column (e.g. also deletes the backfilled
   ``project_members`` rows), or upgrading twice duplicates a membership row
   -> ``test_round_trip_drops_only_the_column_and_re_upgrade_is_idempotent``
+
+Amendment (same day): the workspace-owner fallback for projects step 1 left
+unattributed. Mutations this half is built to catch, and the test that
+catches each:
+
+* The fallback fires even when step 1 already resolved a ``created_by``
+  (stealing a correctly-attributed project for the org owner instead of
+  leaving it alone)
+  -> ``test_fallback_never_overrides_an_attributable_author``
+* The fallback is skipped entirely, or picks the wrong user, when no
+  attributed memory exists
+  -> ``test_fallback_seats_the_workspace_owner_when_no_attributed_author``
+* The ``is_personal_account = false`` guard is dropped from the account
+  lookup (a personal account's owner leaks in as a workspace's fallback
+  owner)
+  -> ``test_fallback_ignores_a_matching_personal_account``
+* The ``primary_owner_user_id`` NULL case silently resolves to nobody
+  instead of falling back to the earliest membership
+  -> ``test_fallback_uses_earliest_membership_when_no_primary_owner``
+* An org with no resolvable Supabase owner (no ``SUPABASE_DATABASE_URL``, or
+  no matching account) is left with an invented owner instead of staying
+  NULL
+  -> ``test_org_with_no_identifiable_owner_leaves_project_ownerless``
+* The fallback's membership INSERT clobbers or promotes a pre-existing
+  ``project_members`` row for the same user
+  -> ``test_fallback_never_touches_a_pre_existing_membership_row``
+* Re-running the migration after the fallback already ran duplicates the
+  membership row or re-derives a different owner
+  -> ``test_fallback_round_trip_is_idempotent``
 """
 
 import os
@@ -48,6 +77,7 @@ DB_URL = os.environ.get(
 )
 
 SCRATCH_DB = "klio_mig_039_project_membership"
+SUPABASE_SHADOW_DB = "klio_mig_039_supabase_shadow"
 
 MIGRATIONS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -61,8 +91,16 @@ def _with_database(url: str, database: str) -> str:
     )
 
 
-def _alembic(url: str, *args: str):
+def _alembic(url: str, *args: str, supabase_url: str | None = None):
     env = {**os.environ, "DATABASE_URL": url}
+    # Never let an ambient SUPABASE_DATABASE_URL (e.g. from a developer's
+    # shell profile) leak into a test that means to exercise "not
+    # configured" — every caller either states the shadow URL explicitly or
+    # gets an explicit absence.
+    if supabase_url is None:
+        env.pop("SUPABASE_DATABASE_URL", None)
+    else:
+        env["SUPABASE_DATABASE_URL"] = supabase_url
     return subprocess.run(
         [sys.executable, "-m", "alembic", *args],
         cwd=MIGRATIONS_DIR,
@@ -110,6 +148,74 @@ def db(scratch_url):
         c.execute(text("DELETE FROM project_members"))
         c.execute(text("DELETE FROM session_memories"))
         c.execute(text("DELETE FROM projects"))
+        c.execute(text("DELETE FROM organizations"))
+        yield c
+    engine.dispose()
+
+
+@pytest.fixture(scope="module")
+def supabase_shadow_url():
+    """A real, separate Postgres database standing in for Supabase.
+
+    The fallback migration code doesn't know or care that it's talking to
+    "Supabase" — it just opens ``SUPABASE_DATABASE_URL`` and queries
+    ``accounts`` / ``accounts_memberships``, exactly as
+    ``app/directory.py`` and ``shared/auth.py`` do in production. A second
+    real database with those two tables is a faithful double for this
+    migration's purposes, and keeps the test on real Postgres as the task
+    requires rather than mocking the SQL layer.
+    """
+    admin_url = _with_database(DB_URL, "postgres")
+    admin = create_engine(admin_url, isolation_level="AUTOCOMMIT")
+    with admin.connect() as c:
+        c.execute(text("SELECT 1"))
+    url = _with_database(DB_URL, SUPABASE_SHADOW_DB)
+    with admin.connect() as c:
+        c.execute(text(f'DROP DATABASE IF EXISTS "{SUPABASE_SHADOW_DB}" WITH (FORCE)'))
+        c.execute(text(f'CREATE DATABASE "{SUPABASE_SHADOW_DB}"'))
+    engine = create_engine(url, isolation_level="AUTOCOMMIT")
+    with engine.connect() as c:
+        c.execute(
+            text(
+                """
+                CREATE TABLE accounts (
+                    id uuid PRIMARY KEY,
+                    slug text UNIQUE,
+                    is_personal_account boolean NOT NULL DEFAULT false,
+                    primary_owner_user_id text,
+                    created_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+        c.execute(
+            text(
+                """
+                CREATE TABLE accounts_memberships (
+                    account_id uuid NOT NULL REFERENCES accounts(id),
+                    user_id text NOT NULL,
+                    created_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+        )
+    engine.dispose()
+    try:
+        yield url
+    finally:
+        with admin.connect() as c:
+            c.execute(
+                text(f'DROP DATABASE IF EXISTS "{SUPABASE_SHADOW_DB}" WITH (FORCE)')
+            )
+
+
+@pytest.fixture
+def shadow(supabase_shadow_url):
+    """A clean ``accounts`` / ``accounts_memberships`` per test."""
+    engine = create_engine(supabase_shadow_url, isolation_level="AUTOCOMMIT")
+    with engine.connect() as c:
+        c.execute(text("DELETE FROM accounts_memberships"))
+        c.execute(text("DELETE FROM accounts"))
         yield c
     engine.dispose()
 
@@ -120,7 +226,11 @@ def db(scratch_url):
 
 
 def _seed_project(
-    conn, *, git_remote: str | None = None, repo_root_path: str | None = None
+    conn,
+    *,
+    org: str = ORG,
+    git_remote: str | None = None,
+    repo_root_path: str | None = None,
 ) -> str:
     project_id = str(uuid.uuid4())
     conn.execute(
@@ -130,12 +240,60 @@ def _seed_project(
         ),
         {
             "id": project_id,
-            "org": ORG,
+            "org": org,
             "remote": git_remote or f"git@example.com:acme/{uuid.uuid4().hex[:8]}.git",
             "path": repo_root_path,
         },
     )
     return project_id
+
+
+def _seed_org(conn, *, org_id: str, account_slug: str) -> None:
+    """A row in ``organizations`` — the local join the fallback needs to turn
+    an ``org_id`` into the ``account_slug`` it looks up in the shadow DB."""
+    conn.execute(
+        text(
+            "INSERT INTO organizations (org_id, name, account_slug) "
+            "VALUES (:org_id, :org_id, :slug) "
+            "ON CONFLICT (org_id) DO UPDATE SET account_slug = EXCLUDED.account_slug"
+        ),
+        {"org_id": org_id, "slug": account_slug},
+    )
+
+
+def _seed_account(
+    shadow_conn,
+    *,
+    slug: str,
+    primary_owner_user_id: str | None,
+    is_personal_account: bool = False,
+) -> str:
+    account_id = str(uuid.uuid4())
+    shadow_conn.execute(
+        text(
+            "INSERT INTO accounts (id, slug, is_personal_account, primary_owner_user_id) "
+            "VALUES (:id, :slug, :personal, :owner)"
+        ),
+        {
+            "id": account_id,
+            "slug": slug,
+            "personal": is_personal_account,
+            "owner": primary_owner_user_id,
+        },
+    )
+    return account_id
+
+
+def _seed_account_membership(
+    shadow_conn, *, account_id: str, user_id: str, minutes_ago: int
+) -> None:
+    shadow_conn.execute(
+        text(
+            "INSERT INTO accounts_memberships (account_id, user_id, created_at) "
+            "VALUES (:account_id, :user_id, NOW() - (:mins || ' minutes')::interval)"
+        ),
+        {"account_id": account_id, "user_id": user_id, "mins": minutes_ago},
+    )
 
 
 def _seed_memory(
@@ -348,3 +506,200 @@ def test_created_by_column_is_nullable(scratch_url, db):
         )
     ).scalar()
     assert nullable == "YES"
+
+
+# ---------------------------------------------------------------------------
+# the workspace-owner fallback (amendment, same day)
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_seats_the_workspace_owner_when_no_attributed_author(
+    scratch_url, db, shadow, supabase_shadow_url
+):
+    """No session_memories at all for this project: the fallback assigns the
+    org's Supabase account owner and seats them as admin — the orphan does
+    NOT stay ownerless when an owner is honestly identifiable."""
+    org_id = "org-with-owner"
+    _seed_org(db, org_id=org_id, account_slug="acme")
+    _seed_account(shadow, slug="acme", primary_owner_user_id="owner-user")
+    project_id = _seed_project(db, org=org_id)
+
+    _require(
+        _alembic(scratch_url, "upgrade", "head", supabase_url=supabase_shadow_url),
+        "upgrade to 039 with fallback",
+    )
+
+    assert _created_by(db, project_id) == "owner-user"
+    assert _members(db, project_id) == [("owner-user", "admin")]
+
+
+def test_fallback_never_overrides_an_attributable_author(
+    scratch_url, db, shadow, supabase_shadow_url
+):
+    """The regression that matters most: a project WITH an attributable
+    author keeps that author, even when the org also has a resolvable
+    owner the fallback would otherwise have assigned. Step 1 must win, and
+    step 3 must never reconsider a project it already resolved."""
+    org_id = "org-with-owner-2"
+    _seed_org(db, org_id=org_id, account_slug="acme2")
+    _seed_account(shadow, slug="acme2", primary_owner_user_id="the-owner")
+    project_id = _seed_project(db, org=org_id)
+    _seed_memory(db, project_id=project_id, user_id="real-author", minutes_ago=10)
+
+    _require(
+        _alembic(scratch_url, "upgrade", "head", supabase_url=supabase_shadow_url),
+        "upgrade to 039 with fallback",
+    )
+
+    assert _created_by(db, project_id) == "real-author"
+    assert _members(db, project_id) == [("real-author", "admin")]
+
+
+def test_fallback_ignores_a_matching_personal_account(
+    scratch_url, db, shadow, supabase_shadow_url
+):
+    """A personal account (``is_personal_account = true``) sharing the same
+    slug must never be picked as the workspace owner — only a workspace
+    (non-personal) account counts. Dropping that filter would let a
+    stranger's personal-account owner become a project's admin."""
+    org_id = "org-personal-collision"
+    _seed_org(db, org_id=org_id, account_slug="shared-slug")
+    _seed_account(
+        shadow,
+        slug="shared-slug",
+        primary_owner_user_id="wrong-personal-owner",
+        is_personal_account=True,
+    )
+    project_id = _seed_project(db, org=org_id)
+
+    _require(
+        _alembic(scratch_url, "upgrade", "head", supabase_url=supabase_shadow_url),
+        "upgrade to 039 with fallback",
+    )
+
+    assert _created_by(db, project_id) is None
+    assert _members(db, project_id) == []
+
+
+def test_fallback_uses_earliest_membership_when_no_primary_owner(
+    scratch_url, db, shadow, supabase_shadow_url
+):
+    """When the account has no ``primary_owner_user_id`` (e.g. a deleted
+    owner user), the deterministic tie-break is the EARLIEST
+    ``accounts_memberships`` row for that account — not the latest, not an
+    arbitrary one."""
+    org_id = "org-no-primary-owner"
+    _seed_org(db, org_id=org_id, account_slug="no-owner-acme")
+    account_id = _seed_account(
+        shadow, slug="no-owner-acme", primary_owner_user_id=None
+    )
+    _seed_account_membership(
+        shadow, account_id=account_id, user_id="later-member", minutes_ago=5
+    )
+    _seed_account_membership(
+        shadow, account_id=account_id, user_id="earliest-member", minutes_ago=90
+    )
+    project_id = _seed_project(db, org=org_id)
+
+    _require(
+        _alembic(scratch_url, "upgrade", "head", supabase_url=supabase_shadow_url),
+        "upgrade to 039 with fallback",
+    )
+
+    assert _created_by(db, project_id) == "earliest-member"
+    assert _members(db, project_id) == [("earliest-member", "admin")]
+
+
+def test_org_with_no_identifiable_owner_leaves_project_ownerless(scratch_url, db):
+    """No ``SUPABASE_DATABASE_URL`` configured at all: the fallback must
+    fail closed, exactly like every other cross-database identity lookup in
+    this codebase (``app/directory.py``, ``shared/auth.py``). The project
+    stays an orphan — invisible once members-only listing ships — rather
+    than getting an invented owner."""
+    org_id = "org-unreachable"
+    _seed_org(db, org_id=org_id, account_slug="whatever")
+    project_id = _seed_project(db, org=org_id)
+
+    _require(
+        _alembic(scratch_url, "upgrade", "head"),  # no supabase_url -> unset
+        "upgrade to 039 without SUPABASE_DATABASE_URL",
+    )
+
+    assert _created_by(db, project_id) is None
+    assert _members(db, project_id) == []
+
+
+def test_org_with_no_matching_account_leaves_project_ownerless(
+    scratch_url, db, shadow, supabase_shadow_url
+):
+    """``SUPABASE_DATABASE_URL`` IS configured and reachable, but no
+    ``accounts`` row matches this org's slug: still no invented owner."""
+    org_id = "org-no-account-row"
+    _seed_org(db, org_id=org_id, account_slug="does-not-exist-in-shadow")
+    project_id = _seed_project(db, org=org_id)
+
+    _require(
+        _alembic(scratch_url, "upgrade", "head", supabase_url=supabase_shadow_url),
+        "upgrade to 039 with fallback, no matching account",
+    )
+
+    assert _created_by(db, project_id) is None
+    assert _members(db, project_id) == []
+
+
+def test_fallback_never_touches_a_pre_existing_membership_row(
+    scratch_url, db, shadow, supabase_shadow_url
+):
+    """The org owner the fallback would derive already holds a
+    ``project_members`` row with a DIFFERENT role: ``ON CONFLICT DO
+    NOTHING`` must leave that role exactly as it was, the same guarantee
+    step 2's insert already gives the earliest-author path."""
+    org_id = "org-pre-existing-member"
+    _seed_org(db, org_id=org_id, account_slug="preexist-acme")
+    _seed_account(shadow, slug="preexist-acme", primary_owner_user_id="owner-user")
+    project_id = _seed_project(db, org=org_id)
+    _seed_membership(db, project_id=project_id, user_id="owner-user", role="member")
+
+    _require(
+        _alembic(scratch_url, "upgrade", "head", supabase_url=supabase_shadow_url),
+        "upgrade to 039 with fallback",
+    )
+
+    assert _created_by(db, project_id) == "owner-user"
+    assert _members(db, project_id) == [("owner-user", "member")], (
+        "a pre-existing membership row must never be clobbered or promoted "
+        "by the fallback's heuristic either"
+    )
+
+
+def test_fallback_round_trip_is_idempotent(
+    scratch_url, db, shadow, supabase_shadow_url
+):
+    """Forward, back, forward again, with the fallback path exercised both
+    times: the derived owner must be re-derived identically and the
+    membership row must not be duplicated."""
+    org_id = "org-fallback-roundtrip"
+    _seed_org(db, org_id=org_id, account_slug="roundtrip-acme")
+    _seed_account(shadow, slug="roundtrip-acme", primary_owner_user_id="rt-owner")
+    project_id = _seed_project(db, org=org_id)
+
+    _require(
+        _alembic(scratch_url, "upgrade", "head", supabase_url=supabase_shadow_url),
+        "first upgrade to 039 with fallback",
+    )
+    assert _created_by(db, project_id) == "rt-owner"
+    assert _members(db, project_id) == [("rt-owner", "admin")]
+
+    _require(_alembic(scratch_url, "downgrade", "038"), "downgrade 039 -> 038")
+    assert _members(db, project_id) == [("rt-owner", "admin")], (
+        "downgrade must not touch project_members for the fallback path either"
+    )
+
+    _require(
+        _alembic(scratch_url, "upgrade", "head", supabase_url=supabase_shadow_url),
+        "second upgrade to 039 with fallback",
+    )
+    assert _created_by(db, project_id) == "rt-owner"
+    assert _members(db, project_id) == [("rt-owner", "admin")], (
+        "re-running the fallback backfill must not duplicate the membership row"
+    )
