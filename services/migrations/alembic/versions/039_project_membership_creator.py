@@ -122,114 +122,26 @@ Revises: 038
 Create Date: 2026-08-12
 """
 
-import os
-import uuid
 from collections.abc import Sequence
-from typing import Optional, Union
+from typing import Union
 
 import sqlalchemy as sa
 from alembic import op
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
+
+# Owner-resolution is shared with the project-ownership-transfer sweep
+# (services/async-worker/app/ownership_sweep.py, spec
+# docs/superpowers/specs/2026-08-13-project-ownership-transfer-design.md) so
+# the two can never define "workspace owner" differently. See
+# services/shared/shared/workspace_owner.py's module docstring. The CI
+# migration-tests job installs `services/shared` before running this suite
+# specifically so this import resolves — see .github/workflows/ci.yml.
+from shared.workspace_owner import resolve_workspace_owners as _resolve_workspace_owners
 
 revision: str = "039"
 down_revision: Union[str, None] = "038"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
-
-
-def _is_uuid(value: Optional[str]) -> bool:
-    """Mirrors ``shared.auth._is_uuid``: guards the ``accounts.id`` join.
-
-    ``org_id`` is a free-form ``varchar(64)``; legacy rows hold slug-like
-    values Postgres would reject when cast to ``uuid``.
-    """
-    if not value:
-        return False
-    try:
-        uuid.UUID(str(value))
-    except (ValueError, AttributeError, TypeError):
-        return False
-    return True
-
-
-def _resolve_workspace_owners(bind, org_ids: list[str]) -> dict[str, str]:
-    """Resolve each of ``org_ids`` to its Supabase workspace owner's user id.
-
-    Fails closed at every step (see the module docstring's step 3): a
-    missing ``SUPABASE_DATABASE_URL``, an org with no ``account_slug``, an
-    account row that cannot be found, or an account with neither a
-    ``primary_owner_user_id`` nor any ``accounts_memberships`` row all
-    simply omit that ``org_id`` from the returned mapping — never raise,
-    never invent a value.
-    """
-    if not org_ids:
-        return {}
-
-    supabase_url = os.environ.get("SUPABASE_DATABASE_URL")
-    if not supabase_url:
-        return {}
-
-    slug_rows = bind.execute(
-        text(
-            "SELECT org_id, account_slug FROM organizations "
-            "WHERE org_id = ANY(:ids)"
-        ),
-        {"ids": list(org_ids)},
-    ).fetchall()
-    slug_by_org = {row.org_id: row.account_slug for row in slug_rows if row.account_slug}
-    if not slug_by_org:
-        return {}
-
-    owners: dict[str, str] = {}
-    engine = create_engine(supabase_url)
-    try:
-        with engine.connect() as sconn:
-            for org_id, slug in slug_by_org.items():
-                account = None
-                if _is_uuid(org_id):
-                    account = sconn.execute(
-                        text(
-                            "SELECT id, primary_owner_user_id FROM accounts "
-                            "WHERE id = CAST(:account_id AS uuid) "
-                            "AND is_personal_account = false LIMIT 1"
-                        ),
-                        {"account_id": org_id},
-                    ).fetchone()
-                if account is None:
-                    account = sconn.execute(
-                        text(
-                            "SELECT id, primary_owner_user_id FROM accounts "
-                            "WHERE slug = :slug AND is_personal_account = false "
-                            "LIMIT 1"
-                        ),
-                        {"slug": slug},
-                    ).fetchone()
-                if account is None:
-                    continue
-
-                account_id, primary_owner = account[0], account[1]
-                if primary_owner:
-                    owners[org_id] = str(primary_owner)
-                    continue
-
-                # No primary owner recorded (e.g. a deleted owner user): the
-                # deterministic fallback is the earliest membership on this
-                # account, mirroring the "earliest wins" logic step 1 above
-                # already uses for session_memories authorship.
-                earliest_member = sconn.execute(
-                    text(
-                        "SELECT user_id FROM accounts_memberships "
-                        "WHERE account_id = :account_id "
-                        "ORDER BY created_at ASC, user_id ASC LIMIT 1"
-                    ),
-                    {"account_id": account_id},
-                ).fetchone()
-                if earliest_member is not None and earliest_member[0]:
-                    owners[org_id] = str(earliest_member[0])
-    finally:
-        engine.dispose()
-
-    return owners
 
 
 def upgrade() -> None:
