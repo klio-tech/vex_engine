@@ -194,7 +194,7 @@ async def test_sharing_to_a_project_requires_membership_of_it():
     with (
         patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=db)),
-        patch("app.mcp_app.projects.is_member", return_value=False),
+        patch("app.mcp_app.projects.can_write", return_value=False),
         patch("app.mcp_app.promote_memory", promote),
     ):
         result = await mcp_app._perform_share(
@@ -229,7 +229,8 @@ async def test_a_non_admin_cannot_grant_even_to_themselves():
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
         patch("app.mcp_app.projects.is_member", return_value=True),
-        patch("app.mcp_app.projects.is_admin", return_value=False),
+        patch("app.mcp_app.projects.can_manage", return_value=False),
+        patch("app.mcp_app.projects.member_role", return_value="write"),
         patch("app.mcp_app.projects.add_member", add_member),
         patch("app.mcp_app.resolve_org_member_by_email", return_value=DEV),
     ):
@@ -310,7 +311,8 @@ async def test_an_email_outside_the_org_cannot_be_granted():
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
         patch("app.mcp_app.projects.is_member", return_value=True),
-        patch("app.mcp_app.projects.is_admin", return_value=True),
+        patch("app.mcp_app.projects.can_manage", return_value=True),
+        patch("app.mcp_app.projects.member_role", return_value="admin"),
         patch("app.mcp_app.resolve_org_member_by_email", return_value=None),
         patch("app.mcp_app.projects.add_member", add_member),
     ):
@@ -334,7 +336,8 @@ async def test_a_successful_grant_is_audited_with_who_what_and_surface():
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
         patch("app.mcp_app.projects.is_member", return_value=True),
-        patch("app.mcp_app.projects.is_admin", return_value=True),
+        patch("app.mcp_app.projects.can_manage", return_value=True),
+        patch("app.mcp_app.projects.member_role", side_effect=["admin", None]),
         patch("app.mcp_app.resolve_org_member_by_email", return_value=PRIYA),
         patch("app.mcp_app.projects.add_member", return_value=True),
         patch("app.mcp_app.projects.record_grant_audit", audit),
@@ -349,7 +352,7 @@ async def test_a_successful_grant_is_audited_with_who_what_and_surface():
     assert kwargs["granted_to"] == PRIYA
     assert kwargs["granted_to_email"] == "priya@oppla.ai"
     assert kwargs["project_id"] == "proj-1"
-    assert kwargs["role"] == "member"
+    assert kwargs["role"] == "write"
     assert kwargs["surface"] == "mcp"
 
 
@@ -421,7 +424,7 @@ async def test_a_non_member_write_falls_back_to_org_not_project_scope():
     relevance hint) without ever fencing it (a boundary) for a non-member."""
     db = MagicMock()
 
-    with patch("app.mcp_app.projects.is_member", return_value=False):
+    with patch("app.mcp_app.projects.can_write", return_value=False):
         scope = mcp_app._explicit_write_scope(
             db,
             requested_scope="org",
@@ -431,7 +434,7 @@ async def test_a_non_member_write_falls_back_to_org_not_project_scope():
         )
     assert scope == "org"
 
-    with patch("app.mcp_app.projects.is_member", return_value=True):
+    with patch("app.mcp_app.projects.can_write", return_value=True):
         scope = mcp_app._explicit_write_scope(
             db,
             requested_scope="org",

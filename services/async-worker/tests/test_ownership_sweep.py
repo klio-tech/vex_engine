@@ -507,14 +507,14 @@ def test_owner_unresolvable_leaves_project_and_departed_row_untouched(
 def test_existing_owner_role_is_never_downgraded_by_the_transfer(
     engine, db, supabase_engine, shadow
 ):
-    """The owner already holds a project row with role ``'member'``. The
+    """The owner already holds a project row with role ``write``. The
     Supabase membership set does NOT include the owner directly (only a
     different, unrelated current member does — a real, if unusual, gap
     between ``primary_owner_user_id`` and ``accounts_memberships`` that
     migration 039's own docstring flags as possible), so the owner's OWN
     project row would otherwise be classified "departed" the same as the
     real departure. The transfer must still: (a) never upgrade the owner's
-    existing 'member' role to 'admin', and (b) never delete the owner's row
+    existing write role to 'admin', and (b) never delete the owner's row
     as a side effect of seating them — the seat and the removal must not
     fight each other on the same user.
     """
@@ -525,7 +525,7 @@ def test_existing_owner_role_is_never_downgraded_by_the_transfer(
         shadow, account_id=account_id, user_id="unrelated-current-member"
     )
     project_id = _seed_project(db, org_id=org)
-    _seed_membership(db, project_id=project_id, user_id="owner-7", role="member")
+    _seed_membership(db, project_id=project_id, user_id="owner-7", role="write")
     _seed_membership(db, project_id=project_id, user_id="departed-solo-owner")
 
     result = _run(engine, supabase_engine)
@@ -536,7 +536,7 @@ def test_existing_owner_role_is_never_downgraded_by_the_transfer(
     # counted among the rows this transfer removes.
     assert result.transfers[0].departed_user_ids == ("departed-solo-owner",)
     assert "owner-7" not in result.transfers[0].departed_user_ids
-    assert _members(db, project_id) == [("owner-7", "member")]
+    assert _members(db, project_id) == [("owner-7", "write")]
 
 
 # ---------------------------------------------------------------------------

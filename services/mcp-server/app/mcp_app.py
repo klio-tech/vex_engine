@@ -191,6 +191,25 @@ def _project_permits(
     )
 
 
+def _project_write_permits(
+    db: Any,
+    *,
+    org_id: str,
+    project_id: Optional[Any],
+    user_id: Optional[str],
+) -> bool:
+    """May ``user_id`` persist into a project-filed artifact or memory?
+
+    Read members may get/recall. They may not put, forget, or share into the
+    project brain. Unfiled (``project_id`` ``None``) stays org-wide.
+    """
+    if not project_id:
+        return True
+    return projects.can_write(
+        db, org_id=org_id, project_id=str(project_id), user_id=user_id
+    )
+
+
 def _explicit_write_scope(
     db: Any,
     *,
@@ -223,7 +242,7 @@ def _explicit_write_scope(
     """
     if requested_scope == "agent":
         return "agent"
-    if project_id and projects.is_member(
+    if project_id and projects.can_write(
         db, org_id=org_id, project_id=project_id, user_id=user_id
     ):
         return "project"
@@ -360,6 +379,29 @@ async def _perform_write(
         header_project_id = await anyio.to_thread.run_sync(
             lambda: resolve_project_from_request(request, db, org_id=org_id)
         )
+
+        if header_project_id and await anyio.to_thread.run_sync(
+            lambda: projects.is_member(
+                db,
+                org_id=org_id,
+                project_id=header_project_id,
+                user_id=user_id,
+            )
+            and not projects.can_write(
+                db,
+                org_id=org_id,
+                project_id=header_project_id,
+                user_id=user_id,
+            )
+        ):
+            return {
+                "stored": False,
+                "error": "read_only",
+                "detail": (
+                    "You have read access to this project. You cannot add "
+                    "memories to it. Ask an admin for write access."
+                ),
+            }
 
         # Resolve the optional space slug to a space_id (get-or-create, keyed on
         # (org_id, slug)). The org_id comes from the resolved principal — never
@@ -529,7 +571,9 @@ def _resolve_artifact_project(
             return None, None
         return None, _unknown_project_error(stripped)
 
-    if not _project_permits(db, org_id=org_id, project_id=project_id, user_id=user_id):
+    if not _project_write_permits(
+        db, org_id=org_id, project_id=project_id, user_id=user_id
+    ):
         label = stripped or request.headers.get(PROJECT_HEADER) or ""
         return None, _unknown_project_error(label)
 
@@ -555,7 +599,7 @@ def _supersede_permitted(
         return False
     if target is None:
         return False
-    return _project_permits(
+    return _project_write_permits(
         db, org_id=org_id, project_id=target["project_id"], user_id=user_id
     )
 
@@ -851,7 +895,7 @@ async def _perform_artifact_put(
             # REQUESTED, possibly by someone else: an artifact id travels in
             # tool results and logs, so confirming one is not proof of standing
             # in its project. Same refusal as an id that does not exist.
-            if not _project_permits(
+            if not _project_write_permits(
                 db, org_id=org_id, project_id=row["project_id"], user_id=user_id
             ):
                 return {"stored": False, "error": "not_found"}
@@ -2090,7 +2134,7 @@ async def _perform_forget(ctx: Context, *, memory_id: str) -> dict[str, Any]:
                 # function returns here rather than falling through to the
                 # memory arm, which would otherwise answer a second time and
                 # reveal that the id resolved to an artifact.
-                if not _project_permits(
+                if not _project_write_permits(
                     db, org_id=org_id, project_id=row["project_id"], user_id=user_id
                 ):
                     return {"forgotten": False, "error": "not_found"}
@@ -2176,14 +2220,14 @@ async def _perform_share(ctx: Context, *, memory_id: str, to: str) -> dict[str, 
                 # Same answer for "not yours", "does not exist" and "not filed
                 # under a project" — see promote_memory on why not_found.
                 return {"shared": False, "error": "not_found"}
-            if not projects.is_member(
+            if not projects.can_write(
                 db, org_id=org_id, project_id=str(row.project_id), user_id=user_id
             ):
                 return {
                     "shared": False,
                     "error": "not_a_member",
                     "detail": (
-                        "You are not a member of the project this memory is "
+                        "You cannot write to the project this memory is "
                         "filed under, so you cannot share it there."
                     ),
                 }
@@ -2693,7 +2737,8 @@ async def _perform_project_grant(
                 "accepted here."
             ),
         }
-    if role not in (projects.ROLE_MEMBER, projects.ROLE_ADMIN):
+    role = projects.normalize_role(role)
+    if role not in projects.ROLES:
         return {"granted": False, "error": "invalid_role"}
 
     db = SessionLocal()
@@ -2722,14 +2767,17 @@ async def _perform_project_grant(
                 "detail": f"unknown project: {project}",
             }
 
-        if not projects.is_admin(
+        actor_role = projects.member_role(
+            db, org_id=org_id, project_id=project_id, user_id=caller
+        )
+        if not projects.can_manage(
             db, org_id=org_id, project_id=project_id, user_id=caller
         ):
             return {
                 "granted": False,
                 "error": "forbidden",
                 "detail": (
-                    "You may only grant access to projects you administer. "
+                    "You may only grant access to projects you manage. "
                     "Create the project, or ask one of its admins."
                 ),
             }
@@ -2743,6 +2791,33 @@ async def _perform_project_grant(
                     f"{email} is not a member of this organisation, so they "
                     "cannot be granted access to its projects."
                 ),
+            }
+
+        existing = projects.member_role(
+            db, org_id=org_id, project_id=project_id, user_id=grantee
+        )
+        if existing and not projects.can_touch_member(actor_role, existing):
+            return {
+                "granted": False,
+                "error": "forbidden",
+                "detail": "You cannot change that member's role.",
+            }
+        if not projects.can_assign_role(actor_role, role):
+            return {
+                "granted": False,
+                "error": "forbidden",
+                "detail": "You cannot grant that role.",
+            }
+        if (
+            existing == projects.ROLE_ADMIN
+            and role != projects.ROLE_ADMIN
+            and projects.admin_count(db, org_id=org_id, project_id=project_id)
+            == 1
+        ):
+            return {
+                "granted": False,
+                "error": "last_admin",
+                "detail": "A project needs at least one admin.",
             }
 
         ok = projects.add_member(
@@ -3384,11 +3459,11 @@ def _register_tools(mcp: FastMCP) -> None:
     @mcp.tool(
         name="project_grant",
         description=(
-            "Give a teammate access to a project you administer. `user` is "
-            "their EMAIL ADDRESS — they must already be in this org. You can "
-            "only grant on projects you administer, and every grant is "
-            "audit-logged. Args: project, user (email), optional role "
-            "('member' default | 'admin')."
+            "Give a teammate access to a project you manage. `user` is "
+            "their EMAIL ADDRESS — they must already be in this org. Roles: "
+            "read (recall only), write (persist), manage (grant read/write), "
+            "admin (grant any role). `member` is accepted as write. Every "
+            "grant is audit-logged."
         ),
     )
     async def project_grant(
@@ -3406,9 +3481,14 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ],
         role: Annotated[
-            Literal["member", "admin"],
-            Field(description="'member' (default) can read; 'admin' can also grant."),
-        ] = "member",
+            Literal["read", "write", "manage", "admin", "member"],
+            Field(
+                description=(
+                    "read | write | manage | admin. `member` is an alias for "
+                    "write."
+                )
+            ),
+        ] = "write",
     ) -> dict[str, Any]:
         return await _perform_project_grant(ctx, project=project, user=user, role=role)
 

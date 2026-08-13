@@ -192,7 +192,7 @@ def _seed_audit_rows(conn, *, grants: int = 1, revokes: int = 0) -> None:
                     "INSERT INTO project_grant_audit "
                     "(id, org_id, project_id, granted_to, role, surface, action) "
                     "VALUES (gen_random_uuid(), 'orgA', gen_random_uuid(), "
-                    "'user-0', 'member', 'mcp', :a)"
+                    "'user-0', 'write', 'mcp', :a)"
                 ),
                 {"a": action},
             )

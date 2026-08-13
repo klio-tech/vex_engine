@@ -9,8 +9,9 @@ one of two questions:
   :func:`shared.memory.retrieve_memories_scoped`. The recall path deliberately
   does NOT call :func:`is_member` per row: entitlement belongs in the same
   statement that returns the rows.
-* **May this user change who reads it?** — :func:`is_admin`, the gate on
-  :func:`add_member`.
+* **May this user write memories into it?** — :func:`can_write`.
+* **May this user change who is on it?** — :func:`can_manage` (Read/Write
+  grants) and :func:`is_admin` (any role, including Manage/Admin).
 
 Two invariants hold throughout:
 
@@ -33,8 +34,58 @@ from sqlalchemy import text
 
 logger = logging.getLogger("agentguard.shared.projects")
 
-ROLE_MEMBER = "member"
+ROLE_READ = "read"
+ROLE_WRITE = "write"
+ROLE_MANAGE = "manage"
 ROLE_ADMIN = "admin"
+# 031 stored "member" for "can see the project". After 040 that capability
+# is ``write`` (existing members were not read-only). Accept the old name
+# at the API edge so a client that has not updated still grants write.
+ROLE_MEMBER = ROLE_WRITE
+
+ROLES = (ROLE_READ, ROLE_WRITE, ROLE_MANAGE, ROLE_ADMIN)
+
+# Who may persist into the project brain (and put/forget artifacts there).
+WRITE_ROLES = frozenset({ROLE_WRITE, ROLE_MANAGE, ROLE_ADMIN})
+# Who may change the member list at all.
+MANAGE_ROLES = frozenset({ROLE_MANAGE, ROLE_ADMIN})
+# What a Manage grantor may assign or revoke.
+MANAGE_TOUCHABLE = frozenset({ROLE_READ, ROLE_WRITE})
+
+
+def normalize_role(role: str) -> str:
+    """Map a caller-supplied role onto a stored value.
+
+    ``member`` is a synonym for ``write``. Anything else is returned as-is;
+    :func:`add_member` still rejects unknown names.
+    """
+    if role == "member":
+        return ROLE_WRITE
+    return role
+
+
+def can_assign_role(actor_role: Optional[str], new_role: str) -> bool:
+    """May someone holding ``actor_role`` grant ``new_role``?"""
+    actor = normalize_role(actor_role) if actor_role else None
+    target = normalize_role(new_role)
+    if target not in ROLES:
+        return False
+    if actor == ROLE_ADMIN:
+        return True
+    if actor == ROLE_MANAGE:
+        return target in MANAGE_TOUCHABLE
+    return False
+
+
+def can_touch_member(actor_role: Optional[str], target_role: Optional[str]) -> bool:
+    """May someone holding ``actor_role`` revoke or reassign ``target_role``?"""
+    actor = normalize_role(actor_role) if actor_role else None
+    target = normalize_role(target_role) if target_role else None
+    if actor == ROLE_ADMIN:
+        return True
+    if actor == ROLE_MANAGE:
+        return target in MANAGE_TOUCHABLE
+    return False
 
 # The surfaces a grant can arrive from. Recorded on every audit row so
 # "which surface" in the spec's who/what/when/which-surface is answerable.
@@ -102,34 +153,83 @@ def is_member(
     return row is not None
 
 
-def is_admin(
+def member_role(
     db_session: Any, *, org_id: str, project_id: str, user_id: Optional[str]
-) -> bool:
-    """True iff ``user_id`` administers this project (may change its ACL).
+) -> Optional[str]:
+    """The caller's stored role on this project, or ``None``.
 
-    This is the whole authorization for ``project_grant``. It is deliberately
-    narrower than org membership: ``project_grant`` is reachable by an LLM, so
-    the blast radius of a prompt injection has to stop at "a project the caller
-    already controls".
+    ``member`` is normalised to ``write`` so callers never have to know the
+    pre-040 name.
     """
     if not user_id:
-        return False
+        return None
     owned = _owned_project_id(db_session, org_id=org_id, project_id=project_id)
     if owned is None:
-        return False
+        return None
     row = db_session.execute(
         text(
             """
-            SELECT 1 FROM project_members
-            WHERE project_id = :project_id
-              AND user_id = :user_id
-              AND role = :role
+            SELECT role FROM project_members
+            WHERE project_id = :project_id AND user_id = :user_id
             LIMIT 1
             """
         ),
-        {"project_id": owned, "user_id": user_id, "role": ROLE_ADMIN},
+        {"project_id": owned, "user_id": user_id},
     ).fetchone()
-    return row is not None
+    if row is None:
+        return None
+    return normalize_role(row.role)
+
+
+def can_write(
+    db_session: Any, *, org_id: str, project_id: str, user_id: Optional[str]
+) -> bool:
+    """True iff ``user_id`` may persist into this project's shared brain."""
+    return member_role(
+        db_session, org_id=org_id, project_id=project_id, user_id=user_id
+    ) in WRITE_ROLES
+
+
+def can_manage(
+    db_session: Any, *, org_id: str, project_id: str, user_id: Optional[str]
+) -> bool:
+    """True iff ``user_id`` may change Read/Write membership on this project."""
+    return member_role(
+        db_session, org_id=org_id, project_id=project_id, user_id=user_id
+    ) in MANAGE_ROLES
+
+
+def is_admin(
+    db_session: Any, *, org_id: str, project_id: str, user_id: Optional[str]
+) -> bool:
+    """True iff ``user_id`` is a project Admin (may grant any role).
+
+    Narrower than :func:`can_manage`. ``project_grant`` is reachable by an
+    LLM, so promoting someone to Manage/Admin has to stay on Admin.
+    """
+    return (
+        member_role(
+            db_session, org_id=org_id, project_id=project_id, user_id=user_id
+        )
+        == ROLE_ADMIN
+    )
+
+
+def admin_count(db_session: Any, *, org_id: str, project_id: str) -> Optional[int]:
+    """Number of Admin rows, or ``None`` when the project is not this org's."""
+    owned = _owned_project_id(db_session, org_id=org_id, project_id=project_id)
+    if owned is None:
+        return None
+    row = db_session.execute(
+        text(
+            """
+            SELECT COUNT(*) FROM project_members
+            WHERE project_id = :project_id AND role = :role
+            """
+        ),
+        {"project_id": owned, "role": ROLE_ADMIN},
+    ).fetchone()
+    return int(row[0])
 
 
 def member_count(db_session: Any, *, org_id: str, project_id: str) -> Optional[int]:
@@ -155,22 +255,23 @@ def add_member(
     org_id: str,
     project_id: str,
     user_id: str,
-    role: str = ROLE_MEMBER,
+    role: str = ROLE_WRITE,
     granted_by: Optional[str],
 ) -> bool:
     """Idempotently grant ``user_id`` access to a project. Returns success.
 
     **Authorization is the caller's job** — this is the storage primitive, and
     the only checks it performs are the structural ones (the project belongs to
-    ``org_id``, the role is a legal value). :func:`is_admin` is the gate; see
-    ``app.mcp_app``'s ``project_grant`` for the composed operation, which also
-    writes the audit row.
+    ``org_id``, the role is a legal value). :func:`can_assign_role` /
+    :func:`can_touch_member` are the policy; see ``app.mcp_app``'s
+    ``project_grant`` for the composed operation, which also writes the audit
+    row.
 
-    A repeat grant upgrades the role rather than erroring, so re-granting an
-    existing member as ``admin`` works and re-granting them as ``member`` is a
-    deliberate demotion.
+    A repeat grant upgrades or demotes the role rather than erroring.
+    ``member`` is accepted and stored as ``write``.
     """
-    if role not in (ROLE_MEMBER, ROLE_ADMIN):
+    role = normalize_role(role)
+    if role not in ROLES:
         raise ValueError(f"unsupported role: {role!r}")
     if not user_id:
         raise ValueError("user_id is required")
