@@ -11,6 +11,14 @@ Features:
   ``memory`` for Klio brain tools)
 - Per-key rate limiting (sliding window, requests per minute)
 - Batched ``last_used_at`` updates (avoids write pressure on hot path)
+- Owner-membership re-check for attributed keys (``KeyInfo.user_id``):
+  every validation confirms the key's creator is still a member of the
+  workspace, folded into the existing Supabase plan lookup so it costs no
+  extra round-trip. A user removed from a workspace has their key stop
+  working within one ``cache_ttl_s`` window, not "whenever someone
+  remembers to revoke it." Unattributed keys (no ``created_by``, the
+  documented back-compat case) and validators with no Supabase engine
+  configured are unaffected -- see ``KeyValidator._query_plan_from_supabase``.
 """
 
 from __future__ import annotations
@@ -166,6 +174,15 @@ class _CachedKey:
     plan: str = "free"
     plan_overrides: dict | None = None
     user_id: str | None = None
+    # Whether ``user_id`` is still a member of the workspace, as of the last
+    # ``organizations``/Supabase query (see ``KeyValidator._query_db``).
+    # ``None`` means the check was not evaluated at all — ``user_id`` is
+    # ``None`` (unattributed key, the documented back-compat contract) or
+    # Supabase is not configured. ``None`` must never be treated as "not a
+    # member"; only an explicit ``False`` blocks the key. Rides the same
+    # cache TTL as everything else on this dataclass, so a revoked
+    # membership is re-checked, and takes effect, within ``cache_ttl_s``.
+    is_member: bool | None = None
     cached_at: float = field(default_factory=time.monotonic)
 
 
@@ -244,6 +261,12 @@ class KeyValidator:
         self._quota_cache_lock = Lock()
         self._quota_cache_ttl_s = 30.0
 
+        # Logged once (not per-request) the first time an attributed key is
+        # validated with no Supabase engine configured, so the membership
+        # check is silently skipped. See ``_query_plan_from_supabase``.
+        self._warned_supabase_unconfigured = False
+        self._warn_lock = Lock()
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -287,6 +310,29 @@ class KeyValidator:
             now = datetime.now(tz=timezone.utc)
             if now > entry.expires_at:
                 raise AuthError(401, "API key has expired")
+
+        # 4.5. Check the owner is still a member of the workspace.
+        #
+        # Mirrors the OAuth grant resolver's "deliberately redundant"
+        # re-check in oauth.py: a key's owner can be removed from the
+        # workspace without the key itself ever being revoked, and without
+        # this check the key would keep working indefinitely. ``is_member``
+        # is only ever ``False`` when the check actually ran and the
+        # membership row was absent -- ``None`` (unattributed key, or
+        # Supabase not configured) always skips this branch, per the
+        # back-compat contract on ``KeyInfo.user_id``.
+        #
+        # This rides the same cache as the rest of ``entry``, so a removed
+        # membership stops the key within one ``cache_ttl_s`` window (a
+        # cache hit re-checks ``entry.is_member`` on every call; a cache
+        # miss re-queries it fresh via ``_query_db``).
+        if entry.user_id is not None and entry.is_member is False:
+            raise AuthError(
+                403,
+                "The user who created this API key is no longer a member "
+                "of this workspace. Ask a workspace admin to issue a new "
+                "key, or re-add the original owner.",
+            )
 
         # 5. Check scope
         if self._required_scope not in entry.scopes:
@@ -374,8 +420,9 @@ class KeyValidator:
         self,
         account_slug: str,
         org_id: str | None = None,
+        user_id: str | None = None,
     ) -> tuple:
-        """Query plan data from the Supabase ``accounts`` table.
+        """Query plan data — and, when ``user_id`` is given, membership — from Supabase.
 
         The join prefers the **immutable** account UUID (``accounts.id``),
         which the dashboard writes into ``organizations.org_id`` when it
@@ -388,49 +435,139 @@ class KeyValidator:
         (migration 003 backfilled ``account_slug = org_id`` for them), so the
         mutable-slug join is retained as a fallback.
 
-        Returns a ``(plan, plan_overrides)`` tuple.  Falls back to
-        ``("free", None)`` if the Supabase engine is not configured, neither
-        join matches, or any error occurs.
+        Membership
+        ----------
+        The same reasoning that motivates the UUID-preferring plan join
+        motivates folding the membership check in here too: it is one more
+        column on a query this method already issues once per cache miss,
+        not a second round-trip to Supabase on the hot path. When
+        ``user_id`` is a well-formed UUID, the SELECT also computes whether
+        that user is a member of the resolved account (a ``LEFT``-style
+        ``EXISTS`` against ``accounts_memberships``) and the third element
+        of the returned tuple carries the answer:
+
+        - ``None`` — membership was not evaluated: ``user_id`` is ``None``
+          (unattributed key, the documented back-compat contract) or not a
+          valid UUID, or Supabase is not configured. Callers must treat
+          ``None`` as "skip the check", never as "not a member".
+        - ``True`` / ``False`` — Supabase was queried and answered.
+
+        Unlike the plan lookup (which fails open to ``"free"`` on any
+        Supabase error, so a paying tenant is never hard-downed by a flaky
+        query), a membership check that was actually requested fails
+        CLOSED: a query error raises :class:`AuthError` (503) instead of
+        returning a fallback. A transient Supabase outage must not look
+        like "key is fine" (a silent allow -- the whole point of this
+        method existing) nor like "owner was removed" (the wrong, and
+        distinct, 403 -- see ``KeyValidator.validate``). This mirrors
+        ``oauth.py``'s ``GrantStoreUnavailable`` -> 503 path, and this
+        module's own ``_check_quota``, which already raises 503 rather than
+        degrading on a reliability-quota query failure.
+
+        Returns a ``(plan, plan_overrides, is_member)`` tuple. ``(plan,
+        plan_overrides)`` keep their pre-existing fallback to ``("free",
+        None)`` when Supabase is unconfigured or the account is not found;
+        that behaviour is unchanged by this method learning to also answer
+        membership.
         """
         if self._supabase_engine is None:
-            return ("free", None)
+            if user_id is not None:
+                self._warn_supabase_unconfigured_once(account_slug)
+            return ("free", None, None)
+
+        check_membership = user_id is not None and _is_uuid(user_id)
+
         try:
             with self._supabase_engine.connect() as conn:
                 row = None
                 if _is_uuid(org_id):
                     row = conn.execute(
                         text(
-                            "SELECT vex_plan, vex_plan_overrides FROM accounts "
-                            "WHERE id = CAST(:account_id AS uuid) "
-                            "AND is_personal_account = false LIMIT 1"
+                            "SELECT a.vex_plan, a.vex_plan_overrides, "
+                            "EXISTS (SELECT 1 FROM public.accounts_memberships m "
+                            "WHERE m.account_id = a.id "
+                            "AND m.user_id = CAST(:user_id AS uuid)) AS is_member "
+                            "FROM accounts a "
+                            "WHERE a.id = CAST(:account_id AS uuid) "
+                            "AND a.is_personal_account = false LIMIT 1"
                         ),
-                        {"account_id": org_id},
+                        {
+                            "account_id": org_id,
+                            "user_id": user_id if check_membership else None,
+                        },
                     ).fetchone()
 
                 if row is None:
                     row = conn.execute(
                         text(
-                            "SELECT vex_plan, vex_plan_overrides FROM accounts "
-                            "WHERE slug = :slug AND is_personal_account = false LIMIT 1"
+                            "SELECT a.vex_plan, a.vex_plan_overrides, "
+                            "EXISTS (SELECT 1 FROM public.accounts_memberships m "
+                            "WHERE m.account_id = a.id "
+                            "AND m.user_id = CAST(:user_id AS uuid)) AS is_member "
+                            "FROM accounts a "
+                            "WHERE a.slug = :slug AND a.is_personal_account = false LIMIT 1"
                         ),
-                        {"slug": account_slug},
+                        {
+                            "slug": account_slug,
+                            "user_id": user_id if check_membership else None,
+                        },
                     ).fetchone()
 
                 if row is None:
-                    return ("free", None)
+                    return ("free", None, None)
                 plan = row[0] or "free"
                 overrides = (
                     row[1]
                     if isinstance(row[1], dict)
                     else (json.loads(row[1]) if row[1] else None)
                 )
-                return (plan, overrides)
+                is_member = bool(row[2]) if check_membership else None
+                return (plan, overrides, is_member)
         except Exception:
+            if check_membership:
+                logger.error(
+                    "Membership check failed for user=%s account=%s -- "
+                    "denying request (fail-closed), not defaulting to "
+                    "'free plan, allow' the way the plan lookup does",
+                    user_id,
+                    account_slug,
+                    exc_info=True,
+                )
+                raise AuthError(
+                    503,
+                    "Membership check temporarily unavailable. Please retry shortly.",
+                    retry_after_seconds=30,
+                ) from None
             logger.warning(
                 "Failed to query plan from Supabase, defaulting to free",
                 exc_info=True,
             )
-            return ("free", None)
+            return ("free", None, None)
+
+    def _warn_supabase_unconfigured_once(self, account_slug: str) -> None:
+        """Log once (not per-request) that the membership gate is disabled.
+
+        A ``KeyValidator`` with no ``supabase_database_url`` cannot check
+        membership at all, so every attributed key on it behaves as if its
+        owner is always still a member -- this IS a bypass of the gate this
+        module implements, and it is silent unless something logs it. Once
+        is enough: this is a static configuration fact about the process,
+        not a per-request event, and repeating it on every cache miss would
+        just be noise an operator learns to ignore.
+        """
+        with self._warn_lock:
+            if self._warned_supabase_unconfigured:
+                return
+            self._warned_supabase_unconfigured = True
+        logger.warning(
+            "KeyValidator has no Supabase engine configured (scope=%r); "
+            "API keys will NOT be re-checked against workspace membership "
+            "for account=%r or any other account. A user removed from a "
+            "workspace keeps using their key indefinitely on this "
+            "validator until it is explicitly revoked.",
+            self._required_scope,
+            account_slug,
+        )
 
     def _cache_get(self, key_hash: str) -> _CachedKey | None:
         with self._cache_lock:
@@ -471,36 +608,46 @@ class KeyValidator:
         org_id = row[0]
         api_keys = row[1] if isinstance(row[1], list) else json.loads(row[1])
         account_slug = row[2] if row[2] else org_id
-        plan_val, plan_overrides_val = self._query_plan_from_supabase(
-            account_slug, org_id
+
+        # Find the matching key entry in the JSONB array first: the
+        # membership check folded into the plan query below needs the
+        # entry's owner (``created_by``) before it can run.
+        key_entry = None
+        for candidate in api_keys:
+            if candidate.get("key_hash") == key_hash:
+                key_entry = candidate
+                break
+
+        if key_entry is None:
+            return None
+
+        user_id = key_entry.get("created_by")
+        plan_val, plan_overrides_val, is_member = self._query_plan_from_supabase(
+            account_slug, org_id, user_id
         )
         plan_config = get_plan_config(plan_val, plan_overrides_val)
 
-        # Find the matching key entry in the JSONB array
-        for key_entry in api_keys:
-            if key_entry.get("key_hash") == key_hash:
-                expires_at = None
-                if key_entry.get("expires_at"):
-                    expires_at = datetime.fromisoformat(
-                        key_entry["expires_at"].replace("Z", "+00:00")
-                    )
+        expires_at = None
+        if key_entry.get("expires_at"):
+            expires_at = datetime.fromisoformat(
+                key_entry["expires_at"].replace("Z", "+00:00")
+            )
 
-                per_key_rpm = key_entry.get("rate_limit_rpm", 1000)
-                effective_rpm = min(per_key_rpm, plan_config.max_rpm)
+        per_key_rpm = key_entry.get("rate_limit_rpm", 1000)
+        effective_rpm = min(per_key_rpm, plan_config.max_rpm)
 
-                return _CachedKey(
-                    org_id=org_id,
-                    key_id=key_entry["id"],
-                    scopes=key_entry.get("scopes", []),
-                    rate_limit_rpm=effective_rpm,
-                    expires_at=expires_at,
-                    revoked=key_entry.get("revoked", False),
-                    plan=plan_val,
-                    plan_overrides=plan_overrides_val,
-                    user_id=key_entry.get("created_by"),
-                )
-
-        return None
+        return _CachedKey(
+            org_id=org_id,
+            key_id=key_entry["id"],
+            scopes=key_entry.get("scopes", []),
+            rate_limit_rpm=effective_rpm,
+            expires_at=expires_at,
+            revoked=key_entry.get("revoked", False),
+            plan=plan_val,
+            plan_overrides=plan_overrides_val,
+            user_id=user_id,
+            is_member=is_member,
+        )
 
     def _check_agent_limit(self, entry: _CachedKey, agent_id: str | None) -> None:
         """Enforce per-plan agent limit."""

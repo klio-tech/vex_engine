@@ -1,6 +1,7 @@
 """Tests for the shared KeyValidator authentication module."""
 
 import hashlib
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -21,8 +22,16 @@ def _make_key_entry(
     rate_limit_rpm=1000,
     expires_at=None,
     revoked=False,
+    created_by="user-001",
 ):
-    """Build an api_keys JSONB entry for test fixtures."""
+    """Build an api_keys JSONB entry for test fixtures.
+
+    ``created_by`` defaults to ``"user-001"``, deliberately not a UUID --
+    the membership-check machinery in ``shared.auth`` treats a non-UUID
+    ``user_id`` the same as an absent one (skip the check), so every
+    existing fixture built from this default is unaffected by that check.
+    Tests that need a real membership check pass a UUID explicitly.
+    """
     key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
     entry = {
         "id": key_id,
@@ -33,7 +42,7 @@ def _make_key_entry(
         "rate_limit_rpm": rate_limit_rpm,
         "expires_at": expires_at,
         "created_at": "2026-02-12T00:00:00Z",
-        "created_by": "user-001",
+        "created_by": created_by,
         "last_used_at": None,
         "revoked": revoked,
     }
@@ -487,7 +496,7 @@ class TestQuotaEnforcement:
 
         # Directly set the plan on the validator's supabase query
         validator._query_plan_from_supabase = MagicMock(
-            return_value=(plan, plan_overrides),
+            return_value=(plan, plan_overrides, None),
         )
 
         return validator, raw_key, mock_conn
@@ -775,7 +784,12 @@ class TestPlanLookupJoin:
         assert result.plan_overrides == {"observations_per_month": 999}
         assert len(supabase_calls) == 1
         sql, params = supabase_calls[0]
-        assert params == {"account_id": ACCOUNT_UUID}
+        # user_id is always bound (even as None) so the membership EXISTS
+        # subquery can live in the same SELECT -- see
+        # _query_plan_from_supabase. This fixture's key entry carries
+        # created_by="user-001", not a UUID, so the membership check itself
+        # is skipped (user_id bound as None).
+        assert params == {"account_id": ACCOUNT_UUID, "user_id": None}
         assert ACCOUNT_UUID not in sql  # bound, never interpolated
 
     def test_overrides_json_string_is_parsed(self):
@@ -816,7 +830,7 @@ class TestPlanLookupJoin:
         assert result.plan == "pro"
         # A non-UUID org_id must not be sent to a uuid-typed column at all.
         assert len(supabase_calls) == 1
-        assert supabase_calls[0][1] == {"slug": "vex"}
+        assert supabase_calls[0][1] == {"slug": "vex", "user_id": None}
 
     def test_uuid_org_without_account_row_falls_back_to_slug(self):
         """UUID miss still tries the slug before giving up."""
@@ -836,8 +850,8 @@ class TestPlanLookupJoin:
 
         assert result.plan == "starter"
         assert len(supabase_calls) == 2
-        assert supabase_calls[0][1] == {"account_id": ACCOUNT_UUID}
-        assert supabase_calls[1][1] == {"slug": "acme"}
+        assert supabase_calls[0][1] == {"account_id": ACCOUNT_UUID, "user_id": None}
+        assert supabase_calls[1][1] == {"slug": "acme", "user_id": None}
 
     def test_unknown_org_falls_back_to_free(self):
         """Neither join matches -> safe ('free', None) fallback."""
@@ -879,6 +893,7 @@ class TestPlanLookupJoin:
         assert validator._query_plan_from_supabase("acme", ACCOUNT_UUID) == (
             "free",
             None,
+            None,
         )
 
 
@@ -904,7 +919,9 @@ class TestMemoryQuotaDecoupling:
         executed = _route_main_engine(
             engine, key_row=_make_db_row([entry]), **route_kwargs
         )
-        validator._query_plan_from_supabase = MagicMock(return_value=("free", None))
+        validator._query_plan_from_supabase = MagicMock(
+            return_value=("free", None, None)
+        )
         return validator, raw_key, executed
 
     def test_memory_scope_does_not_count_executions(self):
@@ -1041,3 +1058,251 @@ def test_cached_key_user_id_defaults_to_none_for_legacy_entries():
         revoked=False,
     )
     assert entry.user_id is None
+
+
+# ---------------------------------------------------------------------------
+# Key-path identity — the producer, end to end.
+#
+# The tests above construct KeyInfo/_CachedKey directly; they prove the
+# dataclasses can carry a user_id but not that the DB-backed path actually
+# populates one. These two exercise the real ``_query_db`` -> ``validate``
+# pipeline against a JSONB ``api_keys`` element, which is where the field
+# would silently stay None if the SELECT ever stopped reading ``created_by``.
+# ---------------------------------------------------------------------------
+
+
+def test_validate_populates_user_id_from_the_jsonb_key_entry():
+    """The full producer path: JSONB ``created_by`` reaches ``KeyInfo.user_id``.
+
+    ``_make_key_entry`` stamps every fixture with ``created_by: "user-001"``
+    (see the docstring above it), so this is the byte-for-byte end-to-end
+    check that ``_query_db`` selects the field out of the element and
+    ``validate`` carries it through onto the returned ``KeyInfo`` rather than
+    leaving it stuck on the internal ``_CachedKey``.
+    """
+    entry, raw_key, _ = _make_key_entry()
+    validator, engine = _build_validator(required_scope="verify")
+    _mock_db_query(engine, _make_db_row([entry]))
+
+    result = validator.validate(raw_key)
+
+    assert result.user_id == "user-001"
+
+
+def test_validate_leaves_user_id_none_for_a_key_entry_with_no_created_by():
+    """Back-compat contract: a key entry predating ``created_by`` must not
+    crash the lookup and must resolve to an unattributed (service) key.
+
+    Unlike the legacy-entry unit tests above, this builds the JSONB element
+    by hand with no ``created_by`` key at all (not even ``None``), which is
+    what a pre-existing production row actually looks like, and drives it
+    through ``validate`` rather than constructing ``_CachedKey`` directly.
+    """
+    raw_key = "ag_live_legacykey1234567890abcdefg"
+    key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+    entry = {
+        "id": "key-legacy",
+        "prefix": raw_key[:12],
+        "key_hash": key_hash,
+        "name": "Legacy Key",
+        "scopes": ["ingest", "verify", "read"],
+        "rate_limit_rpm": 1000,
+        "expires_at": None,
+        "created_at": "2025-01-01T00:00:00Z",
+        "last_used_at": None,
+        "revoked": False,
+        # deliberately no "created_by" key
+    }
+    validator, engine = _build_validator(required_scope="verify")
+    _mock_db_query(engine, _make_db_row([entry]))
+
+    result = validator.validate(raw_key)
+    assert result.user_id is None
+
+
+# ---------------------------------------------------------------------------
+# Tests: a key stops working when its owner leaves the workspace
+#
+# Mirrors app/oauth.py's GrantResolver._lookup, which re-queries
+# accounts_memberships on every grant resolution rather than trusting the
+# grant row's account_slug alone -- "deliberately redundant", per its own
+# comment, because a removed membership must not stay usable indefinitely.
+# KeyValidator._query_plan_from_supabase folds the same membership predicate
+# into the Supabase plan query it already issues per cache miss.
+# ---------------------------------------------------------------------------
+
+OWNER_UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+class TestOwnerMembershipGate:
+    def test_owner_is_a_member_validates_unchanged(self):
+        """Positive control: the suite can't pass vacuously -- a real member
+        must still authenticate normally, distinct from every rejection
+        test below."""
+        entry, raw_key, _ = _make_key_entry(created_by=OWNER_UUID)
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(main_engine, key_row=_make_db_row([entry]))
+        _route_supabase_engine(supabase_engine, by_slug=("free", None, True))
+
+        result = validator.validate(raw_key)
+
+        assert result.org_id == "test-org"
+        assert result.user_id == OWNER_UUID
+
+    def test_owner_not_a_member_is_rejected_with_a_distinct_error(self):
+        """Removed-member rejection must not be the generic 401 invalid-key
+        path -- support needs to tell the two apart."""
+        entry, raw_key, _ = _make_key_entry(created_by=OWNER_UUID)
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(main_engine, key_row=_make_db_row([entry]))
+        _route_supabase_engine(supabase_engine, by_slug=("free", None, False))
+
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+
+        assert exc_info.value.status_code == 403
+        assert exc_info.value.status_code != 401
+        assert "member" in exc_info.value.detail.lower()
+        assert "invalid api key" not in exc_info.value.detail.lower()
+
+    def test_owner_member_of_a_different_account_is_rejected(self):
+        """Adversarial case mirroring OAuth's 'grant repointed at someone
+        else's workspace': membership is scoped to the resolved account's
+        id, so being a member elsewhere buys nothing here."""
+        entry, raw_key, _ = _make_key_entry(created_by=OWNER_UUID)
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(
+            main_engine,
+            key_row=_make_db_row([entry], org_id=ACCOUNT_UUID, account_slug="acme"),
+        )
+        # The account resolves fine (a real plan comes back) but this
+        # owner's EXISTS check against *this* account's memberships is
+        # false -- they belong to some other workspace instead.
+        _route_supabase_engine(supabase_engine, by_id=("pro", None, False))
+
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+
+        assert exc_info.value.status_code == 403
+
+    def test_unattributed_key_ignores_the_membership_answer_entirely(self):
+        """No user_id -> the membership question isn't asked, and even a
+        stray falsy value in that column must never be examined. Proves
+        'no membership query issued' at the parameter level: user_id is
+        bound as None, so the EXISTS subquery can never match anything by
+        construction, not merely by convention."""
+        entry, raw_key, _ = _make_key_entry(created_by=None)
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(main_engine, key_row=_make_db_row([entry]))
+        supabase_calls = _route_supabase_engine(
+            supabase_engine, by_slug=("free", None, False)
+        )
+
+        result = validator.validate(raw_key)
+
+        assert result.org_id == "test-org"
+        assert result.user_id is None
+        assert supabase_calls[0][1]["user_id"] is None
+
+    def test_supabase_transient_failure_is_retryable_not_an_allow(self):
+        """decision 4: a DB blip must not become an open door, and must not
+        be indistinguishable from a genuine 'you were removed' 403."""
+        entry, raw_key, _ = _make_key_entry(created_by=OWNER_UUID)
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_main_engine(main_engine, key_row=_make_db_row([entry]))
+        _route_supabase_engine(supabase_engine, error=True)
+
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+
+        assert exc_info.value.status_code == 503
+        assert exc_info.value.status_code != 403
+        assert exc_info.value.retry_after_seconds == 30
+
+    def test_supabase_unconfigured_validates_with_a_warning(self, caplog):
+        """decision 3: no Supabase engine configured at all -> skip the
+        check and keep today's behaviour, but log once so a misconfigured
+        deployment doesn't silently run with the gate disabled forever."""
+        entry, raw_key, _ = _make_key_entry(created_by=OWNER_UUID)
+        validator, engine = _build_validator(required_scope="verify")
+        _mock_db_query(engine, _make_db_row([entry]))
+
+        with caplog.at_level(logging.WARNING, logger="agentguard.auth"):
+            result = validator.validate(raw_key)
+
+        assert result.org_id == "test-org"
+        assert result.user_id == OWNER_UUID
+        assert any(
+            "membership" in r.getMessage().lower() and "not" in r.getMessage().lower()
+            for r in caplog.records
+        )
+
+    def test_within_ttl_the_prior_membership_answer_is_reused(self):
+        """The membership answer rides the existing key cache -- no second
+        cache, no extra query on a cache hit."""
+        entry, raw_key, _ = _make_key_entry(created_by=OWNER_UUID)
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify", cache_ttl_s=60.0
+        )
+        _route_main_engine(main_engine, key_row=_make_db_row([entry]))
+        supabase_calls = _route_supabase_engine(
+            supabase_engine, by_slug=("free", None, True)
+        )
+
+        validator.validate(raw_key)
+        validator.validate(raw_key)
+
+        assert len(supabase_calls) == 1
+
+    def test_membership_answer_is_none_when_not_asked_even_if_the_row_says_true(self):
+        """Unit-level check of _query_plan_from_supabase's own contract.
+
+        validate() independently gates on entry.user_id is not None before
+        ever consulting is_member, so a wrong answer here would not
+        currently escape to an authentication decision -- but the method's
+        own documented contract ('None means not evaluated, never treat it
+        as an answer') must hold on its own, not merely as an accident of
+        how its one caller happens to use it today."""
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify"
+        )
+        _route_supabase_engine(supabase_engine, by_slug=("free", None, True))
+
+        _plan, _overrides, is_member = validator._query_plan_from_supabase(
+            "acme",
+            None,
+            None,  # no user_id -> membership not requested
+        )
+
+        assert is_member is None
+
+    def test_after_ttl_expiry_a_revoked_membership_is_rejected(self):
+        """decision 5: a removed member's key stops working within one
+        cache_ttl_s window -- not immediately, not 'eventually'."""
+        entry, raw_key, _ = _make_key_entry(created_by=OWNER_UUID)
+        validator, main_engine, supabase_engine = _build_validator_with_supabase(
+            required_scope="verify", cache_ttl_s=0.05
+        )
+        _route_main_engine(main_engine, key_row=_make_db_row([entry]))
+
+        _route_supabase_engine(supabase_engine, by_slug=("free", None, True))
+        first = validator.validate(raw_key)
+        assert first.org_id == "test-org"
+
+        time.sleep(0.1)  # let the cache entry expire
+        _route_supabase_engine(supabase_engine, by_slug=("free", None, False))
+
+        with pytest.raises(AuthError) as exc_info:
+            validator.validate(raw_key)
+
+        assert exc_info.value.status_code == 403

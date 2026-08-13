@@ -161,7 +161,11 @@ def _validator_with_overrides(overrides):
     conn.__exit__ = MagicMock(return_value=False)
     engine.connect.return_value = conn
 
-    validator._query_plan_from_supabase = lambda slug, org: ("free", overrides)
+    validator._query_plan_from_supabase = lambda slug, org, user_id=None: (
+        "free",
+        overrides,
+        None,
+    )
     return validator
 
 
