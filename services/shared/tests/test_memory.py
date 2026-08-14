@@ -553,20 +553,32 @@ async def test_find_similar_memory_below_threshold():
 
 
 def test_supersede_memory():
-    """supersede_memory should update the old memory's status."""
+    """supersede_memory should update the old memory's status, then
+    retroactively mark past stale serves via shared.stale (best-effort, a
+    second execute/commit pair on the same session)."""
     db_session = MagicMock()
+    db_session.execute.return_value.rowcount = 0
     old_id = uuid.uuid4()
     new_id = uuid.uuid4()
 
     supersede_memory(db_session, old_id, new_id, org_id="org-1")
 
-    db_session.execute.assert_called_once()
-    # The tenancy predicate and its bound value, together: a WHERE naming
-    # :org_id with nothing bound to it would silently match every tenant.
-    sql, params = db_session.execute.call_args.args
+    # First call: the status-flip UPDATE on session_memories.
+    assert db_session.execute.call_count == 2
+    sql, params = db_session.execute.call_args_list[0].args
     assert "org_id = :org_id" in str(sql)
+    assert "SET status = 'superseded'" in str(sql)
     assert params["org_id"] == "org-1"
-    db_session.commit.assert_called_once()
+    assert params["old_memory_id"] == str(old_id)
+    assert params["new_memory_id"] == str(new_id)
+
+    # Second call: the stale-serve ledger UPDATE, keyed off the same moment.
+    stale_sql, stale_params = db_session.execute.call_args_list[1].args
+    assert "recall_outcomes" in str(stale_sql)
+    assert stale_params["old_memory_id"] == str(old_id)
+    assert stale_params["superseding_created_at"] == params["superseding_created_at"]
+
+    assert db_session.commit.call_count == 2
 
 
 # ---------------------------------------------------------------------------

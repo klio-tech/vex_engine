@@ -24,7 +24,7 @@ import litellm
 from litellm import acompletion, aembedding
 from sqlalchemy import text
 
-from shared import lexical, metrics
+from shared import lexical, metrics, stale
 from shared.env_config import parse_float, parse_int
 
 # Project ACLs. Safe at module scope: ``projects`` imports nothing from this
@@ -1221,13 +1221,22 @@ def supersede_memory(
 
     A mismatched ``org_id`` updates nothing and raises nothing: the row is not
     this tenant's, which is the same non-event as an id that does not exist.
+
+    After the status flip commits, retroactively marks any past recall
+    serves of the old memory stale (:func:`shared.stale.mark_stale_serves`)
+    — but only the ones served at or after this moment, since that is the
+    instant the fact changed and the superseding belief came into being.
+    Serves before it were correct at the time. This is best-effort: a ledger
+    failure is logged and swallowed, never raised, so it can never turn a
+    successful supersession into a failed one.
     """
+    superseding_created_at = datetime.now(timezone.utc)
     db_session.execute(
         text("""
             UPDATE session_memories
             SET status = 'superseded',
                 superseded_by = :new_memory_id,
-                updated_at = NOW()
+                updated_at = :superseding_created_at
             WHERE id = :old_memory_id
               AND org_id = :org_id
         """),
@@ -1235,9 +1244,16 @@ def supersede_memory(
             "old_memory_id": str(old_memory_id),
             "new_memory_id": str(new_memory_id),
             "org_id": org_id,
+            "superseding_created_at": superseding_created_at,
         },
     )
     db_session.commit()
+    stale.mark_stale_serves(
+        db_session,
+        org_id=org_id,
+        old_memory_id=str(old_memory_id),
+        superseding_created_at=superseding_created_at,
+    )
 
 
 def retract_memory(
