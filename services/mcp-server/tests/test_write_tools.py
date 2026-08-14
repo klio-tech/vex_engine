@@ -495,3 +495,147 @@ async def test_write_space_slug_is_stripped():
     assert ekw["name"] == "spicy"
     assert ekw["org_id"] == "org-x"
     assert write_mock.await_args.kwargs["space_id"] == "sp-spicy"
+
+
+# ---------------------------------------------------------------------------
+# CAS (Task 8): base_revision / memory_id on the four re-assertable tools
+# ---------------------------------------------------------------------------
+#
+# Absent base_revision is asserted ALREADY, indirectly, by every test above:
+# none of them pass it, and every one still reaches write_scoped_memory
+# exactly as before. These tests cover the branch those never touch.
+
+_CAS_TOOLS = ["remember", "observe", "decide", "note"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", _CAS_TOOLS)
+async def test_base_revision_present_skips_plain_write_and_calls_cas(tool_name):
+    """base_revision routes to supersede_with_revision, never write_scoped_memory."""
+    fn = _get_tool_fn(tool_name)
+    write_mock = AsyncMock(return_value=_canned_result("memory"))
+    cas_mock = MagicMock(
+        return_value={"conflict": False, "new_id": "new-1", "new_revision": "rev-2"}
+    )
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app, "supersede_with_revision", cas_mock),
+    ):
+        result = await fn(
+            _fake_ctx(), "corrected content",
+            memory_id="mem-1", base_revision="rev-1",
+        )
+
+    write_mock.assert_not_called()
+    cas_mock.assert_called_once()
+    ckw = cas_mock.call_args.kwargs
+    assert ckw["memory_id"] == "mem-1"
+    assert ckw["base_revision"] == "rev-1"
+    assert ckw["new_content"] == "corrected content"
+    assert ckw["org_id"] == "org-x"
+    assert ckw["agent_id"] == "agent-y"
+
+    assert result["stored"] is True
+    assert result["id"] == "new-1"
+    assert result["revision"] == "rev-2"
+    assert result["superseded_id"] == "mem-1"
+
+
+@pytest.mark.asyncio
+async def test_base_revision_conflict_returns_tool_error_payload():
+    """A stale base_revision returns the documented revision_conflict shape,
+    not a generic write_failed."""
+    fn = _get_tool_fn("remember")
+    write_mock = AsyncMock()
+    cas_mock = MagicMock(
+        return_value={
+            "conflict": True,
+            "current": {
+                "id": "mem-1", "content": "someone else's edit",
+                "revision": "rev-9", "user_id": "u2",
+            },
+        }
+    )
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app, "supersede_with_revision", cas_mock),
+        patch("app.mcp_app.record_usage") as usage_mock,
+    ):
+        result = await fn(
+            _fake_ctx(), "my edit", memory_id="mem-1", base_revision="stale-rev",
+        )
+
+    write_mock.assert_not_called()
+    assert result == {
+        "error": "revision_conflict",
+        "current": {
+            "id": "mem-1", "content": "someone else's edit",
+            "revision": "rev-9", "user_id": "u2",
+        },
+        "hint": "belief changed while you worked — re-read and re-assert",
+    }
+    # A rejected CAS write stores nothing, so it must not consume the org's
+    # monthly memory allowance — same gate as a dedup skip on the plain path.
+    usage_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_base_revision_without_memory_id_is_refused_before_any_write():
+    """base_revision alone (no memory_id naming the row) is a clean error, not
+    a call into supersede_with_revision with a guaranteed-wrong guard."""
+    fn = _get_tool_fn("remember")
+    write_mock = AsyncMock()
+    cas_mock = MagicMock()
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app, "supersede_with_revision", cas_mock),
+    ):
+        result = await fn(_fake_ctx(), "content", base_revision="rev-1")
+
+    write_mock.assert_not_called()
+    cas_mock.assert_not_called()
+    assert result["stored"] is False
+    assert result["error"] == "missing_memory_id"
+
+
+@pytest.mark.asyncio
+async def test_absent_base_revision_is_unaffected_by_the_cas_wiring():
+    """Zero-regression check: with base_revision omitted, supersede_with_revision
+    is never even imported into the call path — write_scoped_memory runs
+    exactly as it did before Task 8."""
+    fn = _get_tool_fn("remember")
+    write_mock = AsyncMock(return_value=_canned_result("memory"))
+    cas_mock = MagicMock()
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app, "supersede_with_revision", cas_mock),
+    ):
+        result = await fn(_fake_ctx(), "plain content")
+
+    cas_mock.assert_not_called()
+    write_mock.assert_awaited_once()
+    assert result["stored"] is True

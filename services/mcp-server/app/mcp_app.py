@@ -62,6 +62,7 @@ from shared.memory import (
     call_llm,
     retract_memory,
     retrieve_memories_scoped,
+    supersede_with_revision,
 )
 from shared.plan_limits import get_plan_config
 from shared.promotion import promote_memory
@@ -153,6 +154,34 @@ SpaceParam = Annotated[
     Field(
         description=(
             "Optional space slug to scope this memory to; created if it doesn't exist."
+        )
+    ),
+]
+
+# Shared annotations for the optional CAS pair (Task 8, optimistic
+# concurrency) on the four write tools that can re-assert an existing row
+# (remember/observe/decide/note — `plan` is unaffected). Defined once for the
+# same drift-proofing reason as SpaceParam. Both default to None, which is
+# EXACTLY today's plain-insert behaviour; passing base_revision without
+# memory_id (or vice versa) is refused at the tool body, not the schema.
+MemoryIdParam = Annotated[
+    Optional[str],
+    Field(
+        description=(
+            "Id of an EXISTING memory this call re-asserts (from a prior "
+            "`recall`). Required together with `base_revision`; omit both "
+            "for an ordinary new write."
+        )
+    ),
+]
+BaseRevisionParam = Annotated[
+    Optional[str],
+    Field(
+        description=(
+            "The `revision` value `recall` returned for `memory_id`. If the "
+            "memory changed since you read it, the call returns "
+            "`revision_conflict` with the current state instead of "
+            "overwriting it — re-read and retry."
         )
     ),
 ]
@@ -257,6 +286,8 @@ async def _perform_write(
     metadata: Optional[dict] = None,
     scope: str = "org",
     space: Optional[str] = None,
+    memory_id: Optional[str] = None,
+    base_revision: Optional[str] = None,
 ) -> dict[str, Any]:
     """Shared body for the five Klio write tools.
 
@@ -300,10 +331,28 @@ async def _perform_write(
         space: Optional space slug to scope this memory to; the space is created
             (get-or-create) under the caller's org if it does not exist. Omitted
             or blank means the org-wide brain (``space_id=None``).
+        memory_id: Optional id of an EXISTING row this write re-asserts.
+            Ignored unless ``base_revision`` is also given (Task 8,
+            optimistic concurrency). Required together with
+            ``base_revision`` — the CAS guard needs a row to guard.
+        base_revision: Optional CAS token (a memory's ``revision``, as
+            returned by ``recall``). ``None`` (the default) is EXACTLY
+            today's behaviour: an ordinary insert via
+            :func:`shared.brain.write_scoped_memory`, no CAS involved. When
+            given, this call re-asserts ``memory_id`` instead of writing a
+            plain new row: :func:`shared.memory.supersede_with_revision`
+            atomically checks that nobody moved the belief since the caller
+            last read it. A stale token returns a
+            ``{"error": "revision_conflict", ...}`` payload instead of
+            silently last-writer-winning — the caller re-reads and retries.
 
     Returns:
-        The result dict from :func:`shared.brain.write_scoped_memory`, or a
-        clean error dict on auth failure / unexpected error.
+        The result dict from :func:`shared.brain.write_scoped_memory` (plain
+        path) or :func:`shared.memory.supersede_with_revision` (CAS path,
+        reshaped to the same ``stored``/``id``/... envelope, plus
+        ``revision`` and ``superseded_id``), or a clean error dict on auth
+        failure, a missing ``memory_id``, a stale ``base_revision``, or an
+        unexpected error.
     """
     request = ctx.request_context.request
     if request is None:
@@ -431,6 +480,68 @@ async def _perform_write(
                 project_id=header_project_id,
             )
         )
+
+        # CAS path (Task 8): base_revision present means "re-assert this
+        # existing row, but only if nobody moved it since I last read it".
+        # Absent base_revision is EXACTLY today's behaviour — the branch
+        # below is never entered, so an existing caller that has never heard
+        # of base_revision sees zero change.
+        if base_revision is not None:
+            if not memory_id:
+                return {
+                    "stored": False,
+                    "error": "missing_memory_id",
+                    "detail": (
+                        "base_revision requires memory_id naming the row "
+                        "being re-asserted."
+                    ),
+                }
+            cas_result = await anyio.to_thread.run_sync(
+                lambda: supersede_with_revision(
+                    db,
+                    org_id=org_id,
+                    memory_id=memory_id,
+                    base_revision=base_revision,
+                    new_content=content,
+                    agent_id=agent_id,
+                    memory_type=memory_type,
+                    session_id=session_id,
+                    scope=effective_scope,
+                    space_id=space_id,
+                    project_id=header_project_id,
+                    metadata=metadata,
+                    user_id=user_id,
+                )
+            )
+            if cas_result.get("conflict"):
+                return {
+                    "error": "revision_conflict",
+                    "current": cas_result.get("current"),
+                    "hint": (
+                        "belief changed while you worked — re-read and "
+                        "re-assert"
+                    ),
+                }
+            # A CAS supersede always stores a new row (there is no dedup
+            # branch on this path — an explicit re-assertion is never a
+            # duplicate of the row it is replacing), so it always meters,
+            # mirroring the ``result.get("stored")`` gate below.
+            await anyio.to_thread.run_sync(
+                lambda: record_usage(db, org_id, "memory", over_cap=over_cap)
+            )
+            return {
+                "stored": True,
+                "deduplicated": False,
+                "id": cas_result.get("new_id"),
+                "memory_type": memory_type,
+                "scope": effective_scope,
+                "space_id": space_id,
+                "project_id": header_project_id,
+                "user_id": user_id,
+                "provenance": "EXTRACTED",
+                "revision": cas_result.get("new_revision"),
+                "superseded_id": memory_id,
+            }
 
         result = await brain.write_scoped_memory(
             db,
@@ -1492,6 +1603,15 @@ def _serialize_record(
     A positive marker, because ``relevance is None`` — the previous and only
     signal — is erased by structural compression's null-key strip, leaving the
     agent unable to tell a semantic match from a one-hop walk.
+
+    ``revision`` (migration 043, Task 8) is the row's current CAS token. A
+    caller that reads it back and passes it as ``base_revision`` on the next
+    ``remember``/``decide``/``note``/``observe`` call gets the
+    optimistic-concurrency guarantee (:func:`shared.memory.
+    supersede_with_revision`); ``None`` when the record was built by a path
+    that never selected the column (graph-expanded rows, for one), which
+    structural compression's null-key strip erases from the wire the same way
+    it erases an absent ``relevance``.
     """
     return {
         "id": str(record.id),
@@ -1506,6 +1626,7 @@ def _serialize_record(
         "provenance": record.provenance,
         "relevance": record.relevance,
         "via": record.via,
+        "revision": record.revision,
         # space_id/project_id are ``sa.UUID()`` columns, so a raw ``text()``
         # SELECT yields ``uuid.UUID`` objects (not strings). Stringify them —
         # like ``id`` above — so the result is plain-``json``-serializable and
@@ -3014,6 +3135,8 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        memory_id: MemoryIdParam = None,
+        base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx,
@@ -3022,6 +3145,8 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata={"source": "mcp"},
             scope=scope,
             space=space,
+            memory_id=memory_id,
+            base_revision=base_revision,
         )
 
     @mcp.tool(
@@ -3043,6 +3168,8 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        memory_id: MemoryIdParam = None,
+        base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx,
@@ -3051,6 +3178,8 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata={"source": "mcp"},
             scope=scope,
             space=space,
+            memory_id=memory_id,
+            base_revision=base_revision,
         )
 
     @mcp.tool(
@@ -3103,6 +3232,8 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        memory_id: MemoryIdParam = None,
+        base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
         metadata = {"source": "mcp"}
         if rationale is not None:
@@ -3114,6 +3245,8 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata=metadata,
             scope=scope,
             space=space,
+            memory_id=memory_id,
+            base_revision=base_revision,
         )
 
     @mcp.tool(
@@ -3133,6 +3266,8 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        memory_id: MemoryIdParam = None,
+        base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx,
@@ -3141,6 +3276,8 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata={"source": "mcp"},
             scope=scope,
             space=space,
+            memory_id=memory_id,
+            base_revision=base_revision,
         )
 
     @mcp.tool(

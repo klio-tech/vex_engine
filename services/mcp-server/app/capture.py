@@ -526,13 +526,20 @@ def _serialize_memory(record: Any) -> dict[str, Any]:
     paths.  Only the fields a context block needs are emitted (no embedding,
     no internal verification columns); ``id`` is stringified and ``created_at``
     is ISO-8601 (or ``None``).
+
+    ``revision`` (migration 043) is the row's current CAS token — present when
+    the caller's row/query selected it, ``None`` otherwise (``getattr`` rather
+    than attribute access so this stays additive over any pre-existing caller
+    that has not started selecting the column).
     """
     created_at = getattr(record, "created_at", None)
+    revision = getattr(record, "revision", None)
     return {
         "id": str(record.id),
         "memory_type": record.memory_type,
         "content": record.content,
         "created_at": created_at.isoformat() if created_at is not None else None,
+        "revision": str(revision) if revision is not None else None,
     }
 
 
@@ -593,7 +600,7 @@ def _recent_memories(
     rows = db.execute(
         text(
             f"""
-            SELECT id, memory_type, content, created_at
+            SELECT id, memory_type, content, created_at, revision
             FROM session_memories
             WHERE org_id = :org_id
               AND {scope_sql}
