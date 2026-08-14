@@ -39,6 +39,23 @@ pgcrypto`` anywhere in this history. Postgres 13+ ships ``gen_random_uuid()``
 in core, so no extension is created here either — consistent with what the
 repo already does.
 
+RE-RUNNABLE (M1). ``autocommit_block()`` commits step 1 the instant it's
+entered — a later failure (say, a step-2 batch erroring, or the process
+being killed mid-backfill) leaves this migration PARTIALLY applied but
+Alembic still believing 043 never finished, since the version stamp only
+lands after ``upgrade()`` returns. Re-running ``alembic upgrade head`` must
+be a safe no-op against that partial state, not a hard failure on step 1's
+``ADD COLUMN`` erroring "column already exists":
+
+1. ``ADD COLUMN`` is guarded by an ``information_schema.columns`` existence
+   check — skipped entirely if ``revision`` is already there.
+2. The backfill loop is already naturally idempotent: its ``WHERE revision
+   IS NULL`` predicate means a second run simply finds zero rows left to
+   touch and exits immediately.
+3. ``SET DEFAULT`` and 4. ``SET NOT NULL`` are themselves idempotent under
+   Postgres — re-issuing either against a column already in that state
+   is a no-op, not an error — so no extra guard is needed for them.
+
 Revision ID: 043
 Revises: 042
 Create Date: 2026-08-13
@@ -62,11 +79,27 @@ depends_on: Union[str, Sequence[str], None] = None
 _BACKFILL_BATCH_SIZE = 5000
 
 
-def upgrade() -> None:
-    op.add_column(
-        "session_memories",
-        sa.Column("revision", postgresql.UUID(as_uuid=True), nullable=True),
+def _column_exists(bind: sa.engine.Connection, table: str, column: str) -> bool:
+    return bool(
+        bind.execute(
+            sa.text(
+                """
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = :table AND column_name = :column
+                """
+            ),
+            {"table": table, "column": column},
+        ).first()
     )
+
+
+def upgrade() -> None:
+    bind = op.get_bind()
+    if not _column_exists(bind, "session_memories", "revision"):
+        op.add_column(
+            "session_memories",
+            sa.Column("revision", postgresql.UUID(as_uuid=True), nullable=True),
+        )
 
     # Entering the block commits the ADD COLUMN above (releasing its ACCESS
     # EXCLUSIVE lock) and switches the connection to autocommit mode, so each

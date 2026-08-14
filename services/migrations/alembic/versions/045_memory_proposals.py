@@ -75,8 +75,8 @@ Indexes:
 * ``ix_memory_proposals_org_status`` serves the REST list endpoint's
   ``GET /proposals?status=open`` — org-scoped, filtered by status, on every
   request.
-* ``ux_memory_proposals_org_detector_target_open`` — a PARTIAL unique index
-  on ``(org_id, detector, target_memory_id)`` WHERE ``status = 'open'``.
+* ``ux_memory_proposals_org_detector_dedup_open`` — a PARTIAL unique index
+  on ``(org_id, detector, dedup_key)`` WHERE ``status = 'open'``.
   Every dream pass re-detects the same ongoing pattern (a tool still
   failing, a memory still under-performing) on every run; without this,
   each pass would file a fresh duplicate proposal for evidence a human
@@ -84,9 +84,24 @@ Indexes:
   a DECIDED proposal (approved/rejected/auto) never blocks a genuinely NEW
   occurrence of the same pattern from being filed later.
   ``app.dreamer._insert_proposal`` inserts with
-  ``ON CONFLICT (org_id, detector, target_memory_id) WHERE status = 'open'
+  ``ON CONFLICT (org_id, detector, dedup_key) WHERE status = 'open'
   DO NOTHING``, whose inference clause must match this index's columns AND
   predicate exactly.
+
+  M2 (amended before release): the original index was
+  ``(org_id, detector, target_memory_id)``, but ``target_memory_id`` is
+  ``NULL`` for the ``tool_failure`` detector (``kind='add'`` has no
+  target) — and Postgres treats every ``NULL`` as DISTINCT from every
+  other ``NULL`` for uniqueness purposes, so that index NEVER actually
+  deduplicated ``tool_failure`` proposals; every dream pass filed a fresh
+  one. ``dedup_key`` is a synthetic, always-non-NULL substitute: for
+  ``tool_failure`` it is ``'tool:' + sha256(tool)[:16]`` (the tool name is
+  the real identity of "the same ongoing pattern" for that detector, and
+  hashing keeps the key a bounded, opaque token rather than embedding the
+  tool name — a shorter, unbounded-shape-free stand-in, matching this
+  migration's own no-raw-evidence-in-index-keys spirit); for every other
+  detector it is simply ``target_memory_id`` as text, which was always a
+  correct, always-non-NULL dedup key on its own.
 
 Revision ID: 045
 Revises: 044
@@ -115,6 +130,11 @@ def upgrade() -> None:
         sa.Column("kind", sa.Text(), nullable=False),
         sa.Column("detector", sa.Text(), nullable=False),
         sa.Column("target_memory_id", postgresql.UUID(as_uuid=True), nullable=True),
+        # M2: synthetic, always-non-NULL dedup key — see module docstring's
+        # "Indexes" section for why target_memory_id alone cannot serve
+        # this role (NULL != NULL under uniqueness, and tool_failure's
+        # target_memory_id is always NULL).
+        sa.Column("dedup_key", sa.Text(), nullable=False),
         sa.Column("diff", sa.Text(), nullable=False),
         sa.Column("proposed_content", sa.Text(), nullable=True),
         sa.Column("evidence", postgresql.JSONB(astext_type=sa.Text()), nullable=False),
@@ -139,11 +159,12 @@ def upgrade() -> None:
     # Partial unique index — Alembic's op.create_index supports postgresql_where
     # for exactly this. The ON CONFLICT inference clause in
     # app.dreamer._insert_proposal must match these columns AND this predicate
-    # verbatim, or Postgres refuses to infer the index (42P10).
+    # verbatim, or Postgres refuses to infer the index (42P10). Keyed on
+    # dedup_key, not target_memory_id — see module docstring (M2).
     op.create_index(
-        "ux_memory_proposals_org_detector_target_open",
+        "ux_memory_proposals_org_detector_dedup_open",
         "memory_proposals",
-        ["org_id", "detector", "target_memory_id"],
+        ["org_id", "detector", "dedup_key"],
         unique=True,
         postgresql_where=sa.text("status = 'open'"),
     )
@@ -151,7 +172,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_index(
-        "ux_memory_proposals_org_detector_target_open",
+        "ux_memory_proposals_org_detector_dedup_open",
         table_name="memory_proposals",
     )
     op.drop_index("ix_memory_proposals_org_status", table_name="memory_proposals")

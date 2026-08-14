@@ -280,6 +280,60 @@ def test_approve_revise_kind_raises_reverts_claim_and_500s():
     assert revert.call_args.kwargs["proposal_id"] == PROPOSAL_ID
 
 
+def test_approve_revise_kind_forwards_project_id_for_project_scoped_target():
+    """M3: a project-scoped target's project_id must reach
+    supersede_with_revision — _target_row's SELECT includes it and
+    approve_proposal forwards it, closing the gap where
+    _prepare_cas_write's ValueError (no project_id for scope='project')
+    was previously masked as an opaque redaction_failed 409."""
+    client = _attributed_client()
+    db_patch, _session = _patch_db()
+    project_id = "44444444-4444-4444-4444-444444444444"
+    row = _open_proposal_row(kind="revise", target_memory_id=MEMORY_ID, scope="project")
+    with (
+        db_patch,
+        patch.object(proposals, "_load_proposal", return_value=row),
+        patch.object(proposals, "_target_row",
+                     return_value={"scope": "project", "revision": "rev-1",
+                                   "memory_type": "fact", "project_id": project_id}),
+        patch.object(proposals, "_claim_proposal", return_value=True),
+        patch.object(proposals, "supersede_with_revision",
+                     return_value={"conflict": False, "stored": True,
+                                   "new_id": "m-new", "new_revision": "rev-2"}) as sup,
+    ):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
+
+    assert resp.status_code == 200
+    assert sup.call_args.kwargs["project_id"] == project_id
+
+
+def test_approve_revise_kind_forbidden_reverts_claim_and_returns_403():
+    """M3: revise's forbidden result must map to 403, aligned with
+    retire's own forbidden -> 403 mapping (see
+    test_approve_retire_kind_forbidden_reverts_claim_and_returns_403) —
+    a 409 implies a retriable conflict, but re-approving will not change
+    who the caller is."""
+    client = _attributed_client()
+    db_patch, _session = _patch_db()
+    row = _open_proposal_row(kind="revise", target_memory_id=MEMORY_ID, scope="org")
+    with (
+        db_patch,
+        patch.object(proposals, "_load_proposal", return_value=row),
+        patch.object(proposals, "_target_row",
+                     return_value={"scope": "org", "revision": "rev-1",
+                                   "memory_type": "fact", "project_id": None}),
+        patch.object(proposals, "_claim_proposal", return_value=True),
+        patch.object(proposals, "_revert_claim") as revert,
+        patch.object(proposals, "supersede_with_revision",
+                     return_value={"conflict": False, "stored": False,
+                                   "error": "forbidden"}),
+    ):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
+
+    assert resp.status_code == 403
+    revert.assert_called_once()
+
+
 def test_approve_revise_kind_missing_target_row_is_409():
     client = _attributed_client()
     db_patch, _session = _patch_db()
@@ -433,3 +487,50 @@ def test_reject_already_decided_is_409():
     with db_patch, patch.object(proposals, "_load_proposal", return_value=row):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/reject")
     assert resp.status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# _revert_claim (H3: rollback-first, status-guarded)
+# ---------------------------------------------------------------------------
+
+
+def test_revert_claim_rolls_back_before_issuing_the_revert_update():
+    """H3: a revert reached after an exception mid-apply must start from a
+    clean transaction — db.rollback() must happen BEFORE the revert
+    UPDATE, undoing whatever the failed apply left half-applied."""
+    db = MagicMock()
+    calls = []
+    db.rollback.side_effect = lambda: calls.append("rollback")
+    db.execute.side_effect = lambda *a, **k: calls.append("execute") or MagicMock(rowcount=1)
+
+    proposals._revert_claim(db, org_id="test-org", proposal_id=PROPOSAL_ID)
+
+    assert calls[0] == "rollback"
+    assert "execute" in calls
+    assert calls.index("rollback") < calls.index("execute")
+
+
+def test_revert_claim_update_is_status_guarded():
+    """The revert UPDATE only touches rows still 'approved' — it must
+    never clobber a decision some other request already made between the
+    failed apply and this revert."""
+    db = MagicMock()
+    db.execute.return_value = MagicMock(rowcount=1)
+
+    proposals._revert_claim(db, org_id="test-org", proposal_id=PROPOSAL_ID)
+
+    executed_sql = str(db.execute.call_args.args[0])
+    assert "status = 'approved'" in executed_sql
+    assert "SET status = 'open'" in executed_sql
+
+
+def test_revert_claim_logs_when_rowcount_zero(caplog):
+    """A guarded revert that matches zero rows (someone else already
+    decided it) must be logged, not silently ignored and not raised."""
+    db = MagicMock()
+    db.execute.return_value = MagicMock(rowcount=0)
+
+    with caplog.at_level("WARNING"):
+        proposals._revert_claim(db, org_id="test-org", proposal_id=PROPOSAL_ID)
+
+    assert any("no row reverted" in rec.message for rec in caplog.records)

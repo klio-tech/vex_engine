@@ -78,6 +78,7 @@ blocks only its own worker thread — never the event loop the grader and
 verification consumers share.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -123,23 +124,10 @@ DEFAULT_SESSION_LOOKBACK = 200
 
 DEFAULT_BATCH_LIMIT = 50
 
-#: Per-field cap on a tool's raw ``args`` before it reaches a prompt or a
-#: proposal's stored content — an unbounded tool call argument (a huge
-#: file write, say) must not become an unbounded LLM request or DB row.
-MAX_SAMPLE_ARGS_CHARS = 500
-
 _DEFAULT_LLM_MODEL = "claude-haiku-4-5-20251001"
 _DEFAULT_LLM_TIMEOUT_S = 10.0
 
 _JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _bounded(value: Any, limit: int = MAX_SAMPLE_ARGS_CHARS) -> str:
-    """``value`` as text, truncated at ``limit`` chars, marker visible."""
-    as_text = value if isinstance(value, str) else str(value)
-    if len(as_text) <= limit:
-        return as_text
-    return as_text[:limit] + "…[truncated]"
 
 
 def _since(days: int = EVIDENCE_LOOKBACK_DAYS) -> datetime:
@@ -254,6 +242,14 @@ def _detect_tool_failures(sessions: list[dict[str, Any]]) -> list[dict[str, Any]
     ``proposed_content`` is set here, deterministically — no LLM involved in
     this value at all — so a ``kind='add'`` proposal from this detector can
     be approved even if LLM drafting fails entirely.
+
+    Evidence and content NEVER carry raw tool-call ``args``: those come
+    from individual (possibly private-scope) captured sessions, but every
+    proposal this detector files is org-scoped (``scope='org'`` — see
+    :func:`_insert_proposal`) and readable by any key in the org via
+    ``GET /proposals``. Only the tool name, how many distinct sessions it
+    failed in, and the session ids themselves (references, not content)
+    are ever recorded here.
     """
     by_tool: dict[str, dict[str, Any]] = {}
     for session in sessions:
@@ -266,7 +262,7 @@ def _detect_tool_failures(sessions: list[dict[str, Any]]) -> list[dict[str, Any]
             if not tool or tool in seen_this_session:
                 continue
             seen_this_session.add(tool)
-            entry = by_tool.setdefault(tool, {"sessions": [], "sample_args": call.get("args")})
+            entry = by_tool.setdefault(tool, {"sessions": []})
             entry["sessions"].append(session_id)
 
     detections = []
@@ -274,18 +270,14 @@ def _detect_tool_failures(sessions: list[dict[str, Any]]) -> list[dict[str, Any]
         prevalence = len(entry["sessions"])
         if prevalence < TOOL_FAILURE_MIN_SESSIONS:
             continue
-        sample_args = _bounded(entry["sample_args"])
-        summary = (
-            f"[auto] {tool} failed in {prevalence} sessions, sample shown: {sample_args}"
-        )
+        summary = f"[auto] {tool} failed in {prevalence} sessions"
         detections.append(
             {
                 "detector": "tool_failure",
                 "kind": "add",
                 "target_memory_id": None,
                 "prevalence": prevalence,
-                "evidence": {"sessions": entry["sessions"], "tool": tool,
-                             "sample_args": sample_args},
+                "evidence": {"sessions": entry["sessions"], "tool": tool},
                 "summary": summary,
                 "proposed_content": summary,
             }
@@ -497,24 +489,53 @@ def _target_row(db: Any, *, org_id: str, memory_id: str) -> Optional[dict[str, A
     return dict(row) if row is not None else None
 
 
+def _dedup_key(detection: dict[str, Any]) -> str:
+    """A synthetic, always-non-NULL dedup key for the partial unique index
+    (migration 045, ``ux_memory_proposals_org_detector_dedup_open``).
+
+    ``target_memory_id`` cannot serve this role on its own: Postgres treats
+    every ``NULL`` as DISTINCT from every other ``NULL`` under uniqueness,
+    and ``tool_failure`` detections always have ``target_memory_id = None``
+    (``kind='add'`` has no target) — so an index keyed on that column alone
+    never actually deduplicated ``tool_failure`` proposals; every dream pass
+    filed a fresh one for the same still-failing tool.
+
+    ``tool_failure``: ``'tool:' + sha256(tool)[:16]`` — the tool name IS
+    "the same ongoing pattern" for this detector; hashed (not embedded
+    verbatim) to keep the key a short, bounded, opaque token rather than an
+    unbounded tool-name string leaking into an index/ON CONFLICT clause.
+
+    Every other detector: ``target_memory_id`` as text — already a correct,
+    always-non-NULL dedup key on its own (each finding names exactly one
+    memory row).
+    """
+    if detection["detector"] == "tool_failure":
+        tool = detection["evidence"]["tool"]
+        digest = hashlib.sha256(tool.encode("utf-8")).hexdigest()[:16]
+        return f"tool:{digest}"
+    return str(detection["target_memory_id"])
+
+
 def _insert_proposal(db: Any, *, org_id: str, detection: dict[str, Any], diff: str) -> Optional[str]:
     """Insert one proposal, deduplicated against any already-OPEN proposal
-    for the same ``(org_id, detector, target_memory_id)`` via the partial
-    unique index (migration 045). Returns the new proposal's id, or
-    ``None`` if a conflicting open proposal already existed (no insert).
+    for the same ``(org_id, detector, dedup_key)`` via the partial unique
+    index (migration 045). Returns the new proposal's id, or ``None`` if a
+    conflicting open proposal already existed (no insert).
     """
     target_memory_id = detection.get("target_memory_id")
     scope = "org"
     proposal_id = str(uuid.uuid4())
+    dedup_key = _dedup_key(detection)
     inserted = db.execute(
         text(
             """
             INSERT INTO memory_proposals
-              (id, org_id, scope, kind, detector, target_memory_id, diff,
-               proposed_content, evidence, confidence, status)
+              (id, org_id, scope, kind, detector, target_memory_id, dedup_key,
+               diff, proposed_content, evidence, confidence, status)
             VALUES (:id, :org_id, :scope, :kind, :detector, :target_memory_id,
-                    :diff, :proposed_content, :evidence, :confidence, :status)
-            ON CONFLICT (org_id, detector, target_memory_id)
+                    :dedup_key, :diff, :proposed_content, :evidence,
+                    :confidence, :status)
+            ON CONFLICT (org_id, detector, dedup_key)
             WHERE status = 'open'
             DO NOTHING
             RETURNING id
@@ -527,6 +548,7 @@ def _insert_proposal(db: Any, *, org_id: str, detection: dict[str, Any], diff: s
             "kind": detection["kind"],
             "detector": detection["detector"],
             "target_memory_id": target_memory_id,
+            "dedup_key": dedup_key,
             "diff": diff,
             "proposed_content": detection.get("proposed_content"),
             "evidence": json.dumps(
@@ -690,14 +712,26 @@ def _try_auto_apply(
         "reverting claim to open",
         org_id, proposal_id, memory_id, result.get("error"),
     )
-    db.execute(
+    # Roll back FIRST: we reach here either after supersede_with_revision
+    # raised (this session's transaction may hold a half-applied write or
+    # sit in a failed/aborted state) or after it returned stored=False
+    # (no exception, but rolling back first is still correct — cheap and
+    # never wrong). The revert UPDATE must start from a clean transaction.
+    db.rollback()
+    result_row = db.execute(
         text(
             """
             UPDATE memory_proposals
             SET status = :status, decided_at = NULL
-            WHERE id = :id AND org_id = :org_id
+            WHERE id = :id AND org_id = :org_id AND status = 'auto'
             """
         ),
         {"status": "open", "id": proposal_id, "org_id": org_id},
     )
     db.commit()
+    if not result_row.rowcount:
+        logger.warning(
+            "dreamer: auto-apply revert matched no row (already decided "
+            "elsewhere) org=%s proposal=%s",
+            org_id, proposal_id,
+        )

@@ -152,26 +152,55 @@ def _revert_claim(db: Any, *, org_id: str, proposal_id: str) -> None:
     """Undo a won claim whose underlying apply then failed — the proposal
     goes back to ``open`` (decision cleared) rather than sitting decided
     with nothing actually written.
+
+    Rolls back FIRST: the caller reaches this after an exception raised
+    mid-apply (e.g. inside ``supersede_with_revision``'s own CAS write),
+    which may have left this session's transaction holding a half-applied
+    write or in a failed/aborted state. Reverting must start from a clean
+    transaction, not build the revert UPDATE on top of whatever the failed
+    apply left behind.
+
+    The UPDATE itself is status-guarded (``AND status = 'approved'``) so a
+    revert can only ever undo the claim IT won — it can never clobber a
+    decision some other request already made (e.g. this proposal being
+    re-claimed and re-decided between the failed apply and this revert).
+    A guarded UPDATE that matches zero rows (someone else already decided
+    it) is logged, not treated as an error.
     """
-    db.execute(
+    db.rollback()
+    result = db.execute(
         text(
             """
             UPDATE memory_proposals
             SET status = 'open', decided_at = NULL, decided_by = NULL
-            WHERE id = :id AND org_id = :org_id
+            WHERE id = :id AND org_id = :org_id AND status = 'approved'
             """
         ),
         {"id": proposal_id, "org_id": org_id},
     )
     db.commit()
+    if not result.rowcount:
+        logger.warning(
+            "_revert_claim: no row reverted (already decided elsewhere) "
+            "org=%s proposal=%s",
+            org_id, proposal_id,
+        )
 
 
 def _target_row(db: Any, *, org_id: str, memory_id: str) -> Optional[dict[str, Any]]:
+    """Includes ``project_id``: a ``scope='project'`` target's revise MUST
+    forward it into ``supersede_with_revision`` (``_prepare_cas_write``
+    raises ``ValueError`` for a project-scoped write with no
+    ``project_id``, which the caller's ``except Exception`` turns into an
+    opaque ``redaction_failed`` 409 — this SELECT closes that gap at the
+    source rather than leaving the caller to guess).
+    """
     row = (
         db.execute(
             text(
                 """
-                SELECT scope, revision, memory_type FROM session_memories
+                SELECT scope, revision, memory_type, project_id
+                FROM session_memories
                 WHERE id = :memory_id AND org_id = :org_id
                 """
             ),
@@ -304,6 +333,7 @@ async def approve_proposal(
                         user_id=user_id,
                         agent_id=agent_id,
                         scope=target["scope"],
+                        project_id=target.get("project_id"),
                     )
                 )
             except Exception:
@@ -326,7 +356,14 @@ async def approve_proposal(
                 await anyio.to_thread.run_sync(
                     lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
                 )
-                raise HTTPException(status_code=409, detail=apply_result)
+                # Align with retire's error-code mapping: "forbidden" (the
+                # scope-authorization ladder inside supersede_with_revision
+                # refused the caller) is a 403, never a 409 — a 409 implies
+                # a retriable conflict, but re-approving will not change
+                # who the caller is.
+                error = apply_result.get("error")
+                status_code = 403 if error == "forbidden" else 409
+                raise HTTPException(status_code=status_code, detail=apply_result)
             return {"status": "approved", "kind": "revise", "result": apply_result}
 
         # kind == "retire": retraction, never a supersede — see module docstring.

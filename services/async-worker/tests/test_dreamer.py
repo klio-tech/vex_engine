@@ -76,11 +76,17 @@ def test_llm_failure_diff_falls_back_to_deterministic_summary():
     assert ins.args[1]["proposed_content"] is not None
 
 
-def test_sample_args_are_truncated_before_reaching_the_prompt_or_row():
+def test_tool_call_args_never_reach_evidence_diff_or_proposed_content():
+    """H2: tool-failure evidence must never carry a session's raw
+    ``args`` — the proposal is org-scoped and readable by any key in the
+    org (``GET /proposals``), while the captured session that produced
+    the args may be private-scope. Only tool name + prevalence + session
+    id references may appear.
+    """
     db = MagicMock()
-    huge_args = "x" * 5000
+    secret_args = "super-secret-file-contents-from-a-private-session"
     sessions = [{"session_id": f"s{i}",
-                 "tool_calls": [{"tool": "Bash", "status": "error", "args": huge_args}]}
+                 "tool_calls": [{"tool": "Bash", "status": "error", "args": secret_args}]}
                 for i in range(3)]
     with patch.object(dreamer, "_load_recent_evidence", return_value={
             "sessions": sessions, "bad_memories": [], "stale_clusters": []}), \
@@ -89,7 +95,15 @@ def test_sample_args_are_truncated_before_reaching_the_prompt_or_row():
     ins = [c for c in db.execute.call_args_list
            if "INSERT INTO memory_proposals" in str(c.args[0])][0]
     evidence = json.loads(ins.args[1]["evidence"])
-    assert len(evidence["sample_args"]) <= dreamer.MAX_SAMPLE_ARGS_CHARS + len("…[truncated]")
+    assert "sample_args" not in evidence
+    assert secret_args not in json.dumps(evidence)
+    assert secret_args not in (ins.args[1]["diff"] or "")
+    assert secret_args not in (ins.args[1]["proposed_content"] or "")
+    # tool name + count are still present — the diff/summary is not blind.
+    assert "Bash" in ins.args[1]["diff"]
+    assert evidence["tool"] == "Bash"
+    assert evidence["prevalence"] == 3
+    assert evidence["sessions"] == ["s0", "s1", "s2"]
 
 
 def test_bad_outcome_memory_detector_emits_revise_proposal_with_null_content():
@@ -275,6 +289,85 @@ def test_duplicate_open_detection_is_deduplicated_by_conflict():
     assert written == 0
 
 
+class _FakeProposalsTable:
+    """Enforces the M2 partial-unique-index semantics
+    ``(org_id, detector, dedup_key) WHERE status = 'open'`` so
+    ``dream_for_org`` can be run twice against real INSERT/ON-CONFLICT
+    behavior without a live Postgres.
+    """
+
+    def __init__(self):
+        self.open_keys: set[tuple[str, str, str]] = set()
+        self.inserted: list[dict] = []
+
+    def execute(self, stmt, params=None):
+        s = str(stmt)
+        m = MagicMock()
+        if "INSERT INTO memory_proposals" in s:
+            key = (params["org_id"], params["detector"], params["dedup_key"])
+            if key in self.open_keys:
+                m.first.return_value = None  # ON CONFLICT ... DO NOTHING
+            else:
+                self.open_keys.add(key)
+                self.inserted.append(params)
+                m.first.return_value = (params["id"],)
+        return m
+
+    def commit(self):
+        pass
+
+
+def test_two_dream_passes_same_failing_tool_files_one_proposal():
+    """M2: tool_failure's dedup key must actually dedupe across passes —
+    the ORIGINAL bug was that target_memory_id (always NULL for
+    tool_failure) never matched itself under Postgres's NULL != NULL
+    uniqueness rule, so every pass filed a fresh duplicate."""
+    db = _FakeProposalsTable()
+    evidence = {"sessions": _sessions_with_tool_failures(3),
+                "bad_memories": [], "stale_clusters": []}
+    with patch.object(dreamer, "_load_recent_evidence", return_value=evidence), \
+         patch.object(dreamer, "_draft_diff", return_value="note"):
+        first = dreamer.dream_for_org(db, MagicMock(), org_id="o")
+        second = dreamer.dream_for_org(db, MagicMock(), org_id="o")
+
+    assert first == 1
+    assert second == 0
+    assert len(db.inserted) == 1
+
+
+def test_two_dream_passes_different_tools_file_two_proposals():
+    db = _FakeProposalsTable()
+    bash_sessions = _sessions_with_tool_failures(3)
+    curl_sessions = [{"session_id": f"c{i}",
+                       "tool_calls": [{"tool": "Curl", "status": "error"}]}
+                      for i in range(3)]
+    with patch.object(dreamer, "_draft_diff", return_value="note"):
+        with patch.object(dreamer, "_load_recent_evidence", return_value={
+                "sessions": bash_sessions, "bad_memories": [], "stale_clusters": []}):
+            first = dreamer.dream_for_org(db, MagicMock(), org_id="o")
+        with patch.object(dreamer, "_load_recent_evidence", return_value={
+                "sessions": curl_sessions, "bad_memories": [], "stale_clusters": []}):
+            second = dreamer.dream_for_org(db, MagicMock(), org_id="o")
+
+    assert first == 1
+    assert second == 1
+    assert len(db.inserted) == 2
+
+
+def test_dedup_key_for_tool_failure_is_stable_and_tool_specific():
+    a = dreamer._dedup_key({"detector": "tool_failure", "evidence": {"tool": "Bash"}})
+    b = dreamer._dedup_key({"detector": "tool_failure", "evidence": {"tool": "Bash"}})
+    c = dreamer._dedup_key({"detector": "tool_failure", "evidence": {"tool": "Curl"}})
+    assert a == b
+    assert a != c
+    assert a.startswith("tool:")
+
+
+def test_dedup_key_for_other_detectors_is_target_memory_id():
+    key = dreamer._dedup_key({"detector": "bad_outcome_memory", "target_memory_id": _MEMORY_ID})
+    assert key == _MEMORY_ID
+
+
 def test_agent_scope_revise_auto_applies_via_real_supersede_with_required_kwargs():
     """CRITICAL regression test: exercises the REAL
     shared.memory.supersede_with_revision (never patched out itself) so a
@@ -344,3 +437,76 @@ def test_agent_scope_revise_auto_applies_via_real_supersede_with_required_kwargs
                if "UPDATE memory_proposals" in str(c.args[0])]
     assert len(updates) == 1
     assert updates[0].args[1]["status"] == "auto"
+
+
+# ---------------------------------------------------------------------------
+# _try_auto_apply revert path (H3: rollback-first, status-guarded)
+# ---------------------------------------------------------------------------
+
+
+def test_try_auto_apply_rolls_back_before_reverting_a_failed_apply():
+    """H3: when supersede_with_revision raises mid-apply, the revert must
+    roll back this session's (possibly half-applied) transaction FIRST,
+    before issuing the revert UPDATE that puts the proposal back to open."""
+    db = MagicMock()
+    calls = []
+    db.rollback.side_effect = lambda: calls.append("rollback")
+
+    def execute(stmt, params=None):
+        calls.append("execute")
+        s = str(stmt)
+        m = MagicMock()
+        if "UPDATE memory_proposals" in s and "status = 'open'" in s:
+            m.first.return_value = ("proposal-1",)  # claim succeeds
+        elif "UPDATE memory_proposals" in s and "status = 'auto'" in s:
+            m.rowcount = 1  # revert UPDATE
+        return m
+    db.execute.side_effect = execute
+
+    with patch.object(dreamer, "supersede_with_revision", side_effect=RuntimeError("boom")):
+        dreamer._try_auto_apply(
+            db, org_id="o", proposal_id="proposal-1", memory_id=_MEMORY_ID,
+            base_revision=_BASE_REVISION, agent_id="agent-1",
+            memory_type="fact", proposed_content="new content",
+        )
+
+    # rollback must precede the revert UPDATE (the second "execute" call).
+    execute_indices = [i for i, c in enumerate(calls) if c == "execute"]
+    rollback_indices = [i for i, c in enumerate(calls) if c == "rollback"]
+    assert rollback_indices, "db.rollback() was never called"
+    assert rollback_indices[-1] > execute_indices[0], (
+        "rollback must happen after the claim but before the revert UPDATE"
+    )
+    assert rollback_indices[-1] < execute_indices[-1]
+
+
+def test_try_auto_apply_revert_update_is_status_guarded():
+    """The revert UPDATE only touches rows still 'auto' — it must never
+    clobber a decision a human made via app.proposals in the gap between
+    the claim and this revert."""
+    db = MagicMock()
+
+    def execute(stmt, params=None):
+        s = str(stmt)
+        m = MagicMock()
+        if "UPDATE memory_proposals" in s and "status = 'open'" in s:
+            m.first.return_value = ("proposal-1",)  # claim
+        elif "UPDATE memory_proposals" in s and "status = 'auto'" in s:
+            m.rowcount = 0  # revert matches nothing (already re-decided)
+        return m
+    db.execute.side_effect = execute
+
+    with patch.object(dreamer, "supersede_with_revision",
+                       return_value={"stored": False, "error": "conflict"}):
+        dreamer._try_auto_apply(
+            db, org_id="o", proposal_id="proposal-1", memory_id=_MEMORY_ID,
+            base_revision=_BASE_REVISION, agent_id="agent-1",
+            memory_type="fact", proposed_content="new content",
+        )
+
+    revert_calls = [
+        c for c in db.execute.call_args_list
+        if "UPDATE memory_proposals" in str(c.args[0]) and "status = 'auto'" in str(c.args[0])
+    ]
+    assert revert_calls
+    assert revert_calls[0].args[1]["status"] == "open"

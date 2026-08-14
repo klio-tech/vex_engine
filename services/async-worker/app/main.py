@@ -391,12 +391,51 @@ async def _consume_sessions_stored(redis_client: aioredis.Redis, s3_client: obje
             await asyncio.sleep(1)
 
 
+_S3_ENDPOINT_DEV_DEFAULT = "http://localhost:9000"
+
+
+def _warn_if_s3_env_missing() -> None:
+    """M5: the grader (``app.outcome_grader``, via ``shared.traces.fetch_trace``)
+    reads trace objects from S3, using the SAME generic ``S3_*`` env vars as
+    ``app.s3_client.get_s3_client`` (see that module's docstring). If those
+    are unset in a real deployment, every ``fetch_trace`` call silently
+    points at a local MinIO that does not exist there — nothing raises,
+    every session simply grades ``verdict='unknown'`` forever, and there is
+    no other signal anything is wrong.
+
+    There is no environment flag in ``app.config`` to gate this on (no
+    ``ENVIRONMENT``/``APP_ENV`` distinguishing dev from prod exists anywhere
+    in this service), so this logs unconditionally whenever the endpoint is
+    still the localhost dev default or credentials are unset — a real dev
+    setup logs one harmless error line on every start; a real deployment
+    that forgot to set these gets a loud, findable signal instead of silent
+    all-unknown grading. Never fails startup (no fail-fast) — grading
+    degrading to unknown is bad, but it must not be worse than not starting
+    at all.
+    """
+    endpoint = os.environ.get("S3_ENDPOINT")
+    access_key = os.environ.get("S3_ACCESS_KEY")
+    secret_key = os.environ.get("S3_SECRET_KEY")
+    if not endpoint or endpoint == _S3_ENDPOINT_DEV_DEFAULT or not access_key or not secret_key:
+        logger.error(
+            "S3 env not fully configured (S3_ENDPOINT=%s, S3_ACCESS_KEY=%s, "
+            "S3_SECRET_KEY=%s) — if this is a real deployment, not local "
+            "dev, every session will grade verdict='unknown' because "
+            "fetch_trace cannot reach the S3 bucket traces were written to. "
+            "Set S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY.",
+            endpoint or "<unset>",
+            "<set>" if access_key else "<unset>",
+            "<set>" if secret_key else "<unset>",
+        )
+
+
 async def run() -> None:
     """Start all consumer loops concurrently."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+    _warn_if_s3_env_missing()
 
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
     redis_client = aioredis.from_url(redis_url, **REDIS_CLIENT_OPTIONS)

@@ -203,7 +203,24 @@ async def _consume_verified(redis_client: aioredis.Redis) -> None:
 
 
 async def _consume_traces(redis_client: aioredis.Redis, s3_client: object) -> None:
-    """Consumer loop for redacted session evidence (S3 + session_traces row)."""
+    """Consumer loop for redacted session evidence (S3 + session_traces row).
+
+    Refuses to start without an explicit ``KLIO_TRACE_BUCKET`` — a silent
+    default here would mean retained session evidence lands wherever
+    ``get_s3_client()``'s default bucket happens to point, unnoticed. This
+    check is scoped to this loop only: it must never prevent the legacy
+    ``executions.raw``/``executions.verified`` consumers from starting.
+    """
+    try:
+        _require_trace_bucket()
+    except Exception as exc:
+        logger.error(
+            "traces-consumer: refusing to start (%s); "
+            "executions.raw/executions.verified consumers are unaffected",
+            exc,
+        )
+        return
+
     while True:
         try:
             messages = await redis_client.xreadgroup(
@@ -261,11 +278,6 @@ async def run() -> None:
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
-
-    # Refuse to start the traces loop without an explicit bucket — a silent
-    # default here would mean retained session evidence lands wherever
-    # get_s3_client()'s default bucket happens to point, unnoticed.
-    _require_trace_bucket()
 
     redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
     redis_client = aioredis.from_url(redis_url, **REDIS_CLIENT_OPTIONS)
