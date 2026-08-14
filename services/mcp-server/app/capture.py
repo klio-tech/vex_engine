@@ -251,6 +251,16 @@ class RecallRequest(BaseModel):
     space: Optional[str] = Field(default=None, description="Optional space slug.")
     git_remote: Optional[str] = Field(default=None)
     repo_root: Optional[str] = Field(default=None)
+    session_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Client session id, same value the transcript capture sends. "
+            "Optional and backward compatible: omitted is a no-op. Used to "
+            "derive the SAME session identity _capture_session_id computes "
+            "for a transcript capture, so the recall audit row can be joined "
+            "to the session it was served into."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -932,6 +942,15 @@ async def capture_recall(
         # psycopg2 I/O, so run it off the event loop per the shared.brain
         # threading contract. A logging failure must NEVER break the recall, so
         # this stays inside the try (the finally still closes the session).
+        #
+        # session_id is derived through the SAME _capture_session_id call the
+        # transcript handler uses (same org/agent/user/raw-session-id inputs),
+        # not the raw req.session_id: the grader joins brain_recall_events to
+        # session_traces on this derived identity, so a mismatched derivation
+        # here would silently break every join.
+        recall_session_id = _capture_session_id(
+            org_id, agent_id, req.session_id, user_id=user_id
+        )
         await anyio.to_thread.run_sync(
             lambda: log_recall_event(
                 db,
@@ -941,6 +960,8 @@ async def capture_recall(
                 query_text=(query or None),
                 result_count=len(memories),
                 source="hook",
+                memory_ids=[m["id"] for m in memories],
+                session_id=recall_session_id,
             )
         )
         await anyio.to_thread.run_sync(

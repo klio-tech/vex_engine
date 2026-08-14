@@ -1858,6 +1858,13 @@ async def _perform_recall(
         # Best-effort recall activity log; it swallows its own errors so a
         # logging failure can never break the recall. Offloaded like every
         # other statement in this body.
+        #
+        # session_id=None: the MCP ``recall`` tool carries no session
+        # identifier in scope (there is no ``_capture_session_id``-style
+        # derivation available here, unlike the hook capture path in
+        # app.capture) — inventing a different derivation would produce a
+        # session_id that never joins to a real session_traces row, which is
+        # worse than a NULL the grader can filter out.
         await anyio.to_thread.run_sync(
             lambda: log_recall_event(
                 db,
@@ -1867,6 +1874,8 @@ async def _perform_recall(
                 query_text=(query or None),
                 result_count=len(records),
                 source="mcp",
+                memory_ids=[str(r.id) for r in records],
+                session_id=None,
             )
         )
         # Meter the recall against the org's monthly allowance (best-effort;
