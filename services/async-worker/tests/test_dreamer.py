@@ -190,12 +190,13 @@ def test_retire_never_auto_applies_even_at_agent_scope():
             "sessions": [], "bad_memories": [],
             "stale_clusters": [{"memory_id": "m2", "stale_count": 3}]}), \
          patch.object(dreamer, "_draft_diff", return_value="retire m2"), \
-         patch.object(dreamer, "retract_memory") as rm, \
          patch.object(dreamer, "supersede_with_revision") as sup:
         written = dreamer.dream_for_org(db, MagicMock(), org_id="o")
 
     assert written == 1
-    rm.assert_not_called()
+    # retract_memory is not even imported by the dreamer anymore —
+    # the never-auto-retire guarantee is structural, not behavioural.
+    assert not hasattr(dreamer, "retract_memory")
     sup.assert_not_called()
     updates = [c for c in db.execute.call_args_list
                if "UPDATE memory_proposals" in str(c.args[0])]

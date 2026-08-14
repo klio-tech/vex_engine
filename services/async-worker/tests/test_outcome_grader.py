@@ -90,8 +90,8 @@ async def test_missing_trace_writes_unknown_session_outcome():
     recalls = [{"id": "re1", "memory_ids": ["m1"], "session_id": "s"}]
     db = _db(recalls, [_mem_row("m1", "x")])
     with patch.object(og, "fetch_trace", return_value=None):
-        result = await og.grade_stored_session(db, MagicMock(), org_id="o",
-                                               session_id="s")
+        await og.grade_stored_session(db, MagicMock(), org_id="o",
+                                      session_id="s")
     inserts = [c for c in db.execute.call_args_list
                if "INSERT INTO session_outcomes" in str(c.args[0])]
     assert inserts and inserts[0].args[1]["verdict"] == "unknown"

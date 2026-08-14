@@ -91,7 +91,7 @@ import litellm
 from sqlalchemy import text
 
 from shared.env_config import parse_float
-from shared.memory import retract_memory, supersede_with_revision
+from shared.memory import supersede_with_revision
 from shared.traces import fetch_trace
 
 logger = logging.getLogger("agentguard.dreamer")
