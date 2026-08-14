@@ -503,6 +503,7 @@ async def _perform_write(
                     memory_id=memory_id,
                     base_revision=base_revision,
                     new_content=content,
+                    user_id=user_id,
                     agent_id=agent_id,
                     memory_type=memory_type,
                     session_id=session_id,
@@ -510,9 +511,18 @@ async def _perform_write(
                     space_id=space_id,
                     project_id=header_project_id,
                     metadata=metadata,
-                    user_id=user_id,
                 )
             )
+            # Refused before any write was attempted: an invalid id, or the
+            # SAME authorization ladder `forget` enforces (not_found for a
+            # private/project row the caller cannot see, forbidden for an
+            # agent-ownership mismatch), or the content itself could not be
+            # prepared (redaction/embedding). None of these is a revision
+            # conflict — that shape is reserved for "the row is real, you may
+            # act on it, but it moved".
+            cas_error = cas_result.get("error")
+            if cas_error is not None:
+                return {"stored": False, "error": cas_error}
             if cas_result.get("conflict"):
                 return {
                     "error": "revision_conflict",
@@ -541,6 +551,8 @@ async def _perform_write(
                 "provenance": "EXTRACTED",
                 "revision": cas_result.get("new_revision"),
                 "superseded_id": memory_id,
+                "redacted": cas_result.get("redacted", False),
+                "redaction_kinds": cas_result.get("redaction_kinds", []),
             }
 
         result = await brain.write_scoped_memory(

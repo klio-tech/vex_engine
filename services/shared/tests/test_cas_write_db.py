@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 import pytest
 from sqlalchemy import create_engine, text
 
-from shared import memory as memory_mod
+from shared import memory as memory_mod, projects
 from shared.testing import database_url, requires_db
 
 DB_URL = database_url()
@@ -37,6 +37,8 @@ pytestmark = requires_db("the CAS write-conflict race tests")
 EMBED_DIM = 1024
 AGENT = "agent-cas"
 ORG_PREFIX = "org_cas_"
+PRIYA = "11111111-2222-3333-4444-555555555555"
+DEV = "99999999-8888-7777-6666-555555555555"
 
 
 def _unique_org() -> str:
@@ -70,8 +72,24 @@ def db():
         try:
             for org_id in orgs:
                 conn.execute(
+                    text(
+                        """
+                        DELETE FROM project_members WHERE project_id IN (
+                            SELECT id FROM projects WHERE org_id = :o)
+                        """
+                    ),
+                    {"o": org_id},
+                )
+                conn.execute(
+                    text("DELETE FROM project_grant_audit WHERE org_id = :o"),
+                    {"o": org_id},
+                )
+                conn.execute(
                     text("DELETE FROM session_memories WHERE org_id = :o"),
                     {"o": org_id},
+                )
+                conn.execute(
+                    text("DELETE FROM projects WHERE org_id = :o"), {"o": org_id}
                 )
             conn.commit()
         finally:
@@ -85,7 +103,16 @@ def _org(db) -> str:
     return org_id
 
 
-def _seed(db, *, org_id: str, content: str = "the on-call rotation is Priya") -> str:
+def _seed(
+    db,
+    *,
+    org_id: str,
+    content: str = "the on-call rotation is Priya",
+    scope: str = "org",
+    user_id: str | None = None,
+    agent_id: str = AGENT,
+    project_id: str | None = None,
+) -> str:
     memory_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     db.execute(
@@ -93,12 +120,12 @@ def _seed(db, *, org_id: str, content: str = "the on-call rotation is Priya") ->
             INSERT INTO session_memories (
                 id, session_id, org_id, agent_id, execution_id,
                 memory_type, content, embedding, scope, status,
-                user_id, provenance, metadata,
+                user_id, provenance, project_id, metadata,
                 created_at, updated_at
             ) VALUES (
                 :id, :session_id, :org_id, :agent_id, NULL,
-                'fact', :content, :embedding, 'org', 'active',
-                NULL, 'EXTRACTED', '{}'::jsonb,
+                'fact', :content, :embedding, :scope, 'active',
+                :user_id, 'EXTRACTED', :project_id, '{}'::jsonb,
                 :created_at, :updated_at
             )
         """),
@@ -106,15 +133,46 @@ def _seed(db, *, org_id: str, content: str = "the on-call rotation is Priya") ->
             "id": memory_id,
             "session_id": f"sess-{uuid.uuid4().hex[:6]}",
             "org_id": org_id,
-            "agent_id": AGENT,
+            "agent_id": agent_id,
             "content": content,
             "embedding": "[" + ",".join(["0.05"] * EMBED_DIM) + "]",
+            "scope": scope,
+            "user_id": user_id,
+            "project_id": project_id,
             "created_at": now,
             "updated_at": now,
         },
     )
     db.commit()
     return memory_id
+
+
+def _project(db, *, org_id: str, name: str = "apollo") -> str:
+    project_id = str(uuid.uuid4())
+    db.execute(
+        text(
+            """
+            INSERT INTO projects (id, org_id, git_remote, display_name)
+            VALUES (:id, :org_id, :remote, :name)
+            """
+        ),
+        {
+            "id": project_id,
+            "org_id": org_id,
+            "remote": f"git@example.com:{uuid.uuid4().hex[:8]}.git",
+            "name": name,
+        },
+    )
+    db.commit()
+    return project_id
+
+
+def _status(db, memory_id: str) -> str | None:
+    row = db.execute(
+        text("SELECT status FROM session_memories WHERE id = :id"),
+        {"id": memory_id},
+    ).fetchone()
+    return None if row is None else row.status
 
 
 def _read_revision(db, *, org_id: str, memory_id: str) -> str:
@@ -160,7 +218,10 @@ def test_sequential_stale_writer_loses(db):
         session_id="sess-cas-2",
     )
     assert second["conflict"] is True
-    assert second["current"]["id"] == memory_id
+    # H2: `current` follows the supersede chain to the LIVE belief — the
+    # winner's new row, not the now-dead memory_id the caller named.
+    assert second["current"]["id"] == first["new_id"]
+    assert second["current"]["revision"] == first["new_revision"]
     assert second["current"]["revision"] != base_revision
 
     # The old row was actually superseded — supersede_memory's semantics are
@@ -230,7 +291,10 @@ def test_two_concurrent_writers_exactly_one_wins(db):
 
     winner = next(r for r in results.values() if r["conflict"] is False)
     loser = next(r for r in results.values() if r["conflict"] is True)
-    assert loser["current"]["id"] == memory_id
+    # H2: `current` follows the chain to the winner's new row, not the dead
+    # memory_id both callers started from.
+    assert loser["current"]["id"] == winner["new_id"]
+    assert loser["current"]["revision"] == winner["new_revision"]
     assert loser["current"]["revision"] != base_revision
 
     status_row = db.execute(
@@ -239,3 +303,207 @@ def test_two_concurrent_writers_exactly_one_wins(db):
     ).fetchone()
     assert status_row.status == "superseded"
     assert str(status_row.superseded_by) == winner["new_id"]
+
+
+# ---------------------------------------------------------------------------
+# H1: the authorization ladder. Same shape as test_forget_isolation.py's
+# attack suite for retract_memory — both now share _authorize_scoped_action,
+# so this is also a regression guard against the two ever drifting apart.
+# Every negative is paired with a positive control performing the identical
+# supersede, so a ladder that refused everyone would not pass this file by
+# accident.
+# ---------------------------------------------------------------------------
+
+
+def test_private_row_owner_can_supersede_it(db):
+    org_id = _org(db)
+    memory_id = _seed(db, org_id=org_id, scope="private", user_id=PRIYA)
+    base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+
+    result = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="updated private note", user_id=PRIYA, agent_id=AGENT,
+        memory_type="fact", session_id="sess-priv-owner", scope="private",
+    )
+
+    assert result["conflict"] is False
+    assert result["stored"] is True
+
+
+def test_private_row_non_owner_gets_not_found_and_leaks_nothing(db):
+    """H1: this is the exact attack the review flagged — CAS-probing a
+    private row for its content+revision, then using that to destroy it.
+    Both halves must fail: no leak, no write."""
+    org_id = _org(db)
+    memory_id = _seed(
+        db, org_id=org_id, scope="private", user_id=PRIYA,
+        content="Priya's salary negotiation notes",
+    )
+    base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+
+    result = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="attacker's overwrite", user_id=DEV, agent_id=AGENT,
+        memory_type="fact", session_id="sess-priv-attack", scope="private",
+    )
+
+    assert result == {"conflict": False, "stored": False, "error": "not_found"}
+    # Never destroyed, and no `current` payload carrying its content ever
+    # left the function — the refusal is a bare error code, nothing else.
+    assert set(result) == {"conflict", "stored", "error"}
+    assert _status(db, memory_id) == "active"
+    assert _read_revision(db, org_id=org_id, memory_id=memory_id) == base_revision
+
+
+def test_an_unattributed_caller_cannot_supersede_a_private_row(db):
+    """user_id=None is not a member of anything, and not a wildcard."""
+    org_id = _org(db)
+    memory_id = _seed(db, org_id=org_id, scope="private", user_id=PRIYA)
+    base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+
+    result = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="attacker's overwrite", user_id=None, agent_id=AGENT,
+        memory_type="fact", session_id="sess-priv-anon", scope="private",
+    )
+
+    assert result == {"conflict": False, "stored": False, "error": "not_found"}
+    assert _status(db, memory_id) == "active"
+
+
+def test_the_private_refusal_is_identical_to_an_unknown_id(db):
+    """No existence oracle: a real private row a non-owner cannot see and an
+    id that was never issued must be the SAME answer."""
+    org_id = _org(db)
+    memory_id = _seed(db, org_id=org_id, scope="private", user_id=PRIYA)
+    base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+
+    refused = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="x", user_id=DEV, agent_id=AGENT, memory_type="fact",
+        session_id="s1",
+    )
+    unknown = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=str(uuid.uuid4()), base_revision=base_revision,
+        new_content="x", user_id=DEV, agent_id=AGENT, memory_type="fact",
+        session_id="s2",
+    )
+
+    assert refused == unknown == {
+        "conflict": False, "stored": False, "error": "not_found",
+    }
+
+
+def test_agent_scope_owning_agent_can_supersede(db):
+    org_id = _org(db)
+    memory_id = _seed(db, org_id=org_id, scope="agent", agent_id=AGENT)
+    base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+
+    result = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="updated agent note", agent_id=AGENT, memory_type="fact",
+        session_id="sess-agent-owner", scope="agent",
+    )
+
+    assert result["conflict"] is False
+    assert result["stored"] is True
+
+
+def test_agent_scope_non_owning_agent_gets_forbidden(db):
+    """Unlike the private/project arms, this answers forbidden — an agent
+    row's existence was never the secret, only the caller's standing."""
+    org_id = _org(db)
+    memory_id = _seed(db, org_id=org_id, scope="agent", agent_id=AGENT)
+    base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+
+    result = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="attacker's overwrite", agent_id="other-agent",
+        memory_type="fact", session_id="sess-agent-attack", scope="agent",
+    )
+
+    assert result == {"conflict": False, "stored": False, "error": "forbidden"}
+    assert _status(db, memory_id) == "active"
+
+
+def test_project_scope_member_can_supersede(db):
+    org_id = _org(db)
+    project_id = _project(db, org_id=org_id)
+    assert projects.add_member(
+        db, org_id=org_id, project_id=project_id, user_id=PRIYA, granted_by=None
+    )
+    db.commit()
+    memory_id = _seed(db, org_id=org_id, scope="project", project_id=project_id)
+    base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+
+    result = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="updated project note", user_id=PRIYA, agent_id=AGENT,
+        memory_type="fact", session_id="sess-proj-member", scope="project",
+        project_id=project_id,
+    )
+
+    assert result["conflict"] is False
+    assert result["stored"] is True
+
+
+def test_project_scope_non_member_gets_not_found(db):
+    org_id = _org(db)
+    project_id = _project(db, org_id=org_id)
+    assert projects.add_member(
+        db, org_id=org_id, project_id=project_id, user_id=PRIYA, granted_by=None
+    )
+    db.commit()
+    memory_id = _seed(db, org_id=org_id, scope="project", project_id=project_id)
+    base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+
+    result = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="attacker's overwrite", user_id=DEV, agent_id=AGENT,
+        memory_type="fact", session_id="sess-proj-attack", scope="project",
+        project_id=project_id,
+    )
+
+    assert result == {"conflict": False, "stored": False, "error": "not_found"}
+    assert _status(db, memory_id) == "active"
+
+
+# ---------------------------------------------------------------------------
+# H2: a superseded row's own (frozen) revision must not be a live CAS token.
+# ---------------------------------------------------------------------------
+
+
+def test_a_superseded_rows_frozen_revision_cannot_be_reused_as_a_cas_token(db):
+    """The guard's revision-only predicate would have MATCHED here: a
+    superseded row's own ``revision`` never changes again after the flip, so
+    a caller who reads it back post-supersession holds an exact-match token
+    for a dead row. ``status = 'active' AND superseded_by IS NULL`` is what
+    refuses it — without those two predicates this would silently succeed at
+    re-superseding an already-dead row."""
+    org_id = _org(db)
+    memory_id = _seed(db, org_id=org_id)
+    base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+
+    first = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="first correction", agent_id=AGENT, memory_type="fact",
+        session_id="sess-h2-1",
+    )
+    assert first["conflict"] is False
+
+    # The dead row's revision, read AFTER it was superseded — frozen at
+    # whatever the guard bumped it to during `first`.
+    frozen_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+    assert frozen_revision != base_revision  # sanity: it DID change once
+
+    replay = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=frozen_revision,
+        new_content="replay attempt", agent_id=AGENT, memory_type="fact",
+        session_id="sess-h2-2",
+    )
+
+    assert replay["conflict"] is True
+    assert replay["current"]["id"] == first["new_id"]
+    assert replay["current"]["revision"] == first["new_revision"]
+    # The dead row was never touched a second time.
+    assert _status(db, memory_id) == "superseded"

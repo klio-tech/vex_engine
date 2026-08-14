@@ -515,7 +515,11 @@ async def test_base_revision_present_skips_plain_write_and_calls_cas(tool_name):
     fn = _get_tool_fn(tool_name)
     write_mock = AsyncMock(return_value=_canned_result("memory"))
     cas_mock = MagicMock(
-        return_value={"conflict": False, "new_id": "new-1", "new_revision": "rev-2"}
+        return_value={
+            "conflict": False, "stored": True, "new_id": "new-1",
+            "new_revision": "rev-2", "redacted": True,
+            "redaction_kinds": ["stripe_secret_key"],
+        }
     )
 
     with (
@@ -540,11 +544,51 @@ async def test_base_revision_present_skips_plain_write_and_calls_cas(tool_name):
     assert ckw["new_content"] == "corrected content"
     assert ckw["org_id"] == "org-x"
     assert ckw["agent_id"] == "agent-y"
+    # user_id is forwarded too — the tool layer resolves it from the request
+    # (see resolve_request_user_id, unpatched here so it resolves to None),
+    # and supersede_with_revision needs it for the authorization ladder.
+    assert "user_id" in ckw
 
     assert result["stored"] is True
     assert result["id"] == "new-1"
     assert result["revision"] == "rev-2"
     assert result["superseded_id"] == "mem-1"
+    assert result["redacted"] is True
+    assert result["redaction_kinds"] == ["stripe_secret_key"]
+
+
+@pytest.mark.asyncio
+async def test_base_revision_auth_refusal_is_passed_through_as_stored_false():
+    """not_found / forbidden / invalid_id from the authorization ladder (H1)
+    surface as a plain stored:False error, never the revision_conflict shape
+    — that shape is reserved for "the row is real, you may act on it, but it
+    moved", and these callers may not act on it at all."""
+    fn = _get_tool_fn("remember")
+    write_mock = AsyncMock()
+    cas_mock = MagicMock(
+        return_value={"conflict": False, "stored": False, "error": "not_found"}
+    )
+
+    with (
+        patch(
+            "app.mcp_app.resolve_principal_plan",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
+        patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
+        patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
+        patch.object(mcp_app, "supersede_with_revision", cas_mock),
+        patch("app.mcp_app.record_usage") as usage_mock,
+    ):
+        result = await fn(
+            _fake_ctx(), "attacker's overwrite",
+            memory_id="mem-1", base_revision="whatever",
+        )
+
+    write_mock.assert_not_called()
+    assert result == {"stored": False, "error": "not_found"}
+    # A refused write stores nothing and must not consume the org's
+    # allowance, same gate as a conflict.
+    usage_mock.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -1368,39 +1368,136 @@ def _embed_text_sync(text_input: str) -> Optional[list[float]]:
     return item["embedding"] if isinstance(item, dict) else item.embedding
 
 
-def _apply_supersession_for_cas(
+#: Hard ceiling on how many hops :func:`_current_belief_in_chain` will walk.
+#: A legitimate ``superseded_by`` chain is a handful of hops at most; this
+#: exists only so a corrupted or (impossible, but never trust that) cyclic
+#: chain fails fast instead of making the database walk it forever.
+_CAS_CHAIN_MAX_DEPTH = 50
+
+
+def _authorize_scoped_action(
     db_session: Any,
+    row: Any,
     *,
     org_id: str,
-    old_id: str,
+    user_id: Optional[str],
+    agent_id: Optional[str],
+) -> Optional[str]:
+    """The shared scope-authorization ladder for acting on an existing row.
+
+    ``row`` must expose ``scope`` / ``agent_id`` / ``user_id`` / ``project_id``
+    via attribute access (a plain ``SELECT`` of those four columns). Returns
+    ``None`` when the caller may act on the row, otherwise the refusal code:
+
+    * ``"not_found"`` — ``scope='private'`` owned by someone else, or
+      ``scope='project'`` in a project the caller is not a member of.
+      Indistinguishable from an id that was never issued: confirming the row
+      EXISTS would itself be the disclosure a private/project scope promises
+      not to make.
+    * ``"forbidden"`` — ``scope='agent'`` owned by a different agent. The
+      row's existence is not in question here, only the caller's standing.
+
+    Extracted from :func:`retract_memory`'s original inline ladder (both now
+    call this) so the two authorization surfaces — retracting a memory and
+    CAS-superseding one — cannot silently drift apart. Same four checks, same
+    order, same refusal shape as before the extraction; see
+    :func:`retract_memory`'s docstring for why each answers the way it does.
+    """
+    if row.scope == "private" and (not user_id or row.user_id != user_id):
+        return "not_found"
+    if row.scope == "project" and not (
+        row.project_id
+        and projects.is_member(
+            db_session,
+            org_id=org_id,
+            project_id=str(row.project_id),
+            user_id=user_id,
+        )
+    ):
+        return "not_found"
+    if row.scope == "agent" and row.agent_id != agent_id:
+        return "forbidden"
+    return None
+
+
+def _current_belief_in_chain(
+    db_session: Any, *, org_id: str, memory_id: str
+) -> Optional[dict[str, Any]]:
+    """Walk ``memory_id``'s ``superseded_by`` chain forward to the live belief.
+
+    A superseded row's OWN ``revision`` never changes again once it stops
+    being current — the CAS guard bumps it once, at the moment it is
+    dethroned, and nothing touches it after. So a caller holding a stale copy
+    of a row that has SINCE been superseded can still present a
+    ``base_revision`` that matches the dead row's current value; the guard
+    itself is what refuses that (``AND status = 'active' AND superseded_by IS
+    NULL``). This function is the other half of that fix: once the guard has
+    missed, the honest answer to "what is current" is whatever sits at the
+    END of the supersede chain, not the (possibly long-dead) row named by
+    ``memory_id``. A recursive CTE walks the chain forward, org-predicated at
+    every hop, capped at :data:`_CAS_CHAIN_MAX_DEPTH` so a corrupted chain
+    cannot spin the database instead of failing fast.
+
+    Returns ``None`` if ``memory_id`` no longer resolves in this org at all
+    (retracted out from under a concurrent embed, or a caller who raced past
+    the earlier existence check — vanishingly rare, and this is the same
+    non-event an unknown id already is everywhere else in this module).
+    """
+    row = (
+        db_session.execute(
+            text(
+                """
+                WITH RECURSIVE chain AS (
+                    SELECT id, content, revision, user_id, superseded_by,
+                           0 AS depth
+                    FROM session_memories
+                    WHERE id = :memory_id AND org_id = :org_id
+                    UNION ALL
+                    SELECT m.id, m.content, m.revision, m.user_id,
+                           m.superseded_by, c.depth + 1
+                    FROM session_memories m
+                    JOIN chain c ON m.id = c.superseded_by
+                    WHERE m.org_id = :org_id AND c.depth < :max_depth
+                )
+                SELECT id, content, revision, user_id
+                FROM chain
+                WHERE superseded_by IS NULL
+                ORDER BY depth DESC
+                LIMIT 1
+                """
+            ),
+            {
+                "memory_id": memory_id,
+                "org_id": org_id,
+                "max_depth": _CAS_CHAIN_MAX_DEPTH,
+            },
+        )
+        .mappings()
+        .first()
+    )
+    return _normalize_current_row(row)
+
+
+def _prepare_cas_write(
     new_content: str,
-    agent_id: str,
-    memory_type: str,
-    session_id: str,
-    scope: str = "org",
-    space_id: Optional[str] = None,
-    project_id: Optional[str] = None,
-    metadata: Optional[dict] = None,
-    recall_hidden: bool = False,
-    user_id: Optional[str] = None,
-    provenance: str = "EXTRACTED",
-) -> dict[str, Any]:
-    """Write the re-asserted belief and flip the old row — the CAS success path.
+    *,
+    metadata: Optional[dict],
+    scope: str,
+    project_id: Optional[str],
+    user_id: Optional[str],
+) -> tuple[str, dict, Optional[list[float]], bool, list[str]]:
+    """Redact and embed the re-asserted belief — BEFORE the CAS guard runs.
 
-    Called ONLY after :func:`supersede_with_revision`'s guard ``UPDATE`` has
-    already confirmed (by rowcount) that ``base_revision`` was current. This
-    function's job is narrow: insert the new row at its final scope, then
-    delegate the status flip and stale-serve marking to
-    :func:`supersede_memory` VERBATIM — changing none of its semantics. That
-    is also why the old row's status flip is not duplicated here: it happens
-    exactly once, inside ``supersede_memory``.
-
-    Deliberately synchronous (see :func:`_embed_text_sync`) and deliberately
-    NOT a thin wrapper around :func:`shared.brain.write_scoped_memory`, which
-    is ``async def`` for the same reason ``embed_text`` is. The insert below
-    writes the row directly at its requested scope (rather than
-    write-then-promote) because there is no session-scoped intermediate state
-    to preserve here — the row is born already superseding something.
+    H3: the guard is a single ``UPDATE`` that takes a row-level lock and
+    holds a pooled connection until commit. A network call (the embedding
+    request) sitting between that ``UPDATE`` and its commit starves the pool
+    under concurrency and is worse than merely slow against Neon's pooled
+    (PgBouncer transaction-mode) endpoint, where a connection held open
+    across an unrelated round trip blocks every other statement sharing that
+    backend. So everything that can happen WITHOUT touching the guard's
+    transaction — scope validation, redaction, embedding — happens here,
+    called strictly before :func:`supersede_with_revision` issues the guard.
+    No network call is ever between the guard and its commit.
 
     Redaction mirrors :func:`shared.brain.write_scoped_memory`'s fail-closed
     contract: a redactor crash rejects the write rather than storing
@@ -1410,33 +1507,34 @@ def _apply_supersession_for_cas(
     ``_expand_via_graph`` imports ``shared.graph_store`` lazily.
 
     Returns:
-        ``{"new_id": ..., "new_revision": ...}`` — the freshly-inserted row's
-        id and its own CAS token, both stringified.
+        ``(content, metadata, embedding, redacted, redaction_kinds)``.
+        ``embedding`` is ``None`` only when the backend call failed — the
+        caller decides how to respond, this function does not raise for it.
 
     Raises:
-        ValueError: same validation ``shared.brain.write_scoped_memory``
-            applies — an unsupported ``scope``, a ``scope='private'`` write
-            with no ``user_id``, or a ``scope='project'`` write with no
-            ``project_id``.
-        RuntimeError: the embedding backend failed at the one attempt this
-            synchronous path makes.
+        ValueError: unsupported ``scope``, a ``scope='private'`` write with
+            no ``user_id``, or a ``scope='project'`` write with no
+            ``project_id`` — the same validation
+            :func:`shared.brain.write_scoped_memory` applies.
+        Exception: whatever the redactor / metadata screener raise, re-raised
+            after logging (fail closed — unscreened content is never stored).
     """
     if scope not in ("org", "project", "private", "agent"):
         raise ValueError(
-            f"unsupported scope: {scope!r} (_apply_supersession_for_cas "
-            "accepts 'org', 'project', 'private' or 'agent')"
+            f"unsupported scope: {scope!r} (supersede_with_revision accepts "
+            "'org', 'project', 'private' or 'agent')"
         )
     if scope == "private" and not user_id:
         raise ValueError("user_id is required when scope='private'")
     if scope == "project" and not project_id:
         raise ValueError("project_id is required when scope='project'")
 
-    # Lazy import: shared.brain imports find_similar_memory/write_memory from
-    # this module, so a module-scope import here would cycle.
     from shared.brain import screen_metadata
 
     content = new_content
     meta = dict(metadata or {})
+    redacted = False
+    redaction_kinds: list[str] = []
     if os.environ.get("MEMORY_REDACTION_DISABLED") != "1":
         try:
             redaction = redact(content)
@@ -1452,19 +1550,62 @@ def _apply_supersession_for_cas(
             redaction_kinds = sorted(
                 {f.kind for f in redaction.findings} | set(metadata_kinds)
             )
+            redacted = True
             meta = dict(meta or {})
             meta["redactions"] = redaction_kinds
 
     embedding = _embed_text_sync(content)
-    if embedding is None:
-        raise RuntimeError(
-            "CAS supersede: embedding generation failed; the write was not "
-            "stored"
-        )
+    return content, meta, embedding, redacted, redaction_kinds
 
+
+def _apply_supersession_for_cas(
+    db_session: Any,
+    *,
+    org_id: str,
+    old_id: str,
+    content: str,
+    embedding: list[float],
+    metadata: dict,
+    agent_id: str,
+    memory_type: str,
+    session_id: str,
+    scope: str = "org",
+    space_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+    recall_hidden: bool = False,
+    user_id: Optional[str] = None,
+    provenance: str = "EXTRACTED",
+) -> dict[str, Any]:
+    """Insert the pre-redacted, pre-embedded belief and flip the old row.
+
+    Called ONLY after :func:`supersede_with_revision`'s guard ``UPDATE`` has
+    already confirmed (by rowcount) that ``base_revision`` was current, on
+    content that :func:`_prepare_cas_write` already redacted and embedded
+    BEFORE the guard ran (H3 — see that function). Everything this function
+    itself does is a local DB statement — no network call, so nothing here
+    can hold the guard's row lock open across a round trip to a third party.
+
+    This function's own job is narrow: insert the new row at its final
+    scope, then delegate the status flip and stale-serve marking to
+    :func:`supersede_memory` VERBATIM — changing none of its semantics. That
+    is also why the old row's status flip is not duplicated here: it happens
+    exactly once, inside ``supersede_memory``.
+
+    Deliberately NOT a thin wrapper around :func:`shared.brain.
+    write_scoped_memory`, which is ``async def`` (embeds via ``embed_text``)
+    for the same reason :func:`_embed_text_sync` exists. The insert below
+    writes the row directly at its requested scope (rather than
+    write-then-promote) because there is no session-scoped intermediate state
+    to preserve here — the row is born already superseding something.
+
+    Returns:
+        ``{"new_id": ..., "new_revision": ...}`` — the freshly-inserted row's
+        id and its own CAS token (read via ``INSERT ... RETURNING``, not a
+        follow-up ``SELECT``), both stringified.
+    """
     new_id = uuid.uuid4()
     now = datetime.now(timezone.utc)
-    db_session.execute(
+    inserted = db_session.execute(
         text(
             """
             INSERT INTO session_memories (
@@ -1480,6 +1621,7 @@ def _apply_supersession_for_cas(
                 :created_at, :updated_at, :recall_hidden,
                 :user_id, :provenance, :space_id, :project_id
             )
+            RETURNING revision
             """
         ),
         {
@@ -1491,7 +1633,7 @@ def _apply_supersession_for_cas(
             "content": content,
             "embedding": str(embedding),
             "scope": scope,
-            "metadata": json.dumps(meta),
+            "metadata": json.dumps(metadata),
             "created_at": now,
             "updated_at": now,
             "recall_hidden": recall_hidden,
@@ -1501,18 +1643,12 @@ def _apply_supersession_for_cas(
             "project_id": project_id,
         },
     )
+    returned = inserted.fetchone()
+    new_revision = str(returned[0]) if returned is not None else None
 
     # The status flip, superseded_by link, and stale-serve marking — verbatim,
     # unchanged. supersede_memory commits.
     supersede_memory(db_session, uuid.UUID(str(old_id)), new_id, org_id=org_id)
-
-    new_revision_row = db_session.execute(
-        text("SELECT revision FROM session_memories WHERE id = :id AND org_id = :org_id"),
-        {"id": str(new_id), "org_id": org_id},
-    ).fetchone()
-    new_revision = (
-        str(new_revision_row[0]) if new_revision_row is not None else None
-    )
 
     return {"new_id": str(new_id), "new_revision": new_revision}
 
@@ -1547,17 +1683,50 @@ def supersede_with_revision(
     memory_id: str,
     base_revision: str,
     new_content: str,
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
     **write_kwargs: Any,
 ) -> dict[str, Any]:
     """Mukta's optimistic-concurrency loop, server side.
 
-    The guard is one atomic ``UPDATE``: it bumps the row's ``revision`` ONLY
-    if the caller's ``base_revision`` is still current. Zero rows means
-    someone moved the belief while this agent worked — return the current
-    state so the agent re-reads and re-asserts, instead of silently
-    last-writer-winning.
+    Four phases, strictly in this order:
 
-    Under real Postgres this is race-safe with no extra locking on the
+    1. **Validate the id** — an unparseable ``memory_id`` is refused before
+       any query, mirroring :func:`retract_memory`'s ``invalid_id``.
+    2. **Authorize** (H1) — the SAME scope ladder :func:`retract_memory` uses
+       (:func:`_authorize_scoped_action`), run against ``memory_id`` before
+       ANYTHING else happens. Without this, any org principal could name a
+       private row's id, read its content+revision back out of the conflict
+       payload, and then use that revision to actually supersede (destroy)
+       it — a read primitive and a write primitive hiding inside what looks
+       like a single guarded write. An unauthorized or nonexistent id gets
+       the exact same refusal :func:`retract_memory` gives: ``not_found`` for
+       a private/project row the caller cannot see (never ``forbidden`` —
+       that would itself confirm the row exists), ``forbidden`` only for the
+       agent-ownership mismatch, where existence was never secret.
+    3. **Prepare** (H3) — redact and embed ``new_content``
+       (:func:`_prepare_cas_write`) BEFORE the guard runs. The embed is a
+       network call; the guard is a row lock. Doing the network call first
+       means no network call ever sits between the guard ``UPDATE`` and its
+       commit, which is what keeps a slow embed from holding a pooled
+       connection (fatal against Neon's PgBouncer transaction-mode endpoint)
+       or a row lock (starves concurrent writers) open across a third-party
+       round trip.
+    4. **Guard, then apply** (H2) — the atomic ``UPDATE`` bumps ``revision``
+       ONLY if ``base_revision`` is still current AND the row is still
+       ``status = 'active'`` AND ``superseded_by IS NULL``. The status/
+       superseded_by predicates close a hole the revision check alone does
+       not: a superseded row's OWN ``revision`` never changes again once it
+       stops being current, so a caller holding a stale copy of an
+       ALREADY-superseded row could otherwise still pass the guard. Zero rows
+       means someone moved the belief (or it is dead) — the conflict payload
+       follows the ``superseded_by`` chain to the actual live belief
+       (:func:`_current_belief_in_chain`) rather than echoing back the dead
+       row's own (frozen) content, so the field named ``current`` means
+       current. A match proceeds through the existing supersession machinery
+       (:func:`_apply_supersession_for_cas`) unchanged.
+
+    Under real Postgres phase 4 is race-safe with no extra locking on the
     caller's part: the ``UPDATE ... WHERE revision = :base_revision`` takes a
     row-level lock, so a second writer racing on the SAME row blocks until the
     first commits or rolls back, then re-evaluates its own ``WHERE`` against
@@ -1569,8 +1738,8 @@ def supersede_with_revision(
     a worker thread (``anyio.to_thread.run_sync``), matching the house
     pattern for every other blocking DB write in this module
     (:func:`supersede_memory`, :func:`retract_memory`). See
-    :func:`_embed_text_sync` for why the success path cannot use the async
-    embedding helper.
+    :func:`_embed_text_sync` for why phase 3 cannot use the async embedding
+    helper.
 
     Args:
         db: A synchronous SQLAlchemy session/connection.
@@ -1578,19 +1747,80 @@ def supersede_with_revision(
         memory_id: The row being re-asserted.
         base_revision: The ``revision`` the caller last read. Stale → conflict.
         new_content: The re-asserted belief's text.
-        **write_kwargs: Forwarded verbatim to
-            :func:`_apply_supersession_for_cas` on the success path
-            (``agent_id``, ``memory_type``, ``session_id``, and the optional
-            ``scope`` / ``space_id`` / ``project_id`` / ``metadata`` /
-            ``recall_hidden`` / ``user_id`` / ``provenance``).
+        user_id: The caller's resolved identity — the SAME thing
+            :func:`retract_memory` takes, used identically: it is the owner
+            check on a ``private`` row and the membership check on a
+            ``project`` row, and it is forwarded to the new row as authorship.
+        agent_id: The caller's agent principal — the ownership check on an
+            ``agent``-scoped row, and forwarded to the new row as author.
+        **write_kwargs: Forwarded to :func:`_apply_supersession_for_cas` on
+            the success path (``memory_type``, ``session_id``, and the
+            optional ``scope`` / ``space_id`` / ``project_id`` / ``metadata``
+            / ``recall_hidden`` / ``provenance``). ``metadata`` here is the
+            RAW value — the redacted one built in phase 3 is what actually
+            gets forwarded.
 
     Returns:
-        On conflict: ``{"conflict": True, "current": {"id", "content",
-        "revision", "user_id"} | None}`` — ``None`` only if the row vanished
-        (retracted/cross-org) between the failed guard and the read-back.
-        On success: ``{"conflict": False, "new_id": ..., "new_revision":
-        ...}``.
+        Refused before any write is attempted (``stored`` is always
+        ``False``): ``{"conflict": False, "stored": False, "error":
+        "invalid_id" | "not_found" | "forbidden" | "redaction_failed" |
+        "embedding_failed"}``.
+
+        On conflict: ``{"conflict": True, "stored": False, "current": {"id",
+        "content", "revision", "user_id"} | None}`` — ``current`` is ``None``
+        only if the row vanished from this org entirely between the
+        authorization check and the guard (a race with a delete, not a normal
+        outcome).
+
+        On success: ``{"conflict": False, "stored": True, "redacted": bool,
+        "redaction_kinds": [...], "new_id": ..., "new_revision": ...}`` — the
+        same ``redacted``/``redaction_kinds`` shape
+        :func:`shared.brain.write_scoped_memory` returns on its success path.
     """
+    try:
+        parsed_id = uuid.UUID(str(memory_id))
+    except (ValueError, AttributeError, TypeError):
+        return {"conflict": False, "stored": False, "error": "invalid_id"}
+    memory_id = str(parsed_id)
+
+    # ---- phase 2: authorize (H1) ------------------------------------------
+    row = db.execute(
+        text(
+            """
+            SELECT scope, agent_id, user_id, project_id
+            FROM session_memories
+            WHERE id = :memory_id AND org_id = :org_id
+            LIMIT 1
+            """
+        ),
+        {"memory_id": memory_id, "org_id": org_id},
+    ).fetchone()
+    if row is None:
+        return {"conflict": False, "stored": False, "error": "not_found"}
+    refusal = _authorize_scoped_action(
+        db, row, org_id=org_id, user_id=user_id, agent_id=agent_id
+    )
+    if refusal is not None:
+        return {"conflict": False, "stored": False, "error": refusal}
+
+    # ---- phase 3: prepare — redact + embed, BEFORE the guard (H3) --------
+    try:
+        content, meta, embedding, redacted, redaction_kinds = _prepare_cas_write(
+            new_content,
+            metadata=write_kwargs.get("metadata"),
+            scope=write_kwargs.get("scope", "org"),
+            project_id=write_kwargs.get("project_id"),
+            user_id=user_id,
+        )
+    except Exception:
+        metrics.record(metrics.MEMORY_WRITES.inc, outcome="error")
+        return {"conflict": False, "stored": False, "error": "redaction_failed"}
+
+    if embedding is None:
+        metrics.record(metrics.MEMORY_WRITES.inc, outcome="error")
+        return {"conflict": False, "stored": False, "error": "embedding_failed"}
+
+    # ---- phase 4: guard (H2), then apply -----------------------------------
     guard = db.execute(
         text(
             """
@@ -1598,6 +1828,8 @@ def supersede_with_revision(
             SET revision = gen_random_uuid()
             WHERE id = :memory_id AND org_id = :org_id
               AND revision = :base_revision
+              AND status = 'active'
+              AND superseded_by IS NULL
             """
         ),
         {
@@ -1608,30 +1840,29 @@ def supersede_with_revision(
     )
     if not guard.rowcount:
         record_write_conflict()
-        current = db.execute(
-            text(
-                """
-                SELECT id, content, revision, user_id
-                FROM session_memories
-                WHERE id = :memory_id AND org_id = :org_id
-                """
-            ),
-            {"memory_id": memory_id, "org_id": org_id},
-        ).mappings().first()
-        return {
-            "conflict": True,
-            "current": _normalize_current_row(current),
-        }
+        current = _current_belief_in_chain(db, org_id=org_id, memory_id=memory_id)
+        return {"conflict": True, "stored": False, "current": current}
 
+    forwarded = dict(write_kwargs)
+    forwarded.pop("metadata", None)  # the redacted `meta` replaces it below
+    result = _apply_supersession_for_cas(
+        db,
+        org_id=org_id,
+        old_id=memory_id,
+        content=content,
+        embedding=embedding,
+        metadata=meta,
+        agent_id=agent_id,
+        user_id=user_id,
+        **forwarded,
+    )
+    metrics.record(metrics.MEMORY_WRITES.inc, outcome="ok")
     return {
         "conflict": False,
-        **_apply_supersession_for_cas(
-            db,
-            org_id=org_id,
-            old_id=memory_id,
-            new_content=new_content,
-            **write_kwargs,
-        ),
+        "stored": True,
+        "redacted": redacted,
+        "redaction_kinds": redaction_kinds,
+        **result,
     }
 
 
@@ -1707,20 +1938,11 @@ def retract_memory(
     ).fetchone()
     if row is None:
         return {"forgotten": False, "error": "not_found"}
-    if row.scope == "private" and (not user_id or row.user_id != user_id):
-        return {"forgotten": False, "error": "not_found"}
-    if row.scope == "project" and not (
-        row.project_id
-        and projects.is_member(
-            db_session,
-            org_id=org_id,
-            project_id=str(row.project_id),
-            user_id=user_id,
-        )
-    ):
-        return {"forgotten": False, "error": "not_found"}
-    if row.scope == "agent" and row.agent_id != agent_id:
-        return {"forgotten": False, "error": "forbidden"}
+    refusal = _authorize_scoped_action(
+        db_session, row, org_id=org_id, user_id=user_id, agent_id=agent_id
+    )
+    if refusal is not None:
+        return {"forgotten": False, "error": refusal}
 
     db_session.execute(
         text(
