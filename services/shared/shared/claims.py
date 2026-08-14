@@ -206,7 +206,9 @@ def live_claims(
             FROM work_claims
             WHERE org_id = :org_id AND released_at IS NULL
               AND expires_at > now()
-              AND (:project_id::uuid IS NULL OR project_id = :project_id)
+              AND (CAST(:project_id AS uuid) IS NULL OR project_id = CAST(:project_id AS uuid))
+              -- CAST(), not ::. text() misparses a bind followed by a
+              -- double-colon cast; broke live_claims in prod on first deploy.
             ORDER BY created_at DESC LIMIT :limit
             """
             ),
