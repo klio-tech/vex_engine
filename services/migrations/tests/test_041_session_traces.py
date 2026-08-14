@@ -1,5 +1,3 @@
-import os
-import pytest
 import sqlalchemy as sa
 
 from shared.testing import requires_db, database_url
@@ -21,6 +19,6 @@ def test_session_traces_columns():
 
 
 def test_session_traces_unique_org_session():
-    idx = _insp().get_indexes("session_traces")
-    u = [i for i in idx if i["name"] == "uq_session_traces_org_session"]
-    assert u and u[0]["unique"] is True
+    constraints = _insp().get_unique_constraints("session_traces")
+    u = [c for c in constraints if c["name"] == "uq_session_traces_org_session"]
+    assert u and u[0]["column_names"] == ["org_id", "session_id"]

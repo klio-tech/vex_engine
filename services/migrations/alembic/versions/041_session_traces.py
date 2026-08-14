@@ -34,14 +34,12 @@ def upgrade() -> None:
                   server_default=sa.text("now()"), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True),
                   server_default=sa.text("now()"), nullable=False),
+        sa.UniqueConstraint("org_id", "session_id", name="uq_session_traces_org_session"),
     )
     op.create_index("ix_session_traces_org_created", "session_traces",
                     ["org_id", "created_at"])
-    op.create_index("uq_session_traces_org_session", "session_traces",
-                    ["org_id", "session_id"], unique=True)
 
 
 def downgrade() -> None:
-    op.drop_index("uq_session_traces_org_session", table_name="session_traces")
     op.drop_index("ix_session_traces_org_created", table_name="session_traces")
     op.drop_table("session_traces")
