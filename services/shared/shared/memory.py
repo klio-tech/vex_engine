@@ -1421,7 +1421,12 @@ def _authorize_scoped_action(
 
 
 def _current_belief_in_chain(
-    db_session: Any, *, org_id: str, memory_id: str
+    db_session: Any,
+    *,
+    org_id: str,
+    memory_id: str,
+    user_id: Optional[str],
+    agent_id: Optional[str],
 ) -> Optional[dict[str, Any]]:
     """Walk ``memory_id``'s ``superseded_by`` chain forward to the live belief.
 
@@ -1438,28 +1443,49 @@ def _current_belief_in_chain(
     every hop, capped at :data:`_CAS_CHAIN_MAX_DEPTH` so a corrupted chain
     cannot spin the database instead of failing fast.
 
+    N1: the chain can cross scope. An org-scoped row can be superseded by a
+    ``private`` or ``project``-scoped successor (the caller supplies the new
+    row's scope on every CAS write, and nothing forces it to match the row
+    being replaced), so the terminal row is NOT covered by the authorization
+    check :func:`supersede_with_revision` already ran against the row NAMED
+    by ``memory_id`` — that check happened one hop back. Returning the
+    terminal row's content unconditionally would hand a non-member the
+    content, ``user_id`` and live ``revision`` of a row they cannot read,
+    through a conflict payload rather than a `recall` — the exact class of
+    leak H1 closed one layer up. So the SAME ladder
+    (:func:`_authorize_scoped_action`) runs again here, against the terminal
+    row specifically. A refusal here returns ``None`` — not a distinct error
+    code, since :func:`supersede_with_revision` already established the
+    caller may act on ``memory_id`` itself; ``current: None`` just means "the
+    live belief is not something you're entitled to see," and the caller's
+    own retry with a corrected ``base_revision`` will re-run the WHOLE ladder
+    from scratch against whatever they name next.
+
     Returns ``None`` if ``memory_id`` no longer resolves in this org at all
     (retracted out from under a concurrent embed, or a caller who raced past
     the earlier existence check — vanishingly rare, and this is the same
-    non-event an unknown id already is everywhere else in this module).
+    non-event an unknown id already is everywhere else in this module) OR if
+    the terminal row exists but the caller may not see it (N1, above).
     """
     row = (
         db_session.execute(
             text(
                 """
                 WITH RECURSIVE chain AS (
-                    SELECT id, content, revision, user_id, superseded_by,
-                           0 AS depth
+                    SELECT id, content, revision, user_id, agent_id, scope,
+                           project_id, superseded_by, 0 AS depth
                     FROM session_memories
                     WHERE id = :memory_id AND org_id = :org_id
                     UNION ALL
                     SELECT m.id, m.content, m.revision, m.user_id,
+                           m.agent_id, m.scope, m.project_id,
                            m.superseded_by, c.depth + 1
                     FROM session_memories m
                     JOIN chain c ON m.id = c.superseded_by
                     WHERE m.org_id = :org_id AND c.depth < :max_depth
                 )
-                SELECT id, content, revision, user_id
+                SELECT id, content, revision, user_id, agent_id, scope,
+                       project_id
                 FROM chain
                 WHERE superseded_by IS NULL
                 ORDER BY depth DESC
@@ -1475,6 +1501,13 @@ def _current_belief_in_chain(
         .mappings()
         .first()
     )
+    if row is None:
+        return None
+    refusal = _authorize_scoped_action(
+        db_session, row, org_id=org_id, user_id=user_id, agent_id=agent_id
+    )
+    if refusal is not None:
+        return None
     return _normalize_current_row(row)
 
 
@@ -1691,8 +1724,13 @@ def supersede_with_revision(
 
     Four phases, strictly in this order:
 
-    1. **Validate the id** — an unparseable ``memory_id`` is refused before
-       any query, mirroring :func:`retract_memory`'s ``invalid_id``.
+    1. **Validate** (N3) — an unparseable ``memory_id`` OR ``base_revision``
+       (both UUID-shaped columns) is refused before any query, mirroring
+       :func:`retract_memory`'s ``invalid_id``. Catching a bad
+       ``base_revision`` here also prevents it reaching the guard's
+       ``revision = :base_revision`` comparison against a UUID column, which
+       would otherwise raise an uncaught driver error instead of a clean
+       refusal.
     2. **Authorize** (H1) — the SAME scope ladder :func:`retract_memory` uses
        (:func:`_authorize_scoped_action`), run against ``memory_id`` before
        ANYTHING else happens. Without this, any org principal could name a
@@ -1703,15 +1741,23 @@ def supersede_with_revision(
        the exact same refusal :func:`retract_memory` gives: ``not_found`` for
        a private/project row the caller cannot see (never ``forbidden`` —
        that would itself confirm the row exists), ``forbidden`` only for the
-       agent-ownership mismatch, where existence was never secret.
+       agent-ownership mismatch, where existence was never secret. This
+       phase's own read is closed out with a rollback (N2) before phase 3 —
+       nothing was written, and holding that transaction (hence the pooled
+       connection) open across phase 3's network call is exactly the
+       pin-a-backend-across-an-embed problem phase 3 exists to avoid; see
+       phase 3 for why that matters under a transaction-mode pooler.
     3. **Prepare** (H3) — redact and embed ``new_content``
-       (:func:`_prepare_cas_write`) BEFORE the guard runs. The embed is a
-       network call; the guard is a row lock. Doing the network call first
-       means no network call ever sits between the guard ``UPDATE`` and its
-       commit, which is what keeps a slow embed from holding a pooled
-       connection (fatal against Neon's PgBouncer transaction-mode endpoint)
-       or a row lock (starves concurrent writers) open across a third-party
-       round trip.
+       (:func:`_prepare_cas_write`) BEFORE the guard runs, on a connection
+       that phase 2 already released (no open transaction, per N2 above).
+       The embed is a network call; the guard is a row lock. Doing the
+       network call first, with nothing else pinning the connection, means
+       no network call ever sits inside an open transaction on this
+       connection — which is what keeps a slow embed from holding a pooled
+       connection checked out (fatal against Neon's PgBouncer
+       transaction-mode endpoint, where a connection held across an
+       unrelated round trip blocks every other statement sharing that
+       backend) for longer than the embed itself needs.
     4. **Guard, then apply** (H2) — the atomic ``UPDATE`` bumps ``revision``
        ONLY if ``base_revision`` is still current AND the row is still
        ``status = 'active'`` AND ``superseded_by IS NULL``. The status/
@@ -1721,10 +1767,13 @@ def supersede_with_revision(
        ALREADY-superseded row could otherwise still pass the guard. Zero rows
        means someone moved the belief (or it is dead) — the conflict payload
        follows the ``superseded_by`` chain to the actual live belief
-       (:func:`_current_belief_in_chain`) rather than echoing back the dead
-       row's own (frozen) content, so the field named ``current`` means
-       current. A match proceeds through the existing supersession machinery
-       (:func:`_apply_supersession_for_cas`) unchanged.
+       (:func:`_current_belief_in_chain`), which re-runs the SAME
+       authorization ladder against whatever sits at the end of that chain
+       (N1: the chain can cross scope, so the terminal row is not covered by
+       phase 2's check on ``memory_id`` — see that function), rather than
+       echoing back the dead row's own (frozen) content or an unauthorized
+       terminal row's. A match proceeds through the existing supersession
+       machinery (:func:`_apply_supersession_for_cas`) unchanged.
 
     Under real Postgres phase 4 is race-safe with no extra locking on the
     caller's part: the ``UPDATE ... WHERE revision = :base_revision`` takes a
@@ -1777,11 +1826,20 @@ def supersede_with_revision(
         same ``redacted``/``redaction_kinds`` shape
         :func:`shared.brain.write_scoped_memory` returns on its success path.
     """
+    # N3: both ids are UUID-shaped columns. A malformed memory_id fails the
+    # existence lookup below anyway, but a malformed base_revision would
+    # reach the guard's ``revision = :base_revision`` comparison against a
+    # UUID column and raise an uncaught driver error instead of a clean
+    # refusal — validate both up front, before any DB round trip or spend.
     try:
         parsed_id = uuid.UUID(str(memory_id))
     except (ValueError, AttributeError, TypeError):
         return {"conflict": False, "stored": False, "error": "invalid_id"}
     memory_id = str(parsed_id)
+    try:
+        uuid.UUID(str(base_revision))
+    except (ValueError, AttributeError, TypeError):
+        return {"conflict": False, "stored": False, "error": "invalid_id"}
 
     # ---- phase 2: authorize (H1) ------------------------------------------
     row = db.execute(
@@ -1802,6 +1860,16 @@ def supersede_with_revision(
     )
     if refusal is not None:
         return {"conflict": False, "stored": False, "error": refusal}
+
+    # N2: the authz SELECT above opened a transaction on this pooled
+    # connection (SQLAlchemy 2.0 autobegins on first execute). Nothing was
+    # written, so a plain rollback closes it out — otherwise this backend
+    # stays checked out across phase 3's network call, and under a
+    # transaction-mode pooler (Neon/PgBouncer) a connection held open across
+    # an unrelated round trip blocks every other statement sharing it. The
+    # guard below re-reads status/superseded_by/revision itself, so nothing
+    # after this point depends on the rolled-back transaction's snapshot.
+    db.rollback()
 
     # ---- phase 3: prepare — redact + embed, BEFORE the guard (H3) --------
     try:
@@ -1840,7 +1908,10 @@ def supersede_with_revision(
     )
     if not guard.rowcount:
         record_write_conflict()
-        current = _current_belief_in_chain(db, org_id=org_id, memory_id=memory_id)
+        current = _current_belief_in_chain(
+            db, org_id=org_id, memory_id=memory_id,
+            user_id=user_id, agent_id=agent_id,
+        )
         return {"conflict": True, "stored": False, "current": current}
 
     forwarded = dict(write_kwargs)

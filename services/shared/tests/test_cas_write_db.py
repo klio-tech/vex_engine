@@ -507,3 +507,89 @@ def test_a_superseded_rows_frozen_revision_cannot_be_reused_as_a_cas_token(db):
     assert replay["current"]["revision"] == first["new_revision"]
     # The dead row was never touched a second time.
     assert _status(db, memory_id) == "superseded"
+
+
+# ---------------------------------------------------------------------------
+# N1: the chain-follow authorizes the TERMINAL row, not just the one named
+# by memory_id. The chain can cross scope — the caller picks the new row's
+# scope on every CAS write, and nothing forces it to match what it replaces
+# — so a caller authorized on the ORIGINAL id must not see a narrower-scoped
+# successor's content through the conflict payload just because they were
+# allowed to name the id that led there.
+# ---------------------------------------------------------------------------
+
+
+def test_chain_follow_hides_a_project_scoped_successor_from_a_non_member(db):
+    org_id = _org(db)
+    project_id = _project(db, org_id=org_id)
+    assert projects.add_member(
+        db, org_id=org_id, project_id=project_id, user_id=PRIYA, granted_by=None
+    )
+    db.commit()
+
+    memory_id = _seed(db, org_id=org_id, scope="org", content="org-wide fact")
+    base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+
+    # A project member supersedes the ORG row with a PROJECT-scoped
+    # successor. Legitimate: any caller may choose the scope of what they
+    # write, and nothing ties a new row's scope to the one it replaces.
+    first = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="project-private follow-up", user_id=PRIYA, agent_id=AGENT,
+        memory_type="fact", session_id="sess-n1-1", scope="project",
+        project_id=project_id,
+    )
+    assert first["conflict"] is False
+
+    # A non-member, holding the now-stale base_revision of the ORIGINAL
+    # (org-scoped) row, is authorized on memory_id itself (scope='org' has
+    # no owner/membership check) but must NOT see the project row's content
+    # once the guard misses and the chain-follow lands on it.
+    non_member = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="attempt", user_id=DEV, agent_id=AGENT, memory_type="fact",
+        session_id="sess-n1-2",
+    )
+    assert non_member["conflict"] is True
+    assert non_member["current"] is None
+
+    # Positive control: the project member DOES see the terminal row — a
+    # ladder that refused everyone would pass the negative above by accident.
+    member = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="attempt", user_id=PRIYA, agent_id=AGENT, memory_type="fact",
+        session_id="sess-n1-3",
+    )
+    assert member["conflict"] is True
+    assert member["current"]["id"] == first["new_id"]
+    assert member["current"]["content"] == "project-private follow-up"
+
+
+def test_chain_follow_hides_an_agent_scoped_successor_from_another_agent(db):
+    org_id = _org(db)
+    memory_id = _seed(db, org_id=org_id, scope="org", content="org-wide fact")
+    base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
+
+    first = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="agent-private follow-up", agent_id=AGENT, memory_type="fact",
+        session_id="sess-n1-agent-1", scope="agent",
+    )
+    assert first["conflict"] is False
+
+    other_agent = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="attempt", agent_id="other-agent", memory_type="fact",
+        session_id="sess-n1-agent-2",
+    )
+    assert other_agent["conflict"] is True
+    assert other_agent["current"] is None
+
+    owning_agent = memory_mod.supersede_with_revision(
+        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
+        new_content="attempt", agent_id=AGENT, memory_type="fact",
+        session_id="sess-n1-agent-3",
+    )
+    assert owning_agent["conflict"] is True
+    assert owning_agent["current"]["id"] == first["new_id"]
+    assert owning_agent["current"]["content"] == "agent-private follow-up"

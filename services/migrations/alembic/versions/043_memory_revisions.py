@@ -13,10 +13,21 @@ an ``ACCESS EXCLUSIVE`` lock — on this table, the busiest one in the schema,
 that is an outage. Instead:
 
 1. ``ADD COLUMN revision UUID`` — nullable, no default. Metadata-only, no
-   table rewrite, no lock held beyond the DDL itself.
-2. Batched backfill — ``UPDATE ... WHERE revision IS NULL LIMIT :batch_size``
-   in a loop until no rows remain. Each batch is its own short transaction,
-   so no single lock is held for the duration of the whole table.
+   table rewrite. Cheap, but Alembic runs a whole migration inside ONE
+   transaction (``env.py``'s ``context.begin_transaction()``), so this
+   ``ACCESS EXCLUSIVE`` DDL lock is held open until something actually
+   commits — which a naive "just loop the UPDATEs" does not do, because
+   they all still share that same outer transaction. That is what step 2's
+   ``autocommit_block()`` is for.
+2. Batched backfill, inside ``op.get_context().autocommit_block()`` —
+   Alembic's documented escape hatch from the one-transaction-per-migration
+   default. Entering it COMMITS whatever is pending (releasing step 1's
+   ``ACCESS EXCLUSIVE`` lock right there) and puts the connection in
+   Postgres's autocommit mode, so each ``UPDATE ... WHERE revision IS NULL
+   LIMIT :batch_size`` in the loop commits the instant it runs — no batch
+   holds a lock for longer than its own statement, and the backfill can be
+   interrupted between batches without losing partial progress. Exiting the
+   block opens a fresh transaction for what follows.
 3. ``ALTER COLUMN ... SET DEFAULT gen_random_uuid()`` — metadata-only; every
    row inserted from here on gets one automatically.
 4. ``ALTER COLUMN ... SET NOT NULL`` — by now every row already has a value,
@@ -57,24 +68,33 @@ def upgrade() -> None:
         sa.Column("revision", postgresql.UUID(as_uuid=True), nullable=True),
     )
 
-    bind = op.get_bind()
-    while True:
-        result = bind.execute(
-            sa.text(
-                """
-                UPDATE session_memories
-                SET revision = gen_random_uuid()
-                WHERE id IN (
-                    SELECT id FROM session_memories
-                    WHERE revision IS NULL
-                    LIMIT :batch_size
-                )
-                """
-            ),
-            {"batch_size": _BACKFILL_BATCH_SIZE},
-        )
-        if result.rowcount == 0:
-            break
+    # Entering the block commits the ADD COLUMN above (releasing its ACCESS
+    # EXCLUSIVE lock) and switches the connection to autocommit mode, so each
+    # loop iteration's UPDATE commits on its own — none of them share a
+    # transaction with each other OR with the DDL above. Without this, every
+    # statement in this function runs inside the single outer transaction
+    # env.py wraps the whole migration in, and the batching below would be
+    # cosmetic: the ACCESS EXCLUSIVE lock would stay held for the entire
+    # backfill regardless of how many small UPDATEs it was split into.
+    with op.get_context().autocommit_block():
+        bind = op.get_bind()
+        while True:
+            result = bind.execute(
+                sa.text(
+                    """
+                    UPDATE session_memories
+                    SET revision = gen_random_uuid()
+                    WHERE id IN (
+                        SELECT id FROM session_memories
+                        WHERE revision IS NULL
+                        LIMIT :batch_size
+                    )
+                    """
+                ),
+                {"batch_size": _BACKFILL_BATCH_SIZE},
+            )
+            if result.rowcount == 0:
+                break
 
     op.alter_column(
         "session_memories",
