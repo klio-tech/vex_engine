@@ -47,6 +47,21 @@ def upsert_trace(
     freshly-written S3 object has nothing pointing at it and should be
     treated as orphaned by the caller (see ``trace_consumer.handle_captured``
     for the delete choreography and its bucket-lifecycle-rule backstop).
+
+    ``previous_ref`` is read with a plain, non-locking ``SELECT`` before the
+    upsert — it is NOT re-read inside the same transaction as the
+    conflict-resolving write, and no row lock is taken to hold it stable.
+    Under two consumers racing the same (org_id, session_id) with both
+    calls "winning" in sequence, the second writer's ``previous_ref`` can be
+    stale: it may point at the object the first writer's WON update already
+    replaced, rather than at that intermediate object's true predecessor.
+    The caller's cleanup can then delete an already-gone key while the
+    genuinely orphaned intermediate object leaks. This is accepted as a
+    best-effort gap — locking the hot upsert path just to make eviction
+    cleanup race-free is not a trade worth making — and the S3 bucket's
+    lifecycle expiry rule is the backstop for exactly this case. Richer-wins
+    correctness of the row itself is unaffected; only the object cleanup can
+    miss.
     """
     trace_id = str(uuid.uuid4())
     try:

@@ -22,6 +22,16 @@ Both deletes are best-effort: a delete failure is logged and swallowed,
 never turned into a consumer failure. The S3 bucket's own lifecycle
 expiry rule is the backstop for anything a failed delete leaves behind —
 see the bucket's retention policy, not this module, for the hard guarantee.
+
+That backstop also covers a narrower, non-failure gap: ``previous_ref`` is
+read non-locking (see ``shared.traces.upsert_trace``), so two consumers
+racing the same session can both "win" in sequence. The second winner's
+``previous_ref`` can be stale — pointing at an object the first winner
+already replaced — so its delete call succeeds against an already-deleted
+key while the first winner's now-orphaned intermediate object is never
+targeted at all. This is accepted as best-effort rather than fixed with
+locking; the lifecycle rule is what actually reclaims that object. Session
+data is never lost — only cleanup of an intermediate S3 object can miss.
 """
 
 import json
