@@ -41,8 +41,6 @@ def test_outcome_tables():
 def test_session_outcomes_unique_constraint():
     constraints = _insp().get_unique_constraints("session_outcomes")
     u = [
-        c
-        for c in constraints
-        if c["name"] == "uq_session_outcomes_org_session_grader"
+        c for c in constraints if c["name"] == "uq_session_outcomes_org_session_grader"
     ]
     assert u and set(u[0]["column_names"]) == {"org_id", "session_id", "grader_version"}

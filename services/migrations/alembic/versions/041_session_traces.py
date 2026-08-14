@@ -4,6 +4,7 @@ ADDITIVE ONLY. Rows point at one S3 object holding the REDACTED structured
 payload {messages, tool_calls}. message_count enables richer-transcript-wins
 upserts (a second Stop hook with more messages replaces the first).
 """
+
 from collections.abc import Sequence
 from typing import Union
 
@@ -30,14 +31,25 @@ def upgrade() -> None:
         sa.Column("message_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("tool_calls_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("redaction_version", sa.Text(), nullable=False),
-        sa.Column("created_at", sa.DateTime(timezone=True),
-                  server_default=sa.text("now()"), nullable=False),
-        sa.Column("updated_at", sa.DateTime(timezone=True),
-                  server_default=sa.text("now()"), nullable=False),
-        sa.UniqueConstraint("org_id", "session_id", name="uq_session_traces_org_session"),
+        sa.Column(
+            "created_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(timezone=True),
+            server_default=sa.text("now()"),
+            nullable=False,
+        ),
+        sa.UniqueConstraint(
+            "org_id", "session_id", name="uq_session_traces_org_session"
+        ),
     )
-    op.create_index("ix_session_traces_org_created", "session_traces",
-                    ["org_id", "created_at"])
+    op.create_index(
+        "ix_session_traces_org_created", "session_traces", ["org_id", "created_at"]
+    )
 
 
 def downgrade() -> None:

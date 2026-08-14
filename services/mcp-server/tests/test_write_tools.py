@@ -516,8 +516,11 @@ async def test_base_revision_present_skips_plain_write_and_calls_cas(tool_name):
     write_mock = AsyncMock(return_value=_canned_result("memory"))
     cas_mock = MagicMock(
         return_value={
-            "conflict": False, "stored": True, "new_id": "new-1",
-            "new_revision": "rev-2", "redacted": True,
+            "conflict": False,
+            "stored": True,
+            "new_id": "new-1",
+            "new_revision": "rev-2",
+            "redacted": True,
             "redaction_kinds": ["stripe_secret_key"],
         }
     )
@@ -532,8 +535,10 @@ async def test_base_revision_present_skips_plain_write_and_calls_cas(tool_name):
         patch.object(mcp_app, "supersede_with_revision", cas_mock),
     ):
         result = await fn(
-            _fake_ctx(), "corrected content",
-            memory_id="mem-1", base_revision="rev-1",
+            _fake_ctx(),
+            "corrected content",
+            memory_id="mem-1",
+            base_revision="rev-1",
         )
 
     write_mock.assert_not_called()
@@ -580,8 +585,10 @@ async def test_base_revision_auth_refusal_is_passed_through_as_stored_false():
         patch("app.mcp_app.record_usage") as usage_mock,
     ):
         result = await fn(
-            _fake_ctx(), "attacker's overwrite",
-            memory_id="mem-1", base_revision="whatever",
+            _fake_ctx(),
+            "attacker's overwrite",
+            memory_id="mem-1",
+            base_revision="whatever",
         )
 
     write_mock.assert_not_called()
@@ -601,8 +608,10 @@ async def test_base_revision_conflict_returns_tool_error_payload():
         return_value={
             "conflict": True,
             "current": {
-                "id": "mem-1", "content": "someone else's edit",
-                "revision": "rev-9", "user_id": "u2",
+                "id": "mem-1",
+                "content": "someone else's edit",
+                "revision": "rev-9",
+                "user_id": "u2",
             },
         }
     )
@@ -618,15 +627,20 @@ async def test_base_revision_conflict_returns_tool_error_payload():
         patch("app.mcp_app.record_usage") as usage_mock,
     ):
         result = await fn(
-            _fake_ctx(), "my edit", memory_id="mem-1", base_revision="stale-rev",
+            _fake_ctx(),
+            "my edit",
+            memory_id="mem-1",
+            base_revision="stale-rev",
         )
 
     write_mock.assert_not_called()
     assert result == {
         "error": "revision_conflict",
         "current": {
-            "id": "mem-1", "content": "someone else's edit",
-            "revision": "rev-9", "user_id": "u2",
+            "id": "mem-1",
+            "content": "someone else's edit",
+            "revision": "rev-9",
+            "user_id": "u2",
         },
         "hint": "belief changed while you worked — re-read and re-assert",
     }

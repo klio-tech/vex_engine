@@ -109,9 +109,10 @@ async def create_claim(
     collisions: list[dict[str, Any]] = []
     if emb:
         emb_str = str(emb)
-        rows = db.execute(
-            text(
-                """
+        rows = (
+            db.execute(
+                text(
+                    """
                 SELECT id, description, agent_id,
                        1 - (embedding <=> :emb) AS similarity
                 FROM work_claims
@@ -121,14 +122,17 @@ async def create_claim(
                   AND 1 - (embedding <=> :emb) >= :threshold
                 ORDER BY similarity DESC LIMIT 5
                 """
-            ),
-            {
-                "emb": emb_str,
-                "org_id": org_id,
-                "id": claim_id,
-                "threshold": COLLISION_THRESHOLD,
-            },
-        ).mappings().all()
+                ),
+                {
+                    "emb": emb_str,
+                    "org_id": org_id,
+                    "id": claim_id,
+                    "threshold": COLLISION_THRESHOLD,
+                },
+            )
+            .mappings()
+            .all()
+        )
         collisions = [dict(r) for r in rows]
 
     db.commit()
@@ -194,9 +198,10 @@ def live_claims(
     "Live" matches :func:`create_claim`'s collision predicate exactly:
     ``released_at IS NULL AND expires_at > now()``.
     """
-    rows = db.execute(
-        text(
-            """
+    rows = (
+        db.execute(
+            text(
+                """
             SELECT id, description, agent_id, user_id, expires_at
             FROM work_claims
             WHERE org_id = :org_id AND released_at IS NULL
@@ -204,7 +209,10 @@ def live_claims(
               AND (:project_id::uuid IS NULL OR project_id = :project_id)
             ORDER BY created_at DESC LIMIT :limit
             """
-        ),
-        {"org_id": org_id, "project_id": project_id, "limit": limit},
-    ).mappings().all()
+            ),
+            {"org_id": org_id, "project_id": project_id, "limit": limit},
+        )
+        .mappings()
+        .all()
+    )
     return [dict(r) for r in rows]

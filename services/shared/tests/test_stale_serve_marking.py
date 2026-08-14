@@ -9,7 +9,8 @@ def test_predicate_is_after_superseding_belief_existed():
     db.execute.return_value.rowcount = 2
     ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
     marked = stale.mark_stale_serves(
-        db, org_id="o", old_memory_id="m-old", superseding_created_at=ts)
+        db, org_id="o", old_memory_id="m-old", superseding_created_at=ts
+    )
     assert marked == 2
     sql = " ".join(str(db.execute.call_args.args[0]).split())
     params = db.execute.call_args.args[1]
@@ -23,6 +24,12 @@ def test_predicate_is_after_superseding_belief_existed():
 def test_never_raises():
     db = MagicMock()
     db.execute.side_effect = RuntimeError("down")
-    assert stale.mark_stale_serves(
-        db, org_id="o", old_memory_id="m",
-        superseding_created_at=datetime.now(timezone.utc)) == 0
+    assert (
+        stale.mark_stale_serves(
+            db,
+            org_id="o",
+            old_memory_id="m",
+            superseding_created_at=datetime.now(timezone.utc),
+        )
+        == 0
+    )

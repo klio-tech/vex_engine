@@ -11,8 +11,17 @@ def _insp():
 
 def test_session_traces_columns():
     cols = {c["name"]: c for c in _insp().get_columns("session_traces")}
-    for n in ("id", "org_id", "session_id", "transcript_ref", "message_count",
-              "tool_calls_count", "redaction_version", "created_at", "updated_at"):
+    for n in (
+        "id",
+        "org_id",
+        "session_id",
+        "transcript_ref",
+        "message_count",
+        "tool_calls_count",
+        "redaction_version",
+        "created_at",
+        "updated_at",
+    ):
         assert n in cols, n
     assert cols["org_id"]["nullable"] is False
     assert cols["message_count"]["nullable"] is False

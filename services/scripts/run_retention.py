@@ -165,9 +165,7 @@ def sweep_expired_originals(db, *, org_id: str) -> int:
     return int(result.rowcount or 0)
 
 
-def sweep_evidence_for_org(
-    conn, *, org_id: str, retention_days: int
-) -> dict[str, int]:
+def sweep_evidence_for_org(conn, *, org_id: str, retention_days: int) -> dict[str, int]:
     """Delete this org's expired evidence: traces and outcome grades.
 
     Evidence, not decisions. Three tables:
@@ -222,38 +220,47 @@ def sweep_evidence_for_org(
 
     cutoff_interval = {"days": retention_days}
 
-    recall_outcomes_removed = conn.execute(
-        text(
-            """
+    recall_outcomes_removed = (
+        conn.execute(
+            text(
+                """
             DELETE FROM recall_outcomes
             WHERE org_id = :org_id
               AND created_at < NOW() - (:days || ' days')::interval
             """
-        ),
-        {"org_id": org_id, **cutoff_interval},
-    ).rowcount or 0
+            ),
+            {"org_id": org_id, **cutoff_interval},
+        ).rowcount
+        or 0
+    )
 
-    session_outcomes_removed = conn.execute(
-        text(
-            """
+    session_outcomes_removed = (
+        conn.execute(
+            text(
+                """
             DELETE FROM session_outcomes
             WHERE org_id = :org_id
               AND graded_at < NOW() - (:days || ' days')::interval
             """
-        ),
-        {"org_id": org_id, **cutoff_interval},
-    ).rowcount or 0
+            ),
+            {"org_id": org_id, **cutoff_interval},
+        ).rowcount
+        or 0
+    )
 
-    session_traces_removed = conn.execute(
-        text(
-            """
+    session_traces_removed = (
+        conn.execute(
+            text(
+                """
             DELETE FROM session_traces
             WHERE org_id = :org_id
               AND created_at < NOW() - (:days || ' days')::interval
             """
-        ),
-        {"org_id": org_id, **cutoff_interval},
-    ).rowcount or 0
+            ),
+            {"org_id": org_id, **cutoff_interval},
+        ).rowcount
+        or 0
+    )
 
     conn.commit()
 

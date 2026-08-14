@@ -93,7 +93,11 @@ def _final_output(messages: list[dict[str, Any]]) -> Optional[str]:
 
 
 async def grade_stored_session(
-    db: Any, s3: Any, *, org_id: str, session_id: str,
+    db: Any,
+    s3: Any,
+    *,
+    org_id: str,
+    session_id: str,
     grader_version: str = GRADER_VERSION,
 ) -> dict[str, Any]:
     """Grade one stored session: ONE verify() call, ONE session_outcomes
@@ -118,16 +122,20 @@ async def grade_stored_session(
     verdict/scores to unknown/null rather than raising into the consumer
     loop that calls this function.
     """
-    recalls = db.execute(
-        text(
-            """
+    recalls = (
+        db.execute(
+            text(
+                """
             SELECT id, memory_ids, session_id FROM brain_recall_events
             WHERE org_id = :org_id AND session_id = :session_id
               AND memory_ids IS NOT NULL
             """
-        ),
-        {"org_id": org_id, "session_id": session_id},
-    ).mappings().all()
+            ),
+            {"org_id": org_id, "session_id": session_id},
+        )
+        .mappings()
+        .all()
+    )
     if not recalls:
         return {"session_outcome_id": None, "attributions": 0}
 
@@ -161,7 +169,9 @@ async def grade_stored_session(
                 mem_consistency = getattr(mc["memory_consistency"], "score", None)
         except Exception:
             logger.warning(
-                "grader: verify failed org=%s session=%s", org_id, session_id,
+                "grader: verify failed org=%s session=%s",
+                org_id,
+                session_id,
                 exc_info=True,
             )
         try:
@@ -174,7 +184,9 @@ async def grade_stored_session(
         except Exception:
             logger.warning(
                 "grader: attribution embedding failed org=%s session=%s",
-                org_id, session_id, exc_info=True,
+                org_id,
+                session_id,
+                exc_info=True,
             )
 
     session_outcome_id = str(uuid.uuid4())
@@ -190,9 +202,15 @@ async def grade_stored_session(
             RETURNING id
             """
         ),
-        {"id": session_outcome_id, "org_id": org_id, "session_id": session_id,
-         "verdict": verdict_str, "confidence": confidence,
-         "memory_consistency": mem_consistency, "grader_version": grader_version},
+        {
+            "id": session_outcome_id,
+            "org_id": org_id,
+            "session_id": session_id,
+            "verdict": verdict_str,
+            "confidence": confidence,
+            "memory_consistency": mem_consistency,
+            "grader_version": grader_version,
+        },
     ).first()
 
     if inserted is None:
@@ -207,7 +225,9 @@ async def grade_stored_session(
         logger.info(
             "grader: org=%s session=%s already graded for grader_version=%s; "
             "skipping duplicate attribution",
-            org_id, session_id, grader_version,
+            org_id,
+            session_id,
+            grader_version,
         )
         db.commit()
         return {"session_outcome_id": None, "attributions": 0}
@@ -226,11 +246,15 @@ async def grade_stored_session(
                             :session_outcome_id, :used, :usage_score)
                     """
                 ),
-                {"id": str(uuid.uuid4()), "org_id": org_id,
-                 "recall_event_id": str(recall["id"]), "memory_id": str(mid),
-                 "session_outcome_id": session_outcome_id,
-                 "used": bool(score is not None and score >= USED_THRESHOLD),
-                 "usage_score": score},
+                {
+                    "id": str(uuid.uuid4()),
+                    "org_id": org_id,
+                    "recall_event_id": str(recall["id"]),
+                    "memory_id": str(mid),
+                    "session_outcome_id": session_outcome_id,
+                    "used": bool(score is not None and score >= USED_THRESHOLD),
+                    "usage_score": score,
+                },
             )
             attributions += 1
     db.commit()

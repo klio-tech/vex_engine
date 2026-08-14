@@ -54,14 +54,21 @@ def test_stale_base_revision_returns_conflict_payload():
             memory_mod,
             "_current_belief_in_chain",
             return_value={
-                "id": _MEMORY_ID, "content": "newer text",
-                "revision": _CURRENT_REVISION, "user_id": "u2",
+                "id": _MEMORY_ID,
+                "content": "newer text",
+                "revision": _CURRENT_REVISION,
+                "user_id": "u2",
             },
         ) as chain_mock,
     ):
         result = memory_mod.supersede_with_revision(
-            db, org_id="o", memory_id=_MEMORY_ID, base_revision=_BASE_REVISION,
-            new_content="mine", agent_id="agent-x", memory_type="fact",
+            db,
+            org_id="o",
+            memory_id=_MEMORY_ID,
+            base_revision=_BASE_REVISION,
+            new_content="mine",
+            agent_id="agent-x",
+            memory_type="fact",
             session_id="s1",
         )
 
@@ -71,7 +78,11 @@ def test_stale_base_revision_returns_conflict_payload():
     # N1: the chain-follow's own authorization runs against the caller's
     # principals too, so user_id/agent_id must reach it.
     chain_mock.assert_called_once_with(
-        db, org_id="o", memory_id=_MEMORY_ID, user_id=None, agent_id="agent-x",
+        db,
+        org_id="o",
+        memory_id=_MEMORY_ID,
+        user_id=None,
+        agent_id="agent-x",
     )
 
     guard_sql = " ".join(str(db.execute.call_args_list[1].args[0]).split())
@@ -94,13 +105,19 @@ def test_current_base_revision_proceeds_to_supersede():
             return_value=("mine", {}, [0.1] * 4, False, []),
         ),
         patch.object(
-            memory_mod, "_apply_supersession_for_cas",
+            memory_mod,
+            "_apply_supersession_for_cas",
             return_value={"new_id": "m2", "new_revision": _CURRENT_REVISION},
         ) as ap,
     ):
         result = memory_mod.supersede_with_revision(
-            db, org_id="o", memory_id=_MEMORY_ID, base_revision=_BASE_REVISION,
-            new_content="mine", agent_id="agent-x", memory_type="fact",
+            db,
+            org_id="o",
+            memory_id=_MEMORY_ID,
+            base_revision=_BASE_REVISION,
+            new_content="mine",
+            agent_id="agent-x",
+            memory_type="fact",
             session_id="s1",
         )
 
@@ -123,8 +140,13 @@ def test_unknown_memory_id_returns_not_found_without_touching_the_guard():
     db.execute.side_effect = [_fetchone_result(None)]
 
     result = memory_mod.supersede_with_revision(
-        db, org_id="o", memory_id=_MEMORY_ID, base_revision=_BASE_REVISION,
-        new_content="mine", agent_id="agent-x", memory_type="fact",
+        db,
+        org_id="o",
+        memory_id=_MEMORY_ID,
+        base_revision=_BASE_REVISION,
+        new_content="mine",
+        agent_id="agent-x",
+        memory_type="fact",
         session_id="s1",
     )
 
@@ -137,8 +159,13 @@ def test_invalid_memory_id_is_refused_before_any_query():
     db = MagicMock()
 
     result = memory_mod.supersede_with_revision(
-        db, org_id="o", memory_id="not-a-uuid", base_revision=_BASE_REVISION,
-        new_content="mine", agent_id="agent-x", memory_type="fact",
+        db,
+        org_id="o",
+        memory_id="not-a-uuid",
+        base_revision=_BASE_REVISION,
+        new_content="mine",
+        agent_id="agent-x",
+        memory_type="fact",
         session_id="s1",
     )
 
@@ -152,8 +179,13 @@ def test_invalid_base_revision_is_refused_before_any_query():
     db = MagicMock()
 
     result = memory_mod.supersede_with_revision(
-        db, org_id="o", memory_id=_MEMORY_ID, base_revision="not-a-uuid-either",
-        new_content="mine", agent_id="agent-x", memory_type="fact",
+        db,
+        org_id="o",
+        memory_id=_MEMORY_ID,
+        base_revision="not-a-uuid-either",
+        new_content="mine",
+        agent_id="agent-x",
+        memory_type="fact",
         session_id="s1",
     )
 
@@ -165,13 +197,21 @@ def test_private_row_non_owner_gets_not_found_before_the_guard():
     """H1: a caller who is not the private row's owner never reaches the
     guard — same indistinguishable not_found retract_memory gives."""
     db = MagicMock()
-    row = MagicMock(scope="private", agent_id="agent-x", user_id="owner-1", project_id=None)
+    row = MagicMock(
+        scope="private", agent_id="agent-x", user_id="owner-1", project_id=None
+    )
     db.execute.side_effect = [_fetchone_result(row)]
 
     result = memory_mod.supersede_with_revision(
-        db, org_id="o", memory_id=_MEMORY_ID, base_revision=_BASE_REVISION,
-        new_content="mine", user_id="someone-else", agent_id="agent-x",
-        memory_type="fact", session_id="s1",
+        db,
+        org_id="o",
+        memory_id=_MEMORY_ID,
+        base_revision=_BASE_REVISION,
+        new_content="mine",
+        user_id="someone-else",
+        agent_id="agent-x",
+        memory_type="fact",
+        session_id="s1",
     )
 
     assert result == {"conflict": False, "stored": False, "error": "not_found"}
@@ -182,12 +222,19 @@ def test_agent_scope_wrong_agent_gets_forbidden_before_the_guard():
     """H1: the agent-ownership mismatch answers forbidden, not not_found —
     existence was never the secret for an agent-scoped row."""
     db = MagicMock()
-    row = MagicMock(scope="agent", agent_id="owning-agent", user_id=None, project_id=None)
+    row = MagicMock(
+        scope="agent", agent_id="owning-agent", user_id=None, project_id=None
+    )
     db.execute.side_effect = [_fetchone_result(row)]
 
     result = memory_mod.supersede_with_revision(
-        db, org_id="o", memory_id=_MEMORY_ID, base_revision=_BASE_REVISION,
-        new_content="mine", agent_id="other-agent", memory_type="fact",
+        db,
+        org_id="o",
+        memory_id=_MEMORY_ID,
+        base_revision=_BASE_REVISION,
+        new_content="mine",
+        agent_id="other-agent",
+        memory_type="fact",
         session_id="s1",
     )
 
@@ -213,13 +260,19 @@ def test_authorized_read_is_rolled_back_before_the_embed():
     with (
         patch.object(memory_mod, "_prepare_cas_write", side_effect=_prepare),
         patch.object(
-            memory_mod, "_apply_supersession_for_cas",
+            memory_mod,
+            "_apply_supersession_for_cas",
             return_value={"new_id": "m2", "new_revision": _CURRENT_REVISION},
         ),
     ):
         memory_mod.supersede_with_revision(
-            db, org_id="o", memory_id=_MEMORY_ID, base_revision=_BASE_REVISION,
-            new_content="mine", agent_id="agent-x", memory_type="fact",
+            db,
+            org_id="o",
+            memory_id=_MEMORY_ID,
+            base_revision=_BASE_REVISION,
+            new_content="mine",
+            agent_id="agent-x",
+            memory_type="fact",
             session_id="s1",
         )
 
@@ -237,14 +290,20 @@ def test_conflict_increments_the_write_conflicts_counter():
 
     with (
         patch.object(
-            memory_mod, "_prepare_cas_write",
+            memory_mod,
+            "_prepare_cas_write",
             return_value=("mine", {}, [0.1] * 4, False, []),
         ),
         patch.object(memory_mod, "_current_belief_in_chain", return_value=None),
     ):
         memory_mod.supersede_with_revision(
-            db, org_id="o", memory_id=_MEMORY_ID, base_revision=_BASE_REVISION,
-            new_content="mine", agent_id="agent-x", memory_type="fact",
+            db,
+            org_id="o",
+            memory_id=_MEMORY_ID,
+            base_revision=_BASE_REVISION,
+            new_content="mine",
+            agent_id="agent-x",
+            memory_type="fact",
             session_id="s1",
         )
 

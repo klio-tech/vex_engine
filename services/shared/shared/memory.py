@@ -817,9 +817,7 @@ def _row_to_record(row: tuple) -> MemoryRecord:
         project_id=row[17] if len(row) > 17 else None,
         user_id=row[18] if len(row) > 18 else None,
         provenance=(row[19] if len(row) > 19 and row[19] is not None else "EXTRACTED"),
-        revision=(
-            str(row[20]) if len(row) > 20 and row[20] is not None else None
-        ),
+        revision=(str(row[20]) if len(row) > 20 and row[20] is not None else None),
     )
 
 
@@ -1290,7 +1288,9 @@ def supersede_memory(
         logger.debug(
             "supersede_memory: could not read new row's created_at "
             "(new=%s org=%s); falling back to flip time",
-            new_memory_id, org_id, exc_info=True,
+            new_memory_id,
+            org_id,
+            exc_info=True,
         )
 
     stale.mark_stale_serves(
@@ -1909,8 +1909,11 @@ def supersede_with_revision(
     if not guard.rowcount:
         record_write_conflict()
         current = _current_belief_in_chain(
-            db, org_id=org_id, memory_id=memory_id,
-            user_id=user_id, agent_id=agent_id,
+            db,
+            org_id=org_id,
+            memory_id=memory_id,
+            user_id=user_id,
+            agent_id=agent_id,
         )
         return {"conflict": True, "stored": False, "current": current}
 

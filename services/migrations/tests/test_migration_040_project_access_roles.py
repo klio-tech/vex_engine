@@ -50,7 +50,9 @@ def _require(proc, what: str) -> None:
 
 @pytest.fixture(scope="module")
 def scratch():
-    admin = create_engine(_with_database(DB_URL, "postgres"), isolation_level="AUTOCOMMIT")
+    admin = create_engine(
+        _with_database(DB_URL, "postgres"), isolation_level="AUTOCOMMIT"
+    )
     try:
         with admin.connect() as conn:
             conn.execute(text(f"DROP DATABASE IF EXISTS {SCRATCH_DB}"))

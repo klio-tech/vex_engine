@@ -95,7 +95,10 @@ def test_release_is_owner_scoped():
 
 def test_release_rejects_malformed_claim_id_before_any_query():
     db = MagicMock()
-    assert claims.release_claim(db, org_id="o", claim_id="not-a-uuid", agent_id="A") is False
+    assert (
+        claims.release_claim(db, org_id="o", claim_id="not-a-uuid", agent_id="A")
+        is False
+    )
     db.execute.assert_not_called()
 
 

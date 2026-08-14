@@ -6,6 +6,7 @@ never a copied session verdict. Querying "how did this memory do" joins
 attribution to the session outcome explicitly, so nobody mistakes session
 weather for memory quality.
 """
+
 from collections.abc import Sequence
 from typing import Union
 
@@ -28,7 +29,9 @@ def upgrade() -> None:
             nullable=True,
         ),
     )
-    op.add_column("brain_recall_events", sa.Column("session_id", sa.Text(), nullable=True))
+    op.add_column(
+        "brain_recall_events", sa.Column("session_id", sa.Text(), nullable=True)
+    )
     op.create_index(
         "ix_brain_recall_events_org_session",
         "brain_recall_events",
@@ -50,8 +53,10 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.UniqueConstraint(
-            "org_id", "session_id", "grader_version",
-            name="uq_session_outcomes_org_session_grader"
+            "org_id",
+            "session_id",
+            "grader_version",
+            name="uq_session_outcomes_org_session_grader",
         ),
     )
     op.create_table(
@@ -71,10 +76,15 @@ def upgrade() -> None:
             sa.ForeignKey("session_outcomes.id", ondelete="CASCADE"),
             nullable=False,
         ),
-        sa.Column("used", sa.Boolean(), server_default=sa.text("false"), nullable=False),
+        sa.Column(
+            "used", sa.Boolean(), server_default=sa.text("false"), nullable=False
+        ),
         sa.Column("usage_score", sa.Numeric(), nullable=True),
         sa.Column(
-            "served_stale", sa.Boolean(), server_default=sa.text("false"), nullable=False
+            "served_stale",
+            sa.Boolean(),
+            server_default=sa.text("false"),
+            nullable=False,
         ),
         sa.Column(
             "created_at",

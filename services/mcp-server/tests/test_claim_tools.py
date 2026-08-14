@@ -236,9 +236,7 @@ async def test_recall_injects_active_claims():
     assert result["active_claims"] == [
         {"id": "c-1", "description": "fix login", "agent_id": "B"}
     ]
-    live_claims_mock.assert_called_once_with(
-        session, org_id="org-x", project_id=None
-    )
+    live_claims_mock.assert_called_once_with(session, org_id="org-x", project_id=None)
 
 
 @pytest.mark.asyncio

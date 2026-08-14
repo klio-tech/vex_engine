@@ -55,7 +55,7 @@ def _bucket() -> str:
 
 def _parse_ref(ref: str) -> tuple[str, str]:
     """``"s3://bucket/key"`` -> ``(bucket, key)``."""
-    bucket, key = ref[len("s3://"):].split("/", 1)
+    bucket, key = ref[len("s3://") :].split("/", 1)
     return bucket, key
 
 
@@ -72,7 +72,9 @@ def _delete_object_best_effort(s3: Any, ref: str, *, reason: str) -> None:
     except Exception:
         logger.warning(
             "trace-consumer: failed to delete orphaned object %s (%s)",
-            ref, reason, exc_info=True,
+            ref,
+            reason,
+            exc_info=True,
         )
 
 
@@ -132,7 +134,9 @@ async def handle_captured(db: Any, s3: Any, redis: Any, entry: dict) -> bool:
         return True
     except Exception:
         logger.warning(
-            "trace-consumer: persist failed org=%s session=%s", org_id, session_id,
+            "trace-consumer: persist failed org=%s session=%s",
+            org_id,
+            session_id,
             exc_info=True,
         )
         return False

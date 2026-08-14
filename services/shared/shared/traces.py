@@ -65,15 +65,19 @@ def upsert_trace(
     """
     trace_id = str(uuid.uuid4())
     try:
-        previous = db.execute(
-            text(
-                """
+        previous = (
+            db.execute(
+                text(
+                    """
                 SELECT transcript_ref FROM session_traces
                 WHERE org_id = :org_id AND session_id = :session_id
                 """
-            ),
-            {"org_id": org_id, "session_id": session_id},
-        ).mappings().first()
+                ),
+                {"org_id": org_id, "session_id": session_id},
+            )
+            .mappings()
+            .first()
+        )
         previous_ref = previous["transcript_ref"] if previous else None
 
         result = db.execute(
@@ -120,7 +124,9 @@ def upsert_trace(
         except Exception:
             pass
         logger.warning(
-            "traces: upsert failed org=%s session=%s", org_id, session_id,
+            "traces: upsert failed org=%s session=%s",
+            org_id,
+            session_id,
             exc_info=True,
         )
         return None
@@ -135,19 +141,23 @@ def fetch_trace(
     cannot fetch another org's trace by guessing/leaking a session_id.
     """
     try:
-        row = db.execute(
-            text(
-                """
+        row = (
+            db.execute(
+                text(
+                    """
                 SELECT id, transcript_ref, message_count, created_at
                 FROM session_traces
                 WHERE org_id = :org_id AND session_id = :session_id
                 """
-            ),
-            {"org_id": org_id, "session_id": session_id},
-        ).mappings().first()
+                ),
+                {"org_id": org_id, "session_id": session_id},
+            )
+            .mappings()
+            .first()
+        )
         if row is None:
             return None
-        bucket, key = row["transcript_ref"][len("s3://"):].split("/", 1)
+        bucket, key = row["transcript_ref"][len("s3://") :].split("/", 1)
         obj = s3.get_object(Bucket=bucket, Key=key)
         data = json.loads(obj["Body"].read().decode("utf-8"))
         return {
@@ -157,7 +167,9 @@ def fetch_trace(
         }
     except Exception:
         logger.warning(
-            "traces: fetch failed org=%s session=%s", org_id, session_id,
+            "traces: fetch failed org=%s session=%s",
+            org_id,
+            session_id,
             exc_info=True,
         )
         return None

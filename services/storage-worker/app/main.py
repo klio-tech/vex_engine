@@ -283,9 +283,7 @@ async def run() -> None:
     redis_client = aioredis.from_url(redis_url, **REDIS_CLIENT_OPTIONS)
 
     await _ensure_consumer_group(redis_client, RAW_STREAM_KEY, RAW_CONSUMER_GROUP)
-    await _ensure_consumer_group(
-        redis_client, SESSIONS_CAPTURED, TRACES_CONSUMER_GROUP
-    )
+    await _ensure_consumer_group(redis_client, SESSIONS_CAPTURED, TRACES_CONSUMER_GROUP)
 
     # Reset the verified consumer group on startup to clear any stuck
     # pending messages from prior deployments.  This is safe because

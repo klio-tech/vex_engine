@@ -36,7 +36,9 @@ def test_no_warning_when_s3_env_is_fully_and_explicitly_configured(monkeypatch, 
     with caplog.at_level("ERROR"):
         main._warn_if_s3_env_missing()
 
-    assert not any("S3 env not fully configured" in rec.message for rec in caplog.records)
+    assert not any(
+        "S3 env not fully configured" in rec.message for rec in caplog.records
+    )
 
 
 def test_warn_never_raises_and_does_not_block_startup(monkeypatch):

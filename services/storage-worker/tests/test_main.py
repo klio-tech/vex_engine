@@ -33,7 +33,9 @@ async def test_consume_traces_enters_loop_when_bucket_set(monkeypatch):
     redis_client = MagicMock()
     redis_client.xreadgroup = AsyncMock(side_effect=RuntimeError("stop-loop"))
 
-    with patch.object(main.asyncio, "sleep", new=AsyncMock(side_effect=RuntimeError("stop-loop"))):
+    with patch.object(
+        main.asyncio, "sleep", new=AsyncMock(side_effect=RuntimeError("stop-loop"))
+    ):
         with pytest.raises(RuntimeError, match="stop-loop"):
             await main._consume_traces(redis_client, s3_client=MagicMock())
 
@@ -55,10 +57,12 @@ async def test_run_starts_legacy_consumers_when_trace_bucket_unset(monkeypatch):
     raw_started = AsyncMock()
     verified_started = AsyncMock()
 
-    with patch.object(main.aioredis, "from_url", return_value=fake_redis_client), \
-         patch.object(main, "get_s3_client", return_value=MagicMock()), \
-         patch.object(main, "_consume_raw", new=raw_started), \
-         patch.object(main, "_consume_verified", new=verified_started):
+    with (
+        patch.object(main.aioredis, "from_url", return_value=fake_redis_client),
+        patch.object(main, "get_s3_client", return_value=MagicMock()),
+        patch.object(main, "_consume_raw", new=raw_started),
+        patch.object(main, "_consume_verified", new=verified_started),
+    ):
         # _consume_traces is left as the real implementation so H1's guard
         # is actually exercised end-to-end through run().
         await main.run()
@@ -85,11 +89,13 @@ async def test_run_does_not_raise_with_trace_bucket_set(monkeypatch):
     verified_started = AsyncMock()
     traces_started = AsyncMock()
 
-    with patch.object(main.aioredis, "from_url", return_value=fake_redis_client), \
-         patch.object(main, "get_s3_client", return_value=MagicMock()), \
-         patch.object(main, "_consume_raw", new=raw_started), \
-         patch.object(main, "_consume_verified", new=verified_started), \
-         patch.object(main, "_consume_traces", new=traces_started):
+    with (
+        patch.object(main.aioredis, "from_url", return_value=fake_redis_client),
+        patch.object(main, "get_s3_client", return_value=MagicMock()),
+        patch.object(main, "_consume_raw", new=raw_started),
+        patch.object(main, "_consume_verified", new=verified_started),
+        patch.object(main, "_consume_traces", new=traces_started),
+    ):
         await main.run()
 
     raw_started.assert_called_once()

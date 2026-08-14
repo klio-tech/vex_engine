@@ -13,7 +13,10 @@ from app import trace_consumer
 
 def _entry(**overrides):
     payload = {
-        "org_id": "o", "session_id": "s", "project_id": None, "user_id": None,
+        "org_id": "o",
+        "session_id": "s",
+        "project_id": None,
+        "user_id": None,
         "agent_id": None,
         "messages": [{"role": "assistant", "content": "done"}],
         "tool_calls": [],
@@ -28,11 +31,14 @@ async def test_handle_captured_puts_s3_then_row_then_emits():
     redis = MagicMock()
     redis.xadd = AsyncMock()
     entry = _entry()
-    with patch.object(trace_consumer, "_bucket", return_value="klio-traces"), \
-         patch.object(
-             trace_consumer.traces, "upsert_trace",
-             return_value={"id": "tid", "previous_ref": None},
-         ) as up:
+    with (
+        patch.object(trace_consumer, "_bucket", return_value="klio-traces"),
+        patch.object(
+            trace_consumer.traces,
+            "upsert_trace",
+            return_value={"id": "tid", "previous_ref": None},
+        ) as up,
+    ):
         ok = await trace_consumer.handle_captured(db, s3, redis, entry)
     assert ok
     body = s3.put_object.call_args.kwargs["Body"]
@@ -62,14 +68,14 @@ async def test_upsert_lost_deletes_fresh_object_but_still_emits_stored():
     redis = MagicMock()
     redis.xadd = AsyncMock()
     entry = _entry()
-    with patch.object(trace_consumer, "_bucket", return_value="klio-traces"), \
-         patch.object(trace_consumer.traces, "upsert_trace", return_value=None):
+    with (
+        patch.object(trace_consumer, "_bucket", return_value="klio-traces"),
+        patch.object(trace_consumer.traces, "upsert_trace", return_value=None),
+    ):
         ok = await trace_consumer.handle_captured(db, s3, redis, entry)
     assert ok is True
     fresh_key = s3.put_object.call_args.kwargs["Key"]
-    s3.delete_object.assert_called_once_with(
-        Bucket="klio-traces", Key=fresh_key
-    )
+    s3.delete_object.assert_called_once_with(Bucket="klio-traces", Key=fresh_key)
     redis.xadd.assert_awaited_once()
     assert redis.xadd.call_args.args[0] == trace_consumer.SESSIONS_STORED
 
@@ -84,11 +90,14 @@ async def test_upsert_won_deletes_previous_ref_object():
     redis.xadd = AsyncMock()
     entry = _entry()
     old_ref = "s3://klio-traces/traces/o/s/old-uuid.json"
-    with patch.object(trace_consumer, "_bucket", return_value="klio-traces"), \
-         patch.object(
-             trace_consumer.traces, "upsert_trace",
-             return_value={"id": "tid", "previous_ref": old_ref},
-         ):
+    with (
+        patch.object(trace_consumer, "_bucket", return_value="klio-traces"),
+        patch.object(
+            trace_consumer.traces,
+            "upsert_trace",
+            return_value={"id": "tid", "previous_ref": old_ref},
+        ),
+    ):
         ok = await trace_consumer.handle_captured(db, s3, redis, entry)
     assert ok is True
     s3.delete_object.assert_called_once_with(

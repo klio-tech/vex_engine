@@ -283,9 +283,11 @@ async def _maybe_dream_for_org(
             lambda: dreamer.dream_for_org(dream_db, s3_client, org_id=org_id)
         )
         logger.info(
-            "dreamer: org=%s wrote %d proposals (sessions_since=%d "
-            "elapsed_hours=%.1f)",
-            org_id, written, state["sessions_since"], elapsed_hours,
+            "dreamer: org=%s wrote %d proposals (sessions_since=%d elapsed_hours=%.1f)",
+            org_id,
+            written,
+            state["sessions_since"],
+            elapsed_hours,
         )
     except Exception:
         logger.error("dreamer: pass failed org=%s", org_id, exc_info=True)
@@ -295,7 +297,9 @@ async def _maybe_dream_for_org(
         state["last_run"] = time.monotonic()
 
 
-async def _consume_sessions_stored(redis_client: aioredis.Redis, s3_client: object) -> None:
+async def _consume_sessions_stored(
+    redis_client: aioredis.Redis, s3_client: object
+) -> None:
     """Consumer loop for ``sessions.stored`` — grades each stored session.
 
     Same consumer-group/ack shape as ``_consume_executions``: read a batch,
@@ -371,9 +375,7 @@ async def _consume_sessions_stored(redis_client: aioredis.Redis, s3_client: obje
                         # duplicate re-delivery (see grade_stored_session's
                         # docstring), neither of which is new evidence.
                         if result.get("session_outcome_id") is not None:
-                            await _maybe_dream_for_org(
-                                s3_client, org_id, dream_state
-                            )
+                            await _maybe_dream_for_org(s3_client, org_id, dream_state)
                     except Exception:
                         logger.error(
                             "Failed to grade session message %s",
@@ -416,7 +418,12 @@ def _warn_if_s3_env_missing() -> None:
     endpoint = os.environ.get("S3_ENDPOINT")
     access_key = os.environ.get("S3_ACCESS_KEY")
     secret_key = os.environ.get("S3_SECRET_KEY")
-    if not endpoint or endpoint == _S3_ENDPOINT_DEV_DEFAULT or not access_key or not secret_key:
+    if (
+        not endpoint
+        or endpoint == _S3_ENDPOINT_DEV_DEFAULT
+        or not access_key
+        or not secret_key
+    ):
         logger.error(
             "S3 env not fully configured (S3_ENDPOINT=%s, S3_ACCESS_KEY=%s, "
             "S3_SECRET_KEY=%s) — if this is a real deployment, not local "

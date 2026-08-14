@@ -87,6 +87,7 @@ def can_touch_member(actor_role: Optional[str], target_role: Optional[str]) -> b
         return target in MANAGE_TOUCHABLE
     return False
 
+
 # The surfaces a grant can arrive from. Recorded on every audit row so
 # "which surface" in the spec's who/what/when/which-surface is answerable.
 SURFACE_MCP = "mcp"
@@ -185,18 +186,20 @@ def can_write(
     db_session: Any, *, org_id: str, project_id: str, user_id: Optional[str]
 ) -> bool:
     """True iff ``user_id`` may persist into this project's shared brain."""
-    return member_role(
-        db_session, org_id=org_id, project_id=project_id, user_id=user_id
-    ) in WRITE_ROLES
+    return (
+        member_role(db_session, org_id=org_id, project_id=project_id, user_id=user_id)
+        in WRITE_ROLES
+    )
 
 
 def can_manage(
     db_session: Any, *, org_id: str, project_id: str, user_id: Optional[str]
 ) -> bool:
     """True iff ``user_id`` may change Read/Write membership on this project."""
-    return member_role(
-        db_session, org_id=org_id, project_id=project_id, user_id=user_id
-    ) in MANAGE_ROLES
+    return (
+        member_role(db_session, org_id=org_id, project_id=project_id, user_id=user_id)
+        in MANAGE_ROLES
+    )
 
 
 def is_admin(
@@ -208,9 +211,7 @@ def is_admin(
     LLM, so promoting someone to Manage/Admin has to stay on Admin.
     """
     return (
-        member_role(
-            db_session, org_id=org_id, project_id=project_id, user_id=user_id
-        )
+        member_role(db_session, org_id=org_id, project_id=project_id, user_id=user_id)
         == ROLE_ADMIN
     )
 

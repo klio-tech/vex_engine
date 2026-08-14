@@ -200,7 +200,11 @@ def _load_recent_evidence(
                 HAVING COUNT(*) >= :min_attrib
                 """
             ),
-            {"org_id": org_id, "min_attrib": BAD_MEMORY_MIN_ATTRIBUTIONS, "since": since},
+            {
+                "org_id": org_id,
+                "min_attrib": BAD_MEMORY_MIN_ATTRIBUTIONS,
+                "since": since,
+            },
         )
         .mappings()
         .all()
@@ -344,7 +348,9 @@ def _detect_bad_memories(bad_memories: list[dict[str, Any]]) -> list[dict[str, A
     return detections
 
 
-def _detect_stale_clusters(stale_clusters: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _detect_stale_clusters(
+    stale_clusters: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """(c) A memory served stale (curator-lag window) >= :data:`STALE_SERVE_MIN_ROWS`
     times — evidence the belief itself has drifted and should be retired
     rather than kept serving a known-stale answer.
@@ -516,7 +522,9 @@ def _dedup_key(detection: dict[str, Any]) -> str:
     return str(detection["target_memory_id"])
 
 
-def _insert_proposal(db: Any, *, org_id: str, detection: dict[str, Any], diff: str) -> Optional[str]:
+def _insert_proposal(
+    db: Any, *, org_id: str, detection: dict[str, Any], diff: str
+) -> Optional[str]:
     """Insert one proposal, deduplicated against any already-OPEN proposal
     for the same ``(org_id, detector, dedup_key)`` via the partial unique
     index (migration 045). Returns the new proposal's id, or ``None`` if a
@@ -552,9 +560,11 @@ def _insert_proposal(db: Any, *, org_id: str, detection: dict[str, Any], diff: s
             "diff": diff,
             "proposed_content": detection.get("proposed_content"),
             "evidence": json.dumps(
-                {"prevalence": detection["prevalence"],
-                 "detector": detection["detector"],
-                 **detection["evidence"]}
+                {
+                    "prevalence": detection["prevalence"],
+                    "detector": detection["detector"],
+                    **detection["evidence"],
+                }
             ),
             "confidence": None,
             "status": "open",
@@ -607,11 +617,15 @@ def dream_for_org(
             logger.warning(
                 "dreamer: drafting failed org=%s detector=%s; using deterministic "
                 "summary",
-                org_id, detection["detector"], exc_info=True,
+                org_id,
+                detection["detector"],
+                exc_info=True,
             )
             diff = detection["summary"]
 
-        proposal_id = _insert_proposal(db, org_id=org_id, detection=detection, diff=diff)
+        proposal_id = _insert_proposal(
+            db, org_id=org_id, detection=detection, diff=diff
+        )
         if proposal_id is None:
             # An open proposal for this org/detector/target already exists
             # (partial unique index) — not a new finding, nothing to count.
@@ -681,7 +695,8 @@ def _try_auto_apply(
         logger.info(
             "dreamer: auto-apply lost the claim org=%s proposal=%s (already "
             "decided elsewhere)",
-            org_id, proposal_id,
+            org_id,
+            proposal_id,
         )
         return
 
@@ -700,7 +715,10 @@ def _try_auto_apply(
     except Exception:
         logger.warning(
             "dreamer: auto-apply raised org=%s proposal=%s memory=%s",
-            org_id, proposal_id, memory_id, exc_info=True,
+            org_id,
+            proposal_id,
+            memory_id,
+            exc_info=True,
         )
         result = {"stored": False}
 
@@ -710,7 +728,10 @@ def _try_auto_apply(
     logger.info(
         "dreamer: auto-apply not stored org=%s proposal=%s memory=%s error=%s; "
         "reverting claim to open",
-        org_id, proposal_id, memory_id, result.get("error"),
+        org_id,
+        proposal_id,
+        memory_id,
+        result.get("error"),
     )
     # Roll back FIRST: we reach here either after supersede_with_revision
     # raised (this session's transaction may hold a half-applied write or
@@ -733,5 +754,6 @@ def _try_auto_apply(
         logger.warning(
             "dreamer: auto-apply revert matched no row (already decided "
             "elsewhere) org=%s proposal=%s",
-            org_id, proposal_id,
+            org_id,
+            proposal_id,
         )

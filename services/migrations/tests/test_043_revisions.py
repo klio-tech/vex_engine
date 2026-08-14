@@ -21,8 +21,6 @@ def test_session_memories_revision_has_a_value_on_every_row():
     engine = sa.create_engine(database_url())
     with engine.connect() as conn:
         (null_count,) = conn.execute(
-            sa.text(
-                "SELECT COUNT(*) FROM session_memories WHERE revision IS NULL"
-            )
+            sa.text("SELECT COUNT(*) FROM session_memories WHERE revision IS NULL")
         ).fetchone()
     assert null_count == 0

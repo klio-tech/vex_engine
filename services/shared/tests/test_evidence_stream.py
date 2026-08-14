@@ -119,8 +119,8 @@ def test_payload_falls_back_to_trimming_tool_calls_when_messages_are_not_enough(
     # The newest tool call must survive; the oldest must not. ``args`` is a
     # JSON-encoded string (e.g. '...-9"}'), so match with the closing
     # delimiter rather than a bare endswith.
-    assert "-9\"}" in p["tool_calls"][-1]["args"]
-    assert not any("-0\"}" in t["args"] for t in p["tool_calls"])
+    assert '-9"}' in p["tool_calls"][-1]["args"]
+    assert not any('-0"}' in t["args"] for t in p["tool_calls"])
 
 
 @pytest.mark.asyncio

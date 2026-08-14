@@ -177,9 +177,7 @@ def _status(db, memory_id: str) -> str | None:
 
 def _read_revision(db, *, org_id: str, memory_id: str) -> str:
     row = db.execute(
-        text(
-            "SELECT revision FROM session_memories WHERE id = :id AND org_id = :o"
-        ),
+        text("SELECT revision FROM session_memories WHERE id = :id AND org_id = :o"),
         {"id": memory_id, "o": org_id},
     ).fetchone()
     return str(row[0])
@@ -282,12 +280,8 @@ def test_two_concurrent_writers_exactly_one_wins(db):
     assert set(results) == {"a", "b"}
 
     conflicts = [r["conflict"] for r in results.values()]
-    assert conflicts.count(False) == 1, (
-        f"expected exactly one winner, got {results}"
-    )
-    assert conflicts.count(True) == 1, (
-        f"expected exactly one conflict, got {results}"
-    )
+    assert conflicts.count(False) == 1, f"expected exactly one winner, got {results}"
+    assert conflicts.count(True) == 1, f"expected exactly one conflict, got {results}"
 
     winner = next(r for r in results.values() if r["conflict"] is False)
     loser = next(r for r in results.values() if r["conflict"] is True)
@@ -321,9 +315,16 @@ def test_private_row_owner_can_supersede_it(db):
     base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
 
     result = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="updated private note", user_id=PRIYA, agent_id=AGENT,
-        memory_type="fact", session_id="sess-priv-owner", scope="private",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="updated private note",
+        user_id=PRIYA,
+        agent_id=AGENT,
+        memory_type="fact",
+        session_id="sess-priv-owner",
+        scope="private",
     )
 
     assert result["conflict"] is False
@@ -336,15 +337,25 @@ def test_private_row_non_owner_gets_not_found_and_leaks_nothing(db):
     Both halves must fail: no leak, no write."""
     org_id = _org(db)
     memory_id = _seed(
-        db, org_id=org_id, scope="private", user_id=PRIYA,
+        db,
+        org_id=org_id,
+        scope="private",
+        user_id=PRIYA,
         content="Priya's salary negotiation notes",
     )
     base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
 
     result = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="attacker's overwrite", user_id=DEV, agent_id=AGENT,
-        memory_type="fact", session_id="sess-priv-attack", scope="private",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="attacker's overwrite",
+        user_id=DEV,
+        agent_id=AGENT,
+        memory_type="fact",
+        session_id="sess-priv-attack",
+        scope="private",
     )
 
     assert result == {"conflict": False, "stored": False, "error": "not_found"}
@@ -362,9 +373,16 @@ def test_an_unattributed_caller_cannot_supersede_a_private_row(db):
     base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
 
     result = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="attacker's overwrite", user_id=None, agent_id=AGENT,
-        memory_type="fact", session_id="sess-priv-anon", scope="private",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="attacker's overwrite",
+        user_id=None,
+        agent_id=AGENT,
+        memory_type="fact",
+        session_id="sess-priv-anon",
+        scope="private",
     )
 
     assert result == {"conflict": False, "stored": False, "error": "not_found"}
@@ -379,19 +397,37 @@ def test_the_private_refusal_is_identical_to_an_unknown_id(db):
     base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
 
     refused = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="x", user_id=DEV, agent_id=AGENT, memory_type="fact",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="x",
+        user_id=DEV,
+        agent_id=AGENT,
+        memory_type="fact",
         session_id="s1",
     )
     unknown = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=str(uuid.uuid4()), base_revision=base_revision,
-        new_content="x", user_id=DEV, agent_id=AGENT, memory_type="fact",
+        db,
+        org_id=org_id,
+        memory_id=str(uuid.uuid4()),
+        base_revision=base_revision,
+        new_content="x",
+        user_id=DEV,
+        agent_id=AGENT,
+        memory_type="fact",
         session_id="s2",
     )
 
-    assert refused == unknown == {
-        "conflict": False, "stored": False, "error": "not_found",
-    }
+    assert (
+        refused
+        == unknown
+        == {
+            "conflict": False,
+            "stored": False,
+            "error": "not_found",
+        }
+    )
 
 
 def test_agent_scope_owning_agent_can_supersede(db):
@@ -400,9 +436,15 @@ def test_agent_scope_owning_agent_can_supersede(db):
     base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
 
     result = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="updated agent note", agent_id=AGENT, memory_type="fact",
-        session_id="sess-agent-owner", scope="agent",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="updated agent note",
+        agent_id=AGENT,
+        memory_type="fact",
+        session_id="sess-agent-owner",
+        scope="agent",
     )
 
     assert result["conflict"] is False
@@ -417,9 +459,15 @@ def test_agent_scope_non_owning_agent_gets_forbidden(db):
     base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
 
     result = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="attacker's overwrite", agent_id="other-agent",
-        memory_type="fact", session_id="sess-agent-attack", scope="agent",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="attacker's overwrite",
+        agent_id="other-agent",
+        memory_type="fact",
+        session_id="sess-agent-attack",
+        scope="agent",
     )
 
     assert result == {"conflict": False, "stored": False, "error": "forbidden"}
@@ -437,9 +485,16 @@ def test_project_scope_member_can_supersede(db):
     base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
 
     result = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="updated project note", user_id=PRIYA, agent_id=AGENT,
-        memory_type="fact", session_id="sess-proj-member", scope="project",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="updated project note",
+        user_id=PRIYA,
+        agent_id=AGENT,
+        memory_type="fact",
+        session_id="sess-proj-member",
+        scope="project",
         project_id=project_id,
     )
 
@@ -458,9 +513,16 @@ def test_project_scope_non_member_gets_not_found(db):
     base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
 
     result = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="attacker's overwrite", user_id=DEV, agent_id=AGENT,
-        memory_type="fact", session_id="sess-proj-attack", scope="project",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="attacker's overwrite",
+        user_id=DEV,
+        agent_id=AGENT,
+        memory_type="fact",
+        session_id="sess-proj-attack",
+        scope="project",
         project_id=project_id,
     )
 
@@ -485,8 +547,13 @@ def test_a_superseded_rows_frozen_revision_cannot_be_reused_as_a_cas_token(db):
     base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
 
     first = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="first correction", agent_id=AGENT, memory_type="fact",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="first correction",
+        agent_id=AGENT,
+        memory_type="fact",
         session_id="sess-h2-1",
     )
     assert first["conflict"] is False
@@ -497,8 +564,13 @@ def test_a_superseded_rows_frozen_revision_cannot_be_reused_as_a_cas_token(db):
     assert frozen_revision != base_revision  # sanity: it DID change once
 
     replay = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=frozen_revision,
-        new_content="replay attempt", agent_id=AGENT, memory_type="fact",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=frozen_revision,
+        new_content="replay attempt",
+        agent_id=AGENT,
+        memory_type="fact",
         session_id="sess-h2-2",
     )
 
@@ -534,9 +606,16 @@ def test_chain_follow_hides_a_project_scoped_successor_from_a_non_member(db):
     # successor. Legitimate: any caller may choose the scope of what they
     # write, and nothing ties a new row's scope to the one it replaces.
     first = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="project-private follow-up", user_id=PRIYA, agent_id=AGENT,
-        memory_type="fact", session_id="sess-n1-1", scope="project",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="project-private follow-up",
+        user_id=PRIYA,
+        agent_id=AGENT,
+        memory_type="fact",
+        session_id="sess-n1-1",
+        scope="project",
         project_id=project_id,
     )
     assert first["conflict"] is False
@@ -546,8 +625,14 @@ def test_chain_follow_hides_a_project_scoped_successor_from_a_non_member(db):
     # no owner/membership check) but must NOT see the project row's content
     # once the guard misses and the chain-follow lands on it.
     non_member = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="attempt", user_id=DEV, agent_id=AGENT, memory_type="fact",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="attempt",
+        user_id=DEV,
+        agent_id=AGENT,
+        memory_type="fact",
         session_id="sess-n1-2",
     )
     assert non_member["conflict"] is True
@@ -556,8 +641,14 @@ def test_chain_follow_hides_a_project_scoped_successor_from_a_non_member(db):
     # Positive control: the project member DOES see the terminal row — a
     # ladder that refused everyone would pass the negative above by accident.
     member = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="attempt", user_id=PRIYA, agent_id=AGENT, memory_type="fact",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="attempt",
+        user_id=PRIYA,
+        agent_id=AGENT,
+        memory_type="fact",
         session_id="sess-n1-3",
     )
     assert member["conflict"] is True
@@ -571,23 +662,39 @@ def test_chain_follow_hides_an_agent_scoped_successor_from_another_agent(db):
     base_revision = _read_revision(db, org_id=org_id, memory_id=memory_id)
 
     first = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="agent-private follow-up", agent_id=AGENT, memory_type="fact",
-        session_id="sess-n1-agent-1", scope="agent",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="agent-private follow-up",
+        agent_id=AGENT,
+        memory_type="fact",
+        session_id="sess-n1-agent-1",
+        scope="agent",
     )
     assert first["conflict"] is False
 
     other_agent = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="attempt", agent_id="other-agent", memory_type="fact",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="attempt",
+        agent_id="other-agent",
+        memory_type="fact",
         session_id="sess-n1-agent-2",
     )
     assert other_agent["conflict"] is True
     assert other_agent["current"] is None
 
     owning_agent = memory_mod.supersede_with_revision(
-        db, org_id=org_id, memory_id=memory_id, base_revision=base_revision,
-        new_content="attempt", agent_id=AGENT, memory_type="fact",
+        db,
+        org_id=org_id,
+        memory_id=memory_id,
+        base_revision=base_revision,
+        new_content="attempt",
+        agent_id=AGENT,
+        memory_type="fact",
         session_id="sess-n1-agent-3",
     )
     assert owning_agent["conflict"] is True

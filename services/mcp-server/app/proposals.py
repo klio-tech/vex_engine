@@ -99,7 +99,9 @@ def _list_proposals(
     return [dict(r) for r in rows]
 
 
-def _load_proposal(db: Any, *, org_id: str, proposal_id: str) -> Optional[dict[str, Any]]:
+def _load_proposal(
+    db: Any, *, org_id: str, proposal_id: str
+) -> Optional[dict[str, Any]]:
     """Read-only lookup for the initial 404/409 checks and to gather what a
     decision needs to apply (target id, proposed content). NOT the
     concurrency guard — :func:`_claim_proposal` is.
@@ -142,7 +144,12 @@ def _claim_proposal(
             WHERE id = :id AND org_id = :org_id AND status = 'open'
             """
         ),
-        {"status": status, "decided_by": decided_by, "id": proposal_id, "org_id": org_id},
+        {
+            "status": status,
+            "decided_by": decided_by,
+            "id": proposal_id,
+            "org_id": org_id,
+        },
     )
     db.commit()
     return bool(result.rowcount)
@@ -183,7 +190,8 @@ def _revert_claim(db: Any, *, org_id: str, proposal_id: str) -> None:
         logger.warning(
             "_revert_claim: no row reverted (already decided elsewhere) "
             "org=%s proposal=%s",
-            org_id, proposal_id,
+            org_id,
+            proposal_id,
         )
 
 
@@ -270,7 +278,8 @@ async def approve_proposal(
             if kind == "revise":
                 target = await anyio.to_thread.run_sync(
                     lambda: _target_row(
-                        db, org_id=org_id,
+                        db,
+                        org_id=org_id,
                         memory_id=str(proposal["target_memory_id"]),
                     )
                 )
@@ -281,8 +290,11 @@ async def approve_proposal(
 
         claimed = await anyio.to_thread.run_sync(
             lambda: _claim_proposal(
-                db, org_id=org_id, proposal_id=proposal_id,
-                status="approved", decided_by=user_id,
+                db,
+                org_id=org_id,
+                proposal_id=proposal_id,
+                status="approved",
+                decided_by=user_id,
             )
         )
         if not claimed:
@@ -305,7 +317,9 @@ async def approve_proposal(
                 logger.error(
                     "approve_proposal: write_scoped_memory raised org=%s "
                     "proposal=%s; reverting claim",
-                    org_id, proposal_id, exc_info=True,
+                    org_id,
+                    proposal_id,
+                    exc_info=True,
                 )
                 await anyio.to_thread.run_sync(
                     lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
@@ -346,7 +360,10 @@ async def approve_proposal(
                 logger.error(
                     "approve_proposal: supersede_with_revision raised org=%s "
                     "proposal=%s memory=%s; reverting claim",
-                    org_id, proposal_id, target_memory_id, exc_info=True,
+                    org_id,
+                    proposal_id,
+                    target_memory_id,
+                    exc_info=True,
                 )
                 await anyio.to_thread.run_sync(
                     lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
@@ -383,7 +400,10 @@ async def approve_proposal(
             logger.error(
                 "approve_proposal: retract_memory raised org=%s proposal=%s "
                 "memory=%s; reverting claim",
-                org_id, proposal_id, target_memory_id, exc_info=True,
+                org_id,
+                proposal_id,
+                target_memory_id,
+                exc_info=True,
             )
             await anyio.to_thread.run_sync(
                 lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
@@ -430,8 +450,11 @@ async def reject_proposal(
 
         claimed = await anyio.to_thread.run_sync(
             lambda: _claim_proposal(
-                db, org_id=org_id, proposal_id=proposal_id,
-                status="rejected", decided_by=user_id,
+                db,
+                org_id=org_id,
+                proposal_id=proposal_id,
+                status="rejected",
+                decided_by=user_id,
             )
         )
         if not claimed:

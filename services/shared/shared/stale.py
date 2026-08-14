@@ -5,6 +5,7 @@ one was served (curator lag). Serves before the new belief existed were
 correct at the time and are never marked. This is the silent-failure counter;
 its integrity is the point.
 """
+
 import logging
 from datetime import datetime
 from typing import Any
@@ -15,7 +16,10 @@ logger = logging.getLogger("klio.stale")
 
 
 def mark_stale_serves(
-    db: Any, *, org_id: str, old_memory_id: str,
+    db: Any,
+    *,
+    org_id: str,
+    old_memory_id: str,
     superseding_created_at: datetime,
 ) -> int:
     """Mark past recall serves of ``old_memory_id`` stale where the
@@ -40,8 +44,11 @@ def mark_stale_serves(
                   AND bre.created_at >= :superseding_created_at
                 """
             ),
-            {"org_id": org_id, "old_memory_id": old_memory_id,
-             "superseding_created_at": superseding_created_at},
+            {
+                "org_id": org_id,
+                "old_memory_id": old_memory_id,
+                "superseding_created_at": superseding_created_at,
+            },
         )
         marked = int(result.rowcount or 0)
         db.commit()
@@ -51,6 +58,10 @@ def mark_stale_serves(
             db.rollback()
         except Exception:
             pass
-        logger.warning("stale marking failed org=%s memory=%s", org_id,
-                       old_memory_id, exc_info=True)
+        logger.warning(
+            "stale marking failed org=%s memory=%s",
+            org_id,
+            old_memory_id,
+            exc_info=True,
+        )
         return 0

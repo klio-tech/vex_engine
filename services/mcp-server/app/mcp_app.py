@@ -435,17 +435,19 @@ async def _perform_write(
         )
 
         if header_project_id and await anyio.to_thread.run_sync(
-            lambda: projects.is_member(
-                db,
-                org_id=org_id,
-                project_id=header_project_id,
-                user_id=user_id,
-            )
-            and not projects.can_write(
-                db,
-                org_id=org_id,
-                project_id=header_project_id,
-                user_id=user_id,
+            lambda: (
+                projects.is_member(
+                    db,
+                    org_id=org_id,
+                    project_id=header_project_id,
+                    user_id=user_id,
+                )
+                and not projects.can_write(
+                    db,
+                    org_id=org_id,
+                    project_id=header_project_id,
+                    user_id=user_id,
+                )
             )
         ):
             return {
@@ -532,10 +534,7 @@ async def _perform_write(
                 return {
                     "error": "revision_conflict",
                     "current": cas_result.get("current"),
-                    "hint": (
-                        "belief changed while you worked — re-read and "
-                        "re-assert"
-                    ),
+                    "hint": ("belief changed while you worked — re-read and re-assert"),
                 }
             # A CAS supersede always stores a new row (there is no dedup
             # branch on this path — an explicit re-assertion is never a
@@ -2426,7 +2425,11 @@ async def _perform_claim(
     request = ctx.request_context.request
     if request is None:
         logger.error("brain claim got no transport request; cannot authenticate")
-        return {"claim_id": None, "error": "unauthorized", "detail": "no request context"}
+        return {
+            "claim_id": None,
+            "error": "unauthorized",
+            "detail": "no request context",
+        }
 
     _attach_client_name(ctx, request)
 
@@ -2469,7 +2472,11 @@ async def _perform_release(ctx: Context, *, claim_id: str) -> dict[str, Any]:
     request = ctx.request_context.request
     if request is None:
         logger.error("brain release got no transport request; cannot authenticate")
-        return {"released": False, "error": "unauthorized", "detail": "no request context"}
+        return {
+            "released": False,
+            "error": "unauthorized",
+            "detail": "no request context",
+        }
 
     _attach_client_name(ctx, request)
 
@@ -3062,8 +3069,7 @@ async def _perform_project_grant(
         if (
             existing == projects.ROLE_ADMIN
             and role != projects.ROLE_ADMIN
-            and projects.admin_count(db, org_id=org_id, project_id=project_id)
-            == 1
+            and projects.admin_count(db, org_id=org_id, project_id=project_id) == 1
         ):
             return {
                 "granted": False,
@@ -3795,8 +3801,7 @@ def _register_tools(mcp: FastMCP) -> None:
             Literal["read", "write", "manage", "admin", "member"],
             Field(
                 description=(
-                    "read | write | manage | admin. `member` is an alias for "
-                    "write."
+                    "read | write | manage | admin. `member` is an alias for write."
                 )
             ),
         ] = "write",

@@ -32,7 +32,10 @@ def _attributed_client(raise_server_exceptions: bool = True) -> TestClient:
     """
     app = create_app()
     app.dependency_overrides[verify_api_key] = lambda: KeyInfo(
-        org_id="test-org", key_id="test-key", scopes=["ingest"], user_id=USER,
+        org_id="test-org",
+        key_id="test-key",
+        scopes=["ingest"],
+        user_id=USER,
     )
     return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
@@ -42,12 +45,18 @@ def _patch_db():
     return patch("app.proposals.SessionLocal", MagicMock(return_value=session)), session
 
 
-def _open_proposal_row(kind="add", target_memory_id=None, scope="org",
-                        proposed_content="proposed content"):
+def _open_proposal_row(
+    kind="add", target_memory_id=None, scope="org", proposed_content="proposed content"
+):
     return {
-        "id": PROPOSAL_ID, "org_id": "test-org", "scope": scope, "kind": kind,
-        "target_memory_id": target_memory_id, "diff": "rationale prose",
-        "proposed_content": proposed_content, "status": "open",
+        "id": PROPOSAL_ID,
+        "org_id": "test-org",
+        "scope": scope,
+        "kind": kind,
+        "target_memory_id": target_memory_id,
+        "diff": "rationale prose",
+        "proposed_content": proposed_content,
+        "status": "open",
     }
 
 
@@ -58,9 +67,14 @@ def _open_proposal_row(kind="add", target_memory_id=None, scope="org",
 
 def test_list_proposals_defaults_to_open_status_and_default_limit(client):
     db_patch, session = _patch_db()
-    with db_patch, patch.object(
-        proposals, "_list_proposals", return_value=[{"id": PROPOSAL_ID, "status": "open"}]
-    ) as list_fn:
+    with (
+        db_patch,
+        patch.object(
+            proposals,
+            "_list_proposals",
+            return_value=[{"id": PROPOSAL_ID, "status": "open"}],
+        ) as list_fn,
+    ):
         resp = client.get("/proposals")
 
     assert resp.status_code == 200
@@ -73,7 +87,10 @@ def test_list_proposals_defaults_to_open_status_and_default_limit(client):
 
 def test_list_proposals_honors_status_and_limit_query_params(client):
     db_patch, _session = _patch_db()
-    with db_patch, patch.object(proposals, "_list_proposals", return_value=[]) as list_fn:
+    with (
+        db_patch,
+        patch.object(proposals, "_list_proposals", return_value=[]) as list_fn,
+    ):
         resp = client.get("/proposals?status=rejected&limit=10")
 
     assert resp.status_code == 200
@@ -142,7 +159,9 @@ def test_approve_add_kind_writes_new_memory_and_records_decided_by():
     write = AsyncMock(return_value={"stored": True, "id": "new-mem", "scope": "org"})
     with (
         db_patch,
-        patch.object(proposals, "_load_proposal", return_value=_open_proposal_row(kind="add")),
+        patch.object(
+            proposals, "_load_proposal", return_value=_open_proposal_row(kind="add")
+        ),
         patch.object(proposals, "_claim_proposal", return_value=True) as claim,
         patch.object(proposals.brain, "write_scoped_memory", write),
     ):
@@ -166,7 +185,9 @@ def test_approve_add_kind_raises_reverts_claim_and_500s():
     write = AsyncMock(side_effect=RuntimeError("boom"))
     with (
         db_patch,
-        patch.object(proposals, "_load_proposal", return_value=_open_proposal_row(kind="add")),
+        patch.object(
+            proposals, "_load_proposal", return_value=_open_proposal_row(kind="add")
+        ),
         patch.object(proposals, "_claim_proposal", return_value=True),
         patch.object(proposals, "_revert_claim") as revert,
         patch.object(proposals.brain, "write_scoped_memory", write),
@@ -184,7 +205,9 @@ def test_approve_add_kind_lost_claim_race_is_409():
     write = AsyncMock()
     with (
         db_patch,
-        patch.object(proposals, "_load_proposal", return_value=_open_proposal_row(kind="add")),
+        patch.object(
+            proposals, "_load_proposal", return_value=_open_proposal_row(kind="add")
+        ),
         patch.object(proposals, "_claim_proposal", return_value=False),
         patch.object(proposals.brain, "write_scoped_memory", write),
     ):
@@ -209,13 +232,22 @@ def test_approve_revise_kind_applies_via_cas_with_target_revision_and_type():
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=row),
-        patch.object(proposals, "_target_row",
-                     return_value={"scope": "agent", "revision": "rev-1",
-                                   "memory_type": "fact"}),
+        patch.object(
+            proposals,
+            "_target_row",
+            return_value={"scope": "agent", "revision": "rev-1", "memory_type": "fact"},
+        ),
         patch.object(proposals, "_claim_proposal", return_value=True),
-        patch.object(proposals, "supersede_with_revision",
-                     return_value={"conflict": False, "stored": True,
-                                   "new_id": "m-new", "new_revision": "rev-2"}) as sup,
+        patch.object(
+            proposals,
+            "supersede_with_revision",
+            return_value={
+                "conflict": False,
+                "stored": True,
+                "new_id": "m-new",
+                "new_revision": "rev-2",
+            },
+        ) as sup,
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
 
@@ -238,14 +270,22 @@ def test_approve_revise_kind_conflict_reverts_claim_and_returns_409():
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=row),
-        patch.object(proposals, "_target_row",
-                     return_value={"scope": "org", "revision": "rev-1",
-                                   "memory_type": "fact"}),
+        patch.object(
+            proposals,
+            "_target_row",
+            return_value={"scope": "org", "revision": "rev-1", "memory_type": "fact"},
+        ),
         patch.object(proposals, "_claim_proposal", return_value=True),
         patch.object(proposals, "_revert_claim") as revert,
-        patch.object(proposals, "supersede_with_revision",
-                     return_value={"conflict": True, "stored": False,
-                                   "current": {"id": MEMORY_ID}}),
+        patch.object(
+            proposals,
+            "supersede_with_revision",
+            return_value={
+                "conflict": True,
+                "stored": False,
+                "current": {"id": MEMORY_ID},
+            },
+        ),
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
 
@@ -264,13 +304,16 @@ def test_approve_revise_kind_raises_reverts_claim_and_500s():
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=row),
-        patch.object(proposals, "_target_row",
-                     return_value={"scope": "org", "revision": "rev-1",
-                                   "memory_type": "fact"}),
+        patch.object(
+            proposals,
+            "_target_row",
+            return_value={"scope": "org", "revision": "rev-1", "memory_type": "fact"},
+        ),
         patch.object(proposals, "_claim_proposal", return_value=True),
         patch.object(proposals, "_revert_claim") as revert,
-        patch.object(proposals, "supersede_with_revision",
-                     side_effect=RuntimeError("boom")),
+        patch.object(
+            proposals, "supersede_with_revision", side_effect=RuntimeError("boom")
+        ),
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
 
@@ -293,13 +336,27 @@ def test_approve_revise_kind_forwards_project_id_for_project_scoped_target():
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=row),
-        patch.object(proposals, "_target_row",
-                     return_value={"scope": "project", "revision": "rev-1",
-                                   "memory_type": "fact", "project_id": project_id}),
+        patch.object(
+            proposals,
+            "_target_row",
+            return_value={
+                "scope": "project",
+                "revision": "rev-1",
+                "memory_type": "fact",
+                "project_id": project_id,
+            },
+        ),
         patch.object(proposals, "_claim_proposal", return_value=True),
-        patch.object(proposals, "supersede_with_revision",
-                     return_value={"conflict": False, "stored": True,
-                                   "new_id": "m-new", "new_revision": "rev-2"}) as sup,
+        patch.object(
+            proposals,
+            "supersede_with_revision",
+            return_value={
+                "conflict": False,
+                "stored": True,
+                "new_id": "m-new",
+                "new_revision": "rev-2",
+            },
+        ) as sup,
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
 
@@ -319,14 +376,23 @@ def test_approve_revise_kind_forbidden_reverts_claim_and_returns_403():
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=row),
-        patch.object(proposals, "_target_row",
-                     return_value={"scope": "org", "revision": "rev-1",
-                                   "memory_type": "fact", "project_id": None}),
+        patch.object(
+            proposals,
+            "_target_row",
+            return_value={
+                "scope": "org",
+                "revision": "rev-1",
+                "memory_type": "fact",
+                "project_id": None,
+            },
+        ),
         patch.object(proposals, "_claim_proposal", return_value=True),
         patch.object(proposals, "_revert_claim") as revert,
-        patch.object(proposals, "supersede_with_revision",
-                     return_value={"conflict": False, "stored": False,
-                                   "error": "forbidden"}),
+        patch.object(
+            proposals,
+            "supersede_with_revision",
+            return_value={"conflict": False, "stored": False, "error": "forbidden"},
+        ),
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
 
@@ -352,14 +418,18 @@ def test_approve_retire_kind_retracts_not_supersedes():
     a retraction removes the belief, it does not replace it with prose."""
     client = _attributed_client()
     db_patch, _session = _patch_db()
-    row = _open_proposal_row(kind="retire", target_memory_id=MEMORY_ID,
-                              proposed_content=None)
+    row = _open_proposal_row(
+        kind="retire", target_memory_id=MEMORY_ID, proposed_content=None
+    )
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=row),
         patch.object(proposals, "_claim_proposal", return_value=True),
-        patch.object(proposals, "retract_memory",
-                     return_value={"forgotten": True, "id": MEMORY_ID}) as rm,
+        patch.object(
+            proposals,
+            "retract_memory",
+            return_value={"forgotten": True, "id": MEMORY_ID},
+        ) as rm,
         patch.object(proposals, "supersede_with_revision") as sup,
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
@@ -378,14 +448,18 @@ def test_approve_retire_kind_needs_no_proposed_content():
     """Unlike add/revise, retire never 422s for missing proposed_content."""
     client = _attributed_client()
     db_patch, _session = _patch_db()
-    row = _open_proposal_row(kind="retire", target_memory_id=MEMORY_ID,
-                              proposed_content=None)
+    row = _open_proposal_row(
+        kind="retire", target_memory_id=MEMORY_ID, proposed_content=None
+    )
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=row),
         patch.object(proposals, "_claim_proposal", return_value=True),
-        patch.object(proposals, "retract_memory",
-                     return_value={"forgotten": True, "id": MEMORY_ID}),
+        patch.object(
+            proposals,
+            "retract_memory",
+            return_value={"forgotten": True, "id": MEMORY_ID},
+        ),
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
     assert resp.status_code == 200
@@ -394,15 +468,19 @@ def test_approve_retire_kind_needs_no_proposed_content():
 def test_approve_retire_kind_forbidden_reverts_claim_and_returns_403():
     client = _attributed_client()
     db_patch, _session = _patch_db()
-    row = _open_proposal_row(kind="retire", target_memory_id=MEMORY_ID,
-                              proposed_content=None)
+    row = _open_proposal_row(
+        kind="retire", target_memory_id=MEMORY_ID, proposed_content=None
+    )
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=row),
         patch.object(proposals, "_claim_proposal", return_value=True),
         patch.object(proposals, "_revert_claim") as revert,
-        patch.object(proposals, "retract_memory",
-                     return_value={"forgotten": False, "error": "forbidden"}),
+        patch.object(
+            proposals,
+            "retract_memory",
+            return_value={"forgotten": False, "error": "forbidden"},
+        ),
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
     assert resp.status_code == 403
@@ -412,8 +490,9 @@ def test_approve_retire_kind_forbidden_reverts_claim_and_returns_403():
 def test_approve_retire_kind_raises_reverts_claim_and_500s():
     client = _attributed_client(raise_server_exceptions=False)
     db_patch, _session = _patch_db()
-    row = _open_proposal_row(kind="retire", target_memory_id=MEMORY_ID,
-                              proposed_content=None)
+    row = _open_proposal_row(
+        kind="retire", target_memory_id=MEMORY_ID, proposed_content=None
+    )
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=row),
@@ -501,7 +580,9 @@ def test_revert_claim_rolls_back_before_issuing_the_revert_update():
     db = MagicMock()
     calls = []
     db.rollback.side_effect = lambda: calls.append("rollback")
-    db.execute.side_effect = lambda *a, **k: calls.append("execute") or MagicMock(rowcount=1)
+    db.execute.side_effect = lambda *a, **k: (
+        calls.append("execute") or MagicMock(rowcount=1)
+    )
 
     proposals._revert_claim(db, org_id="test-org", proposal_id=PROPOSAL_ID)
 

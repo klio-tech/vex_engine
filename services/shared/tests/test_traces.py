@@ -13,8 +13,13 @@ from shared import traces
 def test_upsert_richer_wins_sql():
     db = MagicMock()
     result = traces.upsert_trace(
-        db, org_id="o", session_id="s", transcript_ref="s3://b/k",
-        message_count=5, tool_calls_count=2, redaction_version="1",
+        db,
+        org_id="o",
+        session_id="s",
+        transcript_ref="s3://b/k",
+        message_count=5,
+        tool_calls_count=2,
+        redaction_version="1",
     )
     sql = " ".join(str(db.execute.call_args.args[0]).split())
     assert "INSERT INTO session_traces" in sql
@@ -35,19 +40,35 @@ def test_upsert_lost_race_returns_none():
     db.execute.return_value.mappings.return_value.first.return_value = {
         "transcript_ref": "s3://b/existing.json"
     }
-    assert traces.upsert_trace(
-        db, org_id="o", session_id="s", transcript_ref="s3://b/new.json",
-        message_count=1, tool_calls_count=0, redaction_version="1",
-    ) is None
+    assert (
+        traces.upsert_trace(
+            db,
+            org_id="o",
+            session_id="s",
+            transcript_ref="s3://b/new.json",
+            message_count=1,
+            tool_calls_count=0,
+            redaction_version="1",
+        )
+        is None
+    )
 
 
 def test_upsert_never_raises():
     db = MagicMock()
     db.execute.side_effect = RuntimeError("down")
-    assert traces.upsert_trace(
-        db, org_id="o", session_id="s", transcript_ref="r",
-        message_count=1, tool_calls_count=0, redaction_version="1",
-    ) is None
+    assert (
+        traces.upsert_trace(
+            db,
+            org_id="o",
+            session_id="s",
+            transcript_ref="r",
+            message_count=1,
+            tool_calls_count=0,
+            redaction_version="1",
+        )
+        is None
+    )
 
 
 def test_fetch_predicates_on_org():
