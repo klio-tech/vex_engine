@@ -28,12 +28,40 @@ def upsert_trace(
     project_id: Optional[str] = None,
     user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
-) -> Optional[str]:
+) -> Optional[dict[str, Any]]:
     """Insert or replace-if-richer. A second Stop hook with MORE messages wins;
-    a shorter duplicate never clobbers a fuller trace. Best-effort."""
+    a shorter duplicate never clobbers a fuller trace. Best-effort — never
+    raises.
+
+    Returns ``{"id": <trace row id>, "previous_ref": <str | None>}`` when a
+    row was actually written (fresh insert, or a conflict update that WON
+    the richer-wins race) — ``previous_ref`` is whatever ``transcript_ref``
+    the row pointed at immediately before this call, so the caller can clean
+    up the S3 object it's no longer using.
+
+    Returns ``None`` when nothing was written: either the conflict update
+    LOST the richer-wins race (``ON CONFLICT ... WHERE`` matched zero rows —
+    detected via ``RETURNING id``, so this function no longer reports a
+    locally-generated id for a row that may not exist), or the write failed
+    outright (exception, logged and swallowed). Either way, the caller's own
+    freshly-written S3 object has nothing pointing at it and should be
+    treated as orphaned by the caller (see ``trace_consumer.handle_captured``
+    for the delete choreography and its bucket-lifecycle-rule backstop).
+    """
     trace_id = str(uuid.uuid4())
     try:
-        db.execute(
+        previous = db.execute(
+            text(
+                """
+                SELECT transcript_ref FROM session_traces
+                WHERE org_id = :org_id AND session_id = :session_id
+                """
+            ),
+            {"org_id": org_id, "session_id": session_id},
+        ).mappings().first()
+        previous_ref = previous["transcript_ref"] if previous else None
+
+        result = db.execute(
             text(
                 """
                 INSERT INTO session_traces
@@ -50,6 +78,7 @@ def upsert_trace(
                   redaction_version = EXCLUDED.redaction_version,
                   updated_at = now()
                 WHERE EXCLUDED.message_count > session_traces.message_count
+                RETURNING id
                 """
             ),
             {
@@ -65,8 +94,11 @@ def upsert_trace(
                 "redaction_version": redaction_version,
             },
         )
+        row = result.first()
         db.commit()
-        return trace_id
+        if row is None:
+            return None
+        return {"id": str(row[0]), "previous_ref": previous_ref}
     except Exception:
         try:
             db.rollback()
