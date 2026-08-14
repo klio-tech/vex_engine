@@ -20,13 +20,21 @@ PROPOSAL_ID = "22222222-2222-2222-2222-222222222222"
 MEMORY_ID = "33333333-3333-3333-3333-333333333333"
 
 
-def _attributed_client() -> TestClient:
-    """A TestClient whose key resolves to an attributable user."""
+def _attributed_client(raise_server_exceptions: bool = True) -> TestClient:
+    """A TestClient whose key resolves to an attributable user.
+
+    ``raise_server_exceptions=False`` for the reverted-claim-then-500 tests:
+    the TestClient's default behaviour is to re-raise an unhandled server
+    exception into the TEST rather than converting it to a response, which
+    is right for catching bugs by surprise but wrong here, where the 500 IS
+    the expected, asserted behaviour (mirrors ``tests/test_oauth_middleware.py``'s
+    own use of the same flag).
+    """
     app = create_app()
     app.dependency_overrides[verify_api_key] = lambda: KeyInfo(
         org_id="test-org", key_id="test-key", scopes=["ingest"], user_id=USER,
     )
-    return TestClient(app)
+    return TestClient(app, raise_server_exceptions=raise_server_exceptions)
 
 
 def _patch_db():
@@ -152,6 +160,22 @@ def test_approve_add_kind_writes_new_memory_and_records_decided_by():
     assert kw["provenance"] == "INFERRED"
 
 
+def test_approve_add_kind_raises_reverts_claim_and_500s():
+    client = _attributed_client(raise_server_exceptions=False)
+    db_patch, _session = _patch_db()
+    write = AsyncMock(side_effect=RuntimeError("boom"))
+    with (
+        db_patch,
+        patch.object(proposals, "_load_proposal", return_value=_open_proposal_row(kind="add")),
+        patch.object(proposals, "_claim_proposal", return_value=True),
+        patch.object(proposals, "_revert_claim") as revert,
+        patch.object(proposals.brain, "write_scoped_memory", write),
+    ):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
+    assert resp.status_code == 500
+    revert.assert_called_once()
+
+
 def test_approve_add_kind_lost_claim_race_is_409():
     """Claim races: someone else decided it between the initial load and
     the atomic claim UPDATE."""
@@ -229,6 +253,33 @@ def test_approve_revise_kind_conflict_reverts_claim_and_returns_409():
     revert.assert_called_once()
 
 
+def test_approve_revise_kind_raises_reverts_claim_and_500s():
+    """The proposal is already claimed ('approved') by the time
+    supersede_with_revision runs — an unexpected exception there must not
+    leave it stuck approved with nothing written. FastAPI turns the
+    re-raised exception into a 500."""
+    client = _attributed_client(raise_server_exceptions=False)
+    db_patch, _session = _patch_db()
+    row = _open_proposal_row(kind="revise", target_memory_id=MEMORY_ID, scope="org")
+    with (
+        db_patch,
+        patch.object(proposals, "_load_proposal", return_value=row),
+        patch.object(proposals, "_target_row",
+                     return_value={"scope": "org", "revision": "rev-1",
+                                   "memory_type": "fact"}),
+        patch.object(proposals, "_claim_proposal", return_value=True),
+        patch.object(proposals, "_revert_claim") as revert,
+        patch.object(proposals, "supersede_with_revision",
+                     side_effect=RuntimeError("boom")),
+    ):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
+
+    assert resp.status_code == 500
+    revert.assert_called_once()
+    assert revert.call_args.kwargs["org_id"] == "test-org"
+    assert revert.call_args.kwargs["proposal_id"] == PROPOSAL_ID
+
+
 def test_approve_revise_kind_missing_target_row_is_409():
     client = _attributed_client()
     db_patch, _session = _patch_db()
@@ -301,6 +352,23 @@ def test_approve_retire_kind_forbidden_reverts_claim_and_returns_403():
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
     assert resp.status_code == 403
+    revert.assert_called_once()
+
+
+def test_approve_retire_kind_raises_reverts_claim_and_500s():
+    client = _attributed_client(raise_server_exceptions=False)
+    db_patch, _session = _patch_db()
+    row = _open_proposal_row(kind="retire", target_memory_id=MEMORY_ID,
+                              proposed_content=None)
+    with (
+        db_patch,
+        patch.object(proposals, "_load_proposal", return_value=row),
+        patch.object(proposals, "_claim_proposal", return_value=True),
+        patch.object(proposals, "_revert_claim") as revert,
+        patch.object(proposals, "retract_memory", side_effect=RuntimeError("boom")),
+    ):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
+    assert resp.status_code == 500
     revert.assert_called_once()
 
 

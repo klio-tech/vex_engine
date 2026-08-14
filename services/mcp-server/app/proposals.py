@@ -260,17 +260,28 @@ async def approve_proposal(
             raise HTTPException(status_code=409, detail="already_decided")
 
         if kind == "add":
-            result = await brain.write_scoped_memory(
-                db,
-                org_id=org_id,
-                agent_id=agent_id,
-                content=proposal["proposed_content"],
-                memory_type="fact",
-                session_id=f"proposal-{proposal_id}",
-                scope=proposal["scope"],
-                user_id=user_id if proposal["scope"] == "private" else None,
-                provenance="INFERRED",
-            )
+            try:
+                result = await brain.write_scoped_memory(
+                    db,
+                    org_id=org_id,
+                    agent_id=agent_id,
+                    content=proposal["proposed_content"],
+                    memory_type="fact",
+                    session_id=f"proposal-{proposal_id}",
+                    scope=proposal["scope"],
+                    user_id=user_id if proposal["scope"] == "private" else None,
+                    provenance="INFERRED",
+                )
+            except Exception:
+                logger.error(
+                    "approve_proposal: write_scoped_memory raised org=%s "
+                    "proposal=%s; reverting claim",
+                    org_id, proposal_id, exc_info=True,
+                )
+                await anyio.to_thread.run_sync(
+                    lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
+                )
+                raise
             if not result.get("stored") and not result.get("deduplicated"):
                 await anyio.to_thread.run_sync(
                     lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
@@ -280,20 +291,37 @@ async def approve_proposal(
 
         if kind == "revise":
             target_memory_id = str(proposal["target_memory_id"])
-            apply_result = await anyio.to_thread.run_sync(
-                lambda: supersede_with_revision(
-                    db,
-                    org_id=org_id,
-                    memory_id=target_memory_id,
-                    base_revision=str(target["revision"]),
-                    new_content=proposal["proposed_content"],
-                    memory_type=target["memory_type"],
-                    session_id=f"proposal-{proposal_id}",
-                    user_id=user_id,
-                    agent_id=agent_id,
-                    scope=target["scope"],
+            try:
+                apply_result = await anyio.to_thread.run_sync(
+                    lambda: supersede_with_revision(
+                        db,
+                        org_id=org_id,
+                        memory_id=target_memory_id,
+                        base_revision=str(target["revision"]),
+                        new_content=proposal["proposed_content"],
+                        memory_type=target["memory_type"],
+                        session_id=f"proposal-{proposal_id}",
+                        user_id=user_id,
+                        agent_id=agent_id,
+                        scope=target["scope"],
+                    )
                 )
-            )
+            except Exception:
+                # An exception here happens AFTER _claim_proposal already
+                # committed the proposal to 'approved' — without this revert
+                # the proposal would be stuck permanently decided with
+                # nothing actually written (unreviewable, unretriable).
+                # Mirrors app.dreamer._try_auto_apply's own revert-on-failure
+                # discipline for the identical failure mode.
+                logger.error(
+                    "approve_proposal: supersede_with_revision raised org=%s "
+                    "proposal=%s memory=%s; reverting claim",
+                    org_id, proposal_id, target_memory_id, exc_info=True,
+                )
+                await anyio.to_thread.run_sync(
+                    lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
+                )
+                raise
             if not apply_result.get("stored"):
                 await anyio.to_thread.run_sync(
                     lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
@@ -303,16 +331,27 @@ async def approve_proposal(
 
         # kind == "retire": retraction, never a supersede — see module docstring.
         target_memory_id = str(proposal["target_memory_id"])
-        retract_result = await anyio.to_thread.run_sync(
-            lambda: retract_memory(
-                db,
-                org_id=org_id,
-                agent_id=agent_id,
-                memory_id=target_memory_id,
-                via="dreamer-approved",
-                user_id=user_id,
+        try:
+            retract_result = await anyio.to_thread.run_sync(
+                lambda: retract_memory(
+                    db,
+                    org_id=org_id,
+                    agent_id=agent_id,
+                    memory_id=target_memory_id,
+                    via="dreamer-approved",
+                    user_id=user_id,
+                )
             )
-        )
+        except Exception:
+            logger.error(
+                "approve_proposal: retract_memory raised org=%s proposal=%s "
+                "memory=%s; reverting claim",
+                org_id, proposal_id, target_memory_id, exc_info=True,
+            )
+            await anyio.to_thread.run_sync(
+                lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
+            )
+            raise
         if not retract_result.get("forgotten"):
             await anyio.to_thread.run_sync(
                 lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
