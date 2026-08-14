@@ -34,11 +34,12 @@ def _patch_db():
     return patch("app.proposals.SessionLocal", MagicMock(return_value=session)), session
 
 
-def _open_proposal_row(kind="add", target_memory_id=None, scope="org"):
+def _open_proposal_row(kind="add", target_memory_id=None, scope="org",
+                        proposed_content="proposed content"):
     return {
         "id": PROPOSAL_ID, "org_id": "test-org", "scope": scope, "kind": kind,
-        "target_memory_id": target_memory_id, "diff": "proposed change",
-        "status": "open",
+        "target_memory_id": target_memory_id, "diff": "rationale prose",
+        "proposed_content": proposed_content, "status": "open",
     }
 
 
@@ -47,7 +48,7 @@ def _open_proposal_row(kind="add", target_memory_id=None, scope="org"):
 # ---------------------------------------------------------------------------
 
 
-def test_list_proposals_defaults_to_open_and_is_org_scoped(client):
+def test_list_proposals_defaults_to_open_status_and_default_limit(client):
     db_patch, session = _patch_db()
     with db_patch, patch.object(
         proposals, "_list_proposals", return_value=[{"id": PROPOSAL_ID, "status": "open"}]
@@ -58,16 +59,23 @@ def test_list_proposals_defaults_to_open_and_is_org_scoped(client):
     assert resp.json()["proposals"] == [{"id": PROPOSAL_ID, "status": "open"}]
     assert list_fn.call_args.kwargs["org_id"] == "test-org"
     assert list_fn.call_args.kwargs["status"] == "open"
+    assert list_fn.call_args.kwargs["limit"] == 50
     session.close.assert_called_once()
 
 
-def test_list_proposals_honors_status_query_param(client):
+def test_list_proposals_honors_status_and_limit_query_params(client):
     db_patch, _session = _patch_db()
     with db_patch, patch.object(proposals, "_list_proposals", return_value=[]) as list_fn:
-        resp = client.get("/proposals?status=rejected")
+        resp = client.get("/proposals?status=rejected&limit=10")
 
     assert resp.status_code == 200
     assert list_fn.call_args.kwargs["status"] == "rejected"
+    assert list_fn.call_args.kwargs["limit"] == 10
+
+
+def test_list_proposals_rejects_limit_above_cap(client):
+    resp = client.get("/proposals?limit=99999")
+    assert resp.status_code == 422
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +113,21 @@ def test_approve_already_decided_is_409():
     assert resp.status_code == 409
 
 
+def test_approve_add_kind_without_proposed_content_is_422_needs_content():
+    client = _attributed_client()
+    db_patch, _session = _patch_db()
+    row = _open_proposal_row(kind="add", proposed_content=None)
+    with (
+        db_patch,
+        patch.object(proposals, "_load_proposal", return_value=row),
+        patch.object(proposals, "_claim_proposal") as claim,
+    ):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "needs_content"
+    claim.assert_not_called()
+
+
 def test_approve_add_kind_writes_new_memory_and_records_decided_by():
     client = _attributed_client()
     db_patch, session = _patch_db()
@@ -112,36 +135,63 @@ def test_approve_add_kind_writes_new_memory_and_records_decided_by():
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=_open_proposal_row(kind="add")),
+        patch.object(proposals, "_claim_proposal", return_value=True) as claim,
         patch.object(proposals.brain, "write_scoped_memory", write),
-        patch.object(proposals, "_mark_decided") as mark,
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "approved"
+    claim.assert_called_once()
+    assert claim.call_args.kwargs["decided_by"] == USER
+    assert claim.call_args.kwargs["status"] == "approved"
     write.assert_awaited_once()
     kw = write.await_args.kwargs
     assert kw["org_id"] == "test-org"
-    assert kw["content"] == "proposed change"
+    assert kw["content"] == "proposed content"
     assert kw["provenance"] == "INFERRED"
-    mark.assert_called_once()
-    assert mark.call_args.kwargs["decided_by"] == USER
-    assert mark.call_args.kwargs["status"] == "approved"
 
 
-def test_approve_revise_kind_applies_via_cas_with_target_revision():
+def test_approve_add_kind_lost_claim_race_is_409():
+    """Claim races: someone else decided it between the initial load and
+    the atomic claim UPDATE."""
     client = _attributed_client()
-    db_patch, session = _patch_db()
+    db_patch, _session = _patch_db()
+    write = AsyncMock()
+    with (
+        db_patch,
+        patch.object(proposals, "_load_proposal", return_value=_open_proposal_row(kind="add")),
+        patch.object(proposals, "_claim_proposal", return_value=False),
+        patch.object(proposals.brain, "write_scoped_memory", write),
+    ):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
+    assert resp.status_code == 409
+    write.assert_not_awaited()
+
+
+def test_approve_revise_kind_without_target_id_is_422():
+    client = _attributed_client()
+    db_patch, _session = _patch_db()
+    row = _open_proposal_row(kind="revise", target_memory_id=None)
+    with db_patch, patch.object(proposals, "_load_proposal", return_value=row):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
+    assert resp.status_code == 422
+
+
+def test_approve_revise_kind_applies_via_cas_with_target_revision_and_type():
+    client = _attributed_client()
+    db_patch, _session = _patch_db()
     row = _open_proposal_row(kind="revise", target_memory_id=MEMORY_ID, scope="agent")
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=row),
         patch.object(proposals, "_target_row",
-                     return_value={"scope": "agent", "revision": "rev-1"}),
+                     return_value={"scope": "agent", "revision": "rev-1",
+                                   "memory_type": "fact"}),
+        patch.object(proposals, "_claim_proposal", return_value=True),
         patch.object(proposals, "supersede_with_revision",
                      return_value={"conflict": False, "stored": True,
                                    "new_id": "m-new", "new_revision": "rev-2"}) as sup,
-        patch.object(proposals, "_mark_decided") as mark,
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
 
@@ -151,12 +201,13 @@ def test_approve_revise_kind_applies_via_cas_with_target_revision():
     assert kwargs["org_id"] == "test-org"
     assert kwargs["memory_id"] == MEMORY_ID
     assert kwargs["base_revision"] == "rev-1"
+    assert kwargs["memory_type"] == "fact"
+    assert kwargs["session_id"] == f"proposal-{PROPOSAL_ID}"
+    assert kwargs["new_content"] == "proposed content"
     assert kwargs["user_id"] == USER
-    mark.assert_called_once()
-    assert mark.call_args.kwargs["status"] == "approved"
 
 
-def test_approve_revise_kind_conflict_returns_409_and_does_not_decide():
+def test_approve_revise_kind_conflict_reverts_claim_and_returns_409():
     client = _attributed_client()
     db_patch, _session = _patch_db()
     row = _open_proposal_row(kind="revise", target_memory_id=MEMORY_ID, scope="org")
@@ -164,16 +215,18 @@ def test_approve_revise_kind_conflict_returns_409_and_does_not_decide():
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=row),
         patch.object(proposals, "_target_row",
-                     return_value={"scope": "org", "revision": "rev-1"}),
+                     return_value={"scope": "org", "revision": "rev-1",
+                                   "memory_type": "fact"}),
+        patch.object(proposals, "_claim_proposal", return_value=True),
+        patch.object(proposals, "_revert_claim") as revert,
         patch.object(proposals, "supersede_with_revision",
                      return_value={"conflict": True, "stored": False,
                                    "current": {"id": MEMORY_ID}}),
-        patch.object(proposals, "_mark_decided") as mark,
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
 
     assert resp.status_code == 409
-    mark.assert_not_called()
+    revert.assert_called_once()
 
 
 def test_approve_revise_kind_missing_target_row_is_409():
@@ -189,6 +242,68 @@ def test_approve_revise_kind_missing_target_row_is_409():
     assert resp.status_code == 409
 
 
+def test_approve_retire_kind_retracts_not_supersedes():
+    """HIGH fix: retire calls retract_memory, never supersede_with_revision —
+    a retraction removes the belief, it does not replace it with prose."""
+    client = _attributed_client()
+    db_patch, _session = _patch_db()
+    row = _open_proposal_row(kind="retire", target_memory_id=MEMORY_ID,
+                              proposed_content=None)
+    with (
+        db_patch,
+        patch.object(proposals, "_load_proposal", return_value=row),
+        patch.object(proposals, "_claim_proposal", return_value=True),
+        patch.object(proposals, "retract_memory",
+                     return_value={"forgotten": True, "id": MEMORY_ID}) as rm,
+        patch.object(proposals, "supersede_with_revision") as sup,
+    ):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
+
+    assert resp.status_code == 200
+    assert resp.json()["kind"] == "retire"
+    rm.assert_called_once()
+    kwargs = rm.call_args.kwargs
+    assert kwargs["memory_id"] == MEMORY_ID
+    assert kwargs["user_id"] == USER
+    assert kwargs["org_id"] == "test-org"
+    sup.assert_not_called()
+
+
+def test_approve_retire_kind_needs_no_proposed_content():
+    """Unlike add/revise, retire never 422s for missing proposed_content."""
+    client = _attributed_client()
+    db_patch, _session = _patch_db()
+    row = _open_proposal_row(kind="retire", target_memory_id=MEMORY_ID,
+                              proposed_content=None)
+    with (
+        db_patch,
+        patch.object(proposals, "_load_proposal", return_value=row),
+        patch.object(proposals, "_claim_proposal", return_value=True),
+        patch.object(proposals, "retract_memory",
+                     return_value={"forgotten": True, "id": MEMORY_ID}),
+    ):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
+    assert resp.status_code == 200
+
+
+def test_approve_retire_kind_forbidden_reverts_claim_and_returns_403():
+    client = _attributed_client()
+    db_patch, _session = _patch_db()
+    row = _open_proposal_row(kind="retire", target_memory_id=MEMORY_ID,
+                              proposed_content=None)
+    with (
+        db_patch,
+        patch.object(proposals, "_load_proposal", return_value=row),
+        patch.object(proposals, "_claim_proposal", return_value=True),
+        patch.object(proposals, "_revert_claim") as revert,
+        patch.object(proposals, "retract_memory",
+                     return_value={"forgotten": False, "error": "forbidden"}),
+    ):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/approve")
+    assert resp.status_code == 403
+    revert.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # POST /proposals/{id}/reject
 # ---------------------------------------------------------------------------
@@ -199,25 +314,39 @@ def test_reject_without_attributable_user_is_403(client):
     assert resp.status_code == 403
 
 
-def test_reject_marks_decided_with_no_write(client=None):
+def test_reject_marks_decided_with_no_write():
     client = _attributed_client()
     db_patch, _session = _patch_db()
     with (
         db_patch,
         patch.object(proposals, "_load_proposal", return_value=_open_proposal_row()),
-        patch.object(proposals, "_mark_decided") as mark,
+        patch.object(proposals, "_claim_proposal", return_value=True) as claim,
         patch.object(proposals.brain, "write_scoped_memory") as write,
         patch.object(proposals, "supersede_with_revision") as sup,
+        patch.object(proposals, "retract_memory") as rm,
     ):
         resp = client.post(f"/proposals/{PROPOSAL_ID}/reject")
 
     assert resp.status_code == 200
     assert resp.json()["status"] == "rejected"
-    mark.assert_called_once()
-    assert mark.call_args.kwargs["status"] == "rejected"
-    assert mark.call_args.kwargs["decided_by"] == USER
+    claim.assert_called_once()
+    assert claim.call_args.kwargs["status"] == "rejected"
+    assert claim.call_args.kwargs["decided_by"] == USER
     write.assert_not_called()
     sup.assert_not_called()
+    rm.assert_not_called()
+
+
+def test_reject_lost_claim_race_is_409():
+    client = _attributed_client()
+    db_patch, _session = _patch_db()
+    with (
+        db_patch,
+        patch.object(proposals, "_load_proposal", return_value=_open_proposal_row()),
+        patch.object(proposals, "_claim_proposal", return_value=False),
+    ):
+        resp = client.post(f"/proposals/{PROPOSAL_ID}/reject")
+    assert resp.status_code == 409
 
 
 def test_reject_unknown_proposal_is_404():

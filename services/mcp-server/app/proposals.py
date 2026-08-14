@@ -3,30 +3,47 @@
 ``app.dreamer`` (async-worker) files ``memory_proposals`` rows; this module
 is where a human reviews them. Three endpoints, mounted under ``/proposals``:
 
-* ``GET /proposals?status=open`` — list this org's proposals, filtered by
-  status (default ``open``).
-* ``POST /proposals/{id}/approve`` — apply the proposal:
-  ``kind='add'`` writes a brand-new memory through the normal write path
-  (:func:`shared.brain.write_scoped_memory`); ``kind='revise'``/``'retire'``
-  with a ``target_memory_id`` apply through the same CAS path every other
-  writer uses (:func:`shared.memory.supersede_with_revision`), so a human
-  approving a proposal is subject to the identical authorization ladder and
-  optimistic-concurrency guard as any other write — approving a proposal
-  against a ``private`` row you cannot see still fails with ``not_found``,
-  and a target that moved since the dreamer detected it still fails with a
-  conflict rather than silently overwriting.
+* ``GET /proposals?status=open&limit=50`` — list this org's proposals,
+  filtered by status (default ``open``), capped at ``limit`` (default 50).
+* ``POST /proposals/{id}/approve`` — apply the proposal, through the SAME
+  primitive every other writer in this service uses for that ``kind``:
+
+  * ``kind='add'`` / ``kind='revise'`` — require ``proposed_content``
+    (``diff`` is reviewer-facing rationale ONLY, never memory content; see
+    ``app.dreamer``'s module docstring). A ``NULL`` ``proposed_content``
+    refuses with 422 ``needs_content`` — nothing to write yet.
+  * ``kind='add'`` writes a brand-new memory
+    (:func:`shared.brain.write_scoped_memory`).
+  * ``kind='revise'`` applies through the CAS path
+    (:func:`shared.memory.supersede_with_revision`) against
+    ``target_memory_id`` — subject to the identical authorization ladder
+    and optimistic-concurrency guard as any other write; a target that
+    moved since the dreamer detected it fails with a conflict rather than
+    silently overwriting.
+  * ``kind='retire'`` retracts (:func:`shared.memory.retract_memory`) —
+    NOT a supersede. Superseding an active belief with prose ("this memory
+    looks wrong") would leave that meta-commentary AS the belief's new
+    content; retiring removes it from recall instead. No content needed or
+    accepted.
 * ``POST /proposals/{id}/reject`` — marks the proposal decided, no write.
 
 Both decision endpoints require an attributable caller
 (:func:`app.identity.resolve_user_id`) and record it in ``decided_by`` — a
 decision with no accountable human defeats the point of a review queue.
+
+Every decision CLAIMS the proposal first, via an atomic ``UPDATE ... WHERE
+status = 'open'`` (see :func:`_claim_proposal`), before attempting the
+underlying write. A lost claim (someone else already decided it, or the
+same request retried after a partial failure) is a clean 409 — there is no
+window where two concurrent approvals, or an approve racing a reject, can
+both believe they own the decision. If the underlying apply then fails
+(CAS conflict, retraction refused), the claim is REVERTED back to
+``status='open'`` so the proposal stays reviewable rather than stuck
+half-decided with nothing actually written.
+
 Auth mirrors ``app.capture``: the same ``X-Vex-Key`` (+ optional
 ``X-Vex-Agent``) bridge via :func:`app.auth.resolve_principal_dep`, so every
 query and write here is scoped to exactly the org the key authorises.
-Nothing here writes to ``session_memories`` directly — approval always goes
-through :func:`shared.brain.write_scoped_memory` or
-:func:`shared.memory.supersede_with_revision`, the same two primitives
-every other writer in this service uses.
 """
 
 import logging
@@ -37,7 +54,7 @@ import anyio
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from shared import brain
 from shared.auth import KeyInfo
-from shared.memory import supersede_with_revision
+from shared.memory import retract_memory, supersede_with_revision
 from sqlalchemy import text
 
 from app.auth import resolve_principal_dep, verify_api_key
@@ -48,7 +65,8 @@ logger = logging.getLogger("agentguard.mcp.proposals")
 
 router = APIRouter(prefix="/proposals", tags=["proposals"])
 
-_APPLICABLE_KINDS = ("revise", "retire")
+_DEFAULT_LIST_LIMIT = 50
+_MAX_LIST_LIMIT = 200
 
 
 def _validate_uuid(value: str) -> None:
@@ -62,28 +80,36 @@ def _validate_uuid(value: str) -> None:
         raise HTTPException(status_code=404, detail="not_found")
 
 
-def _list_proposals(db: Any, *, org_id: str, status: Optional[str]) -> list[dict[str, Any]]:
+def _list_proposals(
+    db: Any, *, org_id: str, status: Optional[str], limit: int
+) -> list[dict[str, Any]]:
     query = (
-        "SELECT id, org_id, scope, kind, target_memory_id, diff, evidence, "
-        "confidence, status, created_at, decided_at, decided_by "
+        "SELECT id, org_id, scope, kind, detector, target_memory_id, diff, "
+        "proposed_content, evidence, confidence, status, created_at, "
+        "decided_at, decided_by "
         "FROM memory_proposals WHERE org_id = :org_id"
     )
-    params: dict[str, Any] = {"org_id": org_id}
+    params: dict[str, Any] = {"org_id": org_id, "limit": limit}
     if status:
         query += " AND status = :status"
         params["status"] = status
-    query += " ORDER BY created_at DESC"
+    query += " ORDER BY created_at DESC LIMIT :limit"
     rows = db.execute(text(query), params).mappings().all()
     db.commit()
     return [dict(r) for r in rows]
 
 
 def _load_proposal(db: Any, *, org_id: str, proposal_id: str) -> Optional[dict[str, Any]]:
+    """Read-only lookup for the initial 404/409 checks and to gather what a
+    decision needs to apply (target id, proposed content). NOT the
+    concurrency guard — :func:`_claim_proposal` is.
+    """
     row = (
         db.execute(
             text(
                 """
-                SELECT id, org_id, scope, kind, target_memory_id, diff, status
+                SELECT id, org_id, scope, kind, target_memory_id, diff,
+                       proposed_content, status
                 FROM memory_proposals
                 WHERE id = :id AND org_id = :org_id
                 """
@@ -97,12 +123,55 @@ def _load_proposal(db: Any, *, org_id: str, proposal_id: str) -> Optional[dict[s
     return dict(row) if row is not None else None
 
 
+def _claim_proposal(
+    db: Any, *, org_id: str, proposal_id: str, status: str, decided_by: str
+) -> bool:
+    """Atomically transition ``proposal_id`` from ``open`` to ``status``.
+
+    Returns ``True`` if this call won the claim (rowcount 1), ``False`` if
+    someone else already decided it (rowcount 0) — the caller's job at that
+    point is to refuse with 409, not to proceed. This is the SAME
+    CAS-before-apply discipline every write in this schema follows; a
+    review decision is a write too.
+    """
+    result = db.execute(
+        text(
+            """
+            UPDATE memory_proposals
+            SET status = :status, decided_at = now(), decided_by = :decided_by
+            WHERE id = :id AND org_id = :org_id AND status = 'open'
+            """
+        ),
+        {"status": status, "decided_by": decided_by, "id": proposal_id, "org_id": org_id},
+    )
+    db.commit()
+    return bool(result.rowcount)
+
+
+def _revert_claim(db: Any, *, org_id: str, proposal_id: str) -> None:
+    """Undo a won claim whose underlying apply then failed — the proposal
+    goes back to ``open`` (decision cleared) rather than sitting decided
+    with nothing actually written.
+    """
+    db.execute(
+        text(
+            """
+            UPDATE memory_proposals
+            SET status = 'open', decided_at = NULL, decided_by = NULL
+            WHERE id = :id AND org_id = :org_id
+            """
+        ),
+        {"id": proposal_id, "org_id": org_id},
+    )
+    db.commit()
+
+
 def _target_row(db: Any, *, org_id: str, memory_id: str) -> Optional[dict[str, Any]]:
     row = (
         db.execute(
             text(
                 """
-                SELECT scope, revision FROM session_memories
+                SELECT scope, revision, memory_type FROM session_memories
                 WHERE id = :memory_id AND org_id = :org_id
                 """
             ),
@@ -115,34 +184,20 @@ def _target_row(db: Any, *, org_id: str, memory_id: str) -> Optional[dict[str, A
     return dict(row) if row is not None else None
 
 
-def _mark_decided(
-    db: Any, *, org_id: str, proposal_id: str, status: str, decided_by: str
-) -> None:
-    db.execute(
-        text(
-            """
-            UPDATE memory_proposals
-            SET status = :status, decided_at = now(), decided_by = :decided_by
-            WHERE id = :id AND org_id = :org_id
-            """
-        ),
-        {"status": status, "decided_by": decided_by, "id": proposal_id, "org_id": org_id},
-    )
-    db.commit()
-
-
 @router.get("")
 async def list_proposals(
     status: Optional[str] = Query("open"),
+    limit: int = Query(_DEFAULT_LIST_LIMIT, ge=1, le=_MAX_LIST_LIMIT),
     principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """``GET /proposals?status=open`` — org-scoped, optionally status-filtered."""
+    """``GET /proposals?status=open&limit=50`` — org-scoped, status-filtered,
+    capped."""
     org_id, _agent_id = principal
     db = SessionLocal()
     try:
         rows = await anyio.to_thread.run_sync(
-            lambda: _list_proposals(db, org_id=org_id, status=status)
+            lambda: _list_proposals(db, org_id=org_id, status=status, limit=limit)
         )
         return {"proposals": rows}
     finally:
@@ -156,14 +211,8 @@ async def approve_proposal(
     principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """Apply a proposal: ``add`` writes a new memory, ``revise``/``retire``
-    apply through the CAS path against ``target_memory_id``.
-
-    404 for an unknown/cross-org/malformed id. 403 if the caller cannot be
-    attributed to a person (``decided_by`` would otherwise be unattributable
-    — the entire point of a review queue). 409 if the proposal was already
-    decided, or if the CAS guard finds the target moved since the dreamer
-    detected it (someone else's write raced this approval).
+    """Apply a proposal: ``add``/``revise`` write via ``proposed_content``,
+    ``retire`` retracts. See module docstring for the full contract.
     """
     _validate_uuid(proposal_id)
     org_id, agent_id = principal
@@ -181,60 +230,97 @@ async def approve_proposal(
         if proposal["status"] != "open":
             raise HTTPException(status_code=409, detail="already_decided")
 
-        if proposal["kind"] == "add":
+        kind = proposal["kind"]
+        if kind in ("add", "revise") and not proposal.get("proposed_content"):
+            raise HTTPException(status_code=422, detail={"error": "needs_content"})
+
+        target = None
+        if kind in ("revise", "retire"):
+            if not proposal["target_memory_id"]:
+                raise HTTPException(status_code=422, detail="invalid_proposal")
+            if kind == "revise":
+                target = await anyio.to_thread.run_sync(
+                    lambda: _target_row(
+                        db, org_id=org_id,
+                        memory_id=str(proposal["target_memory_id"]),
+                    )
+                )
+                if target is None:
+                    raise HTTPException(status_code=409, detail="target_not_found")
+        elif kind != "add":
+            raise HTTPException(status_code=422, detail="invalid_proposal")
+
+        claimed = await anyio.to_thread.run_sync(
+            lambda: _claim_proposal(
+                db, org_id=org_id, proposal_id=proposal_id,
+                status="approved", decided_by=user_id,
+            )
+        )
+        if not claimed:
+            raise HTTPException(status_code=409, detail="already_decided")
+
+        if kind == "add":
             result = await brain.write_scoped_memory(
                 db,
                 org_id=org_id,
                 agent_id=agent_id,
-                content=proposal["diff"],
+                content=proposal["proposed_content"],
                 memory_type="fact",
-                session_id=f"dreamer:{proposal_id}",
+                session_id=f"proposal-{proposal_id}",
                 scope=proposal["scope"],
                 user_id=user_id if proposal["scope"] == "private" else None,
                 provenance="INFERRED",
             )
             if not result.get("stored") and not result.get("deduplicated"):
-                raise HTTPException(status_code=422, detail=result)
-            await anyio.to_thread.run_sync(
-                lambda: _mark_decided(
-                    db, org_id=org_id, proposal_id=proposal_id,
-                    status="approved", decided_by=user_id,
+                await anyio.to_thread.run_sync(
+                    lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
                 )
-            )
+                raise HTTPException(status_code=422, detail=result)
             return {"status": "approved", "kind": "add", "result": result}
 
-        if proposal["kind"] in _APPLICABLE_KINDS and proposal["target_memory_id"]:
+        if kind == "revise":
             target_memory_id = str(proposal["target_memory_id"])
-            target = await anyio.to_thread.run_sync(
-                lambda: _target_row(db, org_id=org_id, memory_id=target_memory_id)
-            )
-            if target is None:
-                raise HTTPException(status_code=409, detail="target_not_found")
-
             apply_result = await anyio.to_thread.run_sync(
                 lambda: supersede_with_revision(
                     db,
                     org_id=org_id,
                     memory_id=target_memory_id,
                     base_revision=str(target["revision"]),
-                    new_content=proposal["diff"],
+                    new_content=proposal["proposed_content"],
+                    memory_type=target["memory_type"],
+                    session_id=f"proposal-{proposal_id}",
                     user_id=user_id,
                     agent_id=agent_id,
                     scope=target["scope"],
                 )
             )
             if not apply_result.get("stored"):
-                raise HTTPException(status_code=409, detail=apply_result)
-
-            await anyio.to_thread.run_sync(
-                lambda: _mark_decided(
-                    db, org_id=org_id, proposal_id=proposal_id,
-                    status="approved", decided_by=user_id,
+                await anyio.to_thread.run_sync(
+                    lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
                 )
-            )
-            return {"status": "approved", "kind": proposal["kind"], "result": apply_result}
+                raise HTTPException(status_code=409, detail=apply_result)
+            return {"status": "approved", "kind": "revise", "result": apply_result}
 
-        raise HTTPException(status_code=422, detail="invalid_proposal")
+        # kind == "retire": retraction, never a supersede — see module docstring.
+        target_memory_id = str(proposal["target_memory_id"])
+        retract_result = await anyio.to_thread.run_sync(
+            lambda: retract_memory(
+                db,
+                org_id=org_id,
+                agent_id=agent_id,
+                memory_id=target_memory_id,
+                via="dreamer-approved",
+                user_id=user_id,
+            )
+        )
+        if not retract_result.get("forgotten"):
+            await anyio.to_thread.run_sync(
+                lambda: _revert_claim(db, org_id=org_id, proposal_id=proposal_id)
+            )
+            error = retract_result.get("error")
+            status_code = 403 if error == "forbidden" else 409
+            raise HTTPException(status_code=status_code, detail=error)
+        return {"status": "approved", "kind": "retire", "result": retract_result}
     finally:
         db.close()
 
@@ -246,8 +332,9 @@ async def reject_proposal(
     principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """Mark a proposal rejected. Same attribution/decided-once contract as
-    approve, but never writes to memory — a reject is purely a record.
+    """Mark a proposal rejected. Same attribution/claim-before-decide
+    contract as approve, but never writes to memory — a reject is purely a
+    record.
     """
     _validate_uuid(proposal_id)
     org_id, _agent_id = principal
@@ -265,12 +352,15 @@ async def reject_proposal(
         if proposal["status"] != "open":
             raise HTTPException(status_code=409, detail="already_decided")
 
-        await anyio.to_thread.run_sync(
-            lambda: _mark_decided(
+        claimed = await anyio.to_thread.run_sync(
+            lambda: _claim_proposal(
                 db, org_id=org_id, proposal_id=proposal_id,
                 status="rejected", decided_by=user_id,
             )
         )
+        if not claimed:
+            raise HTTPException(status_code=409, detail="already_decided")
+
         return {"status": "rejected"}
     finally:
         db.close()

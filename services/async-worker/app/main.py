@@ -32,6 +32,7 @@ import os
 import time
 from typing import Any
 
+import anyio
 import redis.asyncio as aioredis
 from sqlalchemy import create_engine
 from shared.evidence_stream import SESSIONS_STORED
@@ -271,7 +272,16 @@ async def _maybe_dream_for_org(
 
     dream_db = SessionLocal()
     try:
-        written = await dreamer.dream_for_org(dream_db, s3_client, org_id=org_id)
+        # dream_for_org is a plain (synchronous) function on purpose — it does
+        # blocking DB I/O, up to DEFAULT_SESSION_LOOKBACK synchronous S3 GETs,
+        # and a synchronous LLM call. Running it via anyio.to_thread.run_sync
+        # (rather than awaiting an async wrapper) means all of that happens on
+        # a worker thread, never on this event loop — which the verification
+        # consumer (_consume_executions) shares via asyncio.gather, so a slow
+        # dream pass must not stall grading or verification traffic.
+        written = await anyio.to_thread.run_sync(
+            lambda: dreamer.dream_for_org(dream_db, s3_client, org_id=org_id)
+        )
         logger.info(
             "dreamer: org=%s wrote %d proposals (sessions_since=%d "
             "elapsed_hours=%.1f)",
