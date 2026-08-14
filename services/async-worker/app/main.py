@@ -1,11 +1,24 @@
-"""Redis Stream consumer loop for the async verification worker.
+"""Redis Stream consumer loops for the async worker.
 
-Connects to Redis, joins the ``verification-workers`` consumer group on
-the ``executions.raw`` stream, runs verification on each event, and
-publishes verified results to ``executions.verified``.
+Runs two independent consumer loops concurrently (``asyncio.gather``,
+mirroring ``services/storage-worker/app/main.py``'s multi-loop shape — one
+coroutine per stream, each with its own consumer group so they never steal
+each other's messages):
 
-This uses a separate consumer group from the storage worker so both
-can independently consume from the same stream.
+1. ``verification-workers`` on ``executions.raw`` — runs verification on
+   each event and publishes to ``executions.verified``. This loop also
+   drives the ownership-transfer sweep tick (unrelated to streaming, but it
+   needs a recurring wakeup and this loop already has one).
+
+2. ``outcome-grader`` on ``sessions.stored`` — grades a stored session
+   (``app.outcome_grader.grade_stored_session``): one ``verify()`` call, one
+   ``session_outcomes`` row, and per-memory attribution in
+   ``recall_outcomes``. See ``app.outcome_grader`` for why the verdict is
+   written exactly once per session rather than once per recall.
+
+Both loops ACK on success; failures are logged but never crash the loop,
+matching storage-worker's resilience contract for malformed/failing
+messages.
 """
 
 import asyncio
@@ -16,11 +29,15 @@ import time
 
 import redis.asyncio as aioredis
 from sqlalchemy import create_engine
+from shared.evidence_stream import SESSIONS_STORED
 from shared.models import IngestEvent
 from shared.redis_config import REDIS_CLIENT_OPTIONS
 
 from app import config
+from app.db import SessionLocal
+from app.outcome_grader import grade_stored_session
 from app.ownership_sweep import run_ownership_sweep
+from app.s3_client import get_s3_client
 from app.worker import VERIFIED_STREAM_KEY, process_event
 
 logger = logging.getLogger("agentguard.async-worker")
@@ -28,6 +45,8 @@ logger = logging.getLogger("agentguard.async-worker")
 STREAM_KEY = "executions.raw"
 CONSUMER_GROUP = "verification-workers"
 CONSUMER_NAME = os.environ.get("CONSUMER_NAME", "async-worker-1")
+
+SESSIONS_CONSUMER_GROUP = "outcome-grader"
 
 
 def _run_ownership_sweep_tick(engine, supabase_engine) -> None:
@@ -62,25 +81,45 @@ def _run_ownership_sweep_tick(engine, supabase_engine) -> None:
         )
 
 
-async def run() -> None:
-    """Main consumer loop.
+async def _ensure_consumer_group(
+    redis_client: aioredis.Redis,
+    stream_key: str,
+    group_name: str,
+) -> None:
+    """Create a consumer group, ignoring if it already exists."""
+    try:
+        await redis_client.xgroup_create(
+            stream_key,
+            group_name,
+            id="0",
+            mkstream=True,
+        )
+        logger.info(
+            "Created consumer group '%s' on stream '%s'", group_name, stream_key
+        )
+    except Exception:
+        logger.debug(
+            "Consumer group '%s' already exists on stream '%s'",
+            group_name,
+            stream_key,
+        )
 
-    1. Connects to Redis and ensures the consumer group exists.
-    2. Reads batches of up to 10 messages from the stream.
-    3. For each message, deserialises the event, runs verification,
+
+async def _consume_executions(redis_client: aioredis.Redis) -> None:
+    """Consumer loop for ``executions.raw``.
+
+    1. Reads batches of up to 10 messages from the stream.
+    2. For each message, deserialises the event, runs verification,
        and ACKs the message on success.
-    4. Publishes verified results to ``executions.verified``.
-    5. On per-message failure, logs the error and continues.
-    6. On stream-level failure, backs off for 1 second and retries.
+    3. Publishes verified results to ``executions.verified``.
+    4. On per-message failure, logs the error and continues.
+    5. On stream-level failure, backs off for 1 second and retries.
+
+    Also drives the ownership-transfer sweep tick: unrelated to the stream
+    itself, but this loop already has the recurring wakeup (``block=5000``)
+    the sweep needs, so it piggybacks here rather than opening a third loop
+    just to sleep on an interval.
     """
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
-
-    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
-    redis_client = aioredis.from_url(redis_url, **REDIS_CLIENT_OPTIONS)
-
     # --- project-ownership-transfer sweep: engines built once, reused every
     # tick, matching the module docstring's "one engine for a whole run"
     # convention. ``sweep_engine`` stays None when the sweep is disabled so a
@@ -110,23 +149,7 @@ async def run() -> None:
     # rather than firing immediately on startup.
     next_sweep_at = time.monotonic() + config.OWNERSHIP_SWEEP_INTERVAL_SECONDS
 
-    # Create consumer group; ignore error if it already exists.
-    try:
-        await redis_client.xgroup_create(
-            STREAM_KEY,
-            CONSUMER_GROUP,
-            id="0",
-            mkstream=True,
-        )
-        logger.info(
-            "Created consumer group '%s' on stream '%s'", CONSUMER_GROUP, STREAM_KEY
-        )
-    except Exception:
-        logger.debug(
-            "Consumer group '%s' already exists on stream '%s'",
-            CONSUMER_GROUP,
-            STREAM_KEY,
-        )
+    await _ensure_consumer_group(redis_client, STREAM_KEY, CONSUMER_GROUP)
 
     logger.info("Async verification worker started. Listening on %s", STREAM_KEY)
 
@@ -206,6 +229,99 @@ async def run() -> None:
                 extra={"stream": STREAM_KEY},
             )
             await asyncio.sleep(1)
+
+
+async def _consume_sessions_stored(redis_client: aioredis.Redis, s3_client: object) -> None:
+    """Consumer loop for ``sessions.stored`` — grades each stored session.
+
+    Same consumer-group/ack shape as ``_consume_executions``: read a batch,
+    process each entry, ACK on success, log and continue on per-message
+    failure, back off a second on stream-level failure. Grading itself
+    (``app.outcome_grader.grade_stored_session``) is already best-effort
+    internally (a ``verify()``/embedding failure degrades the verdict to
+    unknown rather than raising), so a failure surfacing here means the
+    entry itself was malformed or the DB write failed outright.
+    """
+    await _ensure_consumer_group(redis_client, SESSIONS_STORED, SESSIONS_CONSUMER_GROUP)
+
+    logger.info("Outcome grader started. Listening on %s", SESSIONS_STORED)
+
+    while True:
+        try:
+            messages = await redis_client.xreadgroup(
+                groupname=SESSIONS_CONSUMER_GROUP,
+                consumername=CONSUMER_NAME,
+                streams={SESSIONS_STORED: ">"},
+                count=10,
+                block=5000,
+            )
+            if not messages:
+                continue
+
+            for _stream, entries in messages:
+                for msg_id, data in entries:
+                    try:
+                        payload = json.loads(data["payload"])
+                        org_id = payload["org_id"]
+                        session_id = payload["session_id"]
+
+                        db_session = SessionLocal()
+                        try:
+                            result = await grade_stored_session(
+                                db_session,
+                                s3_client,
+                                org_id=org_id,
+                                session_id=session_id,
+                            )
+                        except Exception:
+                            db_session.rollback()
+                            raise
+                        finally:
+                            db_session.close()
+
+                        await redis_client.xack(
+                            SESSIONS_STORED, SESSIONS_CONSUMER_GROUP, msg_id
+                        )
+                        logger.info(
+                            "graded session org=%s session=%s outcome=%s "
+                            "attributions=%d",
+                            org_id,
+                            session_id,
+                            result.get("session_outcome_id"),
+                            result.get("attributions", 0),
+                        )
+                    except Exception:
+                        logger.error(
+                            "Failed to grade session message %s",
+                            msg_id,
+                            exc_info=True,
+                            extra={"msg_id": msg_id},
+                        )
+        except Exception as exc:
+            logger.error(
+                "Sessions-stored stream read error: %s",
+                exc,
+                exc_info=True,
+                extra={"stream": SESSIONS_STORED},
+            )
+            await asyncio.sleep(1)
+
+
+async def run() -> None:
+    """Start all consumer loops concurrently."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    )
+
+    redis_url = os.environ.get("REDIS_URL", "redis://localhost:6379")
+    redis_client = aioredis.from_url(redis_url, **REDIS_CLIENT_OPTIONS)
+    s3_client = get_s3_client()
+
+    await asyncio.gather(
+        _consume_executions(redis_client),
+        _consume_sessions_stored(redis_client, s3_client),
+    )
 
 
 if __name__ == "__main__":
