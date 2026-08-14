@@ -54,3 +54,25 @@ OWNERSHIP_SWEEP_MAX_TRANSFERS_PER_RUN = parse_int(
     name="OWNERSHIP_SWEEP_MAX_TRANSFERS_PER_RUN",
     minimum=1,
 )
+
+#: The dreamer (``app.dreamer.dream_for_org``) runs for an org once it has
+#: accumulated this many newly-graded sessions since its last dream pass —
+#: "newly graded" tracked per-process (see ``app.main``'s in-memory dream
+#: state), reset on restart, matching the ownership sweep's own
+#: no-persisted-cursor contract for the analogous case.
+DREAM_MIN_GRADED_SESSIONS = parse_int(
+    os.environ.get("DREAM_MIN_GRADED_SESSIONS"),
+    default=25,
+    name="DREAM_MIN_GRADED_SESSIONS",
+    minimum=1,
+)
+
+#: ...or this many hours have elapsed since its last dream pass, whichever
+#: comes first — so a low-traffic org still gets dreamed for occasionally
+#: rather than waiting indefinitely for DREAM_MIN_GRADED_SESSIONS sessions.
+DREAM_INTERVAL_HOURS = parse_int(
+    os.environ.get("DREAM_INTERVAL_HOURS"),
+    default=24,
+    name="DREAM_INTERVAL_HOURS",
+    minimum=1,
+)

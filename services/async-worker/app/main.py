@@ -14,7 +14,11 @@ each other's messages):
    (``app.outcome_grader.grade_stored_session``): one ``verify()`` call, one
    ``session_outcomes`` row, and per-memory attribution in
    ``recall_outcomes``. See ``app.outcome_grader`` for why the verdict is
-   written exactly once per session rather than once per recall.
+   written exactly once per session rather than once per recall. This loop
+   also drives the dreamer (``app.dreamer.dream_for_org``) per org, once
+   ``DREAM_MIN_GRADED_SESSIONS`` new graded sessions have accumulated for
+   that org or ``DREAM_INTERVAL_HOURS`` have elapsed since its last pass —
+   see ``_maybe_dream_for_org``.
 
 Both loops ACK on success; failures are logged but never crash the loop,
 matching storage-worker's resilience contract for malformed/failing
@@ -26,6 +30,7 @@ import json
 import logging
 import os
 import time
+from typing import Any
 
 import redis.asyncio as aioredis
 from sqlalchemy import create_engine
@@ -34,6 +39,7 @@ from shared.models import IngestEvent
 from shared.redis_config import REDIS_CLIENT_OPTIONS
 
 from app import config
+from app import dreamer
 from app.db import SessionLocal
 from app.outcome_grader import grade_stored_session
 from app.ownership_sweep import run_ownership_sweep
@@ -231,6 +237,54 @@ async def _consume_executions(redis_client: aioredis.Redis) -> None:
             await asyncio.sleep(1)
 
 
+async def _maybe_dream_for_org(
+    s3_client: object, org_id: str, dream_state: dict[str, dict[str, Any]]
+) -> None:
+    """Run the dreamer for ``org_id`` once this org has crossed either dream
+    threshold, then reset its counters.
+
+    ``dream_state`` is process-local (``{org_id: {"sessions_since": int,
+    "last_run": float}}``, keyed by ``time.monotonic()``) — reset on
+    restart, matching the ownership sweep's own no-persisted-cursor
+    contract for the analogous per-org cadence. A short-lived process (a
+    quick restart) never runs a real dream pass for an org it barely saw;
+    the first real pass after a fresh deploy waits for a real threshold
+    crossing rather than firing immediately, same idiom as the ownership
+    sweep's ``next_sweep_at`` above.
+
+    A failed dream pass is logged and swallowed — it must never take down
+    the grading loop sharing this coroutine — and its org's counters are
+    reset regardless of outcome, so a persistently-failing org (e.g. a bad
+    LLM config) does not retry every single graded session; it gets one
+    attempt per threshold crossing.
+    """
+    state = dream_state.setdefault(
+        org_id, {"sessions_since": 0, "last_run": time.monotonic()}
+    )
+    state["sessions_since"] += 1
+    elapsed_hours = (time.monotonic() - state["last_run"]) / 3600.0
+    if (
+        state["sessions_since"] < config.DREAM_MIN_GRADED_SESSIONS
+        and elapsed_hours < config.DREAM_INTERVAL_HOURS
+    ):
+        return
+
+    dream_db = SessionLocal()
+    try:
+        written = await dreamer.dream_for_org(dream_db, s3_client, org_id=org_id)
+        logger.info(
+            "dreamer: org=%s wrote %d proposals (sessions_since=%d "
+            "elapsed_hours=%.1f)",
+            org_id, written, state["sessions_since"], elapsed_hours,
+        )
+    except Exception:
+        logger.error("dreamer: pass failed org=%s", org_id, exc_info=True)
+    finally:
+        dream_db.close()
+        state["sessions_since"] = 0
+        state["last_run"] = time.monotonic()
+
+
 async def _consume_sessions_stored(redis_client: aioredis.Redis, s3_client: object) -> None:
     """Consumer loop for ``sessions.stored`` — grades each stored session.
 
@@ -241,10 +295,22 @@ async def _consume_sessions_stored(redis_client: aioredis.Redis, s3_client: obje
     internally (a ``verify()``/embedding failure degrades the verdict to
     unknown rather than raising), so a failure surfacing here means the
     entry itself was malformed or the DB write failed outright.
+
+    Also drives the dreamer (``app.dreamer.dream_for_org``): every
+    successfully-graded session increments that org's counter
+    (``_maybe_dream_for_org``), which fires a dream pass once the org
+    crosses ``DREAM_MIN_GRADED_SESSIONS`` new graded sessions or
+    ``DREAM_INTERVAL_HOURS`` have elapsed since its last pass — the same
+    "piggyback on a loop that already has the recurring wakeup" shape
+    ``_consume_executions`` uses for the ownership sweep, except keyed off
+    real grading events rather than a fixed timer alone, since the
+    threshold is explicitly "N new graded sessions OR M hours".
     """
     await _ensure_consumer_group(redis_client, SESSIONS_STORED, SESSIONS_CONSUMER_GROUP)
 
     logger.info("Outcome grader started. Listening on %s", SESSIONS_STORED)
+
+    dream_state: dict[str, dict[str, Any]] = {}
 
     while True:
         try:
@@ -290,6 +356,14 @@ async def _consume_sessions_stored(redis_client: aioredis.Redis, s3_client: obje
                             result.get("session_outcome_id"),
                             result.get("attributions", 0),
                         )
+                        # Only a REAL grade counts toward the dream threshold —
+                        # a None session_outcome_id means nothing-to-grade or a
+                        # duplicate re-delivery (see grade_stored_session's
+                        # docstring), neither of which is new evidence.
+                        if result.get("session_outcome_id") is not None:
+                            await _maybe_dream_for_org(
+                                s3_client, org_id, dream_state
+                            )
                     except Exception:
                         logger.error(
                             "Failed to grade session message %s",
