@@ -51,7 +51,7 @@ from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
-from shared import artifact_storage, artifacts, brain, graph_store, projects
+from shared import artifact_storage, artifacts, brain, claims, graph_store, projects
 from shared.compression.router import compress as route_compress
 from shared.compression.router import estimate_tokens
 from shared.compression.structural import compress_payload
@@ -126,6 +126,8 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "compress",
     "explore",
     "init",
+    "claim",
+    "release",
 )
 
 # Server-level guidance surfaced to MCP clients during ``initialize``.
@@ -143,7 +145,10 @@ SERVER_INSTRUCTIONS = (
     "when the user states a durable fact or preference, call `remember`; when a "
     "decision is made, call `decide`; when a plan is set, call `plan`; for other "
     "durable context, `note`. Do NOT persist tool calls, file reads, or "
-    "transient steps. Use `forget` to retract a memory by id."
+    "transient steps. Use `forget` to retract a memory by id. Before starting "
+    "work that could overlap with another agent, call `claim` to register "
+    "intent; every `recall` response also carries `active_claims` for "
+    "other agents' current work. Call `release` when the work is done."
 )
 
 # Shared annotation for the optional ``space`` argument on the five write tools
@@ -2054,6 +2059,23 @@ async def _perform_recall(
                 "recall compression raised; returning the uncompressed payload",
                 exc_info=True,
             )
+        # Claims ride every recall response (Build 4): agents already recall
+        # before working, so they cannot NOT see live claims — there is no
+        # separate opt-in surface. Project-scoped where a project resolved
+        # above, org-wide otherwise. Added AFTER compress_payload, which only
+        # ever touches the "memories" key, so active_claims is never subject
+        # to the common-field hoist. Best-effort: a claims-listing failure
+        # must never be the reason a recall fails.
+        try:
+            payload["active_claims"] = await anyio.to_thread.run_sync(
+                lambda: claims.live_claims(db, org_id=org_id, project_id=project_id)
+            )
+        except Exception:
+            logger.warning(
+                "recall: live_claims lookup raised; omitting active_claims",
+                exc_info=True,
+            )
+            payload["active_claims"] = []
         return payload
     except Exception:
         logger.exception("brain recall failed (scope=%s)", scope)
@@ -2380,6 +2402,93 @@ async def _perform_share(ctx: Context, *, memory_id: str, to: str) -> dict[str, 
     except Exception:
         logger.exception("brain share failed (to=%s)", to)
         return {"shared": False, "error": "share_failed"}
+    finally:
+        db.close()
+
+
+async def _perform_claim(
+    ctx: Context, *, description: str, ttl_minutes: int
+) -> dict[str, Any]:
+    """Shared body for the ``claim`` tool: register a work claim.
+
+    A claim is advisory, not a lock — it records intent so OTHER agents find
+    out (via ``recall``'s ``active_claims`` and this call's own
+    ``collisions``) that overlapping work is in flight; it never blocks the
+    caller's own registration. Best-effort on the embed: an embedding
+    failure still registers the claim, just with no collision detection for
+    it (:func:`shared.claims.create_claim`).
+
+    Project filing follows the SAME best-effort X-Vex-Project header
+    resolution :func:`_perform_write` uses: an unresolvable header files the
+    claim org-wide rather than failing the call — filing is relevance here,
+    not security, exactly as it is for a write.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        logger.error("brain claim got no transport request; cannot authenticate")
+        return {"claim_id": None, "error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"claim_id": None, "error": "unauthorized", "detail": str(exc.detail)}
+
+    user_id = resolve_request_user_id(request)
+
+    db = SessionLocal()
+    try:
+        project_id = await anyio.to_thread.run_sync(
+            lambda: resolve_project_from_request(request, db, org_id=org_id)
+        )
+        result = await claims.create_claim(
+            db,
+            org_id=org_id,
+            description=description,
+            agent_id=agent_id,
+            user_id=user_id,
+            project_id=project_id,
+            ttl_minutes=ttl_minutes,
+        )
+        return result
+    except Exception:
+        logger.exception("brain claim failed")
+        return {"claim_id": None, "error": "claim_failed"}
+    finally:
+        db.close()
+
+
+async def _perform_release(ctx: Context, *, claim_id: str) -> dict[str, Any]:
+    """Shared body for the ``release`` tool: release one of MY OWN claims.
+
+    Owner-scoped by :func:`shared.claims.release_claim` (org_id AND
+    agent_id must match); a malformed ``claim_id`` is refused before any
+    query, same discipline as the ``forget`` tool's ``memory_id`` handling.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        logger.error("brain release got no transport request; cannot authenticate")
+        return {"released": False, "error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"released": False, "error": "unauthorized", "detail": str(exc.detail)}
+
+    db = SessionLocal()
+    try:
+        released = await anyio.to_thread.run_sync(
+            lambda: claims.release_claim(
+                db, org_id=org_id, claim_id=claim_id, agent_id=agent_id
+            )
+        )
+        return {"released": released}
+    except Exception:
+        logger.exception("brain release failed")
+        return {"released": False, "error": "release_failed"}
     finally:
         db.close()
 
@@ -3474,6 +3583,50 @@ def _register_tools(mcp: FastMCP) -> None:
         ] = "org",
     ) -> dict[str, Any]:
         return await _perform_share(ctx, memory_id=memory_id, to=to)
+
+    @mcp.tool(
+        name="claim",
+        description=(
+            "Register a work claim before starting something that could "
+            "overlap with another agent — advisory, not a lock. Returns "
+            "`collisions`: other agents' live claims whose description is "
+            "semantically close to yours. Args: description, optional "
+            "ttl_minutes (default 15, clamped 1-240)."
+        ),
+    )
+    async def claim(
+        ctx: Context,
+        description: Annotated[
+            str, Field(description="What you are about to work on.")
+        ],
+        ttl_minutes: Annotated[
+            int,
+            Field(
+                description=(
+                    "How long the claim stays live if never released "
+                    "(default 15, clamped to 1-240)."
+                )
+            ),
+        ] = 15,
+    ) -> dict[str, Any]:
+        return await _perform_claim(
+            ctx, description=description, ttl_minutes=ttl_minutes
+        )
+
+    @mcp.tool(
+        name="release",
+        description=(
+            "Release a work claim you made, so it stops showing up as a "
+            "collision or in active_claims. Arg: claim_id (from `claim`)."
+        ),
+    )
+    async def release(
+        ctx: Context,
+        claim_id: Annotated[
+            str, Field(description="Id of the claim to release, from `claim`.")
+        ],
+    ) -> dict[str, Any]:
+        return await _perform_release(ctx, claim_id=claim_id)
 
     @mcp.tool(
         name="project_create",

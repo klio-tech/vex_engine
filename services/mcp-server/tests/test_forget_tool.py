@@ -96,9 +96,9 @@ def test_forget_is_registered():
     """Phase 2/3 added share + the four project tools, so the count moved from
     10 to 15. Compression added klio_retrieve and then compress, taking it to
     17. The knowledge graph added explore, taking it to 18. Onboarding added
-    init, taking it to 19. The names are asserted rather than only the count,
-    because a count alone would pass if a tool were swapped rather than
-    added."""
+    init, taking it to 19. Build 4 added claim + release, taking it to 21.
+    The names are asserted rather than only the count, because a count alone
+    would pass if a tool were swapped rather than added."""
     from app.mcp_app import EXPECTED_TOOL_NAMES
 
     assert "forget" in EXPECTED_TOOL_NAMES
@@ -112,4 +112,5 @@ def test_forget_is_registered():
     assert {"klio_retrieve", "compress"} <= set(EXPECTED_TOOL_NAMES)
     assert "explore" in EXPECTED_TOOL_NAMES
     assert "init" in EXPECTED_TOOL_NAMES
-    assert len(EXPECTED_TOOL_NAMES) == 19
+    assert {"claim", "release"} <= set(EXPECTED_TOOL_NAMES)
+    assert len(EXPECTED_TOOL_NAMES) == 21

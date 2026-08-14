@@ -56,7 +56,7 @@ from typing import Any, Literal, Optional
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from shared import brain
+from shared import brain, claims
 from shared.auth import KeyInfo
 from shared.memory import (
     extract_facts,
@@ -974,7 +974,26 @@ async def capture_recall(
         await anyio.to_thread.run_sync(
             lambda: record_usage(db, org_id, "recall", over_cap=recall_over_cap)
         )
-        return {"memories": memories, "count": len(memories)}
+        # Claims ride every recall response (Build 4), same as the MCP
+        # `recall` tool: passive session-start injection is still a recall,
+        # so an agent hitting this REST path gets the same active_claims
+        # awareness. Best-effort: a claims-listing failure must never be the
+        # reason a capture recall fails.
+        try:
+            active_claims = await anyio.to_thread.run_sync(
+                lambda: claims.live_claims(db, org_id=org_id, project_id=project_id)
+            )
+        except Exception:
+            logger.warning(
+                "capture recall: live_claims lookup raised; omitting active_claims",
+                exc_info=True,
+            )
+            active_claims = []
+        return {
+            "memories": memories,
+            "count": len(memories),
+            "active_claims": active_claims,
+        }
     except HTTPException:
         raise
     except Exception:

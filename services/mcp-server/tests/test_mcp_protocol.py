@@ -49,6 +49,8 @@ _REQUIRED_SCHEMA_FIELD = {
     "compress": "content",
     "explore": "entity",
     "init": "phase",
+    "claim": "description",
+    "release": "claim_id",
 }
 
 
