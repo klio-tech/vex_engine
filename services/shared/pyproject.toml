@@ -13,6 +13,7 @@ dependencies = [
     "pgvector>=0.3.0",
     "litellm>=1.0.0",
     "boto3>=1.29.0",
+    "redis>=5.0.0",
 ]
 
 [project.optional-dependencies]

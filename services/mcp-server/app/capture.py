@@ -65,6 +65,7 @@ from shared.memory import (
     retrieve_memories_scoped,
 )
 from shared import metrics
+from shared.evidence_stream import build_captured_payload, publish_captured
 from shared.redaction import redact
 from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
@@ -216,6 +217,13 @@ class CaptureTranscriptRequest(BaseModel):
 
     messages: list[TranscriptMessage] = Field(
         default_factory=list, description="Ordered session messages."
+    )
+    tool_calls: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Ordered tool invocations for the session (evidence loop). "
+            "Optional and backward compatible: omitted or empty is a no-op."
+        ),
     )
     session_id: Optional[str] = Field(
         default=None, description="Client session id; groups dedup within a session."
@@ -595,6 +603,19 @@ def _recent_memories(
     return [_serialize_memory(r) for r in rows]
 
 
+async def enqueue_trace_outbox(*, payload: dict[str, Any]) -> None:
+    """Publish one redacted transcript payload to ``sessions.captured``.
+
+    Thin wrapper around :func:`shared.evidence_stream.publish_captured` so the
+    call site in :func:`capture_transcript` has a single, mockable seam (tests
+    patch ``app.capture.enqueue_trace_outbox`` directly rather than reaching
+    into the Redis client). Raises on failure — the caller wraps this in its
+    own try/except, because evidence publishing is best-effort: it must never
+    fail the capture request itself.
+    """
+    await publish_captured(payload=payload)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -782,6 +803,26 @@ async def capture_transcript(
                 )
 
         record_capture("accepted" if stored else "rejected")
+
+        # Evidence loop: publish the redacted session for retention. Best
+        # effort — a publish failure (bad Redis, redaction failure inside
+        # build_captured_payload) must never fail the capture request, which
+        # has already succeeded by this point.
+        try:
+            payload = build_captured_payload(
+                org_id=org_id,
+                session_id=req.session_id or "unknown",
+                messages=[m.model_dump() for m in req.messages],
+                tool_calls=req.tool_calls,
+                project_id=project_id,
+                user_id=user_id,
+                agent_id=agent_id,
+            )
+            if payload is not None:
+                await enqueue_trace_outbox(payload=payload)
+        except Exception:
+            logger.warning("evidence publish failed; capture unaffected", exc_info=True)
+
         return {"stored": stored, "facts": len(facts), "summary": bool(summary)}
     except HTTPException:
         raise
