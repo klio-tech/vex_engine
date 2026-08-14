@@ -1,37 +1,54 @@
-# Evidence Loop (Builds 1+2) Implementation Plan
+# Coordination System (Builds 1–5, complete) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Retain redacted session transcripts + tool traces (Build 1) and join Vex verdicts to the memories served in each recall (Build 2), so dreaming has fuel and "prove the memory worked" becomes a query.
+**Goal:** Ship the complete coordination system in one release: retained evidence, an honest outcome join, hash-based optimistic concurrency, semantic work claims, and dreaming as evidence-backed proposals.
 
-**Architecture:** A new `session_traces` table + S3 object per session, written synchronously at the end of `capture_transcript` (reusing the storage-worker's boto3 client factory). `brain_recall_events` gains a `memory_ids` array + `session_id`; a new `recall_outcomes` table joins recall events to verification verdicts, graded by a new async-worker job that reads the retained trace and runs the existing `engine.pipeline.verify`. Retroactive stale-serve marking rides the existing supersession path.
+**Architecture:** mcp-server publishes redacted session payloads to a Redis stream; storage-worker persists them (S3 + Postgres, its existing job) and emits `sessions.stored`; async-worker grades each stored session (verification pipeline + per-memory usage attribution) and, on schedule, dreams over accumulated evidence to produce reviewable proposals. Writes gain revision-based check-and-set; claims ride every recall response.
 
-**Tech Stack:** FastAPI (mcp-server), SQLAlchemy Core + Alembic (migrations service), boto3 (S3), pytest + the repo's mocked-pool test policy, verification-engine as a library.
+**Tech Stack:** FastAPI/FastMCP (mcp-server), aioredis streams, boto3 (storage-worker only), SQLAlchemy Core + Alembic, verification-engine as a library, pytest with the repo's mocked-pool policy (`KLIO_REQUIRE_DB=1` for DB-gated tests).
+
+## Design corrections from review (binding on every task)
+
+1. **No session verdict masquerading as a memory verdict.** The session grade lives ONCE in `session_outcomes`. Per-recall rows carry *attribution* (`usage_score`, `used`), never a copied pass/flag/block.
+2. **`verify()` receives `session_memories`** — the pipeline's memory-consistency check is the only Vex check that speaks about memories; not passing them wastes the one relevant grader.
+3. **Final output comes from structured messages** (`messages[-1]` with `role == "assistant"`), never a string-prefix hunt over a flattened blob. Traces store the structured messages array.
+4. **Stale-serve = served after the superseding belief already existed** (`bre.created_at >= new_belief.created_at`). Serves that were correct at the time are never marked. This measures curator lag — the honest silent-failure counter.
+5. **mcp-server never touches S3; the hand-off is a Redis stream.** Verified 2026-08-13: mcp-server has no Redis today — this plan ADDS `aioredis` + `REDIS_URL` to it, deliberately. Redis streams are already this repo's production event backbone (`executions.raw` → `stored` → `verified`, consumer groups + acks); publishing `sessions.captured` the same way keeps ONE queueing pattern instead of inventing a second. Publish is best-effort (evidence, not billing): Redis down → warn and drop, capture still succeeds. Deployment: point mcp-server at the same Railway Redis the workers already use.
+6. **A later Stop hook wins:** trace upsert keeps the transcript with MORE messages (`ON CONFLICT ... DO UPDATE ... WHERE EXCLUDED.message_count > session_traces.message_count`).
+7. **`tool_calls` is a first-class request field now**, not a promised follow-up. Hooks that don't send it yield `[]`, which is recorded as `tool_calls_count = 0`, visibly distinct from "not supported".
+8. **The grader is scheduled by construction** — it is a stream consumer, not a callable awaiting Phase 2.
+9. **Engine freeze:** lifted for this work by the founder's explicit instruction (2026-08-13, "all phases complete system to be built in one go").
 
 ## Global Constraints
 
-- **ADDITIVE ONLY migrations.** Next revision is `041` (latest is `040_project_access_roles.py`). No column drops, no rewrites of existing rows.
-- **Redaction before persistence, always.** The transcript must pass `shared.redaction.redact` BEFORE the S3 put — the same chokepoint contract documented in `capture.py:469-499`. Record `redaction_version` so a redactor bug can be scoped.
-- **Best-effort logging never breaks the request.** Trace persistence and recall logging follow `recall_log.py`'s pattern: catch, rollback, `logger.warning`, continue. A failed trace write must not fail `capture_transcript`.
-- **Tenant boundary is absolute.** Every new table carries `org_id`; every query predicates on it. The grader job partitions strictly per org.
-- **Mocked-pool test policy:** the pool mock never evaluates SQL, so tests assert SQL shape + Python assembly. DB-gated tests use `KLIO_REQUIRE_DB=1` and a migrated database.
-- **Free-tier retention applies to traces:** traces are deleted by the same sweep that deletes memories (`run_retention.py` guards: non-positive retention = skip).
-- **No new services.** Build 1 rides mcp-server + the existing S3 client factory pattern; Build 2 rides async-worker.
-- Engine freeze is lifted for this work by explicit decision (spec approved 2026-08-13).
-
----
+- ADDITIVE ONLY migrations; next revision `041`, then 042–045 in this plan's order.
+- Redaction before any persistence or stream publish (`shared.redaction.redact`); on redaction failure, nothing leaves the process — the `recall_log.py` contract.
+- Best-effort evidence: no evidence write may fail a user-facing request. Catch, rollback, `logger.warning`, continue.
+- Every table carries `org_id`; every query predicates on it; the dreamer partitions strictly per org.
+- Mocked-pool test policy: unit tests assert SQL shape + Python assembly; DB-gated tests require `KLIO_REQUIRE_DB=1` + migrated DB.
+- Backward compatibility: all new tool/request fields optional; existing clients unchanged.
+- Production migrations run against the Neon **direct** endpoint (strip `-pooler`).
 
 ## File Structure
 
 | File | Responsibility |
 | --- | --- |
-| `services/migrations/alembic/versions/041_session_traces.py` | `session_traces` table |
-| `services/migrations/alembic/versions/042_recall_evidence.py` | `memory_ids[]` + `session_id` on `brain_recall_events`; `recall_outcomes` table |
-| `services/shared/shared/traces.py` | Write/read API for traces: S3 put/get + row insert (server-side of Build 1) |
-| `services/mcp-server/app/capture.py` | Call `traces.persist_trace` at the end of `capture_transcript` |
-| `services/mcp-server/app/recall_log.py` | Log served `memory_ids` + `session_id` |
-| `services/async-worker/app/outcome_grader.py` | Grade session outputs, write `recall_outcomes` |
-| `services/shared/shared/memory.py` | On supersede: mark later serves of the old row `served_stale` |
+| `services/migrations/alembic/versions/041_session_traces.py` | Trace rows (message_count for upsert-wins) |
+| `services/migrations/alembic/versions/042_recall_evidence.py` | `memory_ids[]`+`session_id` on recalls; `session_outcomes`; `recall_outcomes` |
+| `services/migrations/alembic/versions/043_memory_revisions.py` | `revision` on `session_memories` (CAS) |
+| `services/migrations/alembic/versions/044_work_claims.py` | Claims with embeddings |
+| `services/migrations/alembic/versions/045_memory_proposals.py` | Dreaming proposals |
+| `services/shared/shared/evidence_stream.py` | Stream names + payload schema (producer/consumer contract) |
+| `services/shared/shared/traces.py` | Row upsert + S3 object I/O (called by storage-worker) |
+| `services/shared/shared/stale.py` | Corrected stale-serve marking |
+| `services/shared/shared/claims.py` | Claim create/release/live-lookup with semantic collision |
+| `services/mcp-server/app/capture.py` | Accept `tool_calls`; publish to `sessions.captured` |
+| `services/mcp-server/app/recall_log.py` | Record served `memory_ids` + `session_id` |
+| `services/mcp-server/app/mcp_app.py` | `base_revision` on write tools; `revision` + claims in recall; `claim`/`release` tools; proposals REST |
+| `services/storage-worker/app/trace_consumer.py` | `sessions.captured` → S3+row → `sessions.stored` |
+| `services/async-worker/app/outcome_grader.py` | `sessions.stored` → session verdict + per-recall attribution |
+| `services/async-worker/app/dreamer.py` | Scheduled: evidence → `memory_proposals` |
 
 ---
 
@@ -41,16 +58,13 @@
 - Create: `services/migrations/alembic/versions/041_session_traces.py`
 - Test: `services/migrations/tests/test_041_session_traces.py`
 
-**Interfaces:**
-- Produces table `session_traces`: `id UUID pk`, `org_id String(64) NOT NULL`, `project_id UUID NULL`, `user_id UUID NULL`, `agent_id Text NULL`, `session_id Text NOT NULL`, `started_at timestamptz NULL`, `ended_at timestamptz NULL`, `transcript_ref Text NOT NULL`, `tool_calls_ref Text NULL`, `redaction_version Text NOT NULL`, `retention_class Text NOT NULL DEFAULT 'plan'`, `created_at timestamptz NOT NULL DEFAULT now()`. Indexes: `(org_id, created_at)`, unique `(org_id, session_id)`.
+**Interfaces:** table `session_traces`: `id UUID pk`, `org_id String(64) NOT NULL`, `project_id UUID NULL`, `user_id UUID NULL`, `agent_id Text NULL`, `session_id Text NOT NULL`, `transcript_ref Text NOT NULL` (set by storage-worker at insert — the row exists only once the object does), `message_count Integer NOT NULL DEFAULT 0`, `tool_calls_count Integer NOT NULL DEFAULT 0`, `redaction_version Text NOT NULL`, `created_at/updated_at timestamptz DEFAULT now()`. Unique `(org_id, session_id)`; index `(org_id, created_at)`.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 # services/migrations/tests/test_041_session_traces.py
-"""Migration 041 shape test. DB-gated: requires a migrated database."""
 import os
-
 import pytest
 import sqlalchemy as sa
 
@@ -59,49 +73,38 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _inspector():
-    engine = sa.create_engine(os.environ["DATABASE_URL"])
-    return sa.inspect(engine)
+def _insp():
+    return sa.inspect(sa.create_engine(os.environ["DATABASE_URL"]))
 
 
-def test_session_traces_exists_with_required_columns():
-    cols = {c["name"]: c for c in _inspector().get_columns("session_traces")}
-    for name in (
-        "id", "org_id", "project_id", "user_id", "agent_id", "session_id",
-        "started_at", "ended_at", "transcript_ref", "tool_calls_ref",
-        "redaction_version", "retention_class", "created_at",
-    ):
-        assert name in cols, f"missing column {name}"
+def test_session_traces_columns():
+    cols = {c["name"]: c for c in _insp().get_columns("session_traces")}
+    for n in ("id", "org_id", "session_id", "transcript_ref", "message_count",
+              "tool_calls_count", "redaction_version", "created_at", "updated_at"):
+        assert n in cols, n
     assert cols["org_id"]["nullable"] is False
-    assert cols["session_id"]["nullable"] is False
-    assert cols["transcript_ref"]["nullable"] is False
-    assert cols["redaction_version"]["nullable"] is False
+    assert cols["message_count"]["nullable"] is False
 
 
-def test_session_traces_indexes():
-    idx = _inspector().get_indexes("session_traces")
-    names = {i["name"] for i in idx}
-    assert "ix_session_traces_org_created" in names
-    unique = [i for i in idx if i["name"] == "uq_session_traces_org_session"]
-    assert unique and unique[0]["unique"] is True
+def test_session_traces_unique_org_session():
+    idx = _insp().get_indexes("session_traces")
+    u = [i for i in idx if i["name"] == "uq_session_traces_org_session"]
+    assert u and u[0]["unique"] is True
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run to verify it fails**
 
-Run: `cd services/migrations && KLIO_REQUIRE_DB=1 DATABASE_URL=$DATABASE_URL pytest tests/test_041_session_traces.py -v`
-Expected: FAIL — `session_traces` table does not exist.
+Run: `cd services/migrations && KLIO_REQUIRE_DB=1 pytest tests/test_041_session_traces.py -v` → FAIL (no table).
 
 - [ ] **Step 3: Write the migration**
 
 ```python
 # services/migrations/alembic/versions/041_session_traces.py
-"""session_traces: retained, redacted session evidence.
+"""session_traces: retained, redacted session evidence (Build 1).
 
-ADDITIVE ONLY. Build 1 of the evidence loop (spec
-2026-08-13-context-coordination-design.md). Rows point at S3 objects holding
-the REDACTED transcript and tool-call log; raw text never lands in Postgres.
-``redaction_version`` scopes any future redactor bug to affected traces.
-``retention_class='plan'`` means the org's plan retention governs deletion.
+ADDITIVE ONLY. Rows point at one S3 object holding the REDACTED structured
+payload {messages, tool_calls}. message_count enables richer-transcript-wins
+upserts (a second Stop hook with more messages replaces the first).
 """
 import sqlalchemy as sa
 from alembic import op
@@ -122,30 +125,19 @@ def upgrade() -> None:
         sa.Column("user_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("agent_id", sa.Text(), nullable=True),
         sa.Column("session_id", sa.Text(), nullable=False),
-        sa.Column("started_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("ended_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("transcript_ref", sa.Text(), nullable=False),
-        sa.Column("tool_calls_ref", sa.Text(), nullable=True),
+        sa.Column("message_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("tool_calls_count", sa.Integer(), server_default="0", nullable=False),
         sa.Column("redaction_version", sa.Text(), nullable=False),
-        sa.Column(
-            "retention_class", sa.Text(), server_default="plan", nullable=False
-        ),
-        sa.Column(
-            "created_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
+        sa.Column("created_at", sa.DateTime(timezone=True),
+                  server_default=sa.text("now()"), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True),
+                  server_default=sa.text("now()"), nullable=False),
     )
-    op.create_index(
-        "ix_session_traces_org_created", "session_traces", ["org_id", "created_at"]
-    )
-    op.create_index(
-        "uq_session_traces_org_session",
-        "session_traces",
-        ["org_id", "session_id"],
-        unique=True,
-    )
+    op.create_index("ix_session_traces_org_created", "session_traces",
+                    ["org_id", "created_at"])
+    op.create_index("uq_session_traces_org_session", "session_traces",
+                    ["org_id", "session_id"], unique=True)
 
 
 def downgrade() -> None:
@@ -154,220 +146,328 @@ def downgrade() -> None:
     op.drop_table("session_traces")
 ```
 
-- [ ] **Step 4: Apply and run the test**
-
-Run: `cd services/migrations && alembic upgrade head && KLIO_REQUIRE_DB=1 pytest tests/test_041_session_traces.py -v`
-Expected: PASS, 2 tests.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add services/migrations/alembic/versions/041_session_traces.py services/migrations/tests/test_041_session_traces.py
-git commit -m "feat(migrations): 041 session_traces — retained redacted evidence"
-```
+- [ ] **Step 4: Apply + test** — `alembic upgrade head && KLIO_REQUIRE_DB=1 pytest tests/test_041_session_traces.py -v` → PASS.
+- [ ] **Step 5: Commit** — `git commit -m "feat(migrations): 041 session_traces"`
 
 ---
 
-### Task 2: `shared.traces` — persist and fetch
+### Task 2: Evidence stream contract + capture publish
 
 **Files:**
-- Create: `services/shared/shared/traces.py`
-- Test: `services/shared/tests/test_traces.py`
+- Create: `services/shared/shared/evidence_stream.py`
+- Modify: `services/mcp-server/app/capture.py` (`CaptureTranscriptRequest` + handler)
+- Test: `services/shared/tests/test_evidence_stream.py`, `services/mcp-server/tests/test_capture_publishes_trace.py`
 
 **Interfaces:**
-- Produces: `persist_trace(db, s3, *, org_id, session_id, transcript_text, tool_calls, project_id=None, user_id=None, agent_id=None, started_at=None, ended_at=None) -> str | None` (returns trace id, or `None` on failure — never raises). `fetch_trace(db, s3, *, org_id, session_id) -> dict | None` returning `{"transcript": str, "tool_calls": list, "row": dict}`.
-- Consumes: `shared.redaction.redact` (existing); an S3 client with `put_object`/`get_object` (the storage-worker factory's boto3 shape); env `KLIO_TRACE_BUCKET` (default `klio-traces`), `REDACTION_VERSION` (default `"1"`).
+- Produces: `SESSIONS_CAPTURED = "sessions.captured"`, `SESSIONS_STORED = "sessions.stored"`; `build_captured_payload(*, org_id, session_id, messages, tool_calls, project_id=None, user_id=None, agent_id=None) -> dict | None` — redacts every message content and tool-call args; returns `None` if redaction fails (nothing leaves the process). Payload capped at 256 KB post-redaction (tail-trim messages to fit, counts preserved). `publish_captured(*, payload) -> None` — XADD to `SESSIONS_CAPTURED`; raises on failure (the caller wraps: evidence is best-effort, capture is not). `CaptureTranscriptRequest` gains `tool_calls: list[dict] = []` (optional).
+- Consumes: `shared.redaction.redact`; a NEW lazy aioredis client in mcp-server from `REDIS_URL` (verified 2026-08-13: mcp-server has no Redis today — this task adds `aioredis` to its `pyproject.toml` and `REDIS_URL` to its env, matching the pattern async-worker already uses; point it at the same Railway Redis as the workers).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# services/shared/tests/test_evidence_stream.py
+from unittest.mock import patch
+
+from shared import evidence_stream as es
+
+
+def test_payload_redacts_messages_and_tool_args():
+    class Clean:
+        clean_text = "CLEAN"
+    with patch.object(es, "redact", return_value=Clean()):
+        p = es.build_captured_payload(
+            org_id="o", session_id="s",
+            messages=[{"role": "user", "content": "sk-live-9"}],
+            tool_calls=[{"tool": "Bash", "args": {"command": "curl -H sk-live-9"}}],
+        )
+    assert p["messages"][0]["content"] == "CLEAN"
+    assert "sk-live-9" not in str(p["tool_calls"])
+    assert p["org_id"] == "o" and p["session_id"] == "s"
+
+
+def test_payload_none_when_redaction_fails():
+    with patch.object(es, "redact", side_effect=RuntimeError("down")):
+        p = es.build_captured_payload(
+            org_id="o", session_id="s", messages=[{"role": "user", "content": "x"}],
+            tool_calls=[],
+        )
+    assert p is None
+```
+
+```python
+# services/mcp-server/tests/test_capture_publishes_trace.py
+from unittest.mock import AsyncMock, patch
+
+from fastapi.testclient import TestClient
+import pytest
+
+
+@pytest.fixture()
+def client(app_with_auth):  # existing conftest fixture; do not invent auth bypass
+    return TestClient(app_with_auth)
+
+
+def _body():
+    return {
+        "session_id": "s1",
+        "messages": [{"role": "user", "content": "hello"},
+                     {"role": "assistant", "content": "done"}],
+        "tool_calls": [{"tool": "Edit", "args": {"file_path": "a.py"}}],
+    }
+
+
+def test_transcript_capture_enqueues_outbox(client):
+    with patch("app.capture.enqueue_trace_outbox") as enq:
+        r = client.post("/capture/transcript", json=_body())
+    assert r.status_code == 200
+    assert enq.called
+    payload = enq.call_args.kwargs["payload"]
+    assert payload["session_id"] == "s1"
+    assert len(payload["tool_calls"]) == 1
+
+
+def test_outbox_failure_does_not_break_capture(client):
+    with patch("app.capture.enqueue_trace_outbox", side_effect=RuntimeError):
+        r = client.post("/capture/transcript", json=_body())
+    assert r.status_code == 200
+```
+
+- [ ] **Step 2: Run to verify they fail** — both suites FAIL on missing imports.
+
+- [ ] **Step 3: Implement**
+
+```python
+# services/shared/shared/evidence_stream.py
+"""Producer/consumer contract for the evidence pipeline.
+
+mcp-server publishes REDACTED payloads to ``sessions.captured``;
+storage-worker persists and emits ``sessions.stored``; the grader consumes
+that. Redaction failure means NO publish — unscreened text never leaves the
+process (recall_log contract).
+"""
+import json
+import logging
+from typing import Any, Optional
+
+from shared.redaction import redact
+
+logger = logging.getLogger("klio.evidence")
+
+SESSIONS_CAPTURED = "sessions.captured"
+SESSIONS_STORED = "sessions.stored"
+
+
+def build_captured_payload(
+    *,
+    org_id: str,
+    session_id: str,
+    messages: list[dict[str, Any]],
+    tool_calls: list[dict[str, Any]],
+    project_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    try:
+        clean_messages = [
+            {"role": m.get("role", "user"),
+             "content": redact(str(m.get("content", ""))).clean_text}
+            for m in messages
+        ]
+        clean_tools = [
+            {"tool": t.get("tool", ""),
+             "args": redact(json.dumps(t.get("args", {}), ensure_ascii=False)).clean_text,
+             "status": t.get("status")}
+            for t in tool_calls
+        ]
+    except Exception:
+        logger.warning(
+            "evidence: redaction failed for org %s session %s; payload dropped "
+            "(content withheld — it is unscreened)", org_id, session_id,
+            exc_info=True,
+        )
+        return None
+    return {
+        "org_id": org_id, "session_id": session_id,
+        "project_id": project_id, "user_id": user_id, "agent_id": agent_id,
+        "messages": clean_messages, "tool_calls": clean_tools,
+    }
+```
+
+In `capture.py`: add `tool_calls: list[dict[str, Any]] = Field(default_factory=list)` to `CaptureTranscriptRequest`; add
+
+```python
+async def publish_captured(*, payload: dict[str, Any]) -> None:
+    """XADD the redacted payload to sessions.captured. Raises on failure —
+    the caller wraps it (evidence is best-effort, capture is not)."""
+    redis = await _get_redis()  # reuse existing helper or lazy aioredis.from_url(os.environ["REDIS_URL"])
+    await redis.xadd(SESSIONS_CAPTURED, {"payload": json.dumps(payload)})
+```
+
+and at the end of `capture_transcript` (after distillation, before return):
+
+```python
+        # Evidence loop: publish the redacted session for retention. Best-effort.
+        try:
+            payload = build_captured_payload(
+                org_id=org_id, session_id=req.session_id or "unknown",
+                messages=[m.model_dump() for m in req.messages],
+                tool_calls=req.tool_calls, user_id=user_id, agent_id=agent_id,
+            )
+            if payload is not None:
+                await publish_captured(payload=payload)
+        except Exception:
+            logger.warning("evidence publish failed; capture unaffected", exc_info=True)
+```
+
+- [ ] **Step 4: Run** both test files + existing transcript tests → PASS.
+- [ ] **Step 5: Commit** — `git commit -m "feat(capture): tool_calls field + redacted publish to sessions.captured"`
+
+---
+
+### Task 3: storage-worker trace consumer
+
+**Files:**
+- Create: `services/storage-worker/app/trace_consumer.py`
+- Create: `services/shared/shared/traces.py`
+- Modify: `services/storage-worker/app/main.py` (start the consumer loop alongside `_consume_raw`)
+- Test: `services/storage-worker/tests/test_trace_consumer.py`, `services/shared/tests/test_traces.py`
+
+**Interfaces:**
+- `shared.traces.upsert_trace(db, *, org_id, session_id, transcript_ref, message_count, tool_calls_count, redaction_version, project_id=None, user_id=None, agent_id=None) -> str | None` — richer-wins upsert, returns trace id or None (best-effort).
+- `shared.traces.fetch_trace(db, s3, *, org_id, session_id) -> dict | None` → `{"messages": [...], "tool_calls": [...], "row": {...}}` (org-predicated).
+- `trace_consumer.handle_captured(db, s3, redis, entry: dict) -> bool` — persists one stream entry, emits `SESSIONS_STORED` with `{org_id, session_id}`; returns success. Env: `KLIO_TRACE_BUCKET` (**required** — the consumer refuses to start without it; no default bucket footgun), `REDACTION_VERSION` (default "1").
+
+- [ ] **Step 1: Write the failing tests**
 
 ```python
 # services/shared/tests/test_traces.py
-"""Unit tests: mocked S3 + mocked db (pool policy: assert SQL shape + assembly)."""
-import json
 from unittest.mock import MagicMock
 
 from shared import traces
 
 
-def _db():
+def test_upsert_richer_wins_sql():
     db = MagicMock()
-    return db
-
-
-def _s3():
-    s3 = MagicMock()
-    return s3
-
-
-def test_persist_redacts_before_put(monkeypatch):
-    """The S3 object must contain redacted text, never the raw transcript."""
-    calls = {}
-
-    class FakeRedacted:
-        clean_text = "REDACTED-BODY"
-
-    monkeypatch.setattr(traces, "redact", lambda text: FakeRedacted())
-    s3 = _s3()
-    trace_id = traces.persist_trace(
-        _db(), s3, org_id="org1", session_id="sess1",
-        transcript_text="SECRET sk-live-123", tool_calls=[{"tool": "Edit"}],
+    traces.upsert_trace(
+        db, org_id="o", session_id="s", transcript_ref="s3://b/k",
+        message_count=5, tool_calls_count=2, redaction_version="1",
     )
-    assert trace_id is not None
-    body = s3.put_object.call_args_list[0].kwargs["Body"]
-    assert b"REDACTED-BODY" in body
-    assert b"sk-live-123" not in body
-
-
-def test_persist_inserts_row_with_org_and_refs():
-    db = _db()
-    traces.persist_trace(
-        db, _s3(), org_id="org1", session_id="sess1",
-        transcript_text="hello", tool_calls=[],
-    )
-    sql = str(db.execute.call_args_list[0].args[0])
-    params = db.execute.call_args_list[0].args[1]
+    sql = " ".join(str(db.execute.call_args.args[0]).split())
     assert "INSERT INTO session_traces" in sql
-    assert params["org_id"] == "org1"
-    assert params["session_id"] == "sess1"
-    assert params["transcript_ref"].startswith("s3://")
-    assert params["redaction_version"]
+    assert "ON CONFLICT" in sql and "DO UPDATE" in sql
+    assert "EXCLUDED.message_count > session_traces.message_count" in sql
 
 
-def test_persist_never_raises_on_s3_failure():
-    s3 = _s3()
-    s3.put_object.side_effect = RuntimeError("bucket gone")
-    result = traces.persist_trace(
-        _db(), s3, org_id="org1", session_id="s", transcript_text="x", tool_calls=[]
-    )
-    assert result is None  # best-effort: request must not break
-
-
-def test_persist_refuses_when_redaction_fails(monkeypatch):
-    """Unscreened text is NEVER persisted — same contract as recall_log."""
-    def boom(text):
-        raise RuntimeError("redactor down")
-
-    monkeypatch.setattr(traces, "redact", boom)
-    s3 = _s3()
-    result = traces.persist_trace(
-        _db(), s3, org_id="org1", session_id="s", transcript_text="raw", tool_calls=[]
-    )
-    assert result is None
-    s3.put_object.assert_not_called()
+def test_upsert_never_raises():
+    db = MagicMock()
+    db.execute.side_effect = RuntimeError("down")
+    assert traces.upsert_trace(
+        db, org_id="o", session_id="s", transcript_ref="r",
+        message_count=1, tool_calls_count=0, redaction_version="1",
+    ) is None
 
 
 def test_fetch_predicates_on_org():
-    db = _db()
+    db = MagicMock()
     db.execute.return_value.mappings.return_value.first.return_value = None
-    traces.fetch_trace(db, _s3(), org_id="org1", session_id="sess1")
-    sql = str(db.execute.call_args_list[0].args[0])
-    assert "org_id = :org_id" in sql
+    traces.fetch_trace(db, MagicMock(), org_id="o", session_id="s")
+    assert "org_id = :org_id" in str(db.execute.call_args.args[0])
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+```python
+# services/storage-worker/tests/test_trace_consumer.py
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
-Run: `cd services/shared && pytest tests/test_traces.py -v`
-Expected: FAIL — `cannot import name 'traces'`.
+import pytest
 
-- [ ] **Step 3: Write the implementation**
+from app import trace_consumer
+
+
+@pytest.mark.anyio
+async def test_handle_captured_puts_s3_then_row_then_emits():
+    db, s3 = MagicMock(), MagicMock()
+    redis = MagicMock()
+    redis.xadd = AsyncMock()
+    entry = {"payload": json.dumps({
+        "org_id": "o", "session_id": "s", "project_id": None, "user_id": None,
+        "agent_id": None,
+        "messages": [{"role": "assistant", "content": "done"}],
+        "tool_calls": [],
+    })}
+    with patch.object(trace_consumer, "_bucket", return_value="klio-traces"), \
+         patch.object(trace_consumer.traces, "upsert_trace", return_value="tid") as up:
+        ok = await trace_consumer.handle_captured(db, s3, redis, entry)
+    assert ok
+    body = s3.put_object.call_args.kwargs["Body"]
+    assert b"done" in body
+    assert up.call_args.kwargs["message_count"] == 1
+    stored = redis.xadd.call_args.args
+    assert stored[0] == trace_consumer.SESSIONS_STORED
+    assert json.loads(redis.xadd.call_args.args[1]["payload"])["session_id"] == "s"
+
+
+@pytest.mark.anyio
+async def test_bad_payload_is_skipped_not_fatal():
+    ok = await trace_consumer.handle_captured(
+        MagicMock(), MagicMock(), MagicMock(), {"payload": "not json"}
+    )
+    assert ok is False
+```
+
+- [ ] **Step 2: Run to verify they fail** — missing modules.
+
+- [ ] **Step 3: Implement**
 
 ```python
 # services/shared/shared/traces.py
-"""Retained session evidence (Build 1 of the evidence loop).
-
-One S3 object per session (redacted transcript + tool calls, JSON), one
-``session_traces`` row pointing at it. Persistence is BEST-EFFORT: a failure
-logs and returns ``None`` — it never breaks the capture request that
-triggered it. Redaction is mandatory: if ``redact`` fails, nothing is
-persisted (unscreened text never leaves the process — the recall_log
-contract).
-"""
+"""Trace persistence primitives (row upsert + fetch). Called by storage-worker."""
 import json
 import logging
-import os
 import uuid
-from datetime import datetime
 from typing import Any, Optional
 
 from sqlalchemy import text
 
-from shared.redaction import redact
-
 logger = logging.getLogger("klio.traces")
 
 
-def _bucket() -> str:
-    return os.environ.get("KLIO_TRACE_BUCKET", "klio-traces")
-
-
-def _redaction_version() -> str:
-    return os.environ.get("REDACTION_VERSION", "1")
-
-
-def persist_trace(
-    db: Any,
-    s3: Any,
-    *,
-    org_id: str,
-    session_id: str,
-    transcript_text: str,
-    tool_calls: list[dict[str, Any]],
-    project_id: Optional[str] = None,
-    user_id: Optional[str] = None,
+def upsert_trace(
+    db: Any, *, org_id: str, session_id: str, transcript_ref: str,
+    message_count: int, tool_calls_count: int, redaction_version: str,
+    project_id: Optional[str] = None, user_id: Optional[str] = None,
     agent_id: Optional[str] = None,
-    started_at: Optional[datetime] = None,
-    ended_at: Optional[datetime] = None,
 ) -> Optional[str]:
-    """Redact, store to S3, insert the row. Returns trace id or None."""
-    try:
-        clean = redact(transcript_text).clean_text
-    except Exception:
-        # Same contract as recall_log: the text that failed screening is
-        # exactly the text we must not persist (or log).
-        logger.warning(
-            "traces: redact() failed for org %s session %s; trace NOT "
-            "persisted (content withheld — it is unscreened)",
-            org_id,
-            session_id,
-            exc_info=True,
-        )
-        return None
-
+    """Insert or replace-if-richer. A second Stop hook with MORE messages wins;
+    a shorter duplicate never clobbers a fuller trace. Best-effort."""
     trace_id = str(uuid.uuid4())
-    key = f"traces/{org_id}/{session_id}/{trace_id}.json"
-    ref = f"s3://{_bucket()}/{key}"
-    payload = json.dumps(
-        {"transcript": clean, "tool_calls": tool_calls},
-        ensure_ascii=False,
-    ).encode("utf-8")
-
     try:
-        s3.put_object(Bucket=_bucket(), Key=key, Body=payload)
         db.execute(
             text(
                 """
                 INSERT INTO session_traces
                   (id, org_id, project_id, user_id, agent_id, session_id,
-                   started_at, ended_at, transcript_ref, tool_calls_ref,
+                   transcript_ref, message_count, tool_calls_count,
                    redaction_version)
                 VALUES (:id, :org_id, :project_id, :user_id, :agent_id,
-                        :session_id, :started_at, :ended_at, :transcript_ref,
-                        :tool_calls_ref, :redaction_version)
-                ON CONFLICT DO NOTHING
+                        :session_id, :transcript_ref, :message_count,
+                        :tool_calls_count, :redaction_version)
+                ON CONFLICT (org_id, session_id) DO UPDATE SET
+                  transcript_ref = EXCLUDED.transcript_ref,
+                  message_count = EXCLUDED.message_count,
+                  tool_calls_count = EXCLUDED.tool_calls_count,
+                  redaction_version = EXCLUDED.redaction_version,
+                  updated_at = now()
+                WHERE EXCLUDED.message_count > session_traces.message_count
                 """
             ),
             {
-                "id": trace_id,
-                "org_id": org_id,
-                "project_id": project_id,
-                "user_id": user_id,
-                "agent_id": agent_id,
-                "session_id": session_id,
-                "started_at": started_at,
-                "ended_at": ended_at,
-                "transcript_ref": ref,
-                "tool_calls_ref": ref,  # single object holds both
-                "redaction_version": _redaction_version(),
+                "id": trace_id, "org_id": org_id, "project_id": project_id,
+                "user_id": user_id, "agent_id": agent_id,
+                "session_id": session_id, "transcript_ref": transcript_ref,
+                "message_count": message_count,
+                "tool_calls_count": tool_calls_count,
+                "redaction_version": redaction_version,
             },
         )
         db.commit()
@@ -377,208 +477,118 @@ def persist_trace(
             db.rollback()
         except Exception:
             pass
-        logger.warning(
-            "traces: persist failed for org %s session %s; ignoring",
-            org_id,
-            session_id,
-            exc_info=True,
-        )
+        logger.warning("traces: upsert failed org=%s session=%s", org_id,
+                       session_id, exc_info=True)
         return None
 
 
 def fetch_trace(
     db: Any, s3: Any, *, org_id: str, session_id: str
 ) -> Optional[dict[str, Any]]:
-    """Load a trace row + its S3 payload. Org-predicated. None if absent."""
     try:
-        row = (
-            db.execute(
-                text(
-                    """
-                    SELECT id, transcript_ref, tool_calls_ref, created_at
-                    FROM session_traces
-                    WHERE org_id = :org_id AND session_id = :session_id
-                    """
-                ),
-                {"org_id": org_id, "session_id": session_id},
-            )
-            .mappings()
-            .first()
-        )
+        row = db.execute(
+            text(
+                """
+                SELECT id, transcript_ref, message_count, created_at
+                FROM session_traces
+                WHERE org_id = :org_id AND session_id = :session_id
+                """
+            ),
+            {"org_id": org_id, "session_id": session_id},
+        ).mappings().first()
         if row is None:
             return None
-        ref = row["transcript_ref"]
-        key = ref.split("/", 3)[3]  # s3://bucket/<key>
-        obj = s3.get_object(Bucket=_bucket(), Key=key)
+        bucket, key = row["transcript_ref"][len("s3://"):].split("/", 1)
+        obj = s3.get_object(Bucket=bucket, Key=key)
         data = json.loads(obj["Body"].read().decode("utf-8"))
-        return {
-            "transcript": data.get("transcript", ""),
-            "tool_calls": data.get("tool_calls", []),
-            "row": dict(row),
-        }
+        return {"messages": data.get("messages", []),
+                "tool_calls": data.get("tool_calls", []), "row": dict(row)}
     except Exception:
-        logger.warning(
-            "traces: fetch failed for org %s session %s", org_id, session_id,
-            exc_info=True,
-        )
+        logger.warning("traces: fetch failed org=%s session=%s", org_id,
+                       session_id, exc_info=True)
         return None
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `cd services/shared && pytest tests/test_traces.py -v`
-Expected: PASS, 5 tests.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add services/shared/shared/traces.py services/shared/tests/test_traces.py
-git commit -m "feat(shared): traces module — redact-then-persist session evidence"
-```
-
----
-
-### Task 3: Wire `capture_transcript` to persist the trace
-
-**Files:**
-- Modify: `services/mcp-server/app/capture.py` (the `capture_transcript` handler, after distillation succeeds)
-- Test: `services/mcp-server/tests/test_capture_trace_retention.py`
-
-**Interfaces:**
-- Consumes: `shared.traces.persist_trace` (Task 2); the handler's existing `org_id`, `req.session_id`, `req.messages`; an S3 client obtained lazily via a new module-level `_trace_s3()` helper (boto3 client, same env-driven config as `services/storage-worker/app/s3_client.py` — copy that factory's shape, do not import across service boundaries).
-- Produces: every successful `POST /capture/transcript` also persists a trace. `tool_calls` for this endpoint is `[]` (transcript messages carry the content; tool traces arrive when harness hooks send them — out of scope here).
-
-- [ ] **Step 1: Write the failing test**
-
 ```python
-# services/mcp-server/tests/test_capture_trace_retention.py
-"""capture_transcript must persist a trace (best-effort) after distilling."""
-from unittest.mock import MagicMock, patch
+# services/storage-worker/app/trace_consumer.py
+"""sessions.captured -> S3 + session_traces row -> sessions.stored.
 
-import pytest
-from fastapi.testclient import TestClient
+Payloads arrive ALREADY REDACTED (evidence_stream contract). KLIO_TRACE_BUCKET
+is required — refusing to start beats silently writing to a default bucket.
+"""
+import json
+import logging
+import os
+import uuid
+from typing import Any
 
+from shared import traces
+from shared.evidence_stream import SESSIONS_STORED
 
-@pytest.fixture()
-def client(app_with_auth):  # reuse the repo's existing app fixture pattern
-    return TestClient(app_with_auth)
-
-
-def _transcript_body():
-    return {
-        "session_id": "sess-trace-1",
-        "messages": [
-            {"role": "user", "content": "we chose postgres for tenant isolation"},
-            {"role": "assistant", "content": "noted"},
-        ],
-    }
+logger = logging.getLogger("agentguard.trace-consumer")
 
 
-def test_transcript_capture_persists_trace(client):
-    with patch("app.capture.persist_trace") as persist:
-        persist.return_value = "trace-id-1"
-        resp = client.post("/capture/transcript", json=_transcript_body())
-    assert resp.status_code == 200
-    assert persist.called
-    kwargs = persist.call_args.kwargs
-    assert kwargs["session_id"] == "sess-trace-1"
-    assert "postgres" in kwargs["transcript_text"]
+def _bucket() -> str:
+    bucket = os.environ.get("KLIO_TRACE_BUCKET")
+    if not bucket:
+        raise RuntimeError("KLIO_TRACE_BUCKET is required for trace retention")
+    return bucket
 
 
-def test_trace_failure_does_not_break_capture(client):
-    with patch("app.capture.persist_trace", side_effect=RuntimeError("s3 down")):
-        resp = client.post("/capture/transcript", json=_transcript_body())
-    assert resp.status_code == 200  # capture succeeded regardless
-```
-
-Note for the implementer: `app_with_auth` refers to the mcp-server test suite's existing FastAPI app fixture with auth dependencies overridden — find it in `services/mcp-server/tests/conftest.py` and reuse it verbatim (do not invent a new auth bypass).
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `cd services/mcp-server && pytest tests/test_capture_trace_retention.py -v`
-Expected: FAIL — `cannot import name 'persist_trace' from 'app.capture'`.
-
-- [ ] **Step 3: Wire it in**
-
-In `services/mcp-server/app/capture.py`:
-
-1. Import: `from shared.traces import persist_trace`.
-2. Add a lazy S3 client helper near the module's other helpers:
-
-```python
-_TRACE_S3 = None
-
-
-def _trace_s3():
-    """Lazy boto3 client for trace storage (same env config as storage-worker)."""
-    global _TRACE_S3
-    if _TRACE_S3 is None:
-        import boto3
-
-        _TRACE_S3 = boto3.client(
-            "s3",
-            endpoint_url=os.environ.get("S3_ENDPOINT_URL") or None,
-            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
-            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+async def handle_captured(db: Any, s3: Any, redis: Any, entry: dict) -> bool:
+    try:
+        payload = json.loads(entry["payload"])
+        org_id, session_id = payload["org_id"], payload["session_id"]
+    except Exception:
+        logger.warning("trace-consumer: malformed entry skipped", exc_info=True)
+        return False
+    try:
+        key = f"traces/{org_id}/{session_id}/{uuid.uuid4()}.json"
+        body = json.dumps(
+            {"messages": payload["messages"], "tool_calls": payload["tool_calls"]},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        s3.put_object(Bucket=_bucket(), Key=key, Body=body)
+        traces.upsert_trace(
+            db, org_id=org_id, session_id=session_id,
+            transcript_ref=f"s3://{_bucket()}/{key}",
+            message_count=len(payload["messages"]),
+            tool_calls_count=len(payload["tool_calls"]),
+            redaction_version=os.environ.get("REDACTION_VERSION", "1"),
+            project_id=payload.get("project_id"), user_id=payload.get("user_id"),
+            agent_id=payload.get("agent_id"),
         )
-    return _TRACE_S3
+        await redis.xadd(
+            SESSIONS_STORED,
+            {"payload": json.dumps({"org_id": org_id, "session_id": session_id})},
+        )
+        return True
+    except Exception:
+        logger.warning("trace-consumer: persist failed org=%s session=%s",
+                       org_id, session_id, exc_info=True)
+        return False
 ```
 
-3. In `capture_transcript`, after distillation has succeeded (just before the return), add — wrapped so failure cannot break the response, and run off the event loop like the other blocking calls in this handler:
+Wire a consumer loop in `main.py` following `_consume_raw`'s exact pattern (consumer group, XREADGROUP, ack on success), reading `SESSIONS_CAPTURED`.
 
-```python
-        # Build 1 (evidence loop): retain the redacted transcript. Best-effort —
-        # persist_trace redacts internally and returns None on any failure.
-        try:
-            flat_text = _flatten_transcript(req.messages)  # existing helper
-            await anyio.to_thread.run_sync(
-                lambda: persist_trace(
-                    db,
-                    _trace_s3(),
-                    org_id=org_id,
-                    session_id=req.session_id or "unknown",
-                    transcript_text=flat_text,
-                    tool_calls=[],
-                    user_id=user_id,
-                    agent_id=agent_id,
-                )
-            )
-        except Exception:
-            logger.warning("trace retention failed; capture unaffected", exc_info=True)
-```
-
-(If the flatten helper has a different name, use the one `capture_transcript` already calls at `capture.py:460` — "Flatten transcript messages into one text blob" — and pass the SAME flattened text it feeds the LLM.)
-
-- [ ] **Step 4: Run tests**
-
-Run: `cd services/mcp-server && pytest tests/test_capture_trace_retention.py tests/ -k "transcript" -v`
-Expected: new tests PASS; existing transcript tests still PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add services/mcp-server/app/capture.py services/mcp-server/tests/test_capture_trace_retention.py
-git commit -m "feat(capture): retain redacted session traces on transcript capture"
-```
+- [ ] **Step 4: Run** both suites → PASS.
+- [ ] **Step 5: Commit** — `git commit -m "feat(storage-worker): persist session traces, emit sessions.stored"`
 
 ---
 
-### Task 4: Migration 042 — recall evidence columns + `recall_outcomes`
+### Task 4: Migration 042 — recall evidence (+ honest outcome tables)
 
 **Files:**
 - Create: `services/migrations/alembic/versions/042_recall_evidence.py`
 - Test: `services/migrations/tests/test_042_recall_evidence.py`
 
-**Interfaces:**
-- Produces: `brain_recall_events` gains `memory_ids postgresql.ARRAY(UUID) NULL` and `session_id Text NULL`. New table `recall_outcomes`: `id UUID pk`, `org_id String(64) NOT NULL`, `recall_event_id UUID NOT NULL` (fk `brain_recall_events.id`), `session_id Text NULL`, `verdict Text NOT NULL` (`pass|flag|block|unknown`), `confidence Numeric NULL`, `served_stale Boolean NOT NULL DEFAULT false`, `grader_version Text NOT NULL`, `graded_at timestamptz NOT NULL DEFAULT now()`. Indexes: `(org_id, graded_at)` on outcomes; `(org_id, session_id)` on `brain_recall_events`.
+**Interfaces:** `brain_recall_events` += `memory_ids ARRAY(UUID) NULL`, `session_id Text NULL` (+ index `(org_id, session_id)`). New `session_outcomes`: `id UUID pk, org_id String(64) NOT NULL, session_id Text NOT NULL, verdict Text NOT NULL, confidence Numeric NULL, memory_consistency Numeric NULL, grader_version Text NOT NULL, graded_at timestamptz DEFAULT now()`, unique `(org_id, session_id, grader_version)`. New `recall_outcomes`: `id UUID pk, org_id NOT NULL, recall_event_id UUID fk→brain_recall_events ON DELETE CASCADE, memory_id UUID NOT NULL, session_outcome_id UUID fk→session_outcomes ON DELETE CASCADE, used Boolean NOT NULL DEFAULT false, usage_score Numeric NULL, served_stale Boolean NOT NULL DEFAULT false, created_at timestamptz DEFAULT now()`, index `(org_id, memory_id)`.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 # services/migrations/tests/test_042_recall_evidence.py
 import os
-
 import pytest
 import sqlalchemy as sa
 
@@ -587,44 +597,39 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _inspector():
+def _insp():
     return sa.inspect(sa.create_engine(os.environ["DATABASE_URL"]))
 
 
-def test_recall_events_gained_evidence_columns():
-    cols = {c["name"] for c in _inspector().get_columns("brain_recall_events")}
-    assert "memory_ids" in cols
-    assert "session_id" in cols
+def test_recall_events_columns():
+    cols = {c["name"] for c in _insp().get_columns("brain_recall_events")}
+    assert {"memory_ids", "session_id"} <= cols
 
 
-def test_recall_outcomes_exists():
-    cols = {c["name"]: c for c in _inspector().get_columns("recall_outcomes")}
-    for name in (
-        "id", "org_id", "recall_event_id", "session_id", "verdict",
-        "confidence", "served_stale", "grader_version", "graded_at",
-    ):
-        assert name in cols, f"missing {name}"
-    assert cols["verdict"]["nullable"] is False
-    fks = _inspector().get_foreign_keys("recall_outcomes")
-    assert any(fk["referred_table"] == "brain_recall_events" for fk in fks)
+def test_outcome_tables():
+    so = {c["name"] for c in _insp().get_columns("session_outcomes")}
+    assert {"org_id", "session_id", "verdict", "confidence",
+            "memory_consistency", "grader_version"} <= so
+    ro = {c["name"] for c in _insp().get_columns("recall_outcomes")}
+    assert {"org_id", "recall_event_id", "memory_id", "session_outcome_id",
+            "used", "usage_score", "served_stale"} <= ro
+    fks = {fk["referred_table"] for fk in _insp().get_foreign_keys("recall_outcomes")}
+    assert {"brain_recall_events", "session_outcomes"} <= fks
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [ ] **Step 2: Run to verify it fails** → FAIL.
 
-Run: `cd services/migrations && KLIO_REQUIRE_DB=1 pytest tests/test_042_recall_evidence.py -v`
-Expected: FAIL — columns/table missing.
-
-- [ ] **Step 3: Write the migration**
+- [ ] **Step 3: Write the migration** (same style as 041; the docstring must carry design-correction #1):
 
 ```python
 # services/migrations/alembic/versions/042_recall_evidence.py
-"""Recall evidence: which memories were served, and how it went.
+"""Recall evidence with an HONEST join (Build 2).
 
-ADDITIVE ONLY. Build 2 of the evidence loop. ``memory_ids`` on
-``brain_recall_events`` records WHICH rows a recall returned (022 only
-recorded the count). ``recall_outcomes`` joins a recall to a verification
-verdict; ``served_stale`` is set retroactively when a served memory is later
-superseded — the silent-failure counter.
+ADDITIVE ONLY. The session grade lives ONCE in session_outcomes. Per-memory
+rows in recall_outcomes carry ATTRIBUTION (used / usage_score) and staleness —
+never a copied session verdict. Querying "how did this memory do" joins
+attribution to the session outcome explicitly, so nobody mistakes session
+weather for memory quality.
 """
 import sqlalchemy as sa
 from alembic import op
@@ -637,79 +642,76 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "brain_recall_events",
-        sa.Column("memory_ids", postgresql.ARRAY(postgresql.UUID(as_uuid=True)), nullable=True),
+    op.add_column("brain_recall_events",
+                  sa.Column("memory_ids",
+                            postgresql.ARRAY(postgresql.UUID(as_uuid=True)),
+                            nullable=True))
+    op.add_column("brain_recall_events",
+                  sa.Column("session_id", sa.Text(), nullable=True))
+    op.create_index("ix_brain_recall_events_org_session",
+                    "brain_recall_events", ["org_id", "session_id"])
+    op.create_table(
+        "session_outcomes",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("org_id", sa.String(64), nullable=False),
+        sa.Column("session_id", sa.Text(), nullable=False),
+        sa.Column("verdict", sa.Text(), nullable=False),
+        sa.Column("confidence", sa.Numeric(), nullable=True),
+        sa.Column("memory_consistency", sa.Numeric(), nullable=True),
+        sa.Column("grader_version", sa.Text(), nullable=False),
+        sa.Column("graded_at", sa.DateTime(timezone=True),
+                  server_default=sa.text("now()"), nullable=False),
     )
-    op.add_column(
-        "brain_recall_events", sa.Column("session_id", sa.Text(), nullable=True)
-    )
-    op.create_index(
-        "ix_brain_recall_events_org_session",
-        "brain_recall_events",
-        ["org_id", "session_id"],
-    )
+    op.create_index("uq_session_outcomes_org_session_grader",
+                    "session_outcomes",
+                    ["org_id", "session_id", "grader_version"], unique=True)
     op.create_table(
         "recall_outcomes",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
         sa.Column("org_id", sa.String(64), nullable=False),
-        sa.Column(
-            "recall_event_id",
-            postgresql.UUID(as_uuid=True),
-            sa.ForeignKey("brain_recall_events.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-        sa.Column("session_id", sa.Text(), nullable=True),
-        sa.Column("verdict", sa.Text(), nullable=False),
-        sa.Column("confidence", sa.Numeric(), nullable=True),
-        sa.Column(
-            "served_stale", sa.Boolean(), server_default=sa.text("false"), nullable=False
-        ),
-        sa.Column("grader_version", sa.Text(), nullable=False),
-        sa.Column(
-            "graded_at",
-            sa.DateTime(timezone=True),
-            server_default=sa.text("now()"),
-            nullable=False,
-        ),
+        sa.Column("recall_event_id", postgresql.UUID(as_uuid=True),
+                  sa.ForeignKey("brain_recall_events.id", ondelete="CASCADE"),
+                  nullable=False),
+        sa.Column("memory_id", postgresql.UUID(as_uuid=True), nullable=False),
+        sa.Column("session_outcome_id", postgresql.UUID(as_uuid=True),
+                  sa.ForeignKey("session_outcomes.id", ondelete="CASCADE"),
+                  nullable=False),
+        sa.Column("used", sa.Boolean(), server_default=sa.text("false"),
+                  nullable=False),
+        sa.Column("usage_score", sa.Numeric(), nullable=True),
+        sa.Column("served_stale", sa.Boolean(), server_default=sa.text("false"),
+                  nullable=False),
+        sa.Column("created_at", sa.DateTime(timezone=True),
+                  server_default=sa.text("now()"), nullable=False),
     )
-    op.create_index(
-        "ix_recall_outcomes_org_graded", "recall_outcomes", ["org_id", "graded_at"]
-    )
+    op.create_index("ix_recall_outcomes_org_memory", "recall_outcomes",
+                    ["org_id", "memory_id"])
 
 
 def downgrade() -> None:
-    op.drop_index("ix_recall_outcomes_org_graded", table_name="recall_outcomes")
+    op.drop_index("ix_recall_outcomes_org_memory", table_name="recall_outcomes")
     op.drop_table("recall_outcomes")
-    op.drop_index("ix_brain_recall_events_org_session", table_name="brain_recall_events")
+    op.drop_index("uq_session_outcomes_org_session_grader",
+                  table_name="session_outcomes")
+    op.drop_table("session_outcomes")
+    op.drop_index("ix_brain_recall_events_org_session",
+                  table_name="brain_recall_events")
     op.drop_column("brain_recall_events", "session_id")
     op.drop_column("brain_recall_events", "memory_ids")
 ```
 
-- [ ] **Step 4: Apply and test**
-
-Run: `cd services/migrations && alembic upgrade head && KLIO_REQUIRE_DB=1 pytest tests/test_042_recall_evidence.py -v`
-Expected: PASS, 2 tests.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add services/migrations/alembic/versions/042_recall_evidence.py services/migrations/tests/test_042_recall_evidence.py
-git commit -m "feat(migrations): 042 recall evidence — served memory_ids + outcomes"
-```
+- [ ] **Step 4: Apply + test** → PASS.
+- [ ] **Step 5: Commit** — `git commit -m "feat(migrations): 042 honest recall evidence"`
 
 ---
 
-### Task 5: Log served memory ids in `recall_log`
+### Task 5: `recall_log` records served memory ids + session
 
 **Files:**
-- Modify: `services/mcp-server/app/recall_log.py`
-- Modify: call sites (`services/mcp-server/app/mcp_app.py:2317` area and `services/mcp-server/app/capture.py` recall handler) to pass `memory_ids` + `session_id`
+- Modify: `services/mcp-server/app/recall_log.py`; call sites (`mcp_app.py:~2317`, `capture.py` recall handler)
 - Test: `services/mcp-server/tests/test_recall_log_memory_ids.py`
 
-**Interfaces:**
-- Produces: `log_recall(db, *, org_id, agent_id, project_id, query_text, result_count, source, memory_ids=None, session_id=None)` — two new OPTIONAL kwargs, so untouched call sites keep working.
-- Consumes: recall handlers already hold the serialized memories; pass `[m["id"] for m in memories]`.
+**Interfaces:** `log_recall(..., memory_ids: Optional[list[str]] = None, session_id: Optional[str] = None)` — optional kwargs; INSERT gains both columns; call sites pass `[str(m["id"]) for m in memories]` and the session id in scope (`req.session_id` in capture; `None` + one-line comment at the MCP site if no session identifier exists there).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -720,354 +722,342 @@ from unittest.mock import MagicMock
 from app import recall_log
 
 
-def test_log_recall_includes_memory_ids_and_session():
+def test_log_recall_includes_new_fields():
     db = MagicMock()
     recall_log.log_recall(
-        db,
-        org_id="org1", agent_id="a", project_id=None,
-        query_text="q", result_count=2, source="mcp",
-        memory_ids=["11111111-1111-1111-1111-111111111111"],
-        session_id="sess9",
+        db, org_id="o", agent_id="a", project_id=None, query_text="q",
+        result_count=1, source="mcp",
+        memory_ids=["11111111-1111-1111-1111-111111111111"], session_id="s9",
     )
     sql = str(db.execute.call_args.args[0])
     params = db.execute.call_args.args[1]
     assert "memory_ids" in sql and "session_id" in sql
-    assert params["memory_ids"] == ["11111111-1111-1111-1111-111111111111"]
-    assert params["session_id"] == "sess9"
+    assert params["session_id"] == "s9"
 
 
-def test_log_recall_defaults_remain_compatible():
+def test_log_recall_backward_compatible():
     db = MagicMock()
-    recall_log.log_recall(
-        db,
-        org_id="org1", agent_id=None, project_id=None,
-        query_text=None, result_count=0, source="mcp",
-    )
-    params = db.execute.call_args.args[1]
-    assert params["memory_ids"] is None
-    assert params["session_id"] is None
+    recall_log.log_recall(db, org_id="o", agent_id=None, project_id=None,
+                          query_text=None, result_count=0, source="mcp")
+    assert db.execute.call_args.args[1]["memory_ids"] is None
 ```
 
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `cd services/mcp-server && pytest tests/test_recall_log_memory_ids.py -v`
-Expected: FAIL — unexpected keyword argument.
-
-- [ ] **Step 3: Implement**
-
-In `recall_log.py`, add the two optional params and extend the INSERT:
-
-```python
-def log_recall(
-    db: Any,
-    *,
-    org_id: str,
-    agent_id: Optional[str],
-    project_id: Optional[str],
-    query_text: Optional[str],
-    result_count: int,
-    source: str,
-    memory_ids: Optional[list[str]] = None,
-    session_id: Optional[str] = None,
-) -> None:
-```
-
-SQL becomes:
-
-```sql
-INSERT INTO brain_recall_events
-  (id, org_id, agent_id, project_id, query_text, result_count, source,
-   memory_ids, session_id)
-VALUES (:id, :org_id, :agent_id, :project_id, :query_text,
-        :result_count, :source, :memory_ids, :session_id)
-```
-
-with `"memory_ids": memory_ids, "session_id": session_id` in the params dict. Then update the two call sites to pass `memory_ids=[str(m["id"]) for m in memories]` (or the serialized records the handler holds) and the session id the handler already knows (`req.session_id` in capture; the MCP session identifier at the `mcp_app.py:2317` site — use whatever session identifier that scope already has; if none exists there, pass `None` and leave a one-line comment).
-
-- [ ] **Step 4: Run the full mcp-server suite**
-
-Run: `cd services/mcp-server && pytest tests/ -k "recall" -v`
-Expected: new tests PASS, all existing recall tests PASS (optional kwargs = no breakage).
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add services/mcp-server/app/recall_log.py services/mcp-server/app/mcp_app.py services/mcp-server/app/capture.py services/mcp-server/tests/test_recall_log_memory_ids.py
-git commit -m "feat(recall): record served memory ids + session on recall events"
-```
+- [ ] **Steps 2–4:** FAIL on unexpected kwarg → extend signature + INSERT (columns `memory_ids, :session_id` appended) → update both call sites → `pytest tests/ -k recall -v` all PASS.
+- [ ] **Step 5: Commit** — `git commit -m "feat(recall): record served memory ids + session"`
 
 ---
 
-### Task 6: The outcome grader job
+### Task 6: Outcome grader — honest join, scheduled by construction
 
 **Files:**
 - Create: `services/async-worker/app/outcome_grader.py`
+- Modify: `services/async-worker/app/main.py` (consume `SESSIONS_STORED` alongside the existing consumer)
 - Test: `services/async-worker/tests/test_outcome_grader.py`
 
 **Interfaces:**
-- Produces: `async def grade_session(db, s3, *, org_id: str, session_id: str, grader_version: str = "v1") -> int` — returns number of `recall_outcomes` rows written. Wiring into the worker loop/scheduler is a follow-up; this task delivers the callable + tests (same pattern as `ownership_sweep.py`, which ships as an invocable module).
-- Consumes: `shared.traces.fetch_trace` (Task 2); `engine.pipeline.verify` (existing — signature `verify(output, task=None, ..., session_memories=None) -> VerificationResult` with `.confidence` and `.action`); recall events from Task 5.
+- `grade_stored_session(db, s3, *, org_id, session_id, grader_version="v1") -> dict` returning `{"session_outcome_id": str | None, "attributions": int}`.
+- Consumes: `shared.traces.fetch_trace`; `engine.pipeline.verify(output, session_memories=...)`; `shared.memory.embed_text` (existing) for usage attribution; recall events from Task 5; served memory contents via one org-predicated `SELECT id, content FROM session_memories WHERE id = ANY(:ids) AND org_id = :org_id`.
+- Semantics (design corrections #1–#3): final output = last `role=="assistant"` message from structured trace; ONE `verify()` per session with `session_memories` = the served rows; per-memory `usage_score` = cosine(memory embedding, output embedding), `used = usage_score >= 0.5`; verdict/confidence stored once in `session_outcomes`.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 # services/async-worker/tests/test_outcome_grader.py
-"""Grader: trace in, one recall_outcomes row per recall event."""
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app import outcome_grader
+from app import outcome_grader as og
 
 
-def _db_with_recalls(rows):
+def _db(recalls, memories):
     db = MagicMock()
-    db.execute.return_value.mappings.return_value.all.return_value = rows
+    def execute(stmt, params=None):
+        m = MagicMock()
+        s = str(stmt)
+        if "FROM brain_recall_events" in s:
+            m.mappings.return_value.all.return_value = recalls
+        elif "FROM session_memories" in s:
+            m.mappings.return_value.all.return_value = memories
+        return m
+    db.execute.side_effect = execute
     return db
 
 
+TRACE = {"messages": [{"role": "user", "content": "q"},
+                      {"role": "assistant", "content": "final answer about postgres"}],
+         "tool_calls": [], "row": {}}
+
+
 @pytest.mark.anyio
-async def test_grades_each_recall_event():
-    db = _db_with_recalls(
-        [
-            {"id": "re-1", "memory_ids": ["m-1"], "session_id": "s1"},
-            {"id": "re-2", "memory_ids": ["m-2"], "session_id": "s1"},
-        ]
-    )
-    trace = {"transcript": "user: x\nassistant: final answer", "tool_calls": [], "row": {}}
+async def test_one_session_verdict_and_per_memory_attribution():
+    recalls = [{"id": "re1", "memory_ids": ["m1", "m2"], "session_id": "s"}]
+    memories = [{"id": "m1", "content": "postgres decision"},
+                {"id": "m2", "content": "unrelated fact"}]
     verdict = MagicMock(confidence=0.9, action="pass")
-    with patch.object(outcome_grader, "fetch_trace", return_value=trace), \
-         patch.object(outcome_grader, "verify", new=AsyncMock(return_value=verdict)):
-        written = await outcome_grader.grade_session(
-            db, MagicMock(), org_id="org1", session_id="s1"
-        )
-    assert written == 2
-    inserts = [c for c in db.execute.call_args_list if "INSERT INTO recall_outcomes" in str(c.args[0])]
-    assert len(inserts) == 2
-    params = inserts[0].args[1]
-    assert params["org_id"] == "org1"
-    assert params["verdict"] == "pass"
-    assert params["grader_version"] == "v1"
+    checks = {"memory_consistency": MagicMock(score=0.8)}
+    verdict.checks = checks
+    with patch.object(og, "fetch_trace", return_value=TRACE), \
+         patch.object(og, "verify", new=AsyncMock(return_value=verdict)) as v, \
+         patch.object(og, "embed_text", new=AsyncMock(side_effect=[
+             [1.0, 0.0], [0.9, 0.1], [0.0, 1.0]])):  # output, m1, m2
+        result = await og.grade_stored_session(
+            _db(recalls, memories), MagicMock(), org_id="o", session_id="s")
+    # verify called ONCE, with the served memories
+    assert v.await_count == 1
+    assert v.await_args.kwargs["session_memories"] is not None
+    assert result["attributions"] == 2
 
 
 @pytest.mark.anyio
-async def test_no_trace_means_unknown_verdicts_not_errors():
-    db = _db_with_recalls([{"id": "re-1", "memory_ids": ["m-1"], "session_id": "s1"}])
-    with patch.object(outcome_grader, "fetch_trace", return_value=None):
-        written = await outcome_grader.grade_session(
-            db, MagicMock(), org_id="org1", session_id="s1"
-        )
-    assert written == 1
-    params = db.execute.call_args_list[-2].args[1] if len(db.execute.call_args_list) > 1 else db.execute.call_args_list[-1].args[1]
-    # the INSERT carries verdict='unknown' when there is nothing to grade
-    inserts = [c for c in db.execute.call_args_list if "INSERT INTO recall_outcomes" in str(c.args[0])]
-    assert inserts[0].args[1]["verdict"] == "unknown"
+async def test_session_verdict_written_once_not_per_recall():
+    recalls = [{"id": f"re{i}", "memory_ids": ["m1"], "session_id": "s"}
+               for i in range(8)]
+    memories = [{"id": "m1", "content": "x"}]
+    verdict = MagicMock(confidence=0.5, action="flag", checks={})
+    db = _db(recalls, memories)
+    with patch.object(og, "fetch_trace", return_value=TRACE), \
+         patch.object(og, "verify", new=AsyncMock(return_value=verdict)), \
+         patch.object(og, "embed_text", new=AsyncMock(return_value=[1.0, 0.0])):
+        await og.grade_stored_session(db, MagicMock(), org_id="o", session_id="s")
+    session_inserts = [c for c in db.execute.call_args_list
+                       if "INSERT INTO session_outcomes" in str(c.args[0])]
+    assert len(session_inserts) == 1  # eight recalls, ONE session verdict
 
 
 @pytest.mark.anyio
-async def test_org_boundary_in_recall_query():
-    db = _db_with_recalls([])
-    with patch.object(outcome_grader, "fetch_trace", return_value=None):
-        await outcome_grader.grade_session(db, MagicMock(), org_id="org1", session_id="s1")
-    sql = str(db.execute.call_args_list[0].args[0])
-    assert "org_id = :org_id" in sql
+async def test_missing_trace_writes_unknown_session_outcome():
+    recalls = [{"id": "re1", "memory_ids": ["m1"], "session_id": "s"}]
+    db = _db(recalls, [{"id": "m1", "content": "x"}])
+    with patch.object(og, "fetch_trace", return_value=None):
+        result = await og.grade_stored_session(db, MagicMock(), org_id="o",
+                                               session_id="s")
+    inserts = [c for c in db.execute.call_args_list
+               if "INSERT INTO session_outcomes" in str(c.args[0])]
+    assert inserts and inserts[0].args[1]["verdict"] == "unknown"
 ```
 
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `cd services/async-worker && pytest tests/test_outcome_grader.py -v`
-Expected: FAIL — module does not exist.
+- [ ] **Step 2: Run to verify it fails** — module missing.
 
 - [ ] **Step 3: Implement**
 
 ```python
 # services/async-worker/app/outcome_grader.py
-"""Grade a session's outputs and join verdicts to the recalls that fed them.
+"""Grade a stored session and attribute served memories — honestly.
 
-Build 2 of the evidence loop. For each ``brain_recall_events`` row of the
-session, run the verification pipeline over the session's final output (from
-the retained trace) and write one ``recall_outcomes`` row. A missing trace
-grades as ``unknown`` — the join must exist even when evidence is thin,
-otherwise coverage gaps read as "no data" instead of "ungraded".
-
-Tenant boundary: every query predicates on org_id; a grader run never crosses
-orgs.
+Design corrections (binding):
+- ONE verify() per session; verdict lives ONCE in session_outcomes.
+- recall_outcomes rows carry attribution (used/usage_score), never a verdict.
+- Final output = last assistant message from the STRUCTURED trace.
+- verify() receives session_memories so memory_consistency actually runs.
+Missing evidence grades as verdict='unknown' — coverage gaps must be visible.
 """
 import logging
+import math
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy import text
 
 from engine.pipeline import verify
+from shared.memory import embed_text
 from shared.traces import fetch_trace
 
 logger = logging.getLogger("agentguard.outcome-grader")
 
 GRADER_VERSION = "v1"
+USED_THRESHOLD = 0.5
 
 
-def _final_output(transcript: str) -> str:
-    """Last assistant utterance = the session's final output (grading target)."""
-    lines = [l for l in transcript.splitlines() if l.strip()]
-    for line in reversed(lines):
-        if line.lower().startswith("assistant:"):
-            return line.split(":", 1)[1].strip()
-    return transcript[-2000:]  # fallback: tail of the flattened transcript
+def _cosine(a: list[float], b: list[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a)) or 1.0
+    nb = math.sqrt(sum(x * x for x in b)) or 1.0
+    return dot / (na * nb)
 
 
-async def grade_session(
-    db: Any,
-    s3: Any,
-    *,
-    org_id: str,
-    session_id: str,
+def _final_output(messages: list[dict[str, Any]]) -> Optional[str]:
+    for m in reversed(messages):
+        if m.get("role") == "assistant" and m.get("content"):
+            return str(m["content"])
+    return None
+
+
+async def grade_stored_session(
+    db: Any, s3: Any, *, org_id: str, session_id: str,
     grader_version: str = GRADER_VERSION,
-) -> int:
-    recalls = (
-        db.execute(
-            text(
-                """
-                SELECT id, memory_ids, session_id
-                FROM brain_recall_events
-                WHERE org_id = :org_id AND session_id = :session_id
-                """
-            ),
-            {"org_id": org_id, "session_id": session_id},
-        )
-        .mappings()
-        .all()
-    )
+) -> dict[str, Any]:
+    recalls = db.execute(
+        text(
+            """
+            SELECT id, memory_ids, session_id FROM brain_recall_events
+            WHERE org_id = :org_id AND session_id = :session_id
+              AND memory_ids IS NOT NULL
+            """
+        ),
+        {"org_id": org_id, "session_id": session_id},
+    ).mappings().all()
     if not recalls:
-        return 0
+        return {"session_outcome_id": None, "attributions": 0}
+
+    served_ids = sorted({str(mid) for r in recalls for mid in (r["memory_ids"] or [])})
+    memories = db.execute(
+        text(
+            """
+            SELECT id, content FROM session_memories
+            WHERE org_id = :org_id AND id = ANY(:ids)
+            """
+        ),
+        {"org_id": org_id, "ids": served_ids},
+    ).mappings().all()
 
     trace = fetch_trace(db, s3, org_id=org_id, session_id=session_id)
+    output = _final_output(trace["messages"]) if trace else None
 
-    verdict_str = "unknown"
-    confidence = None
-    if trace and trace["transcript"]:
+    verdict_str, confidence, mem_consistency = "unknown", None, None
+    scores: dict[str, Optional[float]] = {str(m["id"]): None for m in memories}
+    if output:
         try:
-            result = await verify(_final_output(trace["transcript"]))
-            verdict_str = result.action  # pass | flag | block
-            confidence = result.confidence
-        except Exception:
-            logger.warning(
-                "grader: verify failed for org %s session %s; verdict=unknown",
-                org_id,
-                session_id,
-                exc_info=True,
+            result = await verify(
+                output,
+                session_memories=[dict(m) for m in memories],
             )
-
-    written = 0
-    for recall in recalls:
+            verdict_str = result.action
+            confidence = result.confidence
+            mc = getattr(result, "checks", {}) or {}
+            if "memory_consistency" in mc:
+                mem_consistency = getattr(mc["memory_consistency"], "score", None)
+        except Exception:
+            logger.warning("grader: verify failed org=%s session=%s", org_id,
+                           session_id, exc_info=True)
         try:
+            out_emb = await embed_text(output)
+            if out_emb:
+                for m in memories:
+                    m_emb = await embed_text(str(m["content"]))
+                    if m_emb:
+                        scores[str(m["id"])] = _cosine(out_emb, m_emb)
+        except Exception:
+            logger.warning("grader: attribution embedding failed", exc_info=True)
+
+    session_outcome_id = str(uuid.uuid4())
+    db.execute(
+        text(
+            """
+            INSERT INTO session_outcomes
+              (id, org_id, session_id, verdict, confidence, memory_consistency,
+               grader_version)
+            VALUES (:id, :org_id, :session_id, :verdict, :confidence,
+                    :memory_consistency, :grader_version)
+            ON CONFLICT (org_id, session_id, grader_version) DO NOTHING
+            """
+        ),
+        {"id": session_outcome_id, "org_id": org_id, "session_id": session_id,
+         "verdict": verdict_str, "confidence": confidence,
+         "memory_consistency": mem_consistency, "grader_version": grader_version},
+    )
+
+    attributions = 0
+    for recall in recalls:
+        for mid in recall["memory_ids"] or []:
+            score = scores.get(str(mid))
             db.execute(
                 text(
                     """
                     INSERT INTO recall_outcomes
-                      (id, org_id, recall_event_id, session_id, verdict,
-                       confidence, grader_version)
-                    VALUES (:id, :org_id, :recall_event_id, :session_id,
-                            :verdict, :confidence, :grader_version)
+                      (id, org_id, recall_event_id, memory_id,
+                       session_outcome_id, used, usage_score)
+                    VALUES (:id, :org_id, :recall_event_id, :memory_id,
+                            :session_outcome_id, :used, :usage_score)
                     """
                 ),
-                {
-                    "id": str(uuid.uuid4()),
-                    "org_id": org_id,
-                    "recall_event_id": str(recall["id"]),
-                    "session_id": session_id,
-                    "verdict": verdict_str,
-                    "confidence": confidence,
-                    "grader_version": grader_version,
-                },
+                {"id": str(uuid.uuid4()), "org_id": org_id,
+                 "recall_event_id": str(recall["id"]), "memory_id": str(mid),
+                 "session_outcome_id": session_outcome_id,
+                 "used": bool(score is not None and score >= USED_THRESHOLD),
+                 "usage_score": score},
             )
-            written += 1
-        except Exception:
-            try:
-                db.rollback()
-            except Exception:
-                pass
-            logger.warning("grader: insert failed; continuing", exc_info=True)
+            attributions += 1
     db.commit()
-    return written
+    return {"session_outcome_id": session_outcome_id, "attributions": attributions}
 ```
 
-- [ ] **Step 4: Run tests**
+Wire in `main.py`: a consumer-group loop over `SESSIONS_STORED` (same pattern as the existing consumer) calling `grade_stored_session`.
 
-Run: `cd services/async-worker && pytest tests/test_outcome_grader.py -v`
-Expected: PASS, 3 tests.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add services/async-worker/app/outcome_grader.py services/async-worker/tests/test_outcome_grader.py
-git commit -m "feat(async-worker): outcome grader — join verdicts to served recalls"
-```
+- [ ] **Step 4: Run** → PASS, 3 tests.
+- [ ] **Step 5: Commit** — `git commit -m "feat(async-worker): honest outcome grader as a stream consumer"`
 
 ---
 
-### Task 7: Retroactive stale-serve marking on supersession
+### Task 7: Corrected stale-serve marking
 
 **Files:**
-- Modify: `services/shared/shared/memory.py` (inside `supersede_memory`, after the supersession commit point)
+- Create: `services/shared/shared/stale.py`
+- Modify: `services/shared/shared/memory.py` — call inside `supersede_memory` with the NEW belief's created_at
 - Test: `services/shared/tests/test_stale_serve_marking.py`
 
-**Interfaces:**
-- Consumes: `supersede_memory`'s existing scope — it knows `org_id` and the superseded row id.
-- Produces: on supersession, every `recall_outcomes` row whose recall event served the old memory id AFTER the supersession moment... — careful: serves BEFORE the supersession were correct at the time. The rule from the spec: mark rows where the recall happened after the *fact changed*, which is the supersession event itself, so the correct predicate is recalls of the old id **from now on**. Since future recalls will not return a superseded row, the practically meaningful marker is: recalls of the old id in the window where it was already stale. That window cannot be known at supersede time, so the implementable contract is: **at supersede time, mark all `recall_outcomes` joined to recall events that served the old id and occurred within the trailing N days (default 30) as `served_stale = true`** — i.e. "these answers were built on a belief we now know was outdated". `mark_stale_serves(db, *, org_id, memory_id, window_days=30) -> int` returns rows marked.
+**Interfaces:** `mark_stale_serves(db, *, org_id, old_memory_id, superseding_created_at) -> int`. Predicate (design correction #4): recall events that served `old_memory_id` **at or after `superseding_created_at`** — the window where the newer belief already existed but the old one was still being served (curator lag). Never raises.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 # services/shared/tests/test_stale_serve_marking.py
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
-from shared import memory as memory_mod
+from shared import stale
 
 
-def test_mark_stale_serves_sql_shape():
+def test_predicate_is_after_superseding_belief_existed():
     db = MagicMock()
-    db.execute.return_value.rowcount = 3
-    marked = memory_mod.mark_stale_serves(
-        db, org_id="org1", memory_id="22222222-2222-2222-2222-222222222222"
-    )
-    assert marked == 3
-    sql = str(db.execute.call_args.args[0])
+    db.execute.return_value.rowcount = 2
+    ts = datetime(2026, 8, 1, tzinfo=timezone.utc)
+    marked = stale.mark_stale_serves(
+        db, org_id="o", old_memory_id="m-old", superseding_created_at=ts)
+    assert marked == 2
+    sql = " ".join(str(db.execute.call_args.args[0]).split())
     params = db.execute.call_args.args[1]
-    assert "UPDATE recall_outcomes" in sql
-    assert "served_stale" in sql
-    assert ":memory_id = ANY(bre.memory_ids)" in sql.replace("\n", " ")
-    assert "org_id = :org_id" in sql
-    assert params["org_id"] == "org1"
+    assert "bre.created_at >= :superseding_created_at" in sql
+    assert ":old_memory_id = ANY(bre.memory_ids)" in sql
+    assert params["superseding_created_at"] == ts
+    # the naive trailing-window predicate must NOT be present
+    assert "make_interval" not in sql
 
 
-def test_mark_stale_serves_never_raises():
+def test_never_raises():
     db = MagicMock()
-    db.execute.side_effect = RuntimeError("db down")
-    marked = memory_mod.mark_stale_serves(db, org_id="o", memory_id="m")
-    assert marked == 0
+    db.execute.side_effect = RuntimeError("down")
+    assert stale.mark_stale_serves(
+        db, org_id="o", old_memory_id="m",
+        superseding_created_at=datetime.now(timezone.utc)) == 0
 ```
 
-- [ ] **Step 2: Run to verify it fails**
-
-Run: `cd services/shared && pytest tests/test_stale_serve_marking.py -v`
-Expected: FAIL — no attribute `mark_stale_serves`.
+- [ ] **Step 2: Run to verify it fails** → module missing.
 
 - [ ] **Step 3: Implement**
 
-Add to `services/shared/shared/memory.py`:
-
 ```python
-def mark_stale_serves(
-    db: Any, *, org_id: str, memory_id: str, window_days: int = 30
-) -> int:
-    """Flag outcomes built on a belief that has just been superseded.
+# services/shared/shared/stale.py
+"""Retroactive stale-serve marking — the honest version.
 
-    Best-effort (never raises): the supersession itself must not fail because
-    the evidence ledger is unavailable. Marks recall_outcomes joined to recall
-    events that served ``memory_id`` in the trailing window — "answers that
-    rested on what we now know was outdated".
-    """
+A serve is stale ONLY if the superseding belief already existed when the old
+one was served (curator lag). Serves before the new belief existed were
+correct at the time and are never marked. This is the silent-failure counter;
+its integrity is the point.
+"""
+import logging
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import text
+
+logger = logging.getLogger("klio.stale")
+
+
+def mark_stale_serves(
+    db: Any, *, org_id: str, old_memory_id: str,
+    superseding_created_at: datetime,
+) -> int:
     try:
         result = db.execute(
             text(
@@ -1078,11 +1068,13 @@ def mark_stale_serves(
                 WHERE ro.recall_event_id = bre.id
                   AND ro.org_id = :org_id
                   AND bre.org_id = :org_id
-                  AND :memory_id = ANY(bre.memory_ids)
-                  AND bre.created_at >= now() - make_interval(days => :window_days)
+                  AND ro.memory_id = :old_memory_id
+                  AND :old_memory_id = ANY(bre.memory_ids)
+                  AND bre.created_at >= :superseding_created_at
                 """
             ),
-            {"org_id": org_id, "memory_id": memory_id, "window_days": window_days},
+            {"org_id": org_id, "old_memory_id": old_memory_id,
+             "superseding_created_at": superseding_created_at},
         )
         return int(result.rowcount or 0)
     except Exception:
@@ -1090,174 +1082,413 @@ def mark_stale_serves(
             db.rollback()
         except Exception:
             pass
-        logger.warning(
-            "stale-serve marking failed for org %s memory %s; ignoring",
-            org_id,
-            memory_id,
-            exc_info=True,
-        )
+        logger.warning("stale marking failed org=%s memory=%s", org_id,
+                       old_memory_id, exc_info=True)
         return 0
 ```
 
-Then call it inside `supersede_memory` immediately after the supersession is applied (same transaction context the function already manages), passing the superseded row's id:
+In `supersede_memory`, after the new row is written, call with the **new belief's** `created_at` (the moment the fact changed) and the old row's id — match the local variable names the function already uses.
 
-```python
-    # Evidence loop: answers built on this belief are now known-stale.
-    mark_stale_serves(db_session, org_id=org_id, memory_id=str(old_row_id))
-```
-
-(`old_row_id` = whatever local name `supersede_memory` uses for the row being superseded — match the existing variable.)
-
-- [ ] **Step 4: Run the shared suite**
-
-Run: `cd services/shared && pytest tests/test_stale_serve_marking.py tests/ -k "supersede" -v`
-Expected: new tests PASS; existing supersession tests PASS.
-
-- [ ] **Step 5: Commit**
-
-```bash
-git add services/shared/shared/memory.py services/shared/tests/test_stale_serve_marking.py
-git commit -m "feat(memory): mark outcomes served from a now-superseded belief"
-```
+- [ ] **Step 4: Run** shared suite `-k "stale or supersede"` → PASS.
+- [ ] **Step 5: Commit** — `git commit -m "feat(memory): honest stale-serve marking (curator-lag window)"`
 
 ---
 
-### Task 8: Retention sweep covers traces + end-to-end DB test
+### Task 8: Migration 043 + CAS on write tools (Build 3)
 
 **Files:**
-- Modify: the retention sweep (`run_retention.py` — locate at `services/` root or scripts; keep its non-positive-retention guard intact)
-- Test: `services/shared/tests/test_trace_retention_sweep.py` (DB-gated)
+- Create: `services/migrations/alembic/versions/043_memory_revisions.py`
+- Modify: `services/shared/shared/memory.py` (CAS supersede path), `services/mcp-server/app/mcp_app.py` (write tools accept `base_revision`; recall returns `revision`)
+- Test: `services/migrations/tests/test_043_revisions.py`, `services/shared/tests/test_cas_write.py`
 
 **Interfaces:**
-- Consumes: `plan_limits.py` retention (`memory_retention_days`); the sweep's existing per-org loop.
-- Produces: orgs with positive retention also delete `session_traces` rows older than the window (S3 objects are left to a lifecycle rule — document this in the sweep's docstring; deleting DB rows removes reachability).
+- Migration: `session_memories` += `revision UUID NOT NULL server_default gen_random_uuid()`.
+- `shared.memory.supersede_with_revision(db, *, org_id, memory_id, base_revision, new_content, **write_kwargs) -> dict` — atomic guard `UPDATE ... WHERE id=:id AND org_id=:org_id AND revision=:base_revision`; on 0 rows returns `{"conflict": True, "current": {id, content, revision, updated_by}}` (the 409 payload — agent re-reads and retries, Mukta's loop); on success proceeds through the EXISTING supersession machinery and returns `{"conflict": False, "new_id": ..., "new_revision": ...}`.
+- MCP: `remember`/`decide`/`note`/`observe` gain optional `base_revision: str | None`; absent = today's behaviour exactly. Recall serialization includes `revision`.
+- Metric: `klio_write_conflicts_total` counter (follow the metrics pattern in `curator.py`).
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing tests**
 
 ```python
-# services/shared/tests/test_trace_retention_sweep.py
-"""DB-gated: the sweep deletes old traces for positive-retention orgs only."""
-import os
-import uuid
+# services/shared/tests/test_cas_write.py
+from unittest.mock import MagicMock, patch
 
-import pytest
-import sqlalchemy as sa
-
-pytestmark = pytest.mark.skipif(
-    not os.environ.get("KLIO_REQUIRE_DB"), reason="needs migrated DB"
-)
+from shared import memory as memory_mod
 
 
-@pytest.fixture()
-def engine():
-    return sa.create_engine(os.environ["DATABASE_URL"])
+def test_stale_base_revision_returns_conflict_payload():
+    db = MagicMock()
+    guard = MagicMock(rowcount=0)  # CAS guard missed
+    current = MagicMock()
+    current.mappings.return_value.first.return_value = {
+        "id": "m1", "content": "newer text", "revision": "r2", "user_id": "u2"}
+    db.execute.side_effect = [guard, current]
+    result = memory_mod.supersede_with_revision(
+        db, org_id="o", memory_id="m1", base_revision="r1", new_content="mine")
+    assert result["conflict"] is True
+    assert result["current"]["revision"] == "r2"
+    sql = " ".join(str(db.execute.call_args_list[0].args[0]).split())
+    assert "revision = :base_revision" in sql and "org_id = :org_id" in sql
 
 
-def _insert_trace(conn, org_id, days_old):
-    conn.execute(
-        sa.text(
-            """
-            INSERT INTO session_traces
-              (id, org_id, session_id, transcript_ref, redaction_version, created_at)
-            VALUES (:id, :org, :sess, 's3://b/k', '1', now() - make_interval(days => :d))
-            """
-        ),
-        {"id": str(uuid.uuid4()), "org": org_id, "sess": str(uuid.uuid4()), "d": days_old},
-    )
-
-
-def test_sweep_deletes_only_expired_traces(engine):
-    from shared.retention import sweep_traces_for_org  # new function under test
-
-    org = f"org-{uuid.uuid4().hex[:8]}"
-    with engine.begin() as conn:
-        _insert_trace(conn, org, days_old=40)
-        _insert_trace(conn, org, days_old=5)
-
-    with engine.begin() as conn:
-        deleted = sweep_traces_for_org(conn, org_id=org, retention_days=30)
-    assert deleted == 1
-
-    with engine.begin() as conn:
-        left = conn.execute(
-            sa.text("SELECT count(*) FROM session_traces WHERE org_id = :o"), {"o": org}
-        ).scalar()
-    assert left == 1
-
-
-def test_sweep_skips_non_positive_retention(engine):
-    from shared.retention import sweep_traces_for_org
-
-    org = f"org-{uuid.uuid4().hex[:8]}"
-    with engine.begin() as conn:
-        _insert_trace(conn, org, days_old=400)
-    with engine.begin() as conn:
-        deleted = sweep_traces_for_org(conn, org_id=org, retention_days=-1)
-    assert deleted == 0
+def test_current_base_revision_proceeds_to_supersede():
+    db = MagicMock()
+    db.execute.return_value.rowcount = 1
+    with patch.object(memory_mod, "_apply_supersession_for_cas",
+                      return_value={"new_id": "m2", "new_revision": "r9"}) as ap:
+        result = memory_mod.supersede_with_revision(
+            db, org_id="o", memory_id="m1", base_revision="r1",
+            new_content="mine")
+    assert result == {"conflict": False, "new_id": "m2", "new_revision": "r9"}
+    assert ap.called
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+(Migration test mirrors 041/042: `revision` column exists, NOT NULL.)
 
-Run: `cd services/shared && KLIO_REQUIRE_DB=1 pytest tests/test_trace_retention_sweep.py -v`
-Expected: FAIL — no module `shared.retention` / function missing. (If a retention module already exists under a different name, add `sweep_traces_for_org` there instead and adjust the import in the test — the sweep entry point is `run_retention.py`; follow where it imports from.)
+- [ ] **Step 2: Run to verify failure** → missing function/column.
 
 - [ ] **Step 3: Implement**
 
+Migration 043:
+
 ```python
-# in the module run_retention.py already imports its per-org helpers from
-# (create services/shared/shared/retention.py if none exists):
-from typing import Any
+def upgrade() -> None:
+    op.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+    op.add_column(
+        "session_memories",
+        sa.Column("revision", postgresql.UUID(as_uuid=True),
+                  server_default=sa.text("gen_random_uuid()"), nullable=False),
+    )
+```
+
+`supersede_with_revision` in `memory.py`:
+
+```python
+def supersede_with_revision(
+    db: Any, *, org_id: str, memory_id: str, base_revision: str,
+    new_content: str, **write_kwargs: Any,
+) -> dict[str, Any]:
+    """Mukta's optimistic-concurrency loop, server side.
+
+    The guard is one atomic UPDATE: it bumps the revision ONLY if the caller's
+    base_revision is still current. Zero rows means someone moved the belief
+    while this agent worked — return the current state so the agent re-reads
+    and re-asserts, instead of silently last-writer-winning.
+    """
+    guard = db.execute(
+        text(
+            """
+            UPDATE session_memories
+            SET revision = gen_random_uuid()
+            WHERE id = :memory_id AND org_id = :org_id
+              AND revision = :base_revision
+            """
+        ),
+        {"memory_id": memory_id, "org_id": org_id,
+         "base_revision": base_revision},
+    )
+    if not guard.rowcount:
+        record_write_conflict()  # klio_write_conflicts_total
+        current = db.execute(
+            text(
+                """
+                SELECT id, content, revision, user_id
+                FROM session_memories
+                WHERE id = :memory_id AND org_id = :org_id
+                """
+            ),
+            {"memory_id": memory_id, "org_id": org_id},
+        ).mappings().first()
+        return {"conflict": True,
+                "current": dict(current) if current else None}
+    return {"conflict": False,
+            **_apply_supersession_for_cas(
+                db, org_id=org_id, old_id=memory_id,
+                new_content=new_content, **write_kwargs)}
+```
+
+`_apply_supersession_for_cas` delegates to the existing supersession write path (`supersede_memory` internals) — the implementer wires it to whatever `supersede_memory` already calls, changing none of its semantics. In `mcp_app.py`: thread optional `base_revision` through the four write tools (absent → current behaviour, no CAS); on `conflict: True` return the tool-error payload `{"error": "revision_conflict", "current": {...}, "hint": "belief changed while you worked — re-read and re-assert"}`. Add `revision` to `_serialize_memory`.
+
+- [ ] **Step 4: Run** shared + mcp-server suites → new PASS, zero regressions (absent field = old path).
+- [ ] **Step 5: Commit** — `git commit -m "feat(memory): revision CAS on writes; conflict returns current state"`
+
+---
+
+### Task 9: Migration 044 + claims (Build 4)
+
+**Files:**
+- Create: `services/migrations/alembic/versions/044_work_claims.py`, `services/shared/shared/claims.py`
+- Modify: `services/mcp-server/app/mcp_app.py` (tools `claim`, `release`; claims injected into recall responses)
+- Test: `services/shared/tests/test_claims.py`, `services/mcp-server/tests/test_claim_tools.py`
+
+**Interfaces:**
+- Migration: `work_claims`: `id UUID pk, org_id String(64) NOT NULL, project_id UUID NULL, agent_id Text NULL, user_id UUID NULL, description Text NOT NULL, embedding vector(1024) NULL, created_at timestamptz DEFAULT now(), expires_at timestamptz NOT NULL, released_at timestamptz NULL`; index `(org_id, expires_at)`.
+- `shared.claims.create_claim(db, *, org_id, description, agent_id, user_id=None, project_id=None, ttl_minutes=15) -> dict` — embeds description (`embed_text`), inserts, then returns `{"claim_id", "collisions": [{id, description, agent_id, similarity}]}` where collisions are live claims (`released_at IS NULL AND expires_at > now()`) with cosine similarity ≥ 0.85, computed via pgvector `1 - (embedding <=> :emb)`.
+- `shared.claims.release_claim(db, *, org_id, claim_id, agent_id) -> bool` (owner-only).
+- `shared.claims.live_claims(db, *, org_id, project_id=None, limit=10) -> list[dict]` — injected into every recall response under `"active_claims"` (design: agents already recall before working; they cannot not see claims). Advisory on cloud; local `PreToolUse` blocking is the client's job.
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# services/shared/tests/test_claims.py
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from shared import claims
+
+
+@pytest.mark.anyio
+async def test_create_claim_returns_semantic_collisions():
+    db = MagicMock()
+    db.execute.return_value.mappings.return_value.all.return_value = [
+        {"id": "c-old", "description": "refactor auth", "agent_id": "B",
+         "similarity": 0.91}]
+    with patch.object(claims, "embed_text", new=AsyncMock(return_value=[0.1] * 4)):
+        result = await claims.create_claim(
+            db, org_id="o", description="fix login token expiry", agent_id="A")
+    assert result["collisions"][0]["agent_id"] == "B"
+    sql = " ".join(str(db.execute.call_args_list[-1].args[0]).split())
+    assert "released_at IS NULL" in sql and "expires_at > now()" in sql
+    assert "org_id = :org_id" in sql
+
+
+@pytest.mark.anyio
+async def test_claim_without_embedding_still_registers():
+    db = MagicMock()
+    db.execute.return_value.mappings.return_value.all.return_value = []
+    with patch.object(claims, "embed_text", new=AsyncMock(return_value=None)):
+        result = await claims.create_claim(
+            db, org_id="o", description="x", agent_id="A")
+    assert result["claim_id"]
+    assert result["collisions"] == []
+
+
+def test_release_is_owner_scoped():
+    db = MagicMock()
+    db.execute.return_value.rowcount = 1
+    assert claims.release_claim(db, org_id="o", claim_id="c1", agent_id="A")
+    sql = " ".join(str(db.execute.call_args.args[0]).split())
+    assert "agent_id = :agent_id" in sql and "org_id = :org_id" in sql
+```
+
+- [ ] **Step 2: Run to verify failure** → module missing.
+
+- [ ] **Step 3: Implement** migration 044 (vector column matches the 1024-dim e5 embeddings used by `session_memories`), then:
+
+```python
+# services/shared/shared/claims.py
+"""Work claims: advisory, semantic, TTL'd awareness (Build 4).
+
+NOT locks. A claim records intent; collisions are detected semantically
+("auth refactor" ≈ "fix login token expiry") because exact-key locking is
+useless against natural language. TTL + released_at handle crashed agents
+with no cleanup job. Enforcement is the client's business: cloud agents get
+awareness, local PreToolUse hooks may block.
+"""
+import logging
+import uuid
+from typing import Any, Optional
 
 from sqlalchemy import text
 
+from shared.memory import embed_text
 
-def sweep_traces_for_org(conn: Any, *, org_id: str, retention_days: int) -> int:
-    """Delete expired session_traces rows. Non-positive retention = keep forever.
+logger = logging.getLogger("klio.claims")
 
-    S3 payloads are governed by a bucket lifecycle rule; deleting the row
-    removes all reachability from the product.
-    """
-    if retention_days is None or retention_days <= 0:
-        return 0
-    result = conn.execute(
+COLLISION_THRESHOLD = 0.85
+
+
+async def create_claim(
+    db: Any, *, org_id: str, description: str, agent_id: str,
+    user_id: Optional[str] = None, project_id: Optional[str] = None,
+    ttl_minutes: int = 15,
+) -> dict[str, Any]:
+    claim_id = str(uuid.uuid4())
+    emb = None
+    try:
+        emb = await embed_text(description)
+    except Exception:
+        logger.warning("claims: embed failed; registering without collision "
+                       "detection", exc_info=True)
+    db.execute(
         text(
             """
-            DELETE FROM session_traces
-            WHERE org_id = :org_id
-              AND created_at < now() - make_interval(days => :days)
+            INSERT INTO work_claims
+              (id, org_id, project_id, agent_id, user_id, description,
+               embedding, expires_at)
+            VALUES (:id, :org_id, :project_id, :agent_id, :user_id,
+                    :description, :embedding,
+                    now() + make_interval(mins => :ttl))
             """
         ),
-        {"org_id": org_id, "days": retention_days},
+        {"id": claim_id, "org_id": org_id, "project_id": project_id,
+         "agent_id": agent_id, "user_id": user_id, "description": description,
+         "embedding": str(emb) if emb else None, "ttl": ttl_minutes},
     )
-    return int(result.rowcount or 0)
+    collisions: list[dict[str, Any]] = []
+    if emb:
+        rows = db.execute(
+            text(
+                """
+                SELECT id, description, agent_id,
+                       1 - (embedding <=> :emb) AS similarity
+                FROM work_claims
+                WHERE org_id = :org_id AND id != :id
+                  AND released_at IS NULL AND expires_at > now()
+                  AND embedding IS NOT NULL
+                  AND 1 - (embedding <=> :emb) >= :threshold
+                ORDER BY similarity DESC LIMIT 5
+                """
+            ),
+            {"emb": str(emb), "org_id": org_id, "id": claim_id,
+             "threshold": COLLISION_THRESHOLD},
+        ).mappings().all()
+        collisions = [dict(r) for r in rows]
+    db.commit()
+    return {"claim_id": claim_id, "collisions": collisions}
+
+
+def release_claim(db: Any, *, org_id: str, claim_id: str, agent_id: str) -> bool:
+    result = db.execute(
+        text(
+            """
+            UPDATE work_claims SET released_at = now()
+            WHERE id = :claim_id AND org_id = :org_id
+              AND agent_id = :agent_id AND released_at IS NULL
+            """
+        ),
+        {"claim_id": claim_id, "org_id": org_id, "agent_id": agent_id},
+    )
+    db.commit()
+    return bool(result.rowcount)
+
+
+def live_claims(
+    db: Any, *, org_id: str, project_id: Optional[str] = None, limit: int = 10
+) -> list[dict[str, Any]]:
+    rows = db.execute(
+        text(
+            """
+            SELECT id, description, agent_id, user_id, expires_at
+            FROM work_claims
+            WHERE org_id = :org_id AND released_at IS NULL
+              AND expires_at > now()
+              AND (:project_id::uuid IS NULL OR project_id = :project_id)
+            ORDER BY created_at DESC LIMIT :limit
+            """
+        ),
+        {"org_id": org_id, "project_id": project_id, "limit": limit},
+    ).mappings().all()
+    return [dict(r) for r in rows]
 ```
 
-Wire it into `run_retention.py`'s per-org loop next to the memory sweep call, passing the same resolved retention the org already gets (including `plan_overrides`).
+MCP wiring: `claim(description, ttl_minutes=15)` and `release(claim_id)` tools (thin wrappers, org/agent from the principal); recall handlers append `"active_claims": live_claims(...)` to their response dict.
 
-- [ ] **Step 4: Run DB-gated tests**
+- [ ] **Step 4: Run** shared + mcp-server suites → PASS.
+- [ ] **Step 5: Commit** — `git commit -m "feat(claims): semantic advisory claims, injected into recall"`
 
-Run: `cd services/shared && KLIO_REQUIRE_DB=1 pytest tests/test_trace_retention_sweep.py -v`
-Expected: PASS, 2 tests.
+---
 
-- [ ] **Step 5: Full-suite sanity + commit**
+### Task 10: Migration 045 + dreamer (Build 5)
 
-```bash
-cd services/shared && pytest tests/ -x -q && cd ../mcp-server && pytest tests/ -x -q && cd ../async-worker && pytest tests/ -x -q
-git add -A services/shared services/migrations
-git commit -m "feat(retention): traces expire with the org's plan retention"
+**Files:**
+- Create: `services/migrations/alembic/versions/045_memory_proposals.py`, `services/async-worker/app/dreamer.py`
+- Modify: `services/async-worker/app/main.py` (interval schedule: run per org after `DREAM_MIN_GRADED_SESSIONS` new graded sessions, default 25, or every `DREAM_INTERVAL_HOURS`, default 24)
+- Test: `services/async-worker/tests/test_dreamer.py`
+
+**Interfaces:**
+- Migration: `memory_proposals`: `id UUID pk, org_id String(64) NOT NULL, scope Text NOT NULL, kind Text NOT NULL` (`add|revise|retire`), `target_memory_id UUID NULL, diff Text NOT NULL, evidence JSONB NOT NULL` (trace refs, session ids, prevalence, outcome stats), `confidence Numeric NULL, status Text NOT NULL DEFAULT 'open'` (`open|approved|rejected|auto`), `created_at/decided_at timestamptz, decided_by UUID NULL`; index `(org_id, status)`.
+- `dreamer.dream_for_org(db, s3, *, org_id, batch_limit=50) -> int` — returns proposals written. Inputs: recent `session_outcomes` + `recall_outcomes` + traces + current memories. Deterministic detectors FIRST (no LLM): (a) **repeated tool failure** — same `tool` with `status=="error"` in ≥3 sessions' tool_calls; (b) **bad-outcome memory** — memory with ≥5 attributions, `used=true` rate ≥ 0.4, and joined session verdict `pass` rate < 0.5; (c) **stale-serve cluster** — memory with ≥3 `served_stale` rows. Each detector emits a proposal with the evidence rows it counted. An LLM drafting pass (via the same `acompletion` config the curator uses) turns detector output into the `diff` text — the LLM WRITES PROSE ONLY; detection is arithmetic, so dreaming cannot hallucinate a pattern.
+- Proposal application: approved proposals apply through `supersede_with_revision` (Task 8) — the dreamer obeys CAS like every writer. `status='auto'` allowed only for `scope='agent'`.
+- REST (mcp-server): `GET /proposals?status=open`, `POST /proposals/{id}/approve`, `POST /proposals/{id}/reject` — org-scoped via the existing auth dependency; approve requires an attributable user (`resolve_user_id`), recorded in `decided_by`. (Dashboard UI consumes these; that surface is a Dashboard-repo task, out of this plan.)
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# services/async-worker/tests/test_dreamer.py
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from app import dreamer
+
+
+def _sessions_with_tool_failures(n):
+    return [{"session_id": f"s{i}",
+             "tool_calls": [{"tool": "Bash", "status": "error",
+                             "args": "npm test"}]} for i in range(n)]
+
+
+@pytest.mark.anyio
+async def test_repeated_tool_failure_becomes_proposal_with_prevalence():
+    db = MagicMock()
+    with patch.object(dreamer, "_load_recent_evidence", return_value={
+            "sessions": _sessions_with_tool_failures(3),
+            "bad_memories": [], "stale_clusters": []}), \
+         patch.object(dreamer, "_draft_diff", new=AsyncMock(return_value="Add a note: npm test fails without X")):
+        written = await dreamer.dream_for_org(db, MagicMock(), org_id="o")
+    assert written == 1
+    ins = [c for c in db.execute.call_args_list
+           if "INSERT INTO memory_proposals" in str(c.args[0])][0]
+    evidence = json.loads(ins.args[1]["evidence"])
+    assert evidence["prevalence"] == 3
+    assert ins.args[1]["status"] == "open"
+
+
+@pytest.mark.anyio
+async def test_two_failures_is_below_threshold_no_proposal():
+    db = MagicMock()
+    with patch.object(dreamer, "_load_recent_evidence", return_value={
+            "sessions": _sessions_with_tool_failures(2),
+            "bad_memories": [], "stale_clusters": []}):
+        written = await dreamer.dream_for_org(db, MagicMock(), org_id="o")
+    assert written == 0
+
+
+@pytest.mark.anyio
+async def test_llm_failure_still_files_proposal_with_raw_evidence():
+    db = MagicMock()
+    with patch.object(dreamer, "_load_recent_evidence", return_value={
+            "sessions": _sessions_with_tool_failures(4),
+            "bad_memories": [], "stale_clusters": []}), \
+         patch.object(dreamer, "_draft_diff", new=AsyncMock(side_effect=RuntimeError)):
+        written = await dreamer.dream_for_org(db, MagicMock(), org_id="o")
+    assert written == 1  # detection is arithmetic; drafting is optional prose
 ```
+
+- [ ] **Step 2: Run to verify failure** → module missing.
+
+- [ ] **Step 3: Implement** — `dreamer.py` with: `_load_recent_evidence` (three org-predicated SQL queries + trace fetches for tool_calls), the three deterministic detectors as pure functions over that dict, `_draft_diff` (LLM prose via the curator's `acompletion` config; on failure the proposal's diff is the deterministic summary line, e.g. `"[auto] Bash failed identically in 4 sessions: npm test"`), and one `INSERT INTO memory_proposals` per detection with `evidence` JSON `{"prevalence": n, "sessions": [...], "detector": "tool_failure"}`. Migration 045 in the established style. REST endpoints in `mcp_app.py` following the existing FastAPI route patterns with the standard auth dependencies.
+
+- [ ] **Step 4: Run** → PASS, 3 tests; mcp-server suite green.
+- [ ] **Step 5: Commit** — `git commit -m "feat(dreamer): deterministic detection, LLM prose, reviewable proposals"`
+
+---
+
+### Task 11: Retention + wiring sanity (whole-system)
+
+**Files:**
+- Modify: retention sweep (locate via `run_retention.py` imports) — traces AND outcome tables expire with plan retention; claims are self-expiring; proposals persist (they are decisions, not evidence)
+- Test: `services/shared/tests/test_evidence_retention_sweep.py` (DB-gated, mirrors the Task 8 pattern from the reviewed draft: expired deleted, fresh kept, non-positive retention skipped — for `session_traces`, `session_outcomes`, `recall_outcomes`)
+- Full-suite run: every service's pytest green.
+
+- [ ] **Step 1–4:** failing DB-gated test → `sweep_evidence_for_org(conn, *, org_id, retention_days) -> dict[str, int]` deleting from the three tables with the same guard (`<= 0` → skip) → wire into the per-org loop → PASS.
+- [ ] **Step 5: Commit** — `git commit -m "feat(retention): evidence expires with plan retention"`
 
 ---
 
 ## Deployment notes
 
-- **Migrations are manual in production.** Run 041 + 042 against the Neon **direct** endpoint (strip `-pooler`), not the pooled one.
-- New env for mcp-server: `KLIO_TRACE_BUCKET` (create the bucket + a lifecycle rule matching max plan retention), `REDACTION_VERSION=1`, plus the S3 credentials the storage-worker already uses.
-- The grader is a callable this phase; scheduling it (cron / stream consumer) is Phase-2 wiring alongside claims.
-- Rollout order: migrations → shared → mcp-server → async-worker. Each task is independently deployable; traces simply accumulate until the grader runs.
+- Migrations 041–045 run manually against the Neon **direct** endpoint, in order.
+- New env — storage-worker: `KLIO_TRACE_BUCKET` (required; create bucket + lifecycle rule matching max plan retention), `REDACTION_VERSION=1`. mcp-server: `REDIS_URL` (verify it isn't already set). async-worker: `DREAM_MIN_GRADED_SESSIONS=25`, `DREAM_INTERVAL_HOURS=24`.
+- Rollout order: migrations → shared → storage-worker → mcp-server → async-worker.
+- The Dashboard proposals UI (list/diff/approve) consumes the REST endpoints and is a separate Dashboard-repo task.
+- The 5% holdout experiment (prove-it pitch) consumes `session_outcomes` and ships after this plan; the schema already supports it (`grader_version` distinguishes arms).
 
-## Out of scope (later phases of the spec)
+## Out of scope
 
-- Optimistic concurrency (Build 3), claims (Build 4), dreaming (Build 5).
-- Grader scheduling + the holdout experiment.
-- Tool-call capture from harness hooks (the `tool_calls` list is plumbed but arrives empty until the hook payload exists).
+- `klio init` / hooks / local daemon (client-side repo).
+- Dashboard proposals UI (Dashboard repo).
+- Cross-org learning (excluded until legal/consent design exists).
