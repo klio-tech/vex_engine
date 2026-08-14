@@ -22,6 +22,32 @@ same array-typing reason; scalar uuid-string binds elsewhere in this module
 (``id``, ``recall_event_id``, ``memory_id``, ...) do not need it — Postgres
 accepts a text literal directly as ``uuid`` input outside of array
 comparison.
+
+``session_memories`` rows are hydrated into real :class:`shared.memory.MemoryRecord`
+objects via :func:`shared.memory._row_to_record` — the SAME hydrator every
+other reader of this table uses (``shared.memory.recall_memories`` et al.) —
+rather than passed to ``verify()`` as bare ``{id, content}`` dicts.
+``engine.memory_consistency._format_memories`` does ATTRIBUTE access
+(``mem.memory_type``, ``mem.sequence_number``, ``mem.content``) on whatever
+``session_memories`` gives it; a dict there raises ``AttributeError`` inside
+``verify()``'s ``asyncio.gather`` for every real (non-mocked) call, which
+this module's own ``except Exception`` around ``verify()`` would silently
+swallow — degrading every graded session to ``verdict='unknown'`` and
+defeating the point of passing ``session_memories`` at all. The SELECT below
+matches the canonical 16-column order ``_row_to_record`` expects (see its
+docstring and ``shared.memory.recall_memories``'s semantic/summary queries).
+
+Re-grading a session (duplicate ``sessions.stored`` events are DESIGNED —
+storage-worker emits one even when its own upsert lost the richer-wins race,
+see ``app.trace_consumer.handle_captured``) must be a no-op, not a poison
+message. ``session_outcomes`` has a real ``UNIQUE(org_id, session_id,
+grader_version)`` constraint (migration 042); the INSERT below adds
+``RETURNING id`` to ``ON CONFLICT ... DO NOTHING`` so a second grade for the
+same session+grader_version can DETECT that no row was written and skip
+attribution entirely — inserting ``recall_outcomes`` rows against a
+freshly-minted ``session_outcome_id`` that was never persisted would raise
+``ForeignKeyViolation``, and because that happens after the consumer's
+``xack`` window, the message would never ACK and get redelivered forever.
 """
 
 import logging
@@ -32,13 +58,21 @@ from typing import Any, Optional
 from sqlalchemy import text
 
 from engine.pipeline import verify
-from shared.memory import embed_text
+from shared.memory import _row_to_record, embed_text
 from shared.traces import fetch_trace
 
 logger = logging.getLogger("agentguard.outcome-grader")
 
 GRADER_VERSION = "v1"
 USED_THRESHOLD = 0.5
+
+#: Column order MUST match ``shared.memory._row_to_record``'s expected
+#: positional layout (its docstring's "first 16 columns, required").
+_MEMORY_COLUMNS = (
+    "id, session_id, org_id, agent_id, execution_id, memory_type, content, "
+    "embedding, confidence, sequence_number, scope, status, superseded_by, "
+    "metadata, created_at, updated_at"
+)
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
@@ -67,10 +101,18 @@ async def grade_stored_session(
     memory) pair.
 
     Returns ``{"session_outcome_id": str | None, "attributions": int}``.
-    ``session_outcome_id`` is ``None`` only when there is nothing to grade
-    (no recall events with served memory_ids for this session) — a session
-    with recall evidence always gets a session_outcomes row, even when the
-    trace or output is missing (verdict='unknown').
+    ``session_outcome_id`` is ``None`` in two distinct cases the caller
+    cannot tell apart from the return value alone (neither needs to raise —
+    both are legitimate no-ops for the calling consumer, which should ACK
+    either way):
+
+    1. Nothing to grade: no recall events with served memory_ids for this
+       session.
+    2. Already graded: a session_outcomes row for
+       ``(org_id, session_id, grader_version)`` already exists (duplicate
+       ``sessions.stored`` delivery) — attribution is skipped entirely
+       rather than risk a foreign key pointing at an id that was never
+       persisted.
 
     Best-effort: a ``verify()`` or ``embed_text()`` failure degrades the
     verdict/scores to unknown/null rather than raising into the consumer
@@ -90,26 +132,27 @@ async def grade_stored_session(
         return {"session_outcome_id": None, "attributions": 0}
 
     served_ids = sorted({str(mid) for r in recalls for mid in (r["memory_ids"] or [])})
-    memories = db.execute(
+    memory_rows = db.execute(
         text(
-            """
-            SELECT id, content FROM session_memories
+            f"""
+            SELECT {_MEMORY_COLUMNS} FROM session_memories
             WHERE org_id = :org_id AND id = ANY(CAST(:ids AS uuid[]))
             """
         ),
         {"org_id": org_id, "ids": served_ids},
-    ).mappings().all()
+    ).fetchall()
+    memories = [_row_to_record(row) for row in memory_rows]
 
     trace = fetch_trace(db, s3, org_id=org_id, session_id=session_id)
     output = _final_output(trace["messages"]) if trace else None
 
     verdict_str, confidence, mem_consistency = "unknown", None, None
-    scores: dict[str, Optional[float]] = {str(m["id"]): None for m in memories}
+    scores: dict[str, Optional[float]] = {str(m.id): None for m in memories}
     if output:
         try:
             result = await verify(
                 output,
-                session_memories=[dict(m) for m in memories],
+                session_memories=memories,
             )
             verdict_str = result.action
             confidence = result.confidence
@@ -125,9 +168,9 @@ async def grade_stored_session(
             out_emb = await embed_text(output)
             if out_emb:
                 for m in memories:
-                    m_emb = await embed_text(str(m["content"]))
+                    m_emb = await embed_text(str(m.content))
                     if m_emb:
-                        scores[str(m["id"])] = _cosine(out_emb, m_emb)
+                        scores[str(m.id)] = _cosine(out_emb, m_emb)
         except Exception:
             logger.warning(
                 "grader: attribution embedding failed org=%s session=%s",
@@ -135,7 +178,7 @@ async def grade_stored_session(
             )
 
     session_outcome_id = str(uuid.uuid4())
-    db.execute(
+    inserted = db.execute(
         text(
             """
             INSERT INTO session_outcomes
@@ -144,12 +187,30 @@ async def grade_stored_session(
             VALUES (:id, :org_id, :session_id, :verdict, :confidence,
                     :memory_consistency, :grader_version)
             ON CONFLICT (org_id, session_id, grader_version) DO NOTHING
+            RETURNING id
             """
         ),
         {"id": session_outcome_id, "org_id": org_id, "session_id": session_id,
          "verdict": verdict_str, "confidence": confidence,
          "memory_consistency": mem_consistency, "grader_version": grader_version},
-    )
+    ).first()
+
+    if inserted is None:
+        # ON CONFLICT DO NOTHING matched zero rows: a session_outcomes row
+        # for this (org_id, session_id, grader_version) already exists —
+        # this is a re-delivery of sessions.stored (see module docstring),
+        # not a new session to grade. session_outcome_id above was never
+        # written, so it must NOT be used as a foreign key for
+        # recall_outcomes inserts (that would raise ForeignKeyViolation and
+        # leave the message permanently unacked/redelivered). Skip
+        # attribution entirely and let the caller ACK the message.
+        logger.info(
+            "grader: org=%s session=%s already graded for grader_version=%s; "
+            "skipping duplicate attribution",
+            org_id, session_id, grader_version,
+        )
+        db.commit()
+        return {"session_outcome_id": None, "attributions": 0}
 
     attributions = 0
     for recall in recalls:
