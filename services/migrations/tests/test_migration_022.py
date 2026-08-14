@@ -73,6 +73,11 @@ def test_brain_recall_events_columns():
         "result_count",
         "source",
         "created_at",
+        # Added by migration 042 (recall evidence, Build 2): memory_ids links
+        # a recall event to the memories it surfaced, session_id links it to
+        # the brain session it happened in. Both nullable, both additive.
+        "memory_ids",
+        "session_id",
     }
     assert cols["org_id"]["nullable"] is False
     assert cols["agent_id"]["nullable"] is True
