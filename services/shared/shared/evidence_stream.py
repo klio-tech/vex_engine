@@ -91,8 +91,11 @@ def build_captured_payload(
     The returned payload is capped at 256 KB post-redaction. When it would
     exceed the cap, messages are tail-trimmed — the OLDEST messages are
     dropped first — until it fits, so a long session degrades to "recent
-    context" rather than being dropped entirely. ``tool_calls`` is never
-    trimmed by this cap.
+    context" rather than being dropped entirely. If trimming every message
+    still leaves the payload oversized (e.g. a small number of huge tool
+    calls), ``tool_calls`` is trimmed the same way, oldest first, as a
+    fallback — the newest tool calls are the most likely to matter for
+    grading what an agent just did.
     """
     try:
         clean_messages = [
@@ -138,6 +141,12 @@ def build_captured_payload(
     # it is published as-is (best-effort; the alternative is silent loss).
     while payload["messages"] and _payload_size(payload) > _MAX_PAYLOAD_BYTES:
         payload["messages"].pop(0)
+
+    # Fallback: messages alone were not enough (e.g. one or two huge tool
+    # calls). Trim tool_calls the same way — oldest first — so the newest
+    # actions survive; those are what a grader is most likely to need.
+    while payload["tool_calls"] and _payload_size(payload) > _MAX_PAYLOAD_BYTES:
+        payload["tool_calls"].pop(0)
 
     return payload
 

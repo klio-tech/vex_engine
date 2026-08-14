@@ -58,8 +58,43 @@ def test_transcript_capture_enqueues_outbox(client):
     assert r.status_code == 200
     assert enq.called
     payload = enq.call_args.kwargs["payload"]
-    assert payload["session_id"] == "s1"
+    # The published session_id is the DERIVED (principal-scoped) identity,
+    # not the raw client-supplied "s1" — see _capture_session_id. Using the
+    # raw value would collide across principals that happen to send the same
+    # client string, or the same "no session_id" default.
+    expected_session_id = capture._capture_session_id(
+        "test-org", "mcp-default", "s1", user_id=None
+    )
+    assert payload["session_id"] == expected_session_id
+    assert payload["session_id"] != "s1"
     assert len(payload["tool_calls"]) == 1
+
+
+def test_transcript_capture_sessionless_uses_derived_identity_not_unknown(client):
+    """A request with no session_id gets the derived per-principal identity,
+    not a shared literal "unknown" that every sessionless capture in the org
+    would otherwise collapse onto (silently overwriting each other's
+    session_traces row on the richer-wins upsert)."""
+    db_patch, _ = _patch_db()
+    ensure_project, gen_summary, ext_facts = _distillation_mocks()
+    body = _body()
+    del body["session_id"]
+    with (
+        db_patch,
+        ensure_project,
+        gen_summary,
+        ext_facts,
+        patch("app.capture.enqueue_trace_outbox", AsyncMock()) as enq,
+    ):
+        r = client.post("/capture/transcript", json=body)
+
+    assert r.status_code == 200
+    payload = enq.call_args.kwargs["payload"]
+    expected_session_id = capture._capture_session_id(
+        "test-org", "mcp-default", None, user_id=None
+    )
+    assert payload["session_id"] == expected_session_id
+    assert payload["session_id"] != "unknown"
 
 
 def test_transcript_capture_publishes_redacted_content(client):

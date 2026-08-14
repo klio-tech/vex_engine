@@ -808,10 +808,18 @@ async def capture_transcript(
         # effort — a publish failure (bad Redis, redaction failure inside
         # build_captured_payload) must never fail the capture request, which
         # has already succeeded by this point.
+        #
+        # Uses the SAME derived `session_id` the distillation writes above
+        # used (via `_capture_session_id`), not the raw client-supplied
+        # `req.session_id`. The raw value is not unique per principal — two
+        # different agents/users with no session_id (or the same client
+        # string) would otherwise collapse onto one evidence identity, and
+        # storage-worker's richer-wins upsert (migration 041) would let one
+        # silently overwrite another's session_traces row.
         try:
             payload = build_captured_payload(
                 org_id=org_id,
-                session_id=req.session_id or "unknown",
+                session_id=session_id,
                 messages=[m.model_dump() for m in req.messages],
                 tool_calls=req.tool_calls,
                 project_id=project_id,

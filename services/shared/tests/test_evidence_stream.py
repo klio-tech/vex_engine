@@ -86,8 +86,8 @@ def test_payload_tail_trims_oldest_messages_to_fit_cap():
     assert len(p["messages"]) < len(messages)
 
 
-def test_payload_does_not_trim_tool_calls():
-    """The 256 KB cap only tail-trims messages; tool_calls are left intact."""
+def test_payload_does_not_trim_tool_calls_when_messages_alone_fit_cap():
+    """When trimming messages already gets under the cap, tool_calls are untouched."""
     tool_calls = [{"tool": "Bash", "args": {"command": f"cmd-{i}"}} for i in range(5)]
     with patch.object(es, "redact", side_effect=lambda t: _Clean(t)):
         p = es.build_captured_payload(
@@ -97,6 +97,30 @@ def test_payload_does_not_trim_tool_calls():
             tool_calls=tool_calls,
         )
     assert len(p["tool_calls"]) == 5
+
+
+def test_payload_falls_back_to_trimming_tool_calls_when_messages_are_not_enough():
+    """Tiny messages + huge tool_calls: once messages are fully trimmed and the
+    payload is still over the cap, tool_calls are trimmed oldest-first too,
+    and the newest tool call survives."""
+    big = "y" * 60_000
+    messages = [{"role": "user", "content": "hi"}]
+    tool_calls = [
+        {"tool": "Bash", "args": {"command": f"{big}-{i}"}} for i in range(10)
+    ]
+    with patch.object(es, "redact", side_effect=lambda t: _Clean(t)):
+        p = es.build_captured_payload(
+            org_id="o", session_id="s", messages=messages, tool_calls=tool_calls
+        )
+    assert p is not None
+    size = len(json.dumps(p, ensure_ascii=False).encode("utf-8"))
+    assert size <= es._MAX_PAYLOAD_BYTES
+    assert len(p["tool_calls"]) < len(tool_calls)
+    # The newest tool call must survive; the oldest must not. ``args`` is a
+    # JSON-encoded string (e.g. '...-9"}'), so match with the closing
+    # delimiter rather than a bare endswith.
+    assert "-9\"}" in p["tool_calls"][-1]["args"]
+    assert not any("-0\"}" in t["args"] for t in p["tool_calls"])
 
 
 @pytest.mark.asyncio
