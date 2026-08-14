@@ -61,9 +61,10 @@ def _principal_patches(user_id=USER):
 
 
 def test_tool_inventory_is_nineteen_and_includes_init():
-    """18 -> 19 tools; `init` asserted by name (spec acceptance)."""
+    """18 -> 19 tools; `init` asserted by name (spec acceptance). Build 4
+    later added claim + release, taking the count to 21."""
     assert "init" in EXPECTED_TOOL_NAMES
-    assert len(EXPECTED_TOOL_NAMES) == 19
+    assert len(EXPECTED_TOOL_NAMES) == 21
     server = build_mcp_server()
     assert server._tool_manager.get_tool("init") is not None
 

@@ -165,6 +165,112 @@ def sweep_expired_originals(db, *, org_id: str) -> int:
     return int(result.rowcount or 0)
 
 
+def sweep_evidence_for_org(conn, *, org_id: str, retention_days: int) -> dict[str, int]:
+    """Delete this org's expired evidence: traces and outcome grades.
+
+    Evidence, not decisions. Three tables:
+
+    - ``session_traces`` (migration 041): the redacted transcript pointer
+      the dreamer reads to explain a proposal.
+    - ``session_outcomes`` (migration 042): the ONE verdict per graded
+      session.
+    - ``recall_outcomes`` (migration 042): per-memory attribution rows
+      joined to a ``session_outcomes`` row.
+
+    ``memory_proposals`` (migration 045) is deliberately NOT swept here —
+    a proposal is a decision made FROM evidence, not evidence itself, and
+    it outlives the sessions that justified it (an approved/rejected
+    proposal is an audit record). ``claims`` are also untouched — they
+    carry their own TTL and expire on their own schedule, independent of
+    plan retention.
+
+    ``brain_recall_events`` is untouched too, on purpose: nothing in this
+    codebase deletes those rows today (see ``run_retention.py``'s module
+    history), and adding that here would silently widen this function's
+    blast radius past what the three evidence tables above call for. If
+    that gap is ever closed, it should be its own sweep with its own
+    tests, not folded into this one.
+
+    ``recall_outcomes`` rows also disappear via ``ON DELETE CASCADE`` when
+    their parent ``session_outcomes`` row is deleted (migration 042). This
+    function deletes ``recall_outcomes`` directly anyway, on its own
+    ``created_at`` cutoff, rather than relying solely on that cascade:
+    ``recall_outcomes.created_at`` and its parent's ``graded_at`` are not
+    guaranteed to march in lockstep, and a caller of this function (or of
+    the DB-gated tests) should be able to reason about each table's own
+    expiry rule without tracing a foreign key to find out why a row went.
+    The direct delete and the cascade agree on every real row; the direct
+    delete is just the one that is not an implementation detail.
+
+    Guard: ``retention_days <= 0`` means "keep forever" (the same -1
+    convention every other quota field on ``PlanConfig`` uses — see
+    ``shared.plan_limits``) and is refused here exactly as ``run_retention``
+    refuses it before calling ``enforce_plan_retention`` /
+    ``enforce_memory_retention``: passed through, ``NOW() - (:days ||
+    ' days')::interval`` lands at or after NOW(), deleting every row that
+    exists. Skipped, not clamped — the caller may pass ``-1`` for
+    "unlimited" and this function must not turn that into "today".
+
+    Returns ``{"session_traces": n, "session_outcomes": n,
+    "recall_outcomes": n}`` — each count is rows actually removed for
+    ``org_id``, or all zeros when the guard above skips the sweep.
+    """
+    if retention_days <= 0:
+        return {"session_traces": 0, "session_outcomes": 0, "recall_outcomes": 0}
+
+    cutoff_interval = {"days": retention_days}
+
+    recall_outcomes_removed = (
+        conn.execute(
+            text(
+                """
+            DELETE FROM recall_outcomes
+            WHERE org_id = :org_id
+              AND created_at < NOW() - (:days || ' days')::interval
+            """
+            ),
+            {"org_id": org_id, **cutoff_interval},
+        ).rowcount
+        or 0
+    )
+
+    session_outcomes_removed = (
+        conn.execute(
+            text(
+                """
+            DELETE FROM session_outcomes
+            WHERE org_id = :org_id
+              AND graded_at < NOW() - (:days || ' days')::interval
+            """
+            ),
+            {"org_id": org_id, **cutoff_interval},
+        ).rowcount
+        or 0
+    )
+
+    session_traces_removed = (
+        conn.execute(
+            text(
+                """
+            DELETE FROM session_traces
+            WHERE org_id = :org_id
+              AND created_at < NOW() - (:days || ' days')::interval
+            """
+            ),
+            {"org_id": org_id, **cutoff_interval},
+        ).rowcount
+        or 0
+    )
+
+    conn.commit()
+
+    return {
+        "session_traces": int(session_traces_removed),
+        "session_outcomes": int(session_outcomes_removed),
+        "recall_outcomes": int(recall_outcomes_removed),
+    }
+
+
 def _contained(sweep, conn, *, org_id: str, what: str) -> None:
     """Run one org's sweep so that its failure stays its own.
 
@@ -332,6 +438,25 @@ def main() -> None:
                     tsdb_conn,
                     org_id=org_id,
                     what="expired compression originals",
+                )
+                # 4. Evidence: session_traces / session_outcomes /
+                #    recall_outcomes. These are the dreamer's raw material,
+                #    not the memories themselves, so they follow the memory
+                #    retention window (the same value gating
+                #    enforce_memory_retention above) rather than the shorter
+                #    Vex execution-record window — a free-tier org that just
+                #    had its retention_days=1 execution log swept must not
+                #    also lose the transcript its own proposals cite as
+                #    evidence a day later. sweep_evidence_for_org carries its
+                #    own <= 0 guard, so passing -1/"unlimited" through here is
+                #    safe.
+                _contained(
+                    lambda conn, *, org_id: sweep_evidence_for_org(
+                        conn, org_id=org_id, retention_days=config.memory_retention_days
+                    ),
+                    tsdb_conn,
+                    org_id=org_id,
+                    what="expired evidence (traces/outcomes)",
                 )
 
             # Hidden raw captures are curator fuel with a short shelf life:

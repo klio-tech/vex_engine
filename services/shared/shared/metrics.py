@@ -660,6 +660,14 @@ MEMORY_RECALL_RESULTS = REGISTRY.counter(
     labels={"scope": SCOPES},
 )
 
+WRITE_CONFLICTS = REGISTRY.counter(
+    "klio_write_conflicts_total",
+    "Optimistic-concurrency writes rejected because the caller's "
+    "base_revision was stale — someone else moved the belief first. The "
+    "write returns the current state instead of last-writer-winning; this "
+    "counter is how often that guard actually fires.",
+)
+
 # ── the lexical recall arm ────────────────────────────────────────────
 #
 # The feature exists on a hypothesis — that dense retrieval misses rare

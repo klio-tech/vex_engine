@@ -18,6 +18,7 @@ from app.observability import log_remote_write_state
 from app.observability import router as observability_router
 from app.db import SessionLocal
 from app.mcp_app import build_mcp_server
+from app.proposals import router as proposals_router
 from app.scheduler import (
     start_artifact_gc,
     start_curator,
@@ -160,6 +161,11 @@ def create_app() -> FastAPI:
     # Registered BEFORE the root MCP mount so its ``/capture/*`` routes take
     # precedence over the catch-all mount below.
     app.include_router(capture_router)
+
+    # REST review surface for the dreamer's proposals (``app.dreamer`` in
+    # async-worker files them; this is where a human decides). Same
+    # before-the-catch-all-mount reasoning as capture.
+    app.include_router(proposals_router)
 
     # ``/readyz`` and ``/metrics``. Registered before the root MCP mount for the
     # same reason as the capture routes: the mount is a catch-all and would

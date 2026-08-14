@@ -15,6 +15,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "PyJWT[crypto]>=2.8",
     "httpx>=0.25",
+    "redis>=5.0.0",
 ]
 
 [project.optional-dependencies]

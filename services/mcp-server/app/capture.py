@@ -56,7 +56,7 @@ from typing import Any, Literal, Optional
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from shared import brain
+from shared import brain, claims
 from shared.auth import KeyInfo
 from shared.memory import (
     extract_facts,
@@ -65,6 +65,7 @@ from shared.memory import (
     retrieve_memories_scoped,
 )
 from shared import metrics
+from shared.evidence_stream import build_captured_payload, publish_captured
 from shared.redaction import redact
 from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
@@ -217,6 +218,13 @@ class CaptureTranscriptRequest(BaseModel):
     messages: list[TranscriptMessage] = Field(
         default_factory=list, description="Ordered session messages."
     )
+    tool_calls: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Ordered tool invocations for the session (evidence loop). "
+            "Optional and backward compatible: omitted or empty is a no-op."
+        ),
+    )
     session_id: Optional[str] = Field(
         default=None, description="Client session id; groups dedup within a session."
     )
@@ -243,6 +251,16 @@ class RecallRequest(BaseModel):
     space: Optional[str] = Field(default=None, description="Optional space slug.")
     git_remote: Optional[str] = Field(default=None)
     repo_root: Optional[str] = Field(default=None)
+    session_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Client session id, same value the transcript capture sends. "
+            "Optional and backward compatible: omitted is a no-op. Used to "
+            "derive the SAME session identity _capture_session_id computes "
+            "for a transcript capture, so the recall audit row can be joined "
+            "to the session it was served into."
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -508,13 +526,20 @@ def _serialize_memory(record: Any) -> dict[str, Any]:
     paths.  Only the fields a context block needs are emitted (no embedding,
     no internal verification columns); ``id`` is stringified and ``created_at``
     is ISO-8601 (or ``None``).
+
+    ``revision`` (migration 043) is the row's current CAS token — present when
+    the caller's row/query selected it, ``None`` otherwise (``getattr`` rather
+    than attribute access so this stays additive over any pre-existing caller
+    that has not started selecting the column).
     """
     created_at = getattr(record, "created_at", None)
+    revision = getattr(record, "revision", None)
     return {
         "id": str(record.id),
         "memory_type": record.memory_type,
         "content": record.content,
         "created_at": created_at.isoformat() if created_at is not None else None,
+        "revision": str(revision) if revision is not None else None,
     }
 
 
@@ -575,7 +600,7 @@ def _recent_memories(
     rows = db.execute(
         text(
             f"""
-            SELECT id, memory_type, content, created_at
+            SELECT id, memory_type, content, created_at, revision
             FROM session_memories
             WHERE org_id = :org_id
               AND {scope_sql}
@@ -593,6 +618,19 @@ def _recent_memories(
         params,
     ).fetchall()
     return [_serialize_memory(r) for r in rows]
+
+
+async def enqueue_trace_outbox(*, payload: dict[str, Any]) -> None:
+    """Publish one redacted transcript payload to ``sessions.captured``.
+
+    Thin wrapper around :func:`shared.evidence_stream.publish_captured` so the
+    call site in :func:`capture_transcript` has a single, mockable seam (tests
+    patch ``app.capture.enqueue_trace_outbox`` directly rather than reaching
+    into the Redis client). Raises on failure — the caller wraps this in its
+    own try/except, because evidence publishing is best-effort: it must never
+    fail the capture request itself.
+    """
+    await publish_captured(payload=payload)
 
 
 # ---------------------------------------------------------------------------
@@ -782,6 +820,34 @@ async def capture_transcript(
                 )
 
         record_capture("accepted" if stored else "rejected")
+
+        # Evidence loop: publish the redacted session for retention. Best
+        # effort — a publish failure (bad Redis, redaction failure inside
+        # build_captured_payload) must never fail the capture request, which
+        # has already succeeded by this point.
+        #
+        # Uses the SAME derived `session_id` the distillation writes above
+        # used (via `_capture_session_id`), not the raw client-supplied
+        # `req.session_id`. The raw value is not unique per principal — two
+        # different agents/users with no session_id (or the same client
+        # string) would otherwise collapse onto one evidence identity, and
+        # storage-worker's richer-wins upsert (migration 041) would let one
+        # silently overwrite another's session_traces row.
+        try:
+            payload = build_captured_payload(
+                org_id=org_id,
+                session_id=session_id,
+                messages=[m.model_dump() for m in req.messages],
+                tool_calls=req.tool_calls,
+                project_id=project_id,
+                user_id=user_id,
+                agent_id=agent_id,
+            )
+            if payload is not None:
+                await enqueue_trace_outbox(payload=payload)
+        except Exception:
+            logger.warning("evidence publish failed; capture unaffected", exc_info=True)
+
         return {"stored": stored, "facts": len(facts), "summary": bool(summary)}
     except HTTPException:
         raise
@@ -883,6 +949,15 @@ async def capture_recall(
         # psycopg2 I/O, so run it off the event loop per the shared.brain
         # threading contract. A logging failure must NEVER break the recall, so
         # this stays inside the try (the finally still closes the session).
+        #
+        # session_id is derived through the SAME _capture_session_id call the
+        # transcript handler uses (same org/agent/user/raw-session-id inputs),
+        # not the raw req.session_id: the grader joins brain_recall_events to
+        # session_traces on this derived identity, so a mismatched derivation
+        # here would silently break every join.
+        recall_session_id = _capture_session_id(
+            org_id, agent_id, req.session_id, user_id=user_id
+        )
         await anyio.to_thread.run_sync(
             lambda: log_recall_event(
                 db,
@@ -892,12 +967,33 @@ async def capture_recall(
                 query_text=(query or None),
                 result_count=len(memories),
                 source="hook",
+                memory_ids=[m["id"] for m in memories],
+                session_id=recall_session_id,
             )
         )
         await anyio.to_thread.run_sync(
             lambda: record_usage(db, org_id, "recall", over_cap=recall_over_cap)
         )
-        return {"memories": memories, "count": len(memories)}
+        # Claims ride every recall response (Build 4), same as the MCP
+        # `recall` tool: passive session-start injection is still a recall,
+        # so an agent hitting this REST path gets the same active_claims
+        # awareness. Best-effort: a claims-listing failure must never be the
+        # reason a capture recall fails.
+        try:
+            active_claims = await anyio.to_thread.run_sync(
+                lambda: claims.live_claims(db, org_id=org_id, project_id=project_id)
+            )
+        except Exception:
+            logger.warning(
+                "capture recall: live_claims lookup raised; omitting active_claims",
+                exc_info=True,
+            )
+            active_claims = []
+        return {
+            "memories": memories,
+            "count": len(memories),
+            "active_claims": active_claims,
+        }
     except HTTPException:
         raise
     except Exception:

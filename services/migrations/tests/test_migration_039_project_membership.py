@@ -590,9 +590,7 @@ def test_fallback_uses_earliest_membership_when_no_primary_owner(
     arbitrary one."""
     org_id = "org-no-primary-owner"
     _seed_org(db, org_id=org_id, account_slug="no-owner-acme")
-    account_id = _seed_account(
-        shadow, slug="no-owner-acme", primary_owner_user_id=None
-    )
+    account_id = _seed_account(shadow, slug="no-owner-acme", primary_owner_user_id=None)
     _seed_account_membership(
         shadow, account_id=account_id, user_id="later-member", minutes_ago=5
     )

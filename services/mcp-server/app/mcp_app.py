@@ -51,7 +51,7 @@ from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
-from shared import artifact_storage, artifacts, brain, graph_store, projects
+from shared import artifact_storage, artifacts, brain, claims, graph_store, projects
 from shared.compression.router import compress as route_compress
 from shared.compression.router import estimate_tokens
 from shared.compression.structural import compress_payload
@@ -62,6 +62,7 @@ from shared.memory import (
     call_llm,
     retract_memory,
     retrieve_memories_scoped,
+    supersede_with_revision,
 )
 from shared.plan_limits import get_plan_config
 from shared.promotion import promote_memory
@@ -125,6 +126,8 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "compress",
     "explore",
     "init",
+    "claim",
+    "release",
 )
 
 # Server-level guidance surfaced to MCP clients during ``initialize``.
@@ -142,7 +145,10 @@ SERVER_INSTRUCTIONS = (
     "when the user states a durable fact or preference, call `remember`; when a "
     "decision is made, call `decide`; when a plan is set, call `plan`; for other "
     "durable context, `note`. Do NOT persist tool calls, file reads, or "
-    "transient steps. Use `forget` to retract a memory by id."
+    "transient steps. Use `forget` to retract a memory by id. Before starting "
+    "work that could overlap with another agent, call `claim` to register "
+    "intent; every `recall` response also carries `active_claims` for "
+    "other agents' current work. Call `release` when the work is done."
 )
 
 # Shared annotation for the optional ``space`` argument on the five write tools
@@ -153,6 +159,34 @@ SpaceParam = Annotated[
     Field(
         description=(
             "Optional space slug to scope this memory to; created if it doesn't exist."
+        )
+    ),
+]
+
+# Shared annotations for the optional CAS pair (Task 8, optimistic
+# concurrency) on the four write tools that can re-assert an existing row
+# (remember/observe/decide/note — `plan` is unaffected). Defined once for the
+# same drift-proofing reason as SpaceParam. Both default to None, which is
+# EXACTLY today's plain-insert behaviour; passing base_revision without
+# memory_id (or vice versa) is refused at the tool body, not the schema.
+MemoryIdParam = Annotated[
+    Optional[str],
+    Field(
+        description=(
+            "Id of an EXISTING memory this call re-asserts (from a prior "
+            "`recall`). Required together with `base_revision`; omit both "
+            "for an ordinary new write."
+        )
+    ),
+]
+BaseRevisionParam = Annotated[
+    Optional[str],
+    Field(
+        description=(
+            "The `revision` value `recall` returned for `memory_id`. If the "
+            "memory changed since you read it, the call returns "
+            "`revision_conflict` with the current state instead of "
+            "overwriting it — re-read and retry."
         )
     ),
 ]
@@ -257,6 +291,8 @@ async def _perform_write(
     metadata: Optional[dict] = None,
     scope: str = "org",
     space: Optional[str] = None,
+    memory_id: Optional[str] = None,
+    base_revision: Optional[str] = None,
 ) -> dict[str, Any]:
     """Shared body for the five Klio write tools.
 
@@ -300,10 +336,28 @@ async def _perform_write(
         space: Optional space slug to scope this memory to; the space is created
             (get-or-create) under the caller's org if it does not exist. Omitted
             or blank means the org-wide brain (``space_id=None``).
+        memory_id: Optional id of an EXISTING row this write re-asserts.
+            Ignored unless ``base_revision`` is also given (Task 8,
+            optimistic concurrency). Required together with
+            ``base_revision`` — the CAS guard needs a row to guard.
+        base_revision: Optional CAS token (a memory's ``revision``, as
+            returned by ``recall``). ``None`` (the default) is EXACTLY
+            today's behaviour: an ordinary insert via
+            :func:`shared.brain.write_scoped_memory`, no CAS involved. When
+            given, this call re-asserts ``memory_id`` instead of writing a
+            plain new row: :func:`shared.memory.supersede_with_revision`
+            atomically checks that nobody moved the belief since the caller
+            last read it. A stale token returns a
+            ``{"error": "revision_conflict", ...}`` payload instead of
+            silently last-writer-winning — the caller re-reads and retries.
 
     Returns:
-        The result dict from :func:`shared.brain.write_scoped_memory`, or a
-        clean error dict on auth failure / unexpected error.
+        The result dict from :func:`shared.brain.write_scoped_memory` (plain
+        path) or :func:`shared.memory.supersede_with_revision` (CAS path,
+        reshaped to the same ``stored``/``id``/... envelope, plus
+        ``revision`` and ``superseded_id``), or a clean error dict on auth
+        failure, a missing ``memory_id``, a stale ``base_revision``, or an
+        unexpected error.
     """
     request = ctx.request_context.request
     if request is None:
@@ -381,17 +435,19 @@ async def _perform_write(
         )
 
         if header_project_id and await anyio.to_thread.run_sync(
-            lambda: projects.is_member(
-                db,
-                org_id=org_id,
-                project_id=header_project_id,
-                user_id=user_id,
-            )
-            and not projects.can_write(
-                db,
-                org_id=org_id,
-                project_id=header_project_id,
-                user_id=user_id,
+            lambda: (
+                projects.is_member(
+                    db,
+                    org_id=org_id,
+                    project_id=header_project_id,
+                    user_id=user_id,
+                )
+                and not projects.can_write(
+                    db,
+                    org_id=org_id,
+                    project_id=header_project_id,
+                    user_id=user_id,
+                )
             )
         ):
             return {
@@ -431,6 +487,77 @@ async def _perform_write(
                 project_id=header_project_id,
             )
         )
+
+        # CAS path (Task 8): base_revision present means "re-assert this
+        # existing row, but only if nobody moved it since I last read it".
+        # Absent base_revision is EXACTLY today's behaviour — the branch
+        # below is never entered, so an existing caller that has never heard
+        # of base_revision sees zero change.
+        if base_revision is not None:
+            if not memory_id:
+                return {
+                    "stored": False,
+                    "error": "missing_memory_id",
+                    "detail": (
+                        "base_revision requires memory_id naming the row "
+                        "being re-asserted."
+                    ),
+                }
+            cas_result = await anyio.to_thread.run_sync(
+                lambda: supersede_with_revision(
+                    db,
+                    org_id=org_id,
+                    memory_id=memory_id,
+                    base_revision=base_revision,
+                    new_content=content,
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    memory_type=memory_type,
+                    session_id=session_id,
+                    scope=effective_scope,
+                    space_id=space_id,
+                    project_id=header_project_id,
+                    metadata=metadata,
+                )
+            )
+            # Refused before any write was attempted: an invalid id, or the
+            # SAME authorization ladder `forget` enforces (not_found for a
+            # private/project row the caller cannot see, forbidden for an
+            # agent-ownership mismatch), or the content itself could not be
+            # prepared (redaction/embedding). None of these is a revision
+            # conflict — that shape is reserved for "the row is real, you may
+            # act on it, but it moved".
+            cas_error = cas_result.get("error")
+            if cas_error is not None:
+                return {"stored": False, "error": cas_error}
+            if cas_result.get("conflict"):
+                return {
+                    "error": "revision_conflict",
+                    "current": cas_result.get("current"),
+                    "hint": ("belief changed while you worked — re-read and re-assert"),
+                }
+            # A CAS supersede always stores a new row (there is no dedup
+            # branch on this path — an explicit re-assertion is never a
+            # duplicate of the row it is replacing), so it always meters,
+            # mirroring the ``result.get("stored")`` gate below.
+            await anyio.to_thread.run_sync(
+                lambda: record_usage(db, org_id, "memory", over_cap=over_cap)
+            )
+            return {
+                "stored": True,
+                "deduplicated": False,
+                "id": cas_result.get("new_id"),
+                "memory_type": memory_type,
+                "scope": effective_scope,
+                "space_id": space_id,
+                "project_id": header_project_id,
+                "user_id": user_id,
+                "provenance": "EXTRACTED",
+                "revision": cas_result.get("new_revision"),
+                "superseded_id": memory_id,
+                "redacted": cas_result.get("redacted", False),
+                "redaction_kinds": cas_result.get("redaction_kinds", []),
+            }
 
         result = await brain.write_scoped_memory(
             db,
@@ -1492,6 +1619,15 @@ def _serialize_record(
     A positive marker, because ``relevance is None`` — the previous and only
     signal — is erased by structural compression's null-key strip, leaving the
     agent unable to tell a semantic match from a one-hop walk.
+
+    ``revision`` (migration 043, Task 8) is the row's current CAS token. A
+    caller that reads it back and passes it as ``base_revision`` on the next
+    ``remember``/``decide``/``note``/``observe`` call gets the
+    optimistic-concurrency guarantee (:func:`shared.memory.
+    supersede_with_revision`); ``None`` when the record was built by a path
+    that never selected the column (graph-expanded rows, for one), which
+    structural compression's null-key strip erases from the wire the same way
+    it erases an absent ``relevance``.
     """
     return {
         "id": str(record.id),
@@ -1506,6 +1642,7 @@ def _serialize_record(
         "provenance": record.provenance,
         "relevance": record.relevance,
         "via": record.via,
+        "revision": record.revision,
         # space_id/project_id are ``sa.UUID()`` columns, so a raw ``text()``
         # SELECT yields ``uuid.UUID`` objects (not strings). Stringify them —
         # like ``id`` above — so the result is plain-``json``-serializable and
@@ -1858,6 +1995,13 @@ async def _perform_recall(
         # Best-effort recall activity log; it swallows its own errors so a
         # logging failure can never break the recall. Offloaded like every
         # other statement in this body.
+        #
+        # session_id=None: the MCP ``recall`` tool carries no session
+        # identifier in scope (there is no ``_capture_session_id``-style
+        # derivation available here, unlike the hook capture path in
+        # app.capture) — inventing a different derivation would produce a
+        # session_id that never joins to a real session_traces row, which is
+        # worse than a NULL the grader can filter out.
         await anyio.to_thread.run_sync(
             lambda: log_recall_event(
                 db,
@@ -1867,6 +2011,8 @@ async def _perform_recall(
                 query_text=(query or None),
                 result_count=len(records),
                 source="mcp",
+                memory_ids=[str(r.id) for r in records],
+                session_id=None,
             )
         )
         # Meter the recall against the org's monthly allowance (best-effort;
@@ -1912,6 +2058,23 @@ async def _perform_recall(
                 "recall compression raised; returning the uncompressed payload",
                 exc_info=True,
             )
+        # Claims ride every recall response (Build 4): agents already recall
+        # before working, so they cannot NOT see live claims — there is no
+        # separate opt-in surface. Project-scoped where a project resolved
+        # above, org-wide otherwise. Added AFTER compress_payload, which only
+        # ever touches the "memories" key, so active_claims is never subject
+        # to the common-field hoist. Best-effort: a claims-listing failure
+        # must never be the reason a recall fails.
+        try:
+            payload["active_claims"] = await anyio.to_thread.run_sync(
+                lambda: claims.live_claims(db, org_id=org_id, project_id=project_id)
+            )
+        except Exception:
+            logger.warning(
+                "recall: live_claims lookup raised; omitting active_claims",
+                exc_info=True,
+            )
+            payload["active_claims"] = []
         return payload
     except Exception:
         logger.exception("brain recall failed (scope=%s)", scope)
@@ -2238,6 +2401,101 @@ async def _perform_share(ctx: Context, *, memory_id: str, to: str) -> dict[str, 
     except Exception:
         logger.exception("brain share failed (to=%s)", to)
         return {"shared": False, "error": "share_failed"}
+    finally:
+        db.close()
+
+
+async def _perform_claim(
+    ctx: Context, *, description: str, ttl_minutes: int
+) -> dict[str, Any]:
+    """Shared body for the ``claim`` tool: register a work claim.
+
+    A claim is advisory, not a lock — it records intent so OTHER agents find
+    out (via ``recall``'s ``active_claims`` and this call's own
+    ``collisions``) that overlapping work is in flight; it never blocks the
+    caller's own registration. Best-effort on the embed: an embedding
+    failure still registers the claim, just with no collision detection for
+    it (:func:`shared.claims.create_claim`).
+
+    Project filing follows the SAME best-effort X-Vex-Project header
+    resolution :func:`_perform_write` uses: an unresolvable header files the
+    claim org-wide rather than failing the call — filing is relevance here,
+    not security, exactly as it is for a write.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        logger.error("brain claim got no transport request; cannot authenticate")
+        return {
+            "claim_id": None,
+            "error": "unauthorized",
+            "detail": "no request context",
+        }
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"claim_id": None, "error": "unauthorized", "detail": str(exc.detail)}
+
+    user_id = resolve_request_user_id(request)
+
+    db = SessionLocal()
+    try:
+        project_id = await anyio.to_thread.run_sync(
+            lambda: resolve_project_from_request(request, db, org_id=org_id)
+        )
+        result = await claims.create_claim(
+            db,
+            org_id=org_id,
+            description=description,
+            agent_id=agent_id,
+            user_id=user_id,
+            project_id=project_id,
+            ttl_minutes=ttl_minutes,
+        )
+        return result
+    except Exception:
+        logger.exception("brain claim failed")
+        return {"claim_id": None, "error": "claim_failed"}
+    finally:
+        db.close()
+
+
+async def _perform_release(ctx: Context, *, claim_id: str) -> dict[str, Any]:
+    """Shared body for the ``release`` tool: release one of MY OWN claims.
+
+    Owner-scoped by :func:`shared.claims.release_claim` (org_id AND
+    agent_id must match); a malformed ``claim_id`` is refused before any
+    query, same discipline as the ``forget`` tool's ``memory_id`` handling.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        logger.error("brain release got no transport request; cannot authenticate")
+        return {
+            "released": False,
+            "error": "unauthorized",
+            "detail": "no request context",
+        }
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"released": False, "error": "unauthorized", "detail": str(exc.detail)}
+
+    db = SessionLocal()
+    try:
+        released = await anyio.to_thread.run_sync(
+            lambda: claims.release_claim(
+                db, org_id=org_id, claim_id=claim_id, agent_id=agent_id
+            )
+        )
+        return {"released": released}
+    except Exception:
+        logger.exception("brain release failed")
+        return {"released": False, "error": "release_failed"}
     finally:
         db.close()
 
@@ -2811,8 +3069,7 @@ async def _perform_project_grant(
         if (
             existing == projects.ROLE_ADMIN
             and role != projects.ROLE_ADMIN
-            and projects.admin_count(db, org_id=org_id, project_id=project_id)
-            == 1
+            and projects.admin_count(db, org_id=org_id, project_id=project_id) == 1
         ):
             return {
                 "granted": False,
@@ -3005,6 +3262,8 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        memory_id: MemoryIdParam = None,
+        base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx,
@@ -3013,6 +3272,8 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata={"source": "mcp"},
             scope=scope,
             space=space,
+            memory_id=memory_id,
+            base_revision=base_revision,
         )
 
     @mcp.tool(
@@ -3034,6 +3295,8 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        memory_id: MemoryIdParam = None,
+        base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx,
@@ -3042,6 +3305,8 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata={"source": "mcp"},
             scope=scope,
             space=space,
+            memory_id=memory_id,
+            base_revision=base_revision,
         )
 
     @mcp.tool(
@@ -3094,6 +3359,8 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        memory_id: MemoryIdParam = None,
+        base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
         metadata = {"source": "mcp"}
         if rationale is not None:
@@ -3105,6 +3372,8 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata=metadata,
             scope=scope,
             space=space,
+            memory_id=memory_id,
+            base_revision=base_revision,
         )
 
     @mcp.tool(
@@ -3124,6 +3393,8 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        memory_id: MemoryIdParam = None,
+        base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx,
@@ -3132,6 +3403,8 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata={"source": "mcp"},
             scope=scope,
             space=space,
+            memory_id=memory_id,
+            base_revision=base_revision,
         )
 
     @mcp.tool(
@@ -3318,6 +3591,50 @@ def _register_tools(mcp: FastMCP) -> None:
         return await _perform_share(ctx, memory_id=memory_id, to=to)
 
     @mcp.tool(
+        name="claim",
+        description=(
+            "Register a work claim before starting something that could "
+            "overlap with another agent — advisory, not a lock. Returns "
+            "`collisions`: other agents' live claims whose description is "
+            "semantically close to yours. Args: description, optional "
+            "ttl_minutes (default 15, clamped 1-240)."
+        ),
+    )
+    async def claim(
+        ctx: Context,
+        description: Annotated[
+            str, Field(description="What you are about to work on.")
+        ],
+        ttl_minutes: Annotated[
+            int,
+            Field(
+                description=(
+                    "How long the claim stays live if never released "
+                    "(default 15, clamped to 1-240)."
+                )
+            ),
+        ] = 15,
+    ) -> dict[str, Any]:
+        return await _perform_claim(
+            ctx, description=description, ttl_minutes=ttl_minutes
+        )
+
+    @mcp.tool(
+        name="release",
+        description=(
+            "Release a work claim you made, so it stops showing up as a "
+            "collision or in active_claims. Arg: claim_id (from `claim`)."
+        ),
+    )
+    async def release(
+        ctx: Context,
+        claim_id: Annotated[
+            str, Field(description="Id of the claim to release, from `claim`.")
+        ],
+    ) -> dict[str, Any]:
+        return await _perform_release(ctx, claim_id=claim_id)
+
+    @mcp.tool(
         name="project_create",
         description=(
             "Name a project and become its administrator. NOTE: projects are "
@@ -3484,8 +3801,7 @@ def _register_tools(mcp: FastMCP) -> None:
             Literal["read", "write", "manage", "admin", "member"],
             Field(
                 description=(
-                    "read | write | manage | admin. `member` is an alias for "
-                    "write."
+                    "read | write | manage | admin. `member` is an alias for write."
                 )
             ),
         ] = "write",
