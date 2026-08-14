@@ -553,32 +553,85 @@ async def test_find_similar_memory_below_threshold():
 
 
 def test_supersede_memory():
-    """supersede_memory should update the old memory's status, then
-    retroactively mark past stale serves via shared.stale (best-effort, a
-    second execute/commit pair on the same session)."""
+    """supersede_memory should update the old memory's status, look up the
+    NEW row's real created_at (a single org-predicated PK SELECT), and use
+    THAT — not the flip-time now() — for the stale-serve ledger marking.
+    Using now() instead would systematically run late: the worker commits
+    the new row before calling this, and the curator's embed/search/judge
+    pipeline runs first, so now() would under-mark exactly the curator-lag
+    serves this counter exists to catch."""
     db_session = MagicMock()
-    db_session.execute.return_value.rowcount = 0
     old_id = uuid.uuid4()
     new_id = uuid.uuid4()
+    real_created_at = datetime(2020, 1, 1, tzinfo=timezone.utc)  # distinct sentinel
+
+    def _execute(sql, params=None):
+        result = MagicMock()
+        if "SELECT created_at" in str(sql):
+            result.fetchone.return_value = (real_created_at,)
+        else:
+            result.rowcount = 0
+        return result
+
+    db_session.execute.side_effect = _execute
 
     supersede_memory(db_session, old_id, new_id, org_id="org-1")
 
-    # First call: the status-flip UPDATE on session_memories.
-    assert db_session.execute.call_count == 2
-    sql, params = db_session.execute.call_args_list[0].args
+    assert db_session.execute.call_count == 3
+    calls = db_session.execute.call_args_list
+
+    # Call 1: the status-flip UPDATE on session_memories.
+    sql, params = calls[0].args
     assert "org_id = :org_id" in str(sql)
     assert "SET status = 'superseded'" in str(sql)
     assert params["org_id"] == "org-1"
     assert params["old_memory_id"] == str(old_id)
     assert params["new_memory_id"] == str(new_id)
+    flip_at = params["flip_at"]
 
-    # Second call: the stale-serve ledger UPDATE, keyed off the same moment.
-    stale_sql, stale_params = db_session.execute.call_args_list[1].args
+    # Call 2: the org-predicated PK lookup of the NEW row's real created_at.
+    lookup_sql, lookup_params = calls[1].args
+    assert "SELECT created_at" in str(lookup_sql)
+    assert "session_memories" in str(lookup_sql)
+    assert "org_id = :org_id" in str(lookup_sql)
+    assert lookup_params["new_memory_id"] == str(new_id)
+    assert lookup_params["org_id"] == "org-1"
+
+    # Call 3: the stale-serve ledger UPDATE — keyed off the NEW row's real
+    # created_at (the sentinel), NOT the flip-time now().
+    stale_sql, stale_params = calls[2].args
     assert "recall_outcomes" in str(stale_sql)
     assert stale_params["old_memory_id"] == str(old_id)
-    assert stale_params["superseding_created_at"] == params["superseding_created_at"]
+    assert stale_params["superseding_created_at"] == real_created_at
+    assert stale_params["superseding_created_at"] != flip_at
 
     assert db_session.commit.call_count == 2
+
+
+def test_supersede_memory_falls_back_to_flip_time_when_lookup_fails():
+    """If the created_at lookup raises (best-effort), stale marking should
+    still run, keyed off the flip-time now() rather than being skipped."""
+    db_session = MagicMock()
+    old_id = uuid.uuid4()
+    new_id = uuid.uuid4()
+
+    def _execute(sql, params=None):
+        if "SELECT created_at" in str(sql):
+            raise RuntimeError("db down")
+        result = MagicMock()
+        result.rowcount = 0
+        return result
+
+    db_session.execute.side_effect = _execute
+
+    supersede_memory(db_session, old_id, new_id, org_id="org-1")
+
+    calls = db_session.execute.call_args_list
+    assert len(calls) == 3
+    flip_at = calls[0].args[1]["flip_at"]
+    stale_params = calls[2].args[1]
+    assert stale_params["superseding_created_at"] == flip_at
+    db_session.rollback.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

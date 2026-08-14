@@ -1224,19 +1224,26 @@ def supersede_memory(
 
     After the status flip commits, retroactively marks any past recall
     serves of the old memory stale (:func:`shared.stale.mark_stale_serves`)
-    — but only the ones served at or after this moment, since that is the
-    instant the fact changed and the superseding belief came into being.
-    Serves before it were correct at the time. This is best-effort: a ledger
-    failure is logged and swallowed, never raised, so it can never turn a
-    successful supersession into a failed one.
+    — but only the ones served at or after the moment the superseding
+    belief actually came into being. Serves before it were correct at the
+    time. That moment is the *new* row's real ``created_at``, fetched with a
+    single org-predicated primary-key lookup (we already have its id — this
+    is not the "re-query to find the row" the brief warned against, it's an
+    indexed read of one column). Using ``now()`` at call time instead would
+    systematically run late: the worker inserts-and-commits the new row
+    before calling this, and the curator embeds, vector-searches, and runs a
+    per-candidate LLM judge first — seconds of the exact curator-lag window
+    this counter exists to catch would go under-marked. The lookup is
+    best-effort: if it fails or the row is somehow gone, this falls back to
+    ``now()`` rather than block or fail the supersession.
     """
-    superseding_created_at = datetime.now(timezone.utc)
+    flip_at = datetime.now(timezone.utc)
     db_session.execute(
         text("""
             UPDATE session_memories
             SET status = 'superseded',
                 superseded_by = :new_memory_id,
-                updated_at = :superseding_created_at
+                updated_at = :flip_at
             WHERE id = :old_memory_id
               AND org_id = :org_id
         """),
@@ -1244,10 +1251,34 @@ def supersede_memory(
             "old_memory_id": str(old_memory_id),
             "new_memory_id": str(new_memory_id),
             "org_id": org_id,
-            "superseding_created_at": superseding_created_at,
+            "flip_at": flip_at,
         },
     )
     db_session.commit()
+
+    superseding_created_at = flip_at
+    try:
+        row = db_session.execute(
+            text("""
+                SELECT created_at FROM session_memories
+                WHERE id = :new_memory_id
+                  AND org_id = :org_id
+            """),
+            {"new_memory_id": str(new_memory_id), "org_id": org_id},
+        ).fetchone()
+        if row is not None and row[0] is not None:
+            superseding_created_at = row[0]
+    except Exception:
+        try:
+            db_session.rollback()
+        except Exception:
+            pass
+        logger.debug(
+            "supersede_memory: could not read new row's created_at "
+            "(new=%s org=%s); falling back to flip time",
+            new_memory_id, org_id, exc_info=True,
+        )
+
     stale.mark_stale_serves(
         db_session,
         org_id=org_id,
