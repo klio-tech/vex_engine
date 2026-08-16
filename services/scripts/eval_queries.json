@@ -1,0 +1,110 @@
+{
+  "_comment": [
+    "The recall-ranking evaluation set. Two kinds of entry, deliberately mixed:",
+    "the four queries the 2026-08-16 ranking diagnosis used (source: diagnosis),",
+    "and queries taken verbatim from real production brain_recall_events across",
+    "seven different projects (source: session). The real ones matter because a",
+    "hand-written query set is a query set somebody unconsciously wrote to pass.",
+    "",
+    "'project' is the repo the session was in — the ground truth for scoring. A",
+    "returned row filed under a DIFFERENT project is contamination. Rows that are",
+    "unfiled (project_id IS NULL) are neither: nothing claims they belong",
+    "elsewhere, and they are what the two-tier filter deliberately admits.",
+    "",
+    "'expect_empty' marks queries that SHOULD return nothing: the relevance floor",
+    "returning zero rows is the feature, and a query set with no such case cannot",
+    "tell a working floor from an absent one."
+  ],
+  "org_id": "vex",
+  "queries": [
+    {
+      "text": "how does the proxy inject memories",
+      "project": "Klio",
+      "source": "diagnosis"
+    },
+    {
+      "text": "what did we decide about capture defaults",
+      "project": "Klio",
+      "source": "diagnosis"
+    },
+    {
+      "text": "why did we stop wiring Claude Code",
+      "project": "Klio",
+      "source": "diagnosis"
+    },
+    {
+      "text": "team project context: key decisions, conventions, architecture, and current work",
+      "project": "Klio",
+      "source": "diagnosis",
+      "note": "the Node proxy's AMBIENT_QUERY, verbatim"
+    },
+    {
+      "text": "how is Klio positioned and what did we decide about onboarding",
+      "project": "Klio",
+      "source": "session"
+    },
+    {
+      "text": "how does the memory engine handle scoping and recall",
+      "project": "vex_engine",
+      "source": "session"
+    },
+    {
+      "text": "pool_pre_ping",
+      "project": "vex_engine",
+      "source": "session",
+      "note": "a rare literal — the lexical arm's reason for existing"
+    },
+    {
+      "text": "how do we rate limit",
+      "project": "vex_engine",
+      "source": "session"
+    },
+    {
+      "text": "MoonForge architecture design decision ingestion pipeline database schema backend",
+      "project": "moonforge-prod",
+      "source": "session"
+    },
+    {
+      "text": "Unity SDK analytics events error tracking implementation",
+      "project": "moonforge-prod",
+      "source": "session"
+    },
+    {
+      "text": "Vedic astrology dasha calculation",
+      "project": "Astrology",
+      "source": "diagnosis"
+    },
+    {
+      "text": "the varga engine and unequal Trimsamsa portions in D30",
+      "project": "Astrology",
+      "source": "session"
+    },
+    {
+      "text": "captcha solving and keeping Steel sessions alive",
+      "project": "hirly",
+      "source": "session"
+    },
+    {
+      "text": "which Supabase container and port is the local stack on",
+      "project": "hirly",
+      "source": "session"
+    },
+    {
+      "text": "entity budget and the curator's savepoint loop",
+      "project": "Agent Memory",
+      "source": "session"
+    },
+    {
+      "text": "video artifact upload for the founder marketing clip",
+      "project": "loopreel",
+      "source": "session"
+    },
+    {
+      "text": "the mating habits of the Patagonian toothfish in captivity",
+      "project": "Klio",
+      "source": "control",
+      "expect_empty": true,
+      "note": "nothing in this corpus is about this. A recall that answers it confidently is the bug."
+    }
+  ]
+}

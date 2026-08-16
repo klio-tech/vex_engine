@@ -24,7 +24,8 @@ import litellm
 from litellm import acompletion, aembedding
 from sqlalchemy import text
 
-from shared import lexical, metrics, stale
+from shared import embedding_space, lexical, metrics, ranking, stale
+from shared.embedding_space import ROLE_PASSAGE, ROLE_QUERY
 from shared.env_config import parse_float, parse_int
 from shared.redaction import redact
 
@@ -343,7 +344,7 @@ _embed_memo: "OrderedDict[tuple[str, str], tuple[list[float], float]]" = Ordered
 _embed_memo_lock = threading.Lock()
 
 
-def _memo_get(key: tuple[str, str]) -> Optional[list[float]]:
+def _memo_get(key: tuple[str, str, str]) -> Optional[list[float]]:
     """The memoized vector for *key*, or ``None`` if absent or expired."""
     now = time.monotonic()
     with _embed_memo_lock:
@@ -358,7 +359,7 @@ def _memo_get(key: tuple[str, str]) -> Optional[list[float]]:
         return vector
 
 
-def _memo_put(key: tuple[str, str], vector: list[float]) -> None:
+def _memo_put(key: tuple[str, str, str], vector: list[float]) -> None:
     """Memoize *vector*, evicting oldest-first at :data:`EMBED_MEMO_MAX_ENTRIES`."""
     with _embed_memo_lock:
         _embed_memo[key] = (vector, time.monotonic())
@@ -379,8 +380,14 @@ def embedding_memo_size() -> int:
         return len(_embed_memo)
 
 
-async def _aembedding_call(text_input: str) -> list[float]:
+async def _aembedding_call(text_input: str, prefix: str = "") -> list[float]:
     """Perform a single embedding-backend call via ``litellm.aembedding()``.
+
+    *prefix* is prepended to *text_input* immediately before the call and is
+    never counted against the caller's truncation budget. That ordering is the
+    point: the caller truncates its own text, and ``passage: `` is added to
+    whatever survived, so a progressive-retry shrink can never eat the prefix
+    and silently embed a document into the query half of the space.
 
     Reads the model name from the ``MEMORY_EMBEDDING_MODEL`` env var, falling
     back to :data:`DEFAULT_EMBEDDING_MODEL`, and optional gateway credentials
@@ -410,7 +417,7 @@ async def _aembedding_call(text_input: str) -> list[float]:
     api_base = os.environ.get("LITELLM_API_URL") or os.environ.get("OPENAI_API_BASE")
     api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
 
-    kwargs: dict[str, Any] = {"model": model, "input": [text_input]}
+    kwargs: dict[str, Any] = {"model": model, "input": [prefix + text_input]}
     if api_base:
         kwargs["api_base"] = api_base
         kwargs["custom_llm_provider"] = "openai"
@@ -456,11 +463,26 @@ async def _aembedding_call(text_input: str) -> list[float]:
     return item["embedding"] if isinstance(item, dict) else item.embedding
 
 
-async def embed_text(text_input: str) -> Optional[list[float]]:
+async def embed_text(
+    text_input: str,
+    *,
+    role: str = ROLE_PASSAGE,
+    space: Optional[str] = None,
+) -> Optional[list[float]]:
     """Generate an embedding vector via ``litellm.aembedding()``.
 
     Reads the model name from the ``MEMORY_EMBEDDING_MODEL`` env var, falling
     back to :data:`DEFAULT_EMBEDDING_MODEL`.
+
+    Asymmetry — *role* says which half of the space this text belongs to.
+    ``passage`` is stored content, ``query`` is something being searched for.
+    In :data:`shared.embedding_space.SPACE_V1` neither gets a prefix and this
+    argument changes nothing; in ``v2`` it selects E5's mandatory ``passage: ``
+    / ``query: `` prefix, and getting it wrong is silent — the text embeds
+    fine, into the wrong half, and the only symptom is recall quality nobody
+    can attribute. It defaults to ``passage`` because most callers embed
+    content; every call site that embeds a *search string* passes ``query``
+    explicitly.
 
     Robustness — progressive truncation so a long/dense note never fails a
     write: :data:`MAX_EMBED_CHARS` is only a *char* proxy for the model's 512
@@ -492,10 +514,18 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
         A list of floats representing the embedding, or ``None`` only when the
         embedding backend fails at every attempted size.
     """
+    prefix = embedding_space.prefix_for(role, space)
+
     # The memo is keyed on the ORIGINAL input, not the truncated candidate: two
     # callers passing the same content must collapse to one call regardless of
     # which truncation path each would have taken (they take the same one).
-    memo_key = (_embed_model(), text_input)
+    #
+    # The prefix is part of the key, not decoration. Dual-write embeds the same
+    # content twice in one request — once unprefixed for v1, once as a passage
+    # for v2 — and a key that ignored the prefix would hand the second call the
+    # first call's vector, writing an identical vector into both columns and
+    # making the whole migration a very convincing no-op.
+    memo_key = (_embed_model(), prefix, text_input)
     memoized = _memo_get(memo_key)
     if memoized is not None:
         # A single write embeds the same string twice — once to probe for a
@@ -519,7 +549,7 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
 
     while True:
         try:
-            vector = await _aembedding_call(candidate)
+            vector = await _aembedding_call(candidate, prefix)
             # Only successes are memoized. Memoizing a failure would pin a
             # transient gateway blip to that content for the whole TTL, so a
             # retry that would have worked returns None instead.
@@ -571,6 +601,230 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
                 exc_info=True,
             )
             return None
+
+
+# ---------------------------------------------------------------------------
+# Embedding-space plumbing (which column, which prefix, which write)
+# ---------------------------------------------------------------------------
+
+#: Process-lifetime memo for "does session_memories.embedding_v2 exist yet".
+#: ``None`` means "not probed". A dict rather than a bare global so the reset
+#: helper below can clear it without a ``global`` statement.
+_v2_column_state: dict[str, Optional[bool]] = {"present": None}
+
+
+def reset_embedding_space_probe() -> None:
+    """Forget whether ``embedding_v2`` exists. For tests and after a migration."""
+    _v2_column_state["present"] = None
+
+
+def _v2_column_present(db_session: Any) -> bool:
+    """Whether migration 046's ``embedding_v2`` column is on this database.
+
+    Probed once per process and cached, because it answers a question that
+    changes exactly once in the lifetime of the deployment.
+
+    This exists so the code is safe in ANY deploy order. Migration 046 and the
+    services that read the column ship together, and on Railway they are
+    separate deployments that can land in either order or race. Without this
+    probe, a service that came up first would put ``embedding_v2`` in its
+    INSERT column list against a table that has no such column, and every
+    memory write in the org would fail with an ``UndefinedColumn`` error until
+    the migration landed. With it, that service simply behaves as it did the
+    day before.
+
+    Any failure answers ``False`` — the conservative direction, since ``False``
+    is the pre-migration behaviour and is always correct-if-suboptimal, while a
+    wrong ``True`` breaks writes.
+    """
+    cached = _v2_column_state["present"]
+    if cached is not None:
+        return cached
+
+    present = False
+    try:
+        row = db_session.execute(
+            text(
+                """
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'session_memories'
+                  AND column_name = :column
+                """
+            ),
+            {"column": embedding_space.V2_COLUMN},
+        ).first()
+        present = row is not None
+    except Exception:
+        logger.warning(
+            "embedding-space probe failed; assuming %s is absent",
+            embedding_space.V2_COLUMN,
+            exc_info=True,
+        )
+        try:
+            db_session.rollback()
+        except Exception:
+            logger.warning("rollback after a failed embedding-space probe also failed")
+        return False
+
+    _v2_column_state["present"] = present
+    if not present:
+        logger.info(
+            "%s is not present; recall and writes stay on the %s space",
+            embedding_space.V2_COLUMN,
+            embedding_space.SPACE_V1,
+        )
+    return present
+
+
+def _apply_ef_search(db_session: Any, candidate_pool: int) -> None:
+    """Raise ``hnsw.ef_search`` for this transaction, best-effort.
+
+    pgvector's HNSW scan cannot return more rows than its search list held, and
+    the default list is 40. Asking for a candidate pool of 64 without raising
+    ``ef_search`` therefore buys nothing — the query returns 40-ish rows and
+    the deeper pool is a fiction. This is the other half of
+    :func:`shared.ranking.candidate_pool`.
+
+    ``SET LOCAL`` and not ``SET``: the value must die with the transaction, or
+    it leaks onto whatever the pooled connection does next. Safe under Neon's
+    transaction-mode pooler for exactly that reason — it is scoped to the
+    transaction PgBouncer already keeps together, and it is a GUC assignment
+    rather than a libpq startup parameter, which is the thing that endpoint
+    refuses.
+
+    Every failure is swallowed, because a tuning hint must never be the reason
+    a recall fails. A failed statement aborts the transaction, so the rollback
+    is not optional — without it the recall's own SELECT would fail next with
+    an error about a statement it never issued.
+    """
+    target = ranking.ef_search()
+    if target <= 0:
+        return
+    try:
+        db_session.execute(
+            text(f"SET LOCAL hnsw.ef_search = {int(max(target, candidate_pool))}")
+        )
+    except Exception:
+        logger.warning(
+            "recall: could not raise hnsw.ef_search; using the default", exc_info=True
+        )
+        try:
+            db_session.rollback()
+        except Exception:
+            logger.warning("rollback after a failed ef_search hint also failed")
+
+
+def effective_space(db_session: Any) -> str:
+    """The space this database can actually serve, honouring the env switch.
+
+    ``KLIO_EMBEDDING_SPACE=v2`` against a database without the column is an
+    operator mistake that would otherwise turn every recall into a 500. It
+    degrades to ``v1`` — worse ranking, working recall — rather than failing.
+    """
+    space = embedding_space.active_space()
+    if space == embedding_space.SPACE_V2 and not _v2_column_present(db_session):
+        return embedding_space.SPACE_V1
+    return space
+
+
+def resolve_write_spaces(db_session: Any) -> tuple[str, ...]:
+    """The spaces this write should populate, filtered to what exists here.
+
+    Touches the database (via the column probe), so a caller that is about to
+    release its pooled connection must call this BEFORE releasing it and pass
+    the result down.
+    """
+    spaces = embedding_space.write_spaces()
+    if _v2_column_present(db_session):
+        return spaces
+    return tuple(s for s in spaces if s != embedding_space.SPACE_V2)
+
+
+async def embed_passage_for_write(
+    db_session: Any, content: str, *, spaces: Optional[tuple[str, ...]] = None
+) -> Optional[dict[str, list[float]]]:
+    """``{space: vector}`` for a row about to be written, or ``None`` to abort.
+
+    The FIRST space :func:`shared.embedding_space.write_spaces` names is the
+    one recall reads, and its vector is required: a row without it is written
+    but invisible, which is worse than a write that failed and said so. The
+    remaining spaces are best-effort — a row missing its *inactive* vector is
+    fully readable today and merely un-prepared for a switch that has not
+    happened, and the backfill script picks it up.
+
+    *spaces* lets a caller resolve the space list BEFORE it releases its
+    pooled connection. That is not an optimisation: :func:`resolve_write_spaces`
+    executes a query, and a caller that has already called
+    :func:`release_connection` would silently check the connection back out and
+    hold it across the embedding round trip — precisely the thing
+    ``release_connection`` exists to prevent, and precisely the thing
+    ``test_write_memory_does_not_hold_its_caller_s_connection`` measures.
+
+    Returns ``None`` only when the required vector could not be produced,
+    preserving the historical "embedding failed → do not write" contract
+    byte-for-byte in the single-space case.
+    """
+    if spaces is None:
+        spaces = resolve_write_spaces(db_session)
+    vectors: dict[str, list[float]] = {}
+    for index, space in enumerate(spaces):
+        vector = await embed_text(content, role=ROLE_PASSAGE, space=space)
+        if vector is not None:
+            vectors[space] = vector
+            continue
+        if index == 0:
+            return None
+        logger.warning(
+            "embedding for the inactive space %r failed; the row is written "
+            "without it and the backfill will fill it in",
+            space,
+        )
+    return vectors
+
+
+def embed_passage_for_write_sync(
+    db_session: Any, content: str, *, spaces: Optional[tuple[str, ...]] = None
+) -> Optional[dict[str, list[float]]]:
+    """Synchronous twin of :func:`embed_passage_for_write`, for the CAS path.
+
+    Same required/best-effort split; see :func:`_embed_text_sync` for why that
+    path cannot ``await``.
+    """
+    if spaces is None:
+        spaces = resolve_write_spaces(db_session)
+    vectors: dict[str, list[float]] = {}
+    for index, space in enumerate(spaces):
+        vector = _embed_text_sync(content, role=ROLE_PASSAGE, space=space)
+        if vector is not None:
+            vectors[space] = vector
+            continue
+        if index == 0:
+            return None
+        logger.warning(
+            "CAS supersede: embedding for the inactive space %r failed; "
+            "the row is written without it",
+            space,
+        )
+    return vectors
+
+
+def embedding_insert_columns(vectors: dict[str, list[float]]) -> tuple[str, str]:
+    """``(column_list, value_list)`` fragments for an INSERT's vector columns.
+
+    Built from :data:`shared.embedding_space` literals keyed by the spaces
+    present in *vectors* — no caller text reaches the SQL — so an INSERT names
+    exactly the columns this deployment has, and binds them by parameter.
+    """
+    columns = [embedding_space.column_for(space) for space in sorted(vectors)]
+    return ", ".join(columns), ", ".join(f":{column}" for column in columns)
+
+
+def embedding_insert_params(vectors: dict[str, list[float]]) -> dict[str, str]:
+    """The bind parameters matching :func:`embedding_insert_columns`."""
+    return {
+        embedding_space.column_for(space): str(vector)
+        for space, vector in vectors.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -874,10 +1128,18 @@ async def write_memory(
     """
     # Availability: return the pooled connection BEFORE awaiting the
     # embedding. See :func:`release_connection` for the measurements.
+    # Both DB touches happen BEFORE the release, and both have to: the column
+    # probe and the space resolution are queries, and running either after the
+    # release would check the connection straight back out and hold it across
+    # the embedding round trip.
+    space = effective_space(db_session)
+    spaces = resolve_write_spaces(db_session)
     release_connection(db_session)
-    embedding = await embed_text(content)
-    if embedding is None:
+    vectors = await embed_passage_for_write(db_session, content, spaces=spaces)
+    if not vectors:
         return None
+    embedding = vectors[space]
+    vector_columns, vector_values = embedding_insert_columns(vectors)
 
     memory_id = uuid.uuid4()
     now = datetime.now(timezone.utc)
@@ -892,16 +1154,16 @@ async def write_memory(
         to be a function before it can leave the event loop.
         """
         db_session.execute(
-            text("""
+            text(f"""
             INSERT INTO session_memories (
                 id, session_id, org_id, agent_id, execution_id,
-                memory_type, content, embedding, confidence,
+                memory_type, content, {vector_columns}, confidence,
                 sequence_number, scope, status, metadata,
                 created_at, updated_at, recall_hidden,
                 user_id, provenance
             ) VALUES (
                 :id, :session_id, :org_id, :agent_id, :execution_id,
-                :memory_type, :content, :embedding, :confidence,
+                :memory_type, :content, {vector_values}, :confidence,
                 :sequence_number, 'session', 'active', :metadata,
                 :created_at, :updated_at, :recall_hidden,
                 :user_id, :provenance
@@ -915,7 +1177,7 @@ async def write_memory(
                 "execution_id": execution_id,
                 "memory_type": memory_type,
                 "content": content,
-                "embedding": str(embedding),
+                **embedding_insert_params(vectors),
                 "confidence": confidence,
                 "sequence_number": sequence_number,
                 "metadata": json.dumps(meta),
@@ -996,8 +1258,16 @@ async def retrieve_memories(
     """
     # Availability: return the pooled connection BEFORE awaiting the
     # embedding. See :func:`release_connection` for the measurements.
+    # The vector column and the query prefix are resolved together, from the
+    # SAME space, and never independently: a ``query: ``-prefixed vector
+    # compared against the unprefixed v1 column is not a slightly-stale
+    # comparison, it is a different space, and it ranks worse than either
+    # space used consistently. Resolved BEFORE the release, because the probe
+    # behind it is a query.
+    space = effective_space(db_session)
+    vector_column = embedding_space.column_for(space)
     release_connection(db_session)
-    embedding = await embed_text(query_text)
+    embedding = await embed_text(query_text, role=ROLE_QUERY, space=space)
     if embedding is None:
         return []
 
@@ -1005,7 +1275,7 @@ async def retrieve_memories(
 
     # Semantic similarity search
     semantic_result = db_session.execute(
-        text("""
+        text(f"""
             SELECT id, session_id, org_id, agent_id, execution_id,
                    memory_type, content, embedding, confidence,
                    sequence_number, scope, status, superseded_by,
@@ -1016,7 +1286,7 @@ async def retrieve_memories(
               AND status = 'active'
               AND scope = 'session'
               AND recall_hidden = FALSE
-            ORDER BY embedding <=> :embedding
+            ORDER BY {vector_column} <=> :embedding
             LIMIT :limit
         """),
         {
@@ -1126,8 +1396,16 @@ async def find_similar_memory(
 
     # Availability: return the pooled connection BEFORE awaiting the
     # embedding. See :func:`release_connection` for the measurements.
+    # ``passage``, not ``query``: dedup compares a candidate DOCUMENT against
+    # stored DOCUMENTS. Both sides of this comparison are the same kind of
+    # text, so both take the same prefix — and giving the candidate the query
+    # prefix here would shift the whole similarity distribution against a
+    # fixed 0.95 threshold, which is how a dedup threshold silently stops
+    # deduplicating. Resolved before the release; see :func:`write_memory`.
+    space = effective_space(db_session)
+    vector_column = embedding_space.column_for(space)
     release_connection(db_session)
-    embedding = await embed_text(content)
+    embedding = await embed_text(content, role=ROLE_PASSAGE, space=space)
     if embedding is None:
         return None
 
@@ -1188,10 +1466,11 @@ async def find_similar_memory(
                    memory_type, content, embedding, confidence,
                    sequence_number, scope, status, superseded_by,
                    metadata, created_at, updated_at,
-                   1 - (embedding <=> :embedding) AS similarity
+                   1 - ({vector_column} <=> :embedding) AS similarity
             FROM session_memories
             WHERE {where_clause}
-            ORDER BY embedding <=> :embedding
+              AND {vector_column} IS NOT NULL
+            ORDER BY {vector_column} <=> :embedding
             LIMIT 1
         """),
             params,
@@ -1317,7 +1596,12 @@ def record_write_conflict() -> None:
     metrics.record(metrics.WRITE_CONFLICTS.inc)
 
 
-def _embed_text_sync(text_input: str) -> Optional[list[float]]:
+def _embed_text_sync(
+    text_input: str,
+    *,
+    role: str = ROLE_PASSAGE,
+    space: Optional[str] = None,
+) -> Optional[list[float]]:
     """Synchronous embedding, for the one write path that cannot ``await``.
 
     :func:`supersede_with_revision` is the server side of Mukta's
@@ -1337,6 +1621,10 @@ def _embed_text_sync(text_input: str) -> Optional[list[float]]:
     here blocks only that one CAS write rather than the event loop every other
     write path shares.
 
+    *role* and *space* mean exactly what they mean on :func:`embed_text`; this
+    function is prefixed the same way so a CAS-superseded row lands in the same
+    half of the space as the row it replaces.
+
     Returns:
         The embedding vector, or ``None`` if the backend call fails.
     """
@@ -1344,6 +1632,7 @@ def _embed_text_sync(text_input: str) -> Optional[list[float]]:
         candidate = text_input[:MAX_EMBED_CHARS]
     else:
         candidate = text_input
+    candidate = embedding_space.prefix_for(role, space) + candidate
 
     model = _embed_model()
     api_base = os.environ.get("LITELLM_API_URL") or os.environ.get("OPENAI_API_BASE")
@@ -1512,13 +1801,14 @@ def _current_belief_in_chain(
 
 
 def _prepare_cas_write(
+    db_session: Any,
     new_content: str,
     *,
     metadata: Optional[dict],
     scope: str,
     project_id: Optional[str],
     user_id: Optional[str],
-) -> tuple[str, dict, Optional[list[float]], bool, list[str]]:
+) -> tuple[str, dict, Optional[dict[str, list[float]]], bool, list[str]]:
     """Redact and embed the re-asserted belief — BEFORE the CAS guard runs.
 
     H3: the guard is a single ``UPDATE`` that takes a row-level lock and
@@ -1540,9 +1830,11 @@ def _prepare_cas_write(
     ``_expand_via_graph`` imports ``shared.graph_store`` lazily.
 
     Returns:
-        ``(content, metadata, embedding, redacted, redaction_kinds)``.
-        ``embedding`` is ``None`` only when the backend call failed — the
-        caller decides how to respond, this function does not raise for it.
+        ``(content, metadata, vectors, redacted, redaction_kinds)``.
+        ``vectors`` is ``{space: embedding}`` for every space this deployment
+        writes (see :func:`embed_passage_for_write_sync`), or ``None`` only
+        when the backend call for the space recall READS failed — the caller
+        decides how to respond, this function does not raise for it.
 
     Raises:
         ValueError: unsupported ``scope``, a ``scope='private'`` write with
@@ -1587,8 +1879,8 @@ def _prepare_cas_write(
             meta = dict(meta or {})
             meta["redactions"] = redaction_kinds
 
-    embedding = _embed_text_sync(content)
-    return content, meta, embedding, redacted, redaction_kinds
+    vectors = embed_passage_for_write_sync(db_session, content)
+    return content, meta, vectors, redacted, redaction_kinds
 
 
 def _apply_supersession_for_cas(
@@ -1597,7 +1889,7 @@ def _apply_supersession_for_cas(
     org_id: str,
     old_id: str,
     content: str,
-    embedding: list[float],
+    vectors: dict[str, list[float]],
     metadata: dict,
     agent_id: str,
     memory_type: str,
@@ -1638,18 +1930,19 @@ def _apply_supersession_for_cas(
     """
     new_id = uuid.uuid4()
     now = datetime.now(timezone.utc)
+    vector_columns, vector_values = embedding_insert_columns(vectors)
     inserted = db_session.execute(
         text(
-            """
+            f"""
             INSERT INTO session_memories (
                 id, session_id, org_id, agent_id, execution_id,
-                memory_type, content, embedding, confidence,
+                memory_type, content, {vector_columns}, confidence,
                 sequence_number, scope, status, metadata,
                 created_at, updated_at, recall_hidden,
                 user_id, provenance, space_id, project_id
             ) VALUES (
                 :id, :session_id, :org_id, :agent_id, NULL,
-                :memory_type, :content, :embedding, NULL,
+                :memory_type, :content, {vector_values}, NULL,
                 NULL, :scope, 'active', :metadata,
                 :created_at, :updated_at, :recall_hidden,
                 :user_id, :provenance, :space_id, :project_id
@@ -1664,7 +1957,7 @@ def _apply_supersession_for_cas(
             "agent_id": agent_id,
             "memory_type": memory_type,
             "content": content,
-            "embedding": str(embedding),
+            **embedding_insert_params(vectors),
             "scope": scope,
             "metadata": json.dumps(metadata),
             "created_at": now,
@@ -1873,7 +2166,8 @@ def supersede_with_revision(
 
     # ---- phase 3: prepare — redact + embed, BEFORE the guard (H3) --------
     try:
-        content, meta, embedding, redacted, redaction_kinds = _prepare_cas_write(
+        content, meta, vectors, redacted, redaction_kinds = _prepare_cas_write(
+            db,
             new_content,
             metadata=write_kwargs.get("metadata"),
             scope=write_kwargs.get("scope", "org"),
@@ -1884,7 +2178,7 @@ def supersede_with_revision(
         metrics.record(metrics.MEMORY_WRITES.inc, outcome="error")
         return {"conflict": False, "stored": False, "error": "redaction_failed"}
 
-    if embedding is None:
+    if not vectors:
         metrics.record(metrics.MEMORY_WRITES.inc, outcome="error")
         return {"conflict": False, "stored": False, "error": "embedding_failed"}
 
@@ -1924,7 +2218,7 @@ def supersede_with_revision(
         org_id=org_id,
         old_id=memory_id,
         content=content,
-        embedding=embedding,
+        vectors=vectors,
         metadata=meta,
         agent_id=agent_id,
         user_id=user_id,
@@ -2287,9 +2581,11 @@ async def retrieve_memories_scoped(
     and sees the org tier only.
 
     NOTE: HNSW candidate-pool trade-off — the inner query fetches
-    ``candidate_pool = limit * 4`` approximate nearest neighbours, then the
-    outer query re-ranks them by the blended score and returns the top
-    ``limit``.  A relevant-but-stale row that falls outside the top-4× ANN
+    :func:`shared.ranking.candidate_pool` approximate nearest neighbours, then
+    the outer query re-ranks them by the blended score and returns the top
+    ``limit``. Rows below :func:`shared.ranking.apply_relevance_floor`'s bar
+    are then dropped, so the result can be SHORTER than ``limit`` and can be
+    EMPTY — see *Returns*.  A relevant-but-stale row that falls outside the top-4× ANN
     candidates will not be rescued by the recency bonus; this is accepted,
     matching the v1 under-fill acceptance documented below.
 
@@ -2307,7 +2603,8 @@ async def retrieve_memories_scoped(
         org_id: Tenant whose memories to search. Always enforced — results are
             never returned from another org.
         query_text: Natural-language query; embedded and ranked by a blended
-            score (``0.85 * similarity + 0.15 * recency_norm``) over a 30-day
+            score (see :mod:`shared.ranking`: a pool-normalised similarity
+            term at 0.95 plus a recency term at 0.05) over a 30-day
             recency window (recency_norm clamped to [0, 1]) so that stale
             near-duplicates are demoted relative to recent relevant memories.
             Each returned :class:`MemoryRecord` has its ``relevance`` field
@@ -2338,7 +2635,10 @@ async def retrieve_memories_scoped(
 
     Returns:
         A list of :class:`MemoryRecord` ordered by blended score (descending),
-        or an empty list if embedding generation fails. Vector-matched records
+        or an empty list if embedding generation fails **or if nothing cleared
+        the relevance floor**. The second case is not a degradation: recall
+        returning nothing is the designed answer when the brain holds nothing
+        relevant, and every caller must handle it. Vector-matched records
         carry a rounded cosine-similarity score (0–1) in ``relevance``.
 
         **The list can be longer than ``limit``.** After the vector stage,
@@ -2379,8 +2679,15 @@ async def retrieve_memories_scoped(
 
     # Availability: return the pooled connection BEFORE awaiting the
     # embedding. See :func:`release_connection` for the measurements.
+    # Space, column and prefix resolved together — see retrieve_memories for
+    # why they can never be decided independently. ``effective_space`` also
+    # degrades a v2 setting to v1 on a database that has not been migrated,
+    # so a mis-set env var costs ranking quality rather than every recall.
+    # Before the release, because the probe behind it is a query.
+    space = effective_space(db_session)
+    vector_column = embedding_space.column_for(space)
     release_connection(db_session)
-    embedding = await embed_text(query_text)
+    embedding = await embed_text(query_text, role=ROLE_QUERY, space=space)
     if embedding is None:
         return []
 
@@ -2394,13 +2701,26 @@ async def retrieve_memories_scoped(
         "status = 'active'",
         "superseded_by IS NULL",
         "recall_hidden = FALSE",
+        # A row whose vector for THIS space has not been written yet (mid
+        # backfill, or a write whose best-effort inactive embedding failed)
+        # has no similarity to report. Without this it would still be a
+        # candidate, sort last, and arrive carrying a NULL relevance that the
+        # floor cannot weigh and the caller cannot distinguish from a
+        # deliberately unscored graph row.
+        f"{vector_column} IS NOT NULL",
     ]
+    similarity_weight = ranking.similarity_weight()
+    recency_weight = ranking.recency_weight()
     params: dict[str, Any] = {
         "org_id": org_id,
         "embedding": embedding_str,
         "limit": limit,
-        "candidate_pool": limit * 4,
+        "candidate_pool": ranking.candidate_pool(limit),
+        "similarity_weight": similarity_weight,
+        "recency_weight": recency_weight,
+        "recency_window": ranking.RECENCY_WINDOW_SECONDS,
     }
+    _apply_ef_search(db_session, params["candidate_pool"])
 
     # ---- the visibility ladder -------------------------------------------
     # Built as a single OR-group of scope arms. Every arm that reaches beyond
@@ -2443,7 +2763,8 @@ async def retrieve_memories_scoped(
     #   Inner query — HNSW-accelerated cosine-distance ORDER BY fetches a
     #     bounded candidate pool (:candidate_pool = limit * 4).
     #   Outer query — re-ranks the candidates by blended score:
-    #     0.85 * similarity + 0.15 * recency_norm, where recency_norm is the
+    #     :similarity_weight * normalised_similarity
+    #       + :recency_weight * recency_norm, where recency_norm is the
     #     fraction of the 30-day window still remaining, clamped to [0, 1].
     # The outer SELECT * preserves the record columns plus relevance as the
     # LAST column.  blended_score is used only in the ORDER BY and is not a
@@ -2472,23 +2793,51 @@ async def retrieve_memories_scoped(
     # the vector order, and taking its first ``limit`` rows is byte-for-byte
     # what ``LIMIT :limit`` returned before. When the arm is off,
     # ``vector_limit`` IS ``limit`` and the statement is unchanged.
-    select_sql = """
+    #
+    # The blend itself changed in this commit, and the reason is measured
+    # rather than aesthetic. ``0.85 * relevance`` reads as similarity
+    # dominating, but similarity's whole dynamic range over the production
+    # corpus is 0.069 while the recency term's is the full 0.15 — freshness
+    # outweighed relevance outright, and each day of age was worth 0.0059 of
+    # cosine. Two fixes, and neither works without the other:
+    #
+    #   * the similarity term is **normalised inside the candidate pool**
+    #     (``(relevance - MIN) / (MAX - MIN)`` as window functions over the
+    #     ANN result). Absolute cosine in a corpus this compressed carries
+    #     almost no information; relative cosine among the nearest neighbours
+    #     carries all of it, and normalising is what makes the weight mean
+    #     what it says;
+    #   * the weights come from :mod:`shared.ranking` and default to
+    #     0.95/0.05 — recency demoted to the tie-break it should always have
+    #     been.
+    #
+    # ``NULLIF(MAX - MIN, 0)`` guards the degenerate pool where every
+    # candidate scores identically (one row, or exact duplicates): the
+    # division would be by zero, and ``COALESCE(..., 1.0)`` makes every such
+    # row score equally at the top of its own pool, leaving recency to order
+    # them. That is the same answer normalisation gives in the limit, so the
+    # guard changes no ranking — it only stops the statement raising.
+    select_sql = f"""
         SELECT * FROM (
             SELECT id, session_id, org_id, agent_id, execution_id,
                    memory_type, content, embedding, confidence,
                    sequence_number, scope, status, superseded_by,
                    metadata, created_at, updated_at, space_id, project_id,
                    user_id, provenance, revision,
-                   (1 - (embedding <=> :embedding)) AS relevance
+                   (1 - ({vector_column} <=> :embedding)) AS relevance
             FROM session_memories
-            WHERE {where}
-            ORDER BY embedding <=> :embedding
+            WHERE {{where}}
+            ORDER BY {vector_column} <=> :embedding
             LIMIT :candidate_pool
         ) candidates
-        ORDER BY (0.85 * relevance
-                  + 0.15 * LEAST(1, GREATEST(
+        ORDER BY (:similarity_weight * COALESCE(
+                      (relevance - MIN(relevance) OVER ())
+                      / NULLIF(MAX(relevance) OVER () - MIN(relevance) OVER (), 0),
+                      1.0
+                  )
+                  + :recency_weight * LEAST(1, GREATEST(
                       0, 1 - EXTRACT(EPOCH FROM (NOW() - created_at))
-                             / (30 * 86400)
+                             / :recency_window
                     ))) DESC
         LIMIT :vector_limit
     """
@@ -2642,13 +2991,41 @@ async def retrieve_memories_scoped(
             # the inner ANN pool is proportional to the actual remaining slots.
             tier2 = _fetch(
                 "project_id IS NULL",
-                {"limit": remaining, "candidate_pool": remaining * 4},
+                {
+                    "limit": remaining,
+                    "candidate_pool": ranking.candidate_pool(remaining),
+                },
             )
         records = list(tier1) + list(tier2)
     else:
         records = _fetch("TRUE", {})
 
     _report_lexical(skip_reason, stats, lexical_state)
+
+    # ---- the relevance floor ---------------------------------------------
+    # Applied BEFORE graph expansion, not after, and the ordering is the whole
+    # point: expansion walks outward from the rows the vector stage returned,
+    # so filtering first means it walks out from rows that were actually
+    # relevant. Filtering afterwards would let a row that failed the floor
+    # still drag five of its neighbours into the answer.
+    #
+    # This is the step that can return NOTHING, and that is the intended
+    # behaviour rather than a failure: a session about the Klio proxy handed
+    # four memories about an unrelated project is worse than a session handed
+    # none, because the agent that gets nothing asks and the agent that gets
+    # four wrong things builds on them. Every caller must handle an empty
+    # list — the proxy already reports ``reason: "empty"``.
+    kept = ranking.apply_relevance_floor(records, space=space)
+    if len(kept) != len(records):
+        logger.debug(
+            "recall floor dropped %d of %d rows (space=%s)",
+            len(records) - len(kept),
+            len(records),
+            space,
+        )
+    records = kept
+    if not records:
+        return []
 
     # Stage B+C (knowledge graph): one-hop, ladder-scoped expansion around the
     # vector entry points, then the blended re-rank. Adds at most

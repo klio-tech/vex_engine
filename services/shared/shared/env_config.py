@@ -175,6 +175,52 @@ def parse_int(
     )
 
 
+def parse_str(
+    value: str | None,
+    *,
+    default: str,
+    allowed: "tuple[str, ...] | frozenset[str]",
+    name: str = "",
+) -> str:
+    """Parse an env string constrained to a closed set, else ``default``.
+
+    The same contract as the numeric parsers, for the knobs whose value is a
+    name rather than a number. ``allowed`` is not optional: the call sites this
+    exists for interpolate the result into SQL (a column name cannot be a bind
+    parameter), so "unrecognised takes the default" has to be a property of the
+    parser rather than a discipline at each call site.
+
+    Matching is case-insensitive because these are operator-typed tokens, not
+    machine identifiers — the same reasoning that makes :data:`TRUE_TOKENS`
+    lowercase-only and the caller's value ``.lower()``-ed into it.
+
+    Args:
+        value: The raw environment value, or ``None`` when unset.
+        default: Returned when the value is absent or not in ``allowed``.
+        allowed: The permitted values, lowercase.
+        name: The variable name, used only in the warning.
+
+    Returns:
+        One of ``allowed``, or ``default``.
+    """
+    cleaned = _clean(value)
+    if cleaned is None:
+        return default
+
+    lowered = cleaned.lower()
+    if lowered in allowed:
+        return lowered
+
+    logger.warning(
+        "%s=%r is not one of %s; using the default (%s)",
+        name or "str env var",
+        value,
+        ", ".join(sorted(allowed)),
+        default,
+    )
+    return default
+
+
 def _bounded(parsed, *, default, name, minimum, maximum):
     """Return ``parsed`` if it is within bounds, else ``default`` with a warning."""
     if minimum is not None and parsed < minimum:

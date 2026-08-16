@@ -107,12 +107,13 @@ from typing import Any, Callable, NamedTuple, Optional
 
 from sqlalchemy import text
 
-from shared import graph_store, metrics
+from shared import embedding_space, graph_store, metrics
 from shared.brain import write_scoped_memory
 from shared.env_config import parse_int
 from shared.memory import (
     _NO_CREDENTIALS_RULE,
     call_llm,
+    effective_space,
     embed_text,
     generate_summary,
     supersede_memory,
@@ -528,6 +529,21 @@ def _store_graph(
     return drawn
 
 
+async def _reconcile_embedding(db_session: Any, fact: str) -> "list[float] | None":
+    """Embed *fact* into whichever space :func:`reconcile_fact` will query.
+
+    Reconciliation compares a new fact against stored facts, so both sides are
+    passages and both take the ``passage`` role. What must not drift is the
+    *space*: this vector is compared against one specific column, and embedding
+    it for v2 while the query reads the v1 column (or the reverse) produces
+    similarities that are numerically fine and semantically meaningless —
+    against a fixed 0.90 threshold, that is either no reconciliation at all or
+    an LLM judge asked to arbitrate random pairs.
+    """
+    space = effective_space(db_session)
+    return await embed_text(fact, role=embedding_space.ROLE_PASSAGE, space=space)
+
+
 async def reconcile_fact(
     db_session: Any,
     *,
@@ -558,9 +574,12 @@ async def reconcile_fact(
 
     Returns (superseded, judged): rows superseded and judge calls attempted.
     """
+    # Same column the caller embedded against — see ``_reconcile_embedding``
+    # for why the two are resolved from one space.
+    vector_column = embedding_space.column_for(effective_space(db_session))
     rows = db_session.execute(
         text(
-            """
+            f"""
             SELECT id, content
             FROM session_memories
             WHERE org_id = :org_id
@@ -569,8 +588,9 @@ async def reconcile_fact(
               AND status = 'active'
               AND memory_type = 'fact'
               AND id != :new_id
-              AND 1 - (embedding <=> :embedding) >= :threshold
-            ORDER BY embedding <=> :embedding
+              AND {vector_column} IS NOT NULL
+              AND 1 - ({vector_column} <=> :embedding) >= :threshold
+            ORDER BY {vector_column} <=> :embedding
             LIMIT :k
             """
         ),
@@ -923,7 +943,7 @@ async def _synthesize_and_store(
                 # what it might supersede, and nothing said so.
                 record_budget_exhausted("reconcile")
             if reconcile.remaining > 0:
-                fact_embedding = await embed_text(fact)
+                fact_embedding = await _reconcile_embedding(db_session, fact)
                 if fact_embedding is not None:
                     superseded, judged = await reconcile_fact(
                         db_session,

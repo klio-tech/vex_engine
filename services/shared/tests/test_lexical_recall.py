@@ -125,6 +125,20 @@ def _seed_corpus(db, org_id: str) -> str:
     return target_id
 
 
+def _pin_small_candidate_pool(monkeypatch) -> None:
+    """Shrink the ANN candidate pool back to ``limit * 4`` with no floor.
+
+    Two tests here need a row that the vector arm did NOT return, which means
+    the corpus has to be bigger than the pool. The production default is
+    ``max(64, limit * 8)`` — deliberately deep, because a shallow pool is what
+    let recency reorder 32 rows and call it ranking — and seeding 65 rows to
+    get one row outside it would make the fixture about the pool rather than
+    about the marker under test.
+    """
+    monkeypatch.setenv("KLIO_RECALL_CANDIDATE_POOL_FACTOR", "4")
+    monkeypatch.setenv("KLIO_RECALL_MIN_CANDIDATE_POOL", "1")
+
+
 def _embed_as(text_value: str):
     """Patch ``embed_text`` with the stand-in, which is what seeded the rows."""
     return patch(
@@ -517,8 +531,13 @@ async def test_a_lexical_only_row_is_marked_and_carries_no_fake_relevance(
     Reaching this branch takes two things, and both are worth stating because
     together they bound what the feature can do at its default settings:
 
-    * the row must be OUTSIDE the vector candidate pool — with ``limit=2`` the
-      pool is 8, so the corpus below is 13 rows and the target is last;
+    * the row must be OUTSIDE the vector candidate pool. The pool default
+      moved to ``max(64, limit * 8)`` when the ranking blend was fixed, which
+      is larger than any fixture worth seeding here, so the two pool knobs are
+      pinned small for this test rather than seeding 65 rows to keep a
+      13-row corpus outside it. What is under test is the marker on a
+      lexical-only row, not the pool arithmetic (which
+      ``test_lexical_arm_is_bounded_by_the_same_candidate_pool`` covers);
     * the lexical weight must be high enough for a row with no vector rank at
       all to survive the final truncation. At the default 0.5 a lexical-only
       row scores 0.5/61 = 0.0082 while every vector row scores at least
@@ -532,6 +551,7 @@ async def test_a_lexical_only_row_is_marked_and_carries_no_fake_relevance(
     target_id = _seed(db, org_id=org, content=corpus.TARGET_CONTENT)
 
     monkeypatch.setenv("KLIO_LEXICAL_WEIGHT", "1.0")
+    _pin_small_candidate_pool(monkeypatch)
     with _embed_as(corpus.LITERAL):
         results = await retrieve_memories_scoped(db, org, corpus.LITERAL, limit=2)
 
@@ -555,15 +575,19 @@ def clean_metrics():
 
 
 @pytest.mark.asyncio
-async def test_a_contributing_query_is_counted_as_contributing(db, clean_metrics):
+async def test_a_contributing_query_is_counted_as_contributing(
+    db, clean_metrics, monkeypatch
+):
     """THE number: recalls where lexical returned a row the vector arm did
-    not. Here the corpus is larger than the candidate pool, so the target is
-    genuinely absent from the vector arm's rows."""
+    not. The candidate pool is pinned small (see
+    :func:`_pin_small_candidate_pool`) so the 13-row corpus is larger than it
+    and the target is genuinely absent from the vector arm's rows."""
     org = _org(db)
     for index in range(12):
         _seed(db, org_id=org, content=f"The metrics token, note {index}.")
     _seed(db, org_id=org, content=corpus.TARGET_CONTENT)
 
+    _pin_small_candidate_pool(monkeypatch)
     with _embed_as(corpus.LITERAL):
         await retrieve_memories_scoped(db, org, corpus.LITERAL, limit=2)
 

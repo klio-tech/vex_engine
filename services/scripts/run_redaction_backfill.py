@@ -27,7 +27,10 @@ from typing import Any, Callable, Optional
 from sqlalchemy import create_engine, text
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "shared"))
-from shared.memory import embed_text  # noqa: E402
+from shared.memory import (  # noqa: E402
+    embed_passage_for_write,
+    embedding_insert_params,
+)
 from shared.redaction import redact  # noqa: E402
 
 logging.basicConfig(
@@ -43,13 +46,19 @@ async def process_memory_batch(
     rows: list[Any],
     *,
     apply: bool,
-    embed_fn: Callable = embed_text,
+    embed_fn: Callable = embed_passage_for_write,
 ) -> dict:
     """Scan one batch of memory rows; mask + re-embed hits when ``apply``.
 
     Returns a report Counter keyed by ``(org_id, kind)``. A row whose
     re-embedding fails is reported but left UNMODIFIED (content and embedding
     must stay consistent). Idempotent: placeholders never re-match.
+
+    Re-embeds into EVERY vector space this deployment writes, not just the
+    active one. Rewriting the content and refreshing only one of the two
+    vectors would leave the other describing text that no longer exists — and
+    it would do it silently, surfacing much later as the one memory whose
+    ranking never made sense after the read path switched spaces.
     """
     report: Counter = Counter()
     for row in rows:
@@ -60,17 +69,19 @@ async def process_memory_batch(
             report[(row.org_id, f.kind)] += 1
         if not apply:
             continue
-        embedding = await embed_fn(result.clean_text)
-        if embedding is None:
+        vectors = await embed_fn(db, result.clean_text)
+        if not vectors:
             logger.warning("re-embed failed for memory %s; leaving unmodified", row.id)
             continue
+        vector_params = embedding_insert_params(vectors)
+        vector_sets = ", ".join(f"{column} = :{column}" for column in vector_params)
         db.execute(
             text(
-                """
+                f"""
                 UPDATE session_memories
                 SET content = :content,
-                    embedding = :embedding,
-                    metadata = COALESCE(metadata, '{}'::jsonb)
+                    {vector_sets},
+                    metadata = COALESCE(metadata, '{{}}'::jsonb)
                                || CAST(:extra_meta AS jsonb),
                     updated_at = NOW()
                 WHERE id = :id
@@ -78,7 +89,7 @@ async def process_memory_batch(
             ),
             {
                 "content": result.clean_text,
-                "embedding": str(embedding),
+                **vector_params,
                 "extra_meta": json.dumps(
                     {
                         "redaction_backfill": time.strftime("%Y-%m-%d"),

@@ -37,8 +37,9 @@ class FakeDB:
         pass
 
 
-async def _fake_embed(text_input):
-    return [0.0, 0.1]
+async def _fake_embed(_db, _text_input, **_kwargs):
+    # Mirrors ``embed_passage_for_write``: one vector per space written.
+    return {"v1": [0.0, 0.1]}
 
 
 async def test_dry_run_reports_but_writes_nothing():
@@ -63,7 +64,7 @@ async def test_apply_masks_and_reembeds():
 
 
 async def test_embed_failure_leaves_row_unmodified():
-    async def _fail(_):
+    async def _fail(_db, _text_input, **_kwargs):
         return None
 
     db = FakeDB()

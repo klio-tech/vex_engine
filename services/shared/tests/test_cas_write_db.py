@@ -55,7 +55,9 @@ def _fixed_vector(seed: str) -> list[float]:
 @pytest.fixture(autouse=True)
 def _patch_sync_embedding(monkeypatch):
     monkeypatch.setattr(
-        memory_mod, "_embed_text_sync", lambda content: _fixed_vector(content)
+        memory_mod,
+        "_embed_text_sync",
+        lambda content, **_kwargs: _fixed_vector(content),
     )
 
 

@@ -567,7 +567,9 @@ async def _init_call(org_id, user_id, phase, candidates=None, git_remote=None):
     comes from the key/OAuth and NEVER from the payload the agent controls.
     """
     fn = _get_tool().fn
-    async_embed = AsyncMock(side_effect=lambda c: _deterministic_embedding(c))
+    async_embed = AsyncMock(
+        side_effect=lambda c, **_kwargs: _deterministic_embedding(c)
+    )
     with (
         patch(
             "app.onboarding.resolve_principal_plan",
@@ -722,7 +724,9 @@ async def test_invariant2_rows_are_invisible_to_a_teammates_recall(dbconn):
             }
         ],
     )
-    async_embed = AsyncMock(side_effect=lambda c: _deterministic_embedding(c))
+    async_embed = AsyncMock(
+        side_effect=lambda c, **_kwargs: _deterministic_embedding(c)
+    )
     with patch("shared.memory.embed_text", async_embed):
         teammate_sees = await retrieve_memories_scoped(
             dbconn,

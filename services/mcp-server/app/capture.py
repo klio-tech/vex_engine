@@ -22,8 +22,10 @@ Four endpoints, all mounted under ``/capture``:
   comes back at the storage chokepoint).
 * ``POST /capture/recall`` — read memories for context injection at
   ``SessionStart``.  With a query it does vector recall; with an empty query it
-  falls back to recency (most-recent first), so a fresh session always gets
-  *something* even before the curator has synthesised anything.
+  falls back to recency (most-recent first) within the resolved project.  It
+  may return NOTHING, and that is a correct answer rather than a degraded one:
+  a project with no memories yet, or a query nothing in the brain is relevant
+  to, gets an empty list instead of the org's newest unrelated rows.
 * ``POST /capture/forget`` — retract one memory by id (hook-client mirror of
   the MCP ``forget`` tool).  Returns 404 for unknown or cross-org ids, 403
   for cross-agent scope='agent' rows.
@@ -36,11 +38,16 @@ writes reuse :func:`shared.brain.write_scoped_memory`, reads reuse
 :func:`shared.brain.ensure_project` / ``find_project_id`` — the exact same
 primitives the MCP tools use.
 
-Project tagging is *best-effort*: the client may send ``git_remote`` and/or
-``repo_root`` (Claude Code provides ``cwd``).  When present, writes are filed
-under the resolved project; when absent or unresolved, writes go unfiled
-(``project_id = NULL``) and recall falls back to org-wide.  Capture never fails
-because project resolution failed.
+Project tagging is *best-effort* and now *symmetric*: the client may send
+``git_remote`` and/or ``repo_root`` (Claude Code provides ``cwd``), and BOTH
+the write and the read try the remote first and the path second.  When a
+project resolves, writes are filed under it and recall is fenced to it; when
+neither identifier resolves, writes go unfiled (``project_id = NULL``) and
+recall reads exactly that unfiled bucket.  What it no longer does is widen an
+unresolved read to every project in the org — that asymmetry (95 % of memories
+written with a project, 95 % of recalls ignoring it) is what let one session be
+injected with two other projects' memories.  Capture still never fails because
+project resolution failed.
 
 Async note: handlers are ``async def`` and ``await`` the async brain/memory
 helpers (which embed/LLM-call) but those helpers also perform inline synchronous
@@ -451,27 +458,59 @@ def _ensure_project_id(
 
 
 def _find_project_id(
-    db: Any, *, org_id: str, git_remote: Optional[str]
+    db: Any,
+    *,
+    org_id: str,
+    git_remote: Optional[str],
+    repo_root: Optional[str] = None,
 ) -> Optional[str]:
     """Best-effort project lookup for a read; never raises.
 
-    Only resolves by ``git_remote`` (the reliable cross-machine identity).  A
-    miss returns ``None``, which the recall path treats as "no project filter"
-    (org-wide) rather than an empty result — the right default for passive
-    session-start injection, which must not be silenced by an unresolved repo.
+    Resolves by ``git_remote`` first and falls back to ``repo_root``, which is
+    the fix for the single largest source of cross-project memory leakage in
+    production. This function used to return ``None`` the moment ``git_remote``
+    was falsy — but the WRITE path (:func:`_ensure_project_id`) has always
+    passed BOTH identifiers, and :func:`shared.brain.find_project_id` has
+    always resolved ``repo_root_path``. So writes filed by path and reads
+    refused to. Measured over production at the time of the fix:
+
+    * 79 of 118 projects in the org have no ``git_remote`` at all — including
+      every non-git working directory;
+    * 23,895 of 25,101 visible memories (95.2 %) carry a ``project_id``;
+    * 604 of 637 hook recalls (94.8 %) resolved ``project_id = NULL``.
+
+    95 % of memories were written with a project and 95 % of recalls ignored
+    it, which is why a session about one repo was injected with facts from two
+    unrelated ones. Side-by-side replay of the same query with and without the
+    project resolved returned entirely different, and entirely better, rows.
+
+    Order matters and is not arbitrary. ``git_remote`` is stable across
+    machines and checkouts; ``repo_root`` is a local path that two developers
+    will not share. Trying the remote first means a repo cloned to a different
+    directory still resolves to the one project, and the path is only consulted
+    when there is no remote to be more specific than it.
+
+    A miss returns ``None``. What that MEANS to the caller changed with this
+    fix: it no longer widens the read to every project in the org (see
+    :func:`_recent_memories` and the recall handler). It now means "unfiled",
+    symmetrically with what the write path does from the same directory.
     """
-    if not git_remote:
-        return None
-    try:
-        return brain.find_project_id(db, org_id=org_id, identifier=git_remote)
-    except Exception:
-        _rollback(db, "find_project_id", org_id)
-        logger.warning(
-            "capture: find_project_id failed for org %s; recalling org-wide",
-            org_id,
-            exc_info=True,
-        )
-        return None
+    for identifier in (git_remote, repo_root):
+        if not identifier:
+            continue
+        try:
+            resolved = brain.find_project_id(db, org_id=org_id, identifier=identifier)
+        except Exception:
+            _rollback(db, "find_project_id", org_id)
+            logger.warning(
+                "capture: find_project_id failed for org %s; recalling unfiled",
+                org_id,
+                exc_info=True,
+            )
+            return None
+        if resolved:
+            return resolved
+    return None
 
 
 def _combine_messages(messages: list[TranscriptMessage]) -> str:
@@ -572,6 +611,37 @@ def _recent_memories(
     the ``project_members`` subquery — for the same reason as the vector path:
     a Python filter over a wider read is one bug away from returning the wider
     read.
+
+    **The project predicate is a fence, and this is the fix for the reported
+    symptom.** It used to be
+    ``(:project_id IS NULL OR project_id = :project_id OR project_id IS NULL)``,
+    which is two escape hatches in one line: an unresolved project matched
+    every row in the org, and a resolved one still admitted every unfiled row.
+    Combined with ``ORDER BY created_at DESC`` and no relevance term at all,
+    that is literally "the last N things anyone wrote anywhere" — and it is how
+    a session about the Klio proxy opened with two facts about a Vedic
+    astrology app and two about a hiring app, all of them real rows, all filed
+    under other projects, all recent.
+
+    It is now **symmetric with the write path**:
+
+    * project resolved → ``project_id = :project_id``. Rows from other
+      projects cannot appear, and neither can unfiled ones.
+    * project unresolved → ``project_id IS NULL``. A capture from a directory
+      that resolves to no project is written unfiled; a recall from that same
+      directory now reads exactly that bucket back.
+
+    Why not keep the ``OR project_id IS NULL`` widening for a resolved project,
+    given that most deliberate ``note``/``decision``/``plan`` memories are
+    written unfiled through MCP? Because this path has **no relevance signal
+    whatsoever** — it is an ``ORDER BY created_at DESC``. Every row it admits
+    beyond the fence is chosen by nothing but its clock, so widening the fence
+    does not add context, it adds coin flips. The query path
+    (:func:`shared.memory.retrieve_memories_scoped`) keeps its two-tier
+    softness precisely because it *can* rank what it lets in.
+
+    An empty result is a legitimate answer here, not a failure — see the recall
+    handler.
     """
     scope_arms = ["scope = 'org'"]
     params: dict[str, Any] = {
@@ -596,6 +666,11 @@ def _recent_memories(
     # parameter. Same construction as the WHERE-clause assembly in
     # shared.memory.retrieve_memories_scoped.
     scope_sql = "(" + " OR ".join(scope_arms) + ")"
+    # Two module-local literals, chosen by whether a project resolved. Not a
+    # parameterised expression, because the two cases are different predicates
+    # rather than one predicate with different values — writing them as one
+    # SQL string is what produced the escape hatches this replaced.
+    project_sql = "project_id = :project_id" if project_id else "project_id IS NULL"
 
     rows = db.execute(
         text(
@@ -606,11 +681,7 @@ def _recent_memories(
               AND {scope_sql}
               AND status = 'active'
               AND recall_hidden = FALSE
-              AND (
-                :project_id IS NULL
-                OR project_id = :project_id
-                OR project_id IS NULL
-              )
+              AND {project_sql}
             ORDER BY created_at DESC
             LIMIT :limit
             """
@@ -870,11 +941,26 @@ async def capture_recall(
 
     With a non-empty ``query`` this is vector recall via
     :func:`shared.memory.retrieve_memories_scoped`; with an empty ``query`` it
-    falls back to recency (most-recent first) so a fresh ``SessionStart`` always
-    has something to inject.  Project (via ``git_remote``) and space filters are
-    BEST-EFFORT: an unresolved filter widens to org-wide rather than returning
-    empty — appropriate for passive injection (unlike the strict MCP ``recall``
-    tool, which warns + empties on an unknown explicit filter).
+    falls back to recency (most-recent first).
+
+    **Recall may legitimately return zero memories, and callers must handle
+    that as a normal answer.** Two changes here make it more likely than it
+    used to be, both deliberately:
+
+    * the project filter is now a fence rather than a widening (see
+      :func:`_find_project_id` and :func:`_recent_memories`) — a session in a
+      directory with no memories gets none, instead of getting somebody
+      else's;
+    * :func:`shared.ranking.apply_relevance_floor` drops rows that are not
+      relevant enough to be worth injecting, and can drop all of them.
+
+    Injecting nothing beats injecting four wrong things: an agent handed no
+    context asks, and an agent handed confidently-wrong context builds on it.
+    The Node proxy already reports ``reason: "empty"`` for this case.
+
+    Project resolution takes ``git_remote`` then ``repo_root``; the space
+    filter remains best-effort (an unknown slug widens rather than empties,
+    unlike the strict MCP ``recall`` tool, which warns + empties).
 
     The caller's ``user_id`` is forwarded on BOTH branches. Without it a
     session-start injection would return the org brain and none of the caller's
@@ -903,7 +989,12 @@ async def capture_recall(
         # The synchronous brain/recency reads run off the event loop per the
         # shared.brain threading contract (blocking psycopg2 I/O).
         project_id = await anyio.to_thread.run_sync(
-            lambda: _find_project_id(db, org_id=org_id, git_remote=req.git_remote)
+            lambda: _find_project_id(
+                db,
+                org_id=org_id,
+                git_remote=req.git_remote,
+                repo_root=req.repo_root,
+            )
         )
         query = req.query.strip()
         recall_over_cap = await anyio.to_thread.run_sync(

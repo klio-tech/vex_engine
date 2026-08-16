@@ -141,7 +141,12 @@ async def test_write_memory_does_not_hold_its_caller_s_connection(
         db.close()
 
     assert record is not None, "positive control: the write actually happened"
-    assert observed == [0], (
+    # One observation per embedding call, and a write makes one per vector
+    # space it populates (dual-write during the v1→v2 migration). What is under
+    # test is that NONE of them ran with the connection still checked out — the
+    # count of calls is not the property, the checkout during each one is.
+    assert observed, "positive control: the embedding backend was called at all"
+    assert set(observed) == {0}, (
         f"connection was still checked out during the embed: {observed}"
     )
 
