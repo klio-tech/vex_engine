@@ -1,0 +1,30 @@
+version: 2
+
+# Narrow, explained secret-scanning exceptions only. Do NOT add blanket
+# patterns like 'tests/**/*' here — real credentials do leak into test
+# files, and this repo relies on GitGuardian to catch that. Every entry below
+# must name a specific file and say, in a comment, exactly what the flagged
+# value is and why it is not a live credential.
+secret:
+  # NOTE: the hosted GitGuardian GitHub App does NOT honor this file — it
+  # only applies to the `ggshield` CLI (e.g. a local pre-commit hook or a
+  # manually-run scan). It is kept here purely for that CLI use case and as
+  # documentation of intent; do not rely on it to clear a PR check.
+  ignored_paths:
+    # services/dashboard-api/tests/ws_auth_fixtures.py
+    #
+    # Contains TEST_VECTOR: a fixed HMAC-SHA256 signature computed over a
+    # hardcoded, non-secret input ("test-secret-do-not-use" /
+    # "11111111-2222-3333-4444-555555555555" / a fixed timestamp), pinned as
+    # a raw byte tuple rather than its base64url string precisely so it no
+    # longer carries a credential-shaped pattern. It is a cross-language
+    # drift check — this service's Python token verifier
+    # (services/dashboard-api/app/ws_auth.py) and the Dashboard repo's
+    # TypeScript minter (apps/web/lib/agentguard/ws-token.fixture.ts) both
+    # mint a token from these inputs and assert its signature against these
+    # exact bytes, so an encoding/padding/separator change on either side
+    # fails CI instead of shipping as "the live charts silently stopped
+    # updating". Do not delete the fixture or the cross-language test that
+    # depends on it; if you change the values, update them identically in
+    # the Dashboard repo.
+    - 'services/dashboard-api/tests/ws_auth_fixtures.py'

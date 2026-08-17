@@ -193,6 +193,11 @@ services:
       - "8082:8001"
     environment:
       REDIS_URL: redis://redis:6379
+      # HMAC secret for the /ws handshake tokens. Must be the SAME value the
+      # dashboard web tier signs with (AGENTGUARD_WS_TOKEN_SECRET). If the two
+      # disagree, or this is unset, every WebSocket connection is refused —
+      # which is the safe direction, but the live charts stop updating.
+      DASHBOARD_WS_TOKEN_SECRET: ${DASHBOARD_WS_TOKEN_SECRET:-}
     depends_on:
       redis:
         condition: service_healthy
