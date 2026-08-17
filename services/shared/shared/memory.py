@@ -28,6 +28,13 @@ from shared import embedding_prompt, lexical, metrics, ranking, stale
 from shared.embedding_prompt import ROLE_PASSAGE, ROLE_QUERY
 from shared.env_config import parse_float, parse_int
 from shared.redaction import redact
+from shared.taxonomy import (
+    DURABILITY_RULE,
+    TAXONOMY_RULE,
+    TYPED_OUTPUT_SHAPE,
+    ExtractedMemory,
+    parse_typed_items,
+)
 
 # Project ACLs. Safe at module scope: ``projects`` imports nothing from this
 # module (recall inlines its membership subquery rather than calling back
@@ -840,6 +847,58 @@ async def extract_facts(
     if not isinstance(facts, list):
         return []
     return facts
+
+
+async def extract_typed_memories(
+    output: Any,
+    task: Optional[str] = None,
+    input_data: Optional[Any] = None,
+) -> list[ExtractedMemory]:
+    """Extract durable memories from an agent turn, each already classified.
+
+    The typed successor to :func:`extract_facts`. Same single ``call_llm``
+    round trip and the same cost, but the prompt asks two questions instead of
+    one: *is this worth keeping* (:data:`shared.taxonomy.DURABILITY_RULE`) and
+    *what kind of thing is it* (:data:`shared.taxonomy.TAXONOMY_RULE`). Output
+    is screened again in code by :func:`shared.taxonomy.parse_typed_items`.
+
+    :func:`extract_facts` is left untouched rather than reimplemented on top of
+    this. Its one remaining caller is the verification worker, which writes
+    turn-scoped (``scope='session'``) facts for grading rather than the brain
+    the Context workspace reads; giving it a durability filter would silently
+    change what verification has to grade against.
+
+    Returns:
+        A list of :class:`~shared.taxonomy.ExtractedMemory`. Empty on LLM
+        failure, on a malformed response, and — legitimately and often — when
+        a turn produced nothing durable at all.
+    """
+    parts = [f"Output: {_bounded_prompt_input(output)}"]
+    if task:
+        parts.append(f"Task: {_bounded_prompt_input(task)}")
+    if input_data:
+        parts.append(f"Input: {_bounded_prompt_input(input_data)}")
+
+    prompt = (
+        "Extract the durable knowledge from the following agent turn, and "
+        "classify each item. "
+        + _NO_CREDENTIALS_RULE
+        + "\n\n"
+        + DURABILITY_RULE
+        + "\n\n"
+        + TAXONOMY_RULE
+        + "\nEach item must be one short, self-contained statement that reads "
+        "on its own, without the surrounding conversation.\n\n"
+        + "\n".join(parts)
+        + "\n\nRespond with JSON exactly of this shape:\n"
+        + TYPED_OUTPUT_SHAPE
+    )
+
+    result = await call_llm(prompt)
+    if not isinstance(result, dict):
+        return []
+
+    return parse_typed_items(result.get("memories", []))
 
 
 # ---------------------------------------------------------------------------

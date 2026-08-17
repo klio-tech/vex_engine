@@ -31,6 +31,7 @@ import pytest
 from sqlalchemy import create_engine, text
 
 from app.curator import CursorState, _read_new_raw_rows, curator_tick
+from shared.taxonomy import ExtractedMemory
 
 DB_URL = os.environ.get(
     "DATABASE_URL",
@@ -180,7 +181,11 @@ def _seed_production_shape(db, *, org_id: str, user_id: str, hook_captures: int 
 
 def _graph_result(facts=None, entities=None, edges=None):
     return {
-        "facts": facts if facts is not None else [],
+        "memories": (
+            [None if f is None else ExtractedMemory("fact", f) for f in facts]
+            if facts is not None
+            else []
+        ),
         "entities": entities if entities is not None else [],
         "edges": edges if edges is not None else [],
     }

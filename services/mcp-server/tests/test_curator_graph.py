@@ -26,6 +26,7 @@ from sqlalchemy import create_engine, text
 from shared import graph_store
 
 from app.curator import curator_tick, extract_graph, reconcile_fact
+from shared.taxonomy import ExtractedMemory
 from shared.testing import database_url, requires_db
 
 DB_URL = database_url()
@@ -115,8 +116,14 @@ def _seed_raw(db, *, org_id: str, user_id: str, content: str) -> str:
 
 
 def _graph_result(facts=None, entities=None, edges=None):
+    # Callers pass plain strings for readability; extract_graph's contract is
+    # a list of ExtractedMemory (or None), so wrap here in one place.
     return {
-        "facts": facts if facts is not None else [],
+        "memories": (
+            [None if f is None else ExtractedMemory("fact", f) for f in facts]
+            if facts is not None
+            else []
+        ),
         "entities": entities if entities is not None else [],
         "edges": edges if edges is not None else [],
     }
@@ -169,7 +176,10 @@ async def test_extract_graph_parses_the_spec_edge_shape():
     """The spec draws edges as {"src": <fact idx>, "<relation>": "<entity>"};
     the parser must take that shape (and refuse unknown relations)."""
     canned = {
-        "facts": ["the auth service uses jwt", "rate limiter added"],
+        "memories": [
+            {"kind": "fact", "content": "the auth service uses jwt in production"},
+            {"kind": "decision", "content": "a rate limiter was added to the edge"},
+        ],
         "entities": [
             {"name": "auth service", "kind": "system"},
             {"name": "rate limiter", "kind": "system"},
@@ -187,8 +197,11 @@ async def test_extract_graph_parses_the_spec_edge_shape():
     ) as llm:
         graph = await extract_graph("combined text")
 
-    assert llm.await_count == 1, "facts + graph must be ONE pass, not two"
-    assert graph["facts"] == canned["facts"]
+    assert llm.await_count == 1, "memories + graph must be ONE pass, not two"
+    assert graph["memories"] == [
+        ExtractedMemory("fact", "the auth service uses jwt in production"),
+        ExtractedMemory("decision", "a rate limiter was added to the edge"),
+    ]
     assert graph["entities"] == canned["entities"]
     # Only the well-formed about/relates_to edges survive parsing.
     assert graph["edges"] == [
@@ -201,7 +214,7 @@ async def test_extract_graph_parses_the_spec_edge_shape():
 async def test_extract_graph_llm_failure_yields_empty_graph():
     with patch("app.curator.call_llm", new_callable=AsyncMock, return_value=None):
         graph = await extract_graph("combined text")
-    assert graph == {"facts": [], "entities": [], "edges": []}
+    assert graph == {"memories": [], "entities": [], "edges": []}
 
 
 # ---------------------------------------------------------------------------

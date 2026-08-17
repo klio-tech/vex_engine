@@ -35,6 +35,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.curator import curator_tick, run_curator_once
+from shared.taxonomy import ExtractedMemory
 
 
 # ---------------------------------------------------------------------------
@@ -128,7 +129,11 @@ def _patch_curator(*, summary="a synthesized summary", facts=None):
         patch(
             "app.curator.extract_graph",
             new_callable=AsyncMock,
-            return_value={"facts": facts, "entities": [], "edges": []},
+            return_value={
+                "memories": [ExtractedMemory("fact", f) for f in facts],
+                "entities": [],
+                "edges": [],
+            },
         ),
         patch(
             "app.curator.write_scoped_memory",
@@ -394,7 +399,14 @@ async def test_deduped_synthesized_write_not_counted():
         patch(
             "app.curator.extract_graph",
             new_callable=AsyncMock,
-            return_value={"facts": ["f1", "f2"], "entities": [], "edges": []},
+            return_value={
+                "memories": [
+                    ExtractedMemory("fact", "f1"),
+                    ExtractedMemory("fact", "f2"),
+                ],
+                "entities": [],
+                "edges": [],
+            },
         ),
         patch(
             "app.curator.write_scoped_memory",
@@ -943,7 +955,10 @@ async def test_synthesize_and_store_reconciles_facts_not_summaries(monkeypatch):
         "extract_graph",
         AsyncMock(
             return_value={
-                "facts": ["fact one", "fact two"],
+                "memories": [
+                    ExtractedMemory("fact", "fact one"),
+                    ExtractedMemory("fact", "fact two"),
+                ],
                 "entities": [],
                 "edges": [],
             }
