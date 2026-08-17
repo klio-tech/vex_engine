@@ -9,6 +9,7 @@ credential, has to make one of these fail first.
 """
 
 import asyncio
+import base64
 import time
 from unittest.mock import AsyncMock, patch
 
@@ -254,11 +255,28 @@ class TestWsToken:
             TEST_VECTOR["secret"],
             expires_at=TEST_VECTOR["exp"],
         )
-        assert minted == TEST_VECTOR["token"]
+
+        version, encoded_org_id, exp, signature = minted.split(".")
+
+        # Version, org id and expiry are low-entropy and asserted as plain
+        # values. Only the signature is pinned as bytes -- see
+        # ws_auth_fixtures.TEST_VECTOR's "signature_bytes" for why.
+        assert version == "v1"
+        assert exp == str(TEST_VECTOR["exp"])
+        padding = "=" * (-len(encoded_org_id) % 4)
+        assert (
+            base64.urlsafe_b64decode(encoded_org_id + padding).decode("utf-8")
+            == TEST_VECTOR["org_id"]
+        )
+        sig_padding = "=" * (-len(signature) % 4)
+        assert (
+            tuple(base64.urlsafe_b64decode(signature + sig_padding))
+            == TEST_VECTOR["signature_bytes"]
+        )
 
         assert (
             verify_ws_token(
-                TEST_VECTOR["token"],
+                minted,
                 TEST_VECTOR["secret"],
                 now=TEST_VECTOR["exp"] - 10,
             )
