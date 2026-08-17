@@ -90,6 +90,10 @@ DURABILITY_RULE: str = (
     "KEEP the durable residue instead: what was decided, what is planned, what "
     "constrains the system, and the conventions and context a newcomer would "
     "need. "
+    "A root cause discovered while debugging IS durable even though it was "
+    "found once: keep the explanation of why a failure happens, drop the "
+    "incident. Keep a decision NOT to do something, or to exclude something "
+    "from scope, as a decision. "
 )
 
 TAXONOMY_RULE: str = (
@@ -155,12 +159,22 @@ _TRANSIENT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\b(no\s+(crash|error)s?\s+occurred|nothing\s+crashed)\b", re.I),
     re.compile(r"\bduring\s+(the|this)\s+(session|run|turn)\b", re.I),
     # Machine state: what is listening where, right now.
+    #
+    # The verb alternation is the whole filter here, and it used to also carry
+    # `served|exposed|bound`. Those are not state verbs — "the proxy is served
+    # on port 8787" and "the dev server is bound to port 3000" are *config*,
+    # true next month and true on someone else's laptop. Review found this
+    # eating half the real port constraints in a sample, with survival decided
+    # by conjugation: "Postgres listens on 5432" lived only because the pattern
+    # spells "listening". A port number is not by itself machine state.
+    #
+    # A second pattern here matched `(container|process|pid) … port \d+`, which
+    # was redundant — a container that is *running* on a port is already caught
+    # by the verb below, and one that merely *has* a port is config again.
     re.compile(
-        r"\b(is\s+)?(running|listening|served|exposed|bound)\b[^.]{0,40}"
-        r"\b(on\s+)?port\s+\d{2,5}\b",
+        r"\b(is\s+)?(running|listening)\b[^.]{0,40}\b(on\s+)?port\s+\d{2,5}\b",
         re.I,
     ),
-    re.compile(r"\b(container|process|pid)\b[^.]{0,40}\bport\s+\d{2,5}\b", re.I),
     re.compile(r"\bhttps?://(localhost|127\.0\.0\.1)[:/]", re.I),
     # Command outcomes.
     re.compile(r"\bexit(ed\s+with)?\s+(code|status)\s+\d+\b", re.I),
@@ -177,10 +191,129 @@ _TRANSIENT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bfile\s+\S+\s+(exists|does\s+not\s+exist)\b", re.I),
 )
 
-#: Below this, an "item" carries no recallable content whatever its shape
-#: ("ok", "done", "pong"). Chosen to be shorter than any real statement in the
-#: sampled corpus rather than tuned — it is a floor, not a filter.
-_MIN_DURABLE_CHARS: int = 25
+#: Below this, a string is too short to carry a proposition at all ("ok",
+#: "done", "pong", "it works").
+#:
+#: This was 25, which was simply wrong. The extraction prompt asks for "one
+#: short, self-contained statement", so a 25-character floor selects against
+#: precisely what the prompt requests: review found it rejecting 10 of 10
+#: realistic short facts — ``Health path is /healthz``, ``GitHub org:
+#: klio-tech``, ``Prod DB is Neon.``, ``Use pnpm, not npm.`` Brevity is not
+#: transience, and a terse fact is the most recallable kind there is.
+_MIN_DURABLE_CHARS: int = 12
+
+#: Closed-class words that acknowledgements are built from. A string made
+#: ENTIRELY of these asserts nothing about the world however long it is —
+#: "all good now" is twelve characters and still not a memory.
+#:
+#: This carries the job the old 25-character floor was reaching for, without
+#: the collateral damage: it discriminates on whether a specific thing is
+#: named, not on length. A token-based test ("has a digit, a path, or an
+#: identifier") was considered and rejected — it drops ``Use pnpm, not npm.``
+#: and ``Brand font is Inter.``, which name a thing and carry no such token.
+_ACKNOWLEDGEMENT_WORDS: frozenset[str] = frozenset(
+    {
+        "a",
+        "again",
+        "all",
+        "and",
+        "any",
+        "as",
+        "at",
+        "back",
+        "be",
+        "been",
+        "both",
+        "but",
+        "by",
+        "complete",
+        "completed",
+        "confirmed",
+        "correct",
+        "did",
+        "do",
+        "does",
+        "done",
+        "everything",
+        "failed",
+        "fine",
+        "for",
+        "found",
+        "from",
+        "good",
+        "got",
+        "great",
+        "has",
+        "have",
+        "here",
+        "in",
+        "is",
+        "it",
+        "its",
+        "just",
+        "looks",
+        "more",
+        "no",
+        "not",
+        "nothing",
+        "now",
+        "of",
+        "ok",
+        "okay",
+        "on",
+        "or",
+        "perfect",
+        "ready",
+        "right",
+        "same",
+        "seems",
+        "so",
+        "some",
+        "still",
+        "success",
+        "sure",
+        "than",
+        "thanks",
+        "that",
+        "the",
+        "their",
+        "them",
+        "then",
+        "there",
+        "these",
+        "they",
+        "thing",
+        "this",
+        "to",
+        "too",
+        "was",
+        "well",
+        "were",
+        "with",
+        "work",
+        "working",
+        "works",
+        "yes",
+        "yet",
+    }
+)
+
+_WORD = re.compile(r"[A-Za-z0-9_./:-]+")
+
+
+def _is_bare_acknowledgement(text: str) -> bool:
+    """Whether every word in ``text`` comes from the acknowledgement vocabulary.
+
+    One word outside it means something specific was named, and a named thing
+    is the seed of a durable memory. This is why the check is "all words are
+    filler" rather than "no words are content": the former is conservative in
+    the direction that matters — it only ever fires on text that asserts
+    nothing at all.
+    """
+    words = _WORD.findall(text.lower())
+    if not words:
+        return True
+    return all(word in _ACKNOWLEDGEMENT_WORDS for word in words)
 
 
 def is_transient(content: Optional[str]) -> bool:
@@ -188,12 +321,15 @@ def is_transient(content: Optional[str]) -> bool:
 
     A deliberately narrow deterministic backstop behind the prompt; see the
     module docstring for why it is not the primary mechanism. Empty, blank,
-    and sub-:data:`_MIN_DURABLE_CHARS` strings are transient by definition.
+    sub-:data:`_MIN_DURABLE_CHARS`, and contentless acknowledgement strings are
+    transient by definition; everything else is judged on shape alone.
     """
     if not content:
         return True
     text = content.strip()
     if len(text) < _MIN_DURABLE_CHARS:
+        return True
+    if _is_bare_acknowledgement(text):
         return True
     return any(pattern.search(text) for pattern in _TRANSIENT_PATTERNS)
 

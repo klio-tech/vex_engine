@@ -148,3 +148,95 @@ def test_parse_accepts_a_bare_string_as_an_untyped_item():
 def test_parse_of_a_non_list_is_the_empty_list():
     assert parse_typed_items("not a list") == []
     assert parse_typed_items(None) == []
+
+
+# ---------------------------------------------------------------------------
+# Regression: two ways the backstop ate real knowledge
+# ---------------------------------------------------------------------------
+#
+# Independent review found both by sampling the DROPPED set of a real
+# extraction run: roughly 1 in 6 dropped items was durable knowledge. The
+# backstop was the cause in two specific, reproducible ways, and neither had a
+# test — the original corpus above happened to contain no durable port
+# constraint and nothing under 25 characters.
+
+
+# Durable constraints that happen to mention a port. A port number is not by
+# itself machine state: "listens on 5432 by default" is a property of Postgres,
+# not of this laptop right now. The old pattern matched on the noun and on a
+# too-wide verb alternation (`served|exposed|bound`), so which of these lived
+# and which died came down to conjugation luck.
+DURABLE_PORT_SAMPLES = (
+    "Postgres listens on port 5432 by default.",
+    "The Klio proxy is served on port 8787 and must not be reassigned.",
+    "The dashboard dev server is bound to port 3000 in every environment.",
+    "Supabase exposes its API gateway on port 54321 by convention.",
+    "Grafana is exposed on port 3000, which collides with the Next.js dev server.",
+)
+
+# Durable facts that are simply short. The extraction prompt explicitly asks
+# for "one short, self-contained statement", so a blanket 25-character floor
+# selects against exactly what the prompt requests.
+SHORT_DURABLE_SAMPLES = (
+    "Health path is /healthz",
+    "GitHub org: klio-tech",
+    "Prod DB is Neon.",
+    "Python 3.14 is required",
+    "Use pnpm, not npm.",
+    "Node 22 is the floor.",
+    "Auth uses PKCE.",
+    "Deploy target: Railway",
+    "Brand font is Inter.",
+    "Region is us-east-1.",
+)
+
+
+@pytest.mark.parametrize("content", DURABLE_PORT_SAMPLES)
+def test_a_durable_port_constraint_is_not_transient(content):
+    """A port constraint is a property of the system, not of this moment.
+
+    Klio's own stored memory includes one (the proxy owns 8787), so a filter
+    that eats these eats the product's own operating knowledge.
+    """
+    assert not is_transient(content)
+
+
+@pytest.mark.parametrize("content", SHORT_DURABLE_SAMPLES)
+def test_a_short_durable_fact_survives_the_floor(content):
+    """Brevity is not transience.
+
+    The floor exists for contentless tokens ('ok', 'done', 'pong'), not for
+    terse facts. Anything carrying a number, a path, a URL, or an identifier
+    is carrying content however short it is.
+    """
+    assert not is_transient(content)
+
+
+@pytest.mark.parametrize(
+    "content",
+    ("ok", "done", "pong", "yes", "it works", "sure thing", "all good now"),
+)
+def test_contentless_short_strings_are_still_transient(content):
+    """The floor still has to do its original job.
+
+    Positive control on the fix: relaxing the floor must not make every
+    two-word acknowledgement a memory.
+    """
+    assert is_transient(content)
+
+
+# Root causes and negative decisions. These were dropped by the PROMPT rather
+# than the regex — a root cause is phrased in past tense about an incident so
+# it reads as narration, and TAXONOMY_RULE defined `decision` only
+# affirmatively ("resolves alternatives"), which excludes deciding NOT to do
+# something. The rule text is the fix, so the test pins the rule text.
+def test_the_durability_rule_keeps_root_causes_and_negative_decisions():
+    from shared.taxonomy import DURABILITY_RULE
+
+    assert "root cause" in DURABILITY_RULE.lower(), (
+        "a root cause found once is durable; the rule must say so, or the "
+        "model reads it as incident narration and drops it"
+    )
+    assert "not to do" in DURABILITY_RULE.lower(), (
+        "a decision to exclude something from scope is a decision"
+    )

@@ -11,9 +11,17 @@ the moment the curator can write them, the type list alone no longer separates
 input from output, and a freshly written row's ``created_at`` is by
 construction past the keyset cursor. The curator would re-digest its own
 deductions on the very next tick, forever, and each generation would be a
-model's reading of a model's reading. ``provenance <> 'INFERRED'`` is the
-separator that holds: this job distils what was captured, never what was
-concluded.
+model's reading of a model's reading. The separator that holds is AUTHORSHIP:
+the read predicate excludes rows this module wrote (``metadata->>'source' =
+'curator'``).
+
+The obvious alternative, ``provenance <> 'INFERRED'``, was tried first and is
+wrong — ``provenance`` is a confidence label, not a byline. ``klio init``
+stamps ``INFERRED`` on everything the agent derived from the conversation or
+the repo rather than heard verbatim from the user
+(``onboarding.py:_provenance_for``), so that predicate would silently starve
+the curator of the whole onboarding corpus. The last test here is the
+regression for it.
 
 Real Postgres throughout: the guard IS the SQL predicate, and a mocked session
 would pass a query with no predicate at all.
@@ -100,6 +108,7 @@ def _seed(
     content: str,
     memory_type: str = "observation",
     provenance: str = "EXTRACTED",
+    source: str = "hook-tool",
     created_at=None,
 ) -> str:
     memory_id = str(uuid.uuid4())
@@ -113,7 +122,8 @@ def _seed(
                 created_at, updated_at, recall_hidden, provenance
             ) VALUES (
                 :id, :session_id, :org_id, 'agent-1', :memory_type, :content,
-                :embedding, 'private', 'active', :user_id, '{}'::jsonb,
+                :embedding, 'private', 'active', :user_id,
+                jsonb_build_object('source', :source),
                 :now, :now, TRUE, :provenance
             )
             """
@@ -128,6 +138,7 @@ def _seed(
             "user_id": user_id,
             "now": now,
             "provenance": provenance,
+            "source": source,
         },
     )
     db.commit()
@@ -215,11 +226,11 @@ async def test_a_distilled_decision_is_stored_as_a_decision(db):
 
 @pytest.mark.asyncio
 async def test_the_curators_own_output_is_not_fuel_for_the_next_tick(db):
-    """``provenance <> 'INFERRED'`` is what stops the feedback loop.
+    """The authorship predicate is what stops the feedback loop.
 
-    ``decision`` / ``plan`` / ``note`` are all RAW input types, so without the
-    provenance predicate the rows written by the tick above are eligible input
-    the moment they exist — their ``created_at`` is always past the cursor.
+    ``decision`` / ``plan`` / ``note`` are all RAW input types, so without it
+    the rows written by the tick above are eligible input the moment they
+    exist — their ``created_at`` is always past the cursor.
     """
     org = _org(db)
     base = datetime.now(timezone.utc)
@@ -238,6 +249,7 @@ async def test_the_curators_own_output_is_not_fuel_for_the_next_tick(db):
             content=f"a curator-authored {kind} nobody captured",
             memory_type=kind,
             provenance="INFERRED",
+            source="curator",
             created_at=base + timedelta(seconds=1),
         )
 
@@ -245,8 +257,8 @@ async def test_the_curators_own_output_is_not_fuel_for_the_next_tick(db):
 
     contents = [r.content for r in rows]
     assert contents == ["a genuine hook capture about the deploy pipeline"], (
-        "an INFERRED row is a model's conclusion; re-reading it is the "
-        "curator digesting its own distillate"
+        "a row this module wrote is its own distillate; re-reading it closes "
+        "the feedback loop the taxonomy change would otherwise open"
     )
 
 
@@ -271,3 +283,39 @@ async def test_an_extracted_raw_row_of_every_kind_is_still_fuel(db):
 
     rows = _read_new_raw_rows(db, org, PRIYA, CursorState(None, None), batch_size=50)
     assert len(rows) == 5
+
+
+@pytest.mark.asyncio
+async def test_klio_init_content_is_still_curator_fuel(db):
+    """The regression for the predicate that was almost shipped.
+
+    ``onboarding.py`` writes every ``klio init`` candidate through the same
+    door, with ``ALLOWED_KINDS = frozenset(RAW_MEMORY_TYPES)`` and
+    ``_provenance_for()`` stamping ``INFERRED`` on everything the agent derived
+    from the conversation or the repo — i.e. on nearly all of it. A
+    ``provenance <> 'INFERRED'`` guard reads as a sensible "don't eat model
+    output" rule and would have silently made the richest onboarding content
+    invisible to synthesis. Authorship is the correct axis: init rows are
+    ``source='init'``, not ``source='curator'``.
+    """
+    org = _org(db)
+    base = datetime.now(timezone.utc)
+    for i, kind in enumerate(("note", "decision", "observation")):
+        _seed(
+            db,
+            org_id=org,
+            user_id=PRIYA,
+            content=f"an init-seeded {kind} about how this team works",
+            memory_type=kind,
+            provenance="INFERRED",  # exactly what _provenance_for returns
+            source="init",
+            created_at=base + timedelta(seconds=i),
+        )
+
+    rows = _read_new_raw_rows(db, org, PRIYA, CursorState(None, None), batch_size=50)
+
+    assert len(rows) == 3, (
+        "klio init content is captured knowledge with a low confidence label, "
+        "not the curator's own output; excluding it starves synthesis of the "
+        "onboarding corpus"
+    )

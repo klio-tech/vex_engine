@@ -41,15 +41,26 @@ Separation from verification:
 No self-reprocessing:
     The curator reads only the RAW input types
     (``observation``/``note``/``memory``/``plan``/``decision``) **and only rows
-    that are not ``INFERRED``**. The second half is load-bearing since the
-    taxonomy change: the curator now emits ``decision`` / ``plan`` / ``note``
-    as well as ``fact``, and three of those are RAW types. A type list alone
-    would therefore have closed exactly the feedback loop it was written to
-    prevent — the curator re-digesting its own deductions, forever, because a
-    freshly written row's ``created_at`` is always past the cursor. Provenance
-    is the honest separator: this module distils what was *captured*, never
-    what a model *concluded*. Combined with the per-org keyset cursor (it only
-    reads rows past the cursor), a tick cannot loop on its own output.
+    it did not write itself** (:data:`_CURATOR_SOURCE`).
+
+    The second half is new, and it exists because the taxonomy change created
+    the need for it — this is not a latent bug being fixed. Until the curator
+    emitted types, its only outputs were ``fact`` and ``summary``, neither of
+    which is in :data:`RAW_MEMORY_TYPES`, so the type list alone was a complete
+    separator and the docstring above said so correctly. Now that a tick can
+    emit ``decision`` / ``plan`` / ``note`` — three RAW types — the type list
+    no longer separates anything, and a freshly written row's ``created_at`` is
+    by construction past the keyset cursor. Without a second predicate this
+    change would have introduced a permanent feedback loop: the curator
+    re-digesting its own deductions, each generation a model's reading of a
+    model's reading.
+
+    The predicate is on AUTHORSHIP rather than on ``provenance``. See
+    :data:`_CURATOR_SOURCE` for why the confidence label is the wrong tool
+    here — it would have starved this module of every ``klio init`` row.
+
+    Combined with the per-org keyset cursor (it only reads rows past the
+    cursor), a tick cannot loop on its own output.
 
 Hidden rows are fuel, not noise:
     The input predicate deliberately does NOT filter on ``recall_hidden``.
@@ -59,8 +70,8 @@ Hidden rows are fuel, not noise:
     stayed empty: migration 026 backfilled ``recall_hidden=TRUE`` onto every
     passive capture, so ``recall_hidden = FALSE`` AND a RAW-only type list
     intersected to the empty set on real data. The separation of input from
-    output now rests on :data:`RAW_MEMORY_TYPES`, the provenance predicate, and
-    the cursor.
+    output now rests on :data:`RAW_MEMORY_TYPES`, the authorship predicate,
+    and the cursor.
 
 Reconciliation:
     After storing each new ``fact`` the curator runs a bounded reconciliation
@@ -90,8 +101,15 @@ Cursor / idempotency:
     threshold — or one that qualified but stored nothing, because every write
     failed — is deferred, so the cursor stops before the earliest such row
     rather than at the batch's end. Advancing past a row the curator never
-    read back is not a skip: nothing looks behind the cursor, and
-    ``scripts/run_retention.py`` deletes RAW observations on a 7-day TTL.
+    read back is not a skip: nothing looks behind the cursor.
+
+    Caveat, verified against production: ``scripts/run_retention.py`` is *written* to delete RAW observations on
+    a 7-day TTL, but nothing in this repo invokes it — no cron, no Railway
+    service, no workflow, and the in-process scheduler drives only the
+    curator and artifact GC. In production those rows therefore accumulate
+    (27.5k active `hook-tool` observations spanning 80 days at the time of
+    writing). Tracked separately; noted here because two justifications in
+    this module lean on a TTL that is not running.
 
 Async / DB I/O note:
     :func:`curator_tick` is ``async def`` yet performs inline *synchronous*
@@ -212,6 +230,21 @@ _RAW_TYPES_SQL: str = ", ".join(f"'{t}'" for t in RAW_MEMORY_TYPES)
 
 DEFAULT_CURATOR_AGENT_ID: str = "klio-curator"
 """Agent principal under which synthesised memories are authored."""
+
+#: ``metadata->>'source'`` stamped on every row this module writes, and the
+#: value the raw-input predicate excludes. The separator is AUTHORSHIP, not
+#: confidence.
+#:
+#: The obvious-looking alternative, ``provenance <> 'INFERRED'``, is wrong. It
+#: reads as "distil what was captured, not what was concluded", but
+#: ``provenance`` is a confidence label, and plenty of rows the curator SHOULD
+#: eat carry ``INFERRED`` for reasons that have nothing to do with this module:
+#: ``klio init`` stamps it on everything the agent derived from the
+#: conversation or the repo rather than heard verbatim from the user
+#: (``onboarding.py:_provenance_for``). Excluding INFERRED would therefore have
+#: starved the curator of the entire onboarding corpus — small today, and
+#: exactly the content that grows with ``init`` adoption.
+_CURATOR_SOURCE: str = "curator"
 
 # Reconciliation: a new fact supersedes an older one only on DIRECT
 # contradiction. Conservative by design — a stale fact surviving is
@@ -748,7 +781,7 @@ def _read_new_raw_rows(
               AND user_id = :user_id
               AND status = 'active'
               AND memory_type IN ({_RAW_TYPES_SQL})
-              AND provenance <> 'INFERRED'
+              AND metadata->>'source' IS DISTINCT FROM '{_CURATOR_SOURCE}'
               AND (
                 :cursor_ts IS NULL
                 OR created_at > :cursor_ts
@@ -882,7 +915,7 @@ async def _synthesize_and_store(
     # The session id carries user_id so the dedup window (which is keyed on
     # session_id for shared writes) cannot straddle two people.
     session_id = f"{agent_id}:{org_id}:{user_id}"
-    base_meta = {"source": "curator", "input_count": input_count}
+    base_meta = {"source": _CURATOR_SOURCE, "input_count": input_count}
     stored = 0
 
     # --- summary --------------------------------------------------------
@@ -1159,7 +1192,8 @@ async def curator_tick(
         # They do not simply "stay recallable" in the meantime, which is what
         # this comment used to claim: nearly every RAW row is a passive capture
         # with recall_hidden=TRUE, invisible to recall by construction, and
-        # scripts/run_retention.py deletes RAW observations on a 7-day TTL.
+        # scripts/run_retention.py is written to delete RAW observations on a
+        # 7-day TTL — but nothing invokes it, so in production they persist.
         # Advancing past a skipped row does not demote it to raw material; it
         # destroys it on a one-week fuse.
         if len(part_rows) < min_inputs:
@@ -1225,8 +1259,8 @@ def _cursor_stop(rows: list[Any], held: list[Any]) -> int:
     single point on that order, so the only rows it can safely pass are the
     unbroken prefix ending before the FIRST row this tick did not distil.
     Anything past that point would be skipped permanently: the read query only
-    ever looks ahead of the cursor, and ``scripts/run_retention.py`` deletes
-    RAW observations after 7 days.
+    ever looks ahead of the cursor, so a passed-over row is never revisited
+    whether or not retention eventually removes it.
 
     ``len(rows)`` when nothing was held (the ordinary case — advance over the
     whole batch); ``0`` when the very first row was held, in which case the
@@ -1286,7 +1320,7 @@ async def run_curator_once(
                   AND user_id IS NOT NULL
                   AND status = 'active'
                   AND memory_type IN ({_RAW_TYPES_SQL})
-                  AND provenance <> 'INFERRED'
+                  AND metadata->>'source' IS DISTINCT FROM '{_CURATOR_SOURCE}'
                 """
             )
         ).fetchall()
