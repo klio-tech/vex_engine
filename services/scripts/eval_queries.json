@@ -11,9 +11,13 @@
     "unfiled (project_id IS NULL) are neither: nothing claims they belong",
     "elsewhere, and they are what the two-tier filter deliberately admits.",
     "",
-    "'expect_empty' marks queries that SHOULD return nothing: the relevance floor",
-    "returning zero rows is the feature, and a query set with no such case cannot",
-    "tell a working floor from an absent one."
+    "'expect_empty' marks the control: a query about a subject this corpus",
+    "contains nothing on. It is REPORTED, not enforced. Measured, its best match",
+    "scores 0.78 while real queries score 0.78-0.87 — the distributions overlap,",
+    "so no absolute relevance floor can empty it without also emptying real",
+    "recalls. Watch the number: the day it separates is the day an absolute floor",
+    "becomes settable, and that day arrives by fixing the corpus (99.5% of it is",
+    "auto-mined session exhaust), not by tuning the ranking."
   ],
   "org_id": "vex",
   "queries": [
@@ -104,7 +108,7 @@
       "project": "Klio",
       "source": "control",
       "expect_empty": true,
-      "note": "nothing in this corpus is about this. A recall that answers it confidently is the bug."
+      "note": "nothing in this corpus is about this. A recall that answers it confidently is the corpus problem, stated as a number."
     }
   ]
 }

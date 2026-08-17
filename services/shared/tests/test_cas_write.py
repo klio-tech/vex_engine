@@ -48,7 +48,7 @@ def test_stale_base_revision_returns_conflict_payload():
         patch.object(
             memory_mod,
             "_prepare_cas_write",
-            return_value=("mine", {}, {"v1": [0.1] * 4}, False, []),
+            return_value=("mine", {}, [0.1] * 4, False, []),
         ),
         patch.object(
             memory_mod,
@@ -102,7 +102,7 @@ def test_current_base_revision_proceeds_to_supersede():
         patch.object(
             memory_mod,
             "_prepare_cas_write",
-            return_value=("mine", {}, {"v1": [0.1] * 4}, False, []),
+            return_value=("mine", {}, [0.1] * 4, False, []),
         ),
         patch.object(
             memory_mod,
@@ -130,9 +130,7 @@ def test_current_base_revision_proceeds_to_supersede():
     # the raw new_content string.
     apkw = ap.call_args.kwargs
     assert apkw["content"] == "mine"
-    # Dual-write: the prepare step returns one vector per space this
-    # deployment writes, and the insert names the matching columns.
-    assert list(apkw["vectors"].values()) == [[0.1] * 4]
+    assert apkw["embedding"] == [0.1] * 4
 
 
 def test_unknown_memory_id_returns_not_found_without_touching_the_guard():
@@ -294,7 +292,7 @@ def test_conflict_increments_the_write_conflicts_counter():
         patch.object(
             memory_mod,
             "_prepare_cas_write",
-            return_value=("mine", {}, {"v1": [0.1] * 4}, False, []),
+            return_value=("mine", {}, [0.1] * 4, False, []),
         ),
         patch.object(memory_mod, "_current_belief_in_chain", return_value=None),
     ):

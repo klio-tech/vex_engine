@@ -13,7 +13,6 @@ from typing import Optional
 import pytest
 
 from shared import ranking
-from shared.embedding_space import SPACE_ENV, SPACE_V1, SPACE_V2
 
 
 @dataclass
@@ -27,7 +26,6 @@ class _Record:
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     for name in (
-        SPACE_ENV,
         ranking.SIMILARITY_WEIGHT_ENV,
         ranking.RECENCY_WEIGHT_ENV,
         ranking.CANDIDATE_POOL_FACTOR_ENV,
@@ -87,24 +85,24 @@ def test_ef_search_is_at_least_as_deep_as_the_default_pool():
 # ── the floor ─────────────────────────────────────────────────────────────
 
 
-def test_v1_has_no_absolute_floor():
-    """v1's whole corpus sits in a 0.08-wide band with the median at 0.77.
+def test_the_absolute_floor_ships_off():
+    """A finding, not a placeholder.
 
-    There is no value in that band that separates a good row from a bad one,
-    so any floor either keeps everything or empties production. Off is the
-    only honest setting until the corpus is re-embedded.
+    Measured over an 11,648-row production sample, a control query about a
+    subject the corpus contains nothing on still found a best match at 0.80,
+    while real queries' best matches ran 0.78-0.90. The distributions overlap,
+    so no absolute value rejects the nonsense query without also rejecting
+    real ones, and picking one anyway is how a floor silently empties
+    production.
     """
-    assert ranking.min_relevance(SPACE_V1) == 0.0
-    assert ranking.relative_floor(SPACE_V1) == 1.0
+    assert ranking.min_relevance() == 0.0
 
 
-def test_v2_has_a_real_absolute_floor():
-    assert 0.0 < ranking.min_relevance(SPACE_V2) < 1.0
-    assert 0.0 < ranking.relative_floor(SPACE_V2) < 1.0
+def test_the_relative_floor_ships_on_and_can_never_empty_a_result():
+    assert 0.0 < ranking.relative_floor() < 1.0
 
 
 def test_the_floor_can_return_nothing_and_that_is_the_feature(monkeypatch):
-    monkeypatch.setenv(SPACE_ENV, "v2")
     monkeypatch.setenv(ranking.MIN_RELEVANCE_ENV, "0.9")
     rows = [_Record("a", 0.61), _Record("b", 0.60)]
     assert ranking.apply_relevance_floor(rows) == []
@@ -117,7 +115,6 @@ def test_the_relative_floor_never_empties_a_result(monkeypatch):
     trims the tail and cannot silence recall; the absolute floor can, which is
     exactly why it is off in v1.
     """
-    monkeypatch.setenv(SPACE_ENV, "v2")
     monkeypatch.setenv(ranking.MIN_RELEVANCE_ENV, "0.0")
     monkeypatch.setenv(ranking.RELATIVE_FLOOR_ENV, "0.001")
     rows = [_Record("a", 0.5), _Record("b", 0.2), _Record("c", 0.1)]
@@ -134,7 +131,6 @@ def test_the_absolute_floor_is_not_subsumed_by_the_relative_one(monkeypatch):
     result where everything is *consistently* mediocre, which is precisely
     what the un-prefixed corpus produced for every query.
     """
-    monkeypatch.setenv(SPACE_ENV, "v2")
     monkeypatch.setenv(ranking.MIN_RELEVANCE_ENV, "0.85")
     monkeypatch.setenv(ranking.RELATIVE_FLOOR_ENV, "0.10")
     rows = [_Record("high", 0.90), _Record("mid", 0.86), _Record("low", 0.84)]
@@ -146,7 +142,6 @@ def test_rows_with_no_cosine_survive_alongside_scored_ones(monkeypatch):
     """A lexical-only row matched an exact literal and a graph row is anchored
     to a row that already passed. Neither has a cosine, and inventing one to
     compare against a cosine floor would be inventing the evidence."""
-    monkeypatch.setenv(SPACE_ENV, "v2")
     monkeypatch.setenv(ranking.MIN_RELEVANCE_ENV, "0.5")
     rows = [_Record("vector", 0.9), _Record("lexical", None)]
     kept = ranking.apply_relevance_floor(rows)
@@ -156,7 +151,6 @@ def test_rows_with_no_cosine_survive_alongside_scored_ones(monkeypatch):
 def test_unscored_rows_do_not_survive_a_total_wipeout(monkeypatch):
     """When every scored row fails the floor, the search found nothing, and
     handing back its by-products would present them as results."""
-    monkeypatch.setenv(SPACE_ENV, "v2")
     monkeypatch.setenv(ranking.MIN_RELEVANCE_ENV, "0.99")
     rows = [_Record("vector", 0.5), _Record("lexical", None)]
     assert ranking.apply_relevance_floor(rows) == []
@@ -166,16 +160,46 @@ def test_a_result_with_no_scored_rows_at_all_is_left_alone(monkeypatch):
     """Nothing to measure against, so nothing is judged. This is the
     graph-expansion-only shape, and dropping it would be a floor deciding
     about rows it has no evidence on."""
-    monkeypatch.setenv(SPACE_ENV, "v2")
     rows = [_Record("graph-a", None), _Record("graph-b", None)]
     assert len(ranking.apply_relevance_floor(rows)) == 2
 
 
 def test_the_floor_returns_a_new_list_and_preserves_order(monkeypatch):
-    monkeypatch.setenv(SPACE_ENV, "v2")
     monkeypatch.setenv(ranking.MIN_RELEVANCE_ENV, "0.0")
     monkeypatch.setenv(ranking.RELATIVE_FLOOR_ENV, "1.0")
     rows = [_Record("a", 0.9), _Record("b", 0.1), _Record("c", 0.5)]
     kept = ranking.apply_relevance_floor(rows)
     assert kept is not rows
     assert [r.id for r in kept] == ["a", "b", "c"]
+
+
+def test_a_lexically_matched_row_is_exempt_from_the_floor(monkeypatch):
+    """Without this the floor silently undoes the lexical arm.
+
+    The arm exists because a rare literal has no private direction in the
+    embedding space: the row containing ``KLIO_METRICS_TOKEN`` ranks LAST by
+    cosine among rows merely about tokens. That is exactly the position a
+    cosine floor deletes — so the floor would remove the one row the arm was
+    built to promote, and the only symptom would be that a feature quietly
+    stopped working.
+    """
+    monkeypatch.setenv(ranking.MIN_RELEVANCE_ENV, "0.80")
+    monkeypatch.setenv(ranking.RELATIVE_FLOOR_ENV, "0.02")
+    rows = [_Record("semantic", 0.90), _Record("literal", 0.40)]
+    kept = ranking.apply_relevance_floor(rows, exempt_ids={"literal"})
+    assert [r.id for r in kept] == ["semantic", "literal"]
+
+
+def test_an_exempt_row_does_not_raise_the_bar_for_everyone_else(monkeypatch):
+    """The exemption is a pass, not a vote.
+
+    An exempt row must not participate in choosing ``best``: a lexical hit
+    scoring 0.99 would otherwise pull the relative window up and evict
+    semantically-good rows on the strength of a signal they were never
+    measured against.
+    """
+    monkeypatch.setenv(ranking.MIN_RELEVANCE_ENV, "0.0")
+    monkeypatch.setenv(ranking.RELATIVE_FLOOR_ENV, "0.05")
+    rows = [_Record("literal", 0.99), _Record("a", 0.60), _Record("b", 0.58)]
+    kept = ranking.apply_relevance_floor(rows, exempt_ids={"literal"})
+    assert [r.id for r in kept] == ["literal", "a", "b"]

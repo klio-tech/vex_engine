@@ -421,7 +421,10 @@ async def test_an_empty_lexical_arm_leaves_the_order_untouched(db, monkeypatch):
     with _embed_as(corpus.LITERAL):
         with_arm = await retrieve_memories_scoped(db, org, corpus.LITERAL, limit=12)
 
-    assert len(without) == 12
+    # Not 12: the relevance floor (shared.ranking) trims the tail, which is
+    # its job and is orthogonal to the invariant under test. What matters is
+    # that the arm changed NOTHING — same rows, same order, same scores.
+    assert without, "positive control: the recall returned something"
     assert [str(r.id) for r in with_arm] == [str(r.id) for r in without]
     assert [r.relevance for r in with_arm] == [r.relevance for r in without]
 
@@ -443,7 +446,10 @@ async def test_a_stopword_only_query_leaves_the_order_untouched(db, monkeypatch)
     with _embed_as(query):
         with_arm = await retrieve_memories_scoped(db, org, query, limit=12)
 
-    assert len(without) == 12
+    # Not 12: the relevance floor (shared.ranking) trims the tail, which is
+    # its job and is orthogonal to the invariant under test. What matters is
+    # that the arm changed NOTHING — same rows, same order, same scores.
+    assert without, "positive control: the recall returned something"
     assert [str(r.id) for r in with_arm] == [str(r.id) for r in without]
 
 

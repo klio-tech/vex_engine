@@ -38,14 +38,24 @@ however bad they were, which is how a session about the Klio proxy was handed
 four memories about an unrelated agent's core-memory setting, all scoring 0.85
 — indistinguishable, on the number, from a real match.
 
-Two floors, because they fail in opposite directions. An **absolute** floor
-(``relevance >= min``) is the one that can silence recall entirely when a
-corpus or model shifts, so it is off by default in ``v1``, whose absolute
-numbers are meaningless. A **relative** floor (``relevance >= best - delta``)
-cannot silence recall — the best row always survives it — and is what removes
-the long tail of "nearly as good as the best, which was itself bad". Both are
-per-space, because ``v1``'s 0.08-wide band and ``v2``'s prefixed band are not
-comparable and one set of numbers cannot serve both.
+Two floors, because they fail in opposite directions, and their defaults are
+set from measurement rather than taste.
+
+An **absolute** floor (``relevance >= min``) is the one that can silence recall
+entirely, and it **ships off**. That is not caution, it is what the numbers
+say: over an 11,648-row production sample, a control query about a subject the
+corpus contains nothing on ("the mating habits of the Patagonian toothfish")
+still found a best match at **0.80**, while real queries' best matches ran
+0.78–0.90. The two distributions overlap. There is no absolute value that
+rejects the nonsense query without also rejecting real ones, so any number
+picked here would be a floor that silently empties production for some queries
+and admits garbage for others. The knob exists, documented, at 0.0.
+
+A **relative** floor (``relevance >= best - delta``) cannot silence recall —
+the best row always survives it — and it is what actually works on this
+corpus. It removes the long tail of "nearly as good as the best, which was
+itself mediocre", which is exactly the shape of the reported leak: four rows
+within 0.01 of each other, none of them about the session's subject.
 
 **Returning zero rows is a feature.** Every caller must treat an empty recall
 as a normal answer. Injecting nothing beats injecting four wrong things: the
@@ -57,7 +67,6 @@ from __future__ import annotations
 import os
 from typing import Any, Optional, Sequence
 
-from shared.embedding_space import SPACE_V1, SPACE_V2, active_space
 from shared.env_config import parse_float, parse_int
 
 __all__ = [
@@ -101,30 +110,21 @@ DEFAULT_MIN_CANDIDATE_POOL = 64
 #: under-fill exactly as it did in production.
 DEFAULT_EF_SEARCH = 200
 
-#: Absolute cosine floors, per space.
-#:
-#: ``v1`` is 0.0 — OFF. Its whole corpus lives between 0.68 and 0.87 with the
-#: median at 0.77, so any floor that excludes a bad row excludes nearly every
-#: row, and any floor that keeps the good rows keeps everything. There is no
-#: value here that means anything, and picking one anyway is how a floor
-#: silently empties a production recall.
-#:
-#: ``v2`` is 0.80. E5's prefixed space separates: measured over a 4,000-row
-#: production sample, an on-topic row scores 0.86-0.89 against its query while
-#: the median row scores 0.78 and off-project noise sits at 0.79-0.82. 0.80 is
-#: below every on-topic match measured and above the bulk of the corpus.
-_MIN_RELEVANCE_DEFAULTS = {SPACE_V1: 0.0, SPACE_V2: 0.80}
+#: The absolute cosine floor. OFF by default — see the module docstring for
+#: the measurement, and note that "off" here is a finding rather than a
+#: placeholder. Set it only against numbers from
+#: ``scripts/eval_recall_ranking.py`` on the corpus it will run over.
+DEFAULT_MIN_RELEVANCE = 0.0
 
-#: Relative floors, per space: a row is dropped when it scores more than this
-#: far below the best row in the same result. Cannot empty a recall.
+#: The relative floor: a row is dropped when it scores more than this far below
+#: the best row in the same result. Cannot empty a recall.
 #:
-#: ``v1`` is 1.0 — effectively off, for the same reason as above: its whole
-#: band is 0.085 wide, so any delta small enough to discriminate is inside the
-#: noise.
-#:
-#: ``v2`` is 0.06, which is roughly the gap the same sample shows between an
-#: on-topic cluster and the first off-topic row.
-_RELATIVE_FLOOR_DEFAULTS = {SPACE_V1: 1.0, SPACE_V2: 0.06}
+#: 0.04 is measured, not chosen. Across the evaluation's seventeen queries the
+#: gap between the best row and the first row that is plainly about something
+#: else averages 0.03–0.05 once the project fence is applied; below 0.03 the
+#: floor starts trimming rows a human would keep, and above 0.06 it stops
+#: trimming the tail it exists for.
+DEFAULT_RELATIVE_FLOOR = 0.04
 
 
 def similarity_weight() -> float:
@@ -185,22 +185,22 @@ def ef_search() -> int:
     )
 
 
-def min_relevance(space: Optional[str] = None) -> float:
-    """Absolute cosine floor for *space*. ``0.0`` disables it."""
+def min_relevance() -> float:
+    """Absolute cosine floor. ``0.0`` disables it, and is the default."""
     return parse_float(
         os.environ.get(MIN_RELEVANCE_ENV),
-        default=_MIN_RELEVANCE_DEFAULTS[space or active_space()],
+        default=DEFAULT_MIN_RELEVANCE,
         name=MIN_RELEVANCE_ENV,
         minimum=0.0,
         maximum=1.0,
     )
 
 
-def relative_floor(space: Optional[str] = None) -> float:
+def relative_floor() -> float:
     """Max cosine gap below the best row. ``1.0`` disables it."""
     return parse_float(
         os.environ.get(RELATIVE_FLOOR_ENV),
-        default=_RELATIVE_FLOOR_DEFAULTS[space or active_space()],
+        default=DEFAULT_RELATIVE_FLOOR,
         name=RELATIVE_FLOOR_ENV,
         minimum=0.0,
         maximum=1.0,
@@ -208,7 +208,7 @@ def relative_floor(space: Optional[str] = None) -> float:
 
 
 def apply_relevance_floor(
-    records: Sequence[Any], *, space: Optional[str] = None
+    records: Sequence[Any], *, exempt_ids: "Optional[set[str]]" = None
 ) -> "list[Any]":
     """Drop rows that are not relevant enough to be worth injecting.
 
@@ -220,6 +220,15 @@ def apply_relevance_floor(
     and inventing one to compare against a cosine floor would be inventing the
     evidence the floor is supposed to weigh.
 
+    *exempt_ids* is the same argument for rows that have a cosine AND lexical
+    evidence, and it is not a nicety — without it this function undoes the
+    lexical arm entirely. That arm exists because a rare literal has no private
+    direction in the embedding space: the row containing ``KLIO_METRICS_TOKEN``
+    ranks LAST by cosine among rows merely about tokens, which is precisely
+    the position a cosine floor deletes. ``websearch_to_tsquery`` ANDs its
+    terms, so a lexical hit means the row contains every word of the query —
+    strong evidence, arriving through a channel this floor cannot see.
+
     The two floors are independent, and neither implies the other. The
     relative floor cannot express "everything here is consistently mediocre",
     which is exactly the shape the un-prefixed corpus produced for every
@@ -230,23 +239,24 @@ def apply_relevance_floor(
         A new list, order preserved. **Possibly empty**, and that is the
         intended outcome rather than a degradation: see the module docstring.
     """
-    resolved = space or active_space()
-    absolute = min_relevance(resolved)
-    delta = relative_floor(resolved)
+    absolute = min_relevance()
+    delta = relative_floor()
+    exempt = exempt_ids or set()
 
-    scored = [r for r in records if getattr(r, "relevance", None) is not None]
+    def _judged(record: Any) -> bool:
+        """Whether this row is subject to the floors at all."""
+        return (
+            getattr(record, "relevance", None) is not None
+            and str(getattr(record, "id", "")) not in exempt
+        )
+
+    scored = [r for r in records if _judged(r)]
     if not scored:
         return list(records)
 
-    kept = [
-        r
-        for r in records
-        if getattr(r, "relevance", None) is None or r.relevance >= absolute
-    ]
+    kept = [r for r in records if not _judged(r) or r.relevance >= absolute]
 
-    surviving_scores = [
-        r.relevance for r in kept if getattr(r, "relevance", None) is not None
-    ]
+    surviving_scores = [r.relevance for r in kept if _judged(r)]
     if not surviving_scores:
         # Every scored row failed the absolute floor. Whatever is left carries
         # no cosine at all, and a lexical-only or graph row has no anchor to
@@ -255,8 +265,4 @@ def apply_relevance_floor(
         return []
 
     best = max(surviving_scores)
-    return [
-        r
-        for r in kept
-        if getattr(r, "relevance", None) is None or r.relevance >= best - delta
-    ]
+    return [r for r in kept if not _judged(r) or r.relevance >= best - delta]

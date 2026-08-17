@@ -32,7 +32,6 @@ def db():
     engine = create_engine(DB_URL)
     conn = engine.connect()
     conn.org_id = f"org_floor_{uuid.uuid4().hex[:8]}"  # type: ignore[attr-defined]
-    memory.reset_embedding_space_probe()
     try:
         yield conn
     finally:
