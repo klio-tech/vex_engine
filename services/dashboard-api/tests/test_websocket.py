@@ -17,7 +17,6 @@ from app.config import WS_TOKEN_SECRET_ENV
 from app.main import create_app
 from app.websocket import ConnectionManager, manager
 from app.ws_auth import (
-    TEST_VECTOR,
     WS_SUBPROTOCOL,
     WsAuthError,
     authenticate,
@@ -26,6 +25,8 @@ from app.ws_auth import (
 )
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
+
+from .ws_auth_fixtures import TEST_VECTOR
 
 SECRET = "unit-test-signing-secret"
 ORG_A = "org-aaaa-1111"

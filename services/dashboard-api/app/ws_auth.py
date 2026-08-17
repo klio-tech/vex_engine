@@ -45,8 +45,8 @@ TOKEN FORMAT
 character of the token is an RFC 7230 ``token`` character and the whole thing
 is legal in a ``Sec-WebSocket-Protocol`` header. The Dashboard repo mints the
 identical string in TypeScript; both suites pin the same fixed vector
-(see ``TEST_VECTOR`` below) so the two implementations cannot drift apart
-silently.
+(see ``tests/ws_auth_fixtures.py``'s ``TEST_VECTOR``) so the two
+implementations cannot drift apart silently.
 
 TRANSPORT
 ---------
@@ -91,20 +91,6 @@ MAX_TOKEN_LIFETIME_S = 15 * 60
 
 #: Tolerance for clock skew between the minting web tier and this service.
 CLOCK_SKEW_TOLERANCE_S = 30
-
-#: Fixed vector mirrored by the Dashboard repo's ws-token test. Both sides
-#: assert this exact string. If either implementation changes its encoding,
-#: padding, separator or field order, one of the two suites goes red before the
-#: mismatch can reach production as "the charts stopped updating".
-TEST_VECTOR = {
-    "secret": "test-secret-do-not-use",
-    "org_id": "11111111-2222-3333-4444-555555555555",
-    "exp": 1700000000,
-    "token": (
-        "v1.MTExMTExMTEtMjIyMi0zMzMzLTQ0NDQtNTU1NTU1NTU1NTU1.1700000000"
-        ".ixLU_-TiTdxIbjLicOSP5PsoWzB6qPN406MI7yiLlq8"
-    ),
-}
 
 
 class WsAuthError(Exception):
