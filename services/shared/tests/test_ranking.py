@@ -148,12 +148,42 @@ def test_rows_with_no_cosine_survive_alongside_scored_ones(monkeypatch):
     assert [r.id for r in kept] == ["vector", "lexical"]
 
 
-def test_unscored_rows_do_not_survive_a_total_wipeout(monkeypatch):
-    """When every scored row fails the floor, the search found nothing, and
-    handing back its by-products would present them as results."""
+def test_a_total_wipeout_still_returns_the_rows_it_never_judged(monkeypatch):
+    """A wipeout is a verdict on cosines, not on the whole result.
+
+    Every row carrying a cosine failed the bar, so there is no ``best`` for
+    the relative floor to work from — but a lexical-only row was never judged
+    by either floor, and its evidence (the query's every word appears in it)
+    is untouched by the fact that some other row's cosine was low.
+    """
     monkeypatch.setenv(ranking.MIN_RELEVANCE_ENV, "0.99")
     rows = [_Record("vector", 0.5), _Record("lexical", None)]
+    kept = ranking.apply_relevance_floor(rows)
+    assert [r.id for r in kept] == ["lexical"]
+
+
+def test_a_total_wipeout_returns_nothing_when_every_row_was_judged(monkeypatch):
+    """The other half. Nothing but failing cosines really is nothing."""
+    monkeypatch.setenv(ranking.MIN_RELEVANCE_ENV, "0.99")
+    rows = [_Record("a", 0.5), _Record("b", 0.4)]
     assert ranking.apply_relevance_floor(rows) == []
+
+
+def test_an_exempt_row_survives_when_every_judged_row_fails_the_floor(monkeypatch):
+    """The regression this guards is dormant at the shipped default and armed
+    the moment an operator touches the knob.
+
+    ``KLIO_RECALL_MIN_RELEVANCE`` is advertised as the lever to pull after a
+    bad-recall complaint. Set it to 0.80 and — before this case existed — the
+    wipeout branch discarded exempt rows along with everything else, so every
+    exact-literal search (an env var name, an error string, a config key)
+    silently returned nothing. The symptom appears weeks after the knob is
+    turned, and the knob is the last place anyone looks.
+    """
+    monkeypatch.setenv(ranking.MIN_RELEVANCE_ENV, "0.80")
+    rows = [_Record("junk", 0.50), _Record("exact-literal", 0.20)]
+    kept = ranking.apply_relevance_floor(rows, exempt_ids={"exact-literal"})
+    assert [r.id for r in kept] == ["exact-literal"]
 
 
 def test_a_result_with_no_scored_rows_at_all_is_left_alone(monkeypatch):

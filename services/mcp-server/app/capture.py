@@ -38,16 +38,31 @@ writes reuse :func:`shared.brain.write_scoped_memory`, reads reuse
 :func:`shared.brain.ensure_project` / ``find_project_id`` — the exact same
 primitives the MCP tools use.
 
-Project tagging is *best-effort* and now *symmetric*: the client may send
-``git_remote`` and/or ``repo_root`` (Claude Code provides ``cwd``), and BOTH
-the write and the read try the remote first and the path second.  When a
-project resolves, writes are filed under it and recall is fenced to it; when
-neither identifier resolves, writes go unfiled (``project_id = NULL``) and
-recall reads exactly that unfiled bucket.  What it no longer does is widen an
-unresolved read to every project in the org — that asymmetry (95 % of memories
-written with a project, 95 % of recalls ignoring it) is what let one session be
-injected with two other projects' memories.  Capture still never fails because
-project resolution failed.
+Project tagging is *best-effort*: the client may send ``git_remote`` and/or
+``repo_root`` (Claude Code provides ``cwd``), and BOTH the write and the read
+now try the remote first and the path second (the read used to accept only a
+remote, which is why 95 % of memories were written with a project and 95 % of
+recalls ignored it).  Capture never fails because project resolution failed.
+
+**What an unresolved project MEANS differs between the two recall paths, and
+the difference is deliberate.**
+
+* Empty query → :func:`_recent_memories`.  Fenced symmetrically with the write
+  path: resolved → ``project_id = :project_id``; unresolved → ``project_id IS
+  NULL``.  No widening in either direction.  This path orders by nothing but
+  ``created_at``, so every row it admits beyond the fence is chosen by its
+  clock alone — there is no ranking to justify letting more in.
+* Non-empty query → :func:`shared.memory.retrieve_memories_scoped`.  Resolved
+  → two-tier (same-project rows first, unfiled rows backfilling).
+  **Unresolved → still org-wide, unchanged.**  That path can rank what it lets
+  in, and narrowing an unresolved read to the unfiled bucket would silently
+  empty per-query recall for every caller that sends no project.
+
+The practical consequence, until the Node proxy starts sending ``repo_root``
+(``npm/src/proxy/recall.ts`` sends neither identifier today): **per-query proxy
+recalls remain org-wide and exactly as cross-contaminated as before.**  What
+this module fixes on its own is the ``klio hook`` path, which already sends
+both identifiers — that is SessionStart injection, ~87 % of recalls.
 
 Async note: handlers are ``async def`` and ``await`` the async brain/memory
 helpers (which embed/LLM-call) but those helpers also perform inline synchronous
@@ -490,10 +505,18 @@ def _find_project_id(
     directory still resolves to the one project, and the path is only consulted
     when there is no remote to be more specific than it.
 
-    A miss returns ``None``. What that MEANS to the caller changed with this
-    fix: it no longer widens the read to every project in the org (see
-    :func:`_recent_memories` and the recall handler). It now means "unfiled",
-    symmetrically with what the write path does from the same directory.
+    A miss returns ``None``, and what that MEANS depends on which recall path
+    consumes it — do not read this function as installing one fence:
+
+    * :func:`_recent_memories` (empty query) treats ``None`` as **unfiled**:
+      ``project_id IS NULL``, symmetric with what the write path does from the
+      same directory. This is the path that changed.
+    * :func:`shared.memory.retrieve_memories_scoped` (non-empty query) treats
+      ``None`` as **org-wide**, exactly as before. Its two-tier filter applies
+      only when a project resolves; with ``project_id=None`` it still takes the
+      ``_fetch("TRUE", {})`` branch. Narrowing it here would empty per-query
+      recall for every caller that sends no project — which today includes the
+      Node proxy.
     """
     for identifier in (git_remote, repo_root):
         if not identifier:

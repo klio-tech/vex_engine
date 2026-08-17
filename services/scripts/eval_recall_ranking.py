@@ -103,11 +103,31 @@ SEED_PROJECTS = (
 #: projects all pouring into one undifferentiated pool").
 SEED_OTHER_ROWS = 3000
 
+#: The visibility ladder, verbatim from ``retrieve_memories_scoped``'s
+#: ``scope == "org"`` branch. Both arms of this evaluation MUST filter on it or
+#: they are ranking different corpora and the comparison is meaningless — which
+#: is what an earlier version of this script did: it passed no ``user_id`` to
+#: the new path (so that arm saw only ``scope='org'``, 18,345 of 25,103 rows)
+#: while the baseline hard-coded ``scope='org' OR scope='private'``. On a
+#: project with 1 org row, 10 private and 12 project-scoped, the two arms were
+#: not comparable at all, and the "after" arm invented a residual of unfiled
+#: rows that production never sees.
+_LADDER_SQL = """
+          AND (
+            scope = 'org'
+            OR (scope = 'private' AND user_id = :user_id)
+            OR (scope = 'project' AND project_id IN (
+                  SELECT m.project_id FROM project_members m
+                  JOIN projects p ON p.id = m.project_id AND p.org_id = :org_id
+                  WHERE m.user_id = :user_id))
+          )"""
+
 #: The pre-fix ranking statement, kept verbatim so "before" is a measurement
 #: and not a memory. Every constant in it is the one that shipped:
 #: ``limit * 4`` pool, ``0.85``/``0.15`` weights on an UN-normalised cosine,
 #: a 30-day recency window, and no floor of any kind.
-_BASELINE_SQL = """
+_BASELINE_SQL = (
+    """
     SELECT * FROM (
         SELECT id, content, created_at, project_id,
                (1 - (embedding <=> :embedding)) AS relevance
@@ -115,8 +135,9 @@ _BASELINE_SQL = """
         WHERE org_id = :org_id
           AND status = 'active'
           AND superseded_by IS NULL
-          AND recall_hidden = FALSE
-          AND (scope = 'org' OR scope = 'private')
+          AND recall_hidden = FALSE"""
+    + _LADDER_SQL
+    + """
         ORDER BY embedding <=> :embedding
         LIMIT :candidate_pool
     ) candidates
@@ -126,10 +147,12 @@ _BASELINE_SQL = """
                 ))) DESC
     LIMIT :limit
 """
+)
 
 #: Corpus-wide separation, unfenced. ``project_id`` is compared against the
 #: session's project so the two halves can be scored apart.
-_SEPARATION_SQL = """
+_SEPARATION_SQL = (
+    """
     SELECT max(1 - (embedding <=> :embedding))
              FILTER (WHERE project_id = :project_id) AS best_on,
            max(1 - (embedding <=> :embedding))
@@ -143,8 +166,9 @@ _SEPARATION_SQL = """
       AND status = 'active'
       AND superseded_by IS NULL
       AND recall_hidden = FALSE
-      AND embedding IS NOT NULL
-"""
+      AND embedding IS NOT NULL"""
+    + _LADDER_SQL
+)
 
 
 def _load_queries() -> dict[str, Any]:
@@ -222,6 +246,29 @@ def _copy_projects(source: Any, target: Any, org_id: str) -> None:
     target.commit()
     logger.info("copied %d projects", len(rows))
 
+    # Membership, not decoration: ``scope='project'`` rows are visible only
+    # through the ``project_members`` subquery in the visibility ladder. Klio's
+    # 23 visible rows are 1 org, 10 private and 12 project-scoped, so a corpus
+    # seeded without membership hides more than half of exactly the project the
+    # evaluation is about.
+    members = source.execute(
+        text(
+            "SELECT m.project_id, m.user_id, m.role FROM project_members m "
+            "JOIN projects p ON p.id = m.project_id WHERE p.org_id = :org_id"
+        ),
+        {"org_id": org_id},
+    ).fetchall()
+    for row in members:
+        target.execute(
+            text(
+                "INSERT INTO project_members (project_id, user_id, role) "
+                "VALUES (:p, :u, :r) ON CONFLICT DO NOTHING"
+            ),
+            {"p": str(row[0]), "u": row[1], "r": row[2]},
+        )
+    target.commit()
+    logger.info("copied %d project memberships", len(members))
+
 
 async def seed(source_url: str, target_url: str, org_id: str) -> None:
     source_engine = create_engine(source_url, pool_pre_ping=True)
@@ -272,9 +319,10 @@ async def seed(source_url: str, target_url: str, org_id: str) -> None:
             )
         target.commit()
 
-    logger.info("run the v2 backfill against the target to finish seeding:")
     logger.info(
-        "  DATABASE_URL=<target> python -m scripts.run_embedding_v2_backfill --apply"
+        "seeding complete — nothing further to run. The fix deliberately does "
+        "not change stored vectors (see shared.embedding_prompt), so the copied "
+        "embeddings ARE the corpus both arms rank."
     )
 
 
@@ -293,6 +341,34 @@ def _project_id(db: Any, org_id: str, name: Optional[str]) -> Optional[str]:
     return str(row[0]) if row else None
 
 
+def _resolve_user_id(db: Any, org_id: str, override: Optional[str]) -> Optional[str]:
+    """The caller the evaluation runs as.
+
+    Production recalls are attributed — ``capture.py`` resolves a ``user_id``
+    and forwards it on both branches — so an evaluation that runs
+    unattributed is not measuring production. Defaults to the org's most
+    prolific private-memory author, which on a single-operator org is the only
+    candidate; pass ``--user-id`` for anything else.
+    """
+    if override:
+        return override
+    row = db.execute(
+        text(
+            """
+            SELECT user_id, count(*) AS n
+            FROM session_memories
+            WHERE org_id = :org_id AND user_id IS NOT NULL
+              AND status = 'active' AND recall_hidden = FALSE
+            GROUP BY user_id
+            ORDER BY n DESC
+            LIMIT 1
+            """
+        ),
+        {"org_id": org_id},
+    ).first()
+    return str(row[0]) if row else None
+
+
 def _project_names(db: Any) -> dict[str, str]:
     return {
         str(row[0]): row[1]
@@ -300,15 +376,24 @@ def _project_names(db: Any) -> dict[str, str]:
     }
 
 
-async def _baseline(db: Any, org_id: str, query: str) -> list[dict[str, Any]]:
-    """The pre-fix path: bare query, old blend, no project, no floor."""
-    vector = await embed_text(query, role=embedding_prompt.ROLE_PASSAGE)
+async def _baseline(
+    db: Any, org_id: str, query: str, user_id: Optional[str]
+) -> list[dict[str, Any]]:
+    """The pre-fix path: bare query, old blend, no project, no floor.
+
+    ``ROLE_QUERY`` even though the baseline predates the role argument: under
+    the shipped ``bare`` template this is a no-op and the vector is identical
+    to what production produced, and under ``instruct`` it is the difference
+    between comparing two rankings and comparing two different vectors.
+    """
+    vector = await embed_text(query, role=embedding_prompt.ROLE_QUERY)
     if vector is None:
         return []
     rows = db.execute(
         text(_BASELINE_SQL),
         {
             "org_id": org_id,
+            "user_id": user_id,
             "embedding": str(vector),
             "candidate_pool": LIMIT * 4,
             "limit": LIMIT,
@@ -326,10 +411,23 @@ async def _baseline(db: Any, org_id: str, query: str) -> list[dict[str, Any]]:
 
 
 async def _current(
-    db: Any, org_id: str, query: str, project_id: Optional[str]
+    db: Any,
+    org_id: str,
+    query: str,
+    project_id: Optional[str],
+    user_id: Optional[str],
 ) -> list[dict[str, Any]]:
+    """The new path, called the way ``capture.py`` calls it.
+
+    ``user_id`` is not optional in practice and omitting it is not a smaller
+    version of the same measurement: without it the visibility ladder collapses
+    to ``scope='org'`` alone, which for a project whose rows are mostly private
+    and project-scoped means the evaluation ranks a corpus production never
+    sees. Klio has 23 visible rows — 1 org, 10 private, 12 project — so an
+    unattributed run saw one of them.
+    """
     records = await retrieve_memories_scoped(
-        db, org_id, query, project_id=project_id, limit=LIMIT
+        db, org_id, query, user_id=user_id, project_id=project_id, limit=LIMIT
     )
     return [
         {
@@ -352,7 +450,12 @@ def _contamination(rows: list[dict[str, Any]], project_id: Optional[str]) -> int
 
 
 async def _separation(
-    db: Any, org_id: str, query: str, project_id: Optional[str], template: str
+    db: Any,
+    org_id: str,
+    query: str,
+    project_id: Optional[str],
+    user_id: Optional[str],
+    template: str,
 ) -> dict[str, Optional[float]]:
     """Corpus-wide on-project vs off-project cosine, under one query template.
 
@@ -367,7 +470,12 @@ async def _separation(
         return {}
     row = db.execute(
         text(_SEPARATION_SQL),
-        {"org_id": org_id, "embedding": str(vector), "project_id": project_id},
+        {
+            "org_id": org_id,
+            "user_id": user_id,
+            "embedding": str(vector),
+            "project_id": project_id,
+        },
     ).first()
     if row is None or row[0] is None or row[1] is None:
         return {}
@@ -402,7 +510,7 @@ def _print_rows(
         print(f"      {index:2d}. {score}  {project[:22]:24s} {content}{flag}")
 
 
-async def run(url: str, markdown: bool) -> int:
+async def run(url: str, markdown: bool, user_override: Optional[str]) -> int:
     """Report both configurations for every query. Returns a process exit code."""
     spec = _load_queries()
     org_id = spec["org_id"]
@@ -411,6 +519,11 @@ async def run(url: str, markdown: bool) -> int:
 
     with engine.connect() as db:
         names = _project_names(db)
+        user_id = _resolve_user_id(db, org_id, user_override)
+        logger.info(
+            "running as user_id=%s (both arms; see _current for why)",
+            "<none>" if user_id is None else f"{user_id[:8]}...",
+        )
         summary: list[dict[str, Any]] = []
 
         for entry in spec["queries"]:
@@ -419,20 +532,30 @@ async def run(url: str, markdown: bool) -> int:
             print(f"\n=== {query!r}  [project={entry.get('project')}]")
 
             os.environ[embedding_prompt.TEMPLATE_ENV] = embedding_prompt.TEMPLATE_BARE
-            before = await _baseline(db, org_id, query)
+            before = await _baseline(db, org_id, query, user_id)
             sep_bare = await _separation(
-                db, org_id, query, project_id, embedding_prompt.TEMPLATE_BARE
+                db,
+                org_id,
+                query,
+                project_id,
+                user_id,
+                embedding_prompt.TEMPLATE_BARE,
             )
             sep_instruct = await _separation(
-                db, org_id, query, project_id, embedding_prompt.TEMPLATE_INSTRUCT
+                db,
+                org_id,
+                query,
+                project_id,
+                user_id,
+                embedding_prompt.TEMPLATE_INSTRUCT,
             )
 
             # The shipped default is the bare template; the instruct template
             # is reported alongside so the flip is a decision with numbers
             # rather than a hunch.
             os.environ[embedding_prompt.TEMPLATE_ENV] = embedding_prompt.TEMPLATE_BARE
-            after_unfenced = await _current(db, org_id, query, None)
-            after = await _current(db, org_id, query, project_id)
+            after_unfenced = await _current(db, org_id, query, None, user_id)
+            after = await _current(db, org_id, query, project_id, user_id)
 
             _print_rows("before", before, names, project_id, markdown)
             _print_rows("after-unfenced", after_unfenced, names, project_id, markdown)
@@ -549,6 +672,11 @@ def main() -> None:
     run_parser = sub.add_parser("run", help="report before/after for every query")
     run_parser.add_argument("--url", default=os.environ.get("DATABASE_URL"))
     run_parser.add_argument("--markdown", action="store_true")
+    run_parser.add_argument(
+        "--user-id",
+        default=None,
+        help="run as this user; defaults to the org's main private-memory author",
+    )
 
     args = parser.parse_args()
     if args.command == "seed":
@@ -557,7 +685,7 @@ def main() -> None:
     if not args.url:
         logger.error("--url or DATABASE_URL is required")
         sys.exit(1)
-    sys.exit(asyncio.run(run(args.url, args.markdown)))
+    sys.exit(asyncio.run(run(args.url, args.markdown, args.user_id)))
 
 
 if __name__ == "__main__":

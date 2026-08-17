@@ -258,11 +258,25 @@ def apply_relevance_floor(
 
     surviving_scores = [r.relevance for r in kept if _judged(r)]
     if not surviving_scores:
-        # Every scored row failed the absolute floor. Whatever is left carries
-        # no cosine at all, and a lexical-only or graph row has no anchor to
-        # be relative to — returning it alone would be presenting the
-        # by-products of a search that found nothing as if they were results.
-        return []
+        # Every JUDGED row failed the absolute floor, so there is no ``best``
+        # for the relative floor to be relative to. The rows that were never
+        # judged still stand on their own evidence and are returned:
+        #
+        #   * an exempt row has a lexical hit — the query's every word appears
+        #     in it — which is the strongest signal recall has, and it is
+        #     precisely the row whose cosine is LOW (a rare literal has no
+        #     private direction in the embedding space). Dropping it here
+        #     would undo the exemption twenty lines above it, and would do so
+        #     only when an operator raises ``KLIO_RECALL_MIN_RELEVANCE`` — so
+        #     the symptom is "exact-literal search stopped working", weeks
+        #     after the knob was turned, with the knob the last place anyone
+        #     looks;
+        #   * a ``relevance is None`` row came from the lexical arm alone or
+        #     from graph expansion, and the floors have never judged those.
+        #
+        # What is NOT returned is a judged row that failed the bar. An empty
+        # list is still the answer when nothing but failing cosines was found.
+        return [r for r in kept if not _judged(r)]
 
     best = max(surviving_scores)
     return [r for r in kept if not _judged(r) or r.relevance >= best - delta]
