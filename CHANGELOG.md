@@ -6,6 +6,61 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **The dashboard `/ws` feed was unauthenticated and untenanted, and it is
+  neither now.** `dashboard-api` registered `/ws` with no auth dependency and
+  `ConnectionManager.connect` called `accept()` before reading a credential
+  from anywhere — not a header, not the query string, not
+  `Sec-WebSocket-Protocol`. Connections were held in one flat
+  `list[WebSocket]` with no org key, and `stream_updates` fanned every
+  `executions.stored` payload out to all of them verbatim. Those payloads carry
+  `org_id`, `agent_id`, `session_id`, execution and parent ids, timestamps,
+  latency, token counts, cost estimates and the S3 object key of the trace
+  payload. The service is public at `ws.tryvex.dev`, so anyone who could open a
+  socket read every tenant's execution metadata in real time.
+
+  Both halves are required; either alone leaves the leak. **Handshake auth:**
+  `app/ws_auth.py` verifies a short-lived, org-scoped HMAC token before
+  `accept()`, and closes with `1008` — unaccepted, no reason string, so
+  "no token", "bad signature" and "expired" are indistinguishable from
+  outside. **Org-scoped delivery:** `active_connections` is now
+  `dict[org_id, set[WebSocket]]`, `broadcast(org_id, message)` reaches exactly
+  one bucket and has no all-orgs variant, `stream_updates` routes on
+  `payload["org_id"]`, and a payload without one is logged and dropped rather
+  than sent to everyone. Buckets are pruned when their last socket goes.
+
+  The credential is deliberately **not** an `X-Vex-Key` validated through
+  `shared.auth.KeyValidator`, the way sync-gateway and ingestion-api do it. A
+  browser cannot set headers on a WebSocket handshake, so that key would have to
+  travel in the URL or the subprotocol — a long-lived multi-scope org credential
+  in a place every proxy logs. And there is no key to send: the web tier reads
+  the engine database through its own pool, serves many orgs from one
+  deployment, and stored keys are SHA-256 hashes with show-once plaintext, so it
+  cannot obtain the caller's key even in principle. Instead the web tier mints a
+  token after it has authenticated the session and asserted account membership,
+  and this service verifies it with a shared secret. Verification is a keyed
+  hash: no database, no Redis, so a flaky backend cannot make auth fail open.
+
+  Preferred transport is `Sec-WebSocket-Protocol: vex.ws.v1, <token>` — a
+  request header, so it stays out of access logs, `Referer` and browser history,
+  while still being settable from browser JavaScript. `?token=` is accepted as a
+  fallback for clients that cannot negotiate a subprotocol, logs a warning on
+  every use, and is the reason token lifetime is capped at 15 minutes.
+
+  **Operationally breaking.** `DASHBOARD_WS_TOKEN_SECRET` must be set, and must
+  match the web tier's `AGENTGUARD_WS_TOKEN_SECRET`, or every connection is
+  refused. `/health` keeps answering either way, so a missing variable does not
+  flap the service — it just serves nobody. The corresponding client change is
+  in the Dashboard repo and must ship first; see that PR for the ordering.
+
+  The two tests that encoded the vulnerability as intended behaviour —
+  `test_broadcast_sends_to_all` and `test_websocket_multiple_clients`, both of
+  which asserted that every connected socket received every message — are
+  replaced by assertions of the real contract: an unauthenticated socket is
+  rejected without being accepted, org A never receives an org B payload, a
+  payload with no `org_id` is dropped, and disconnect prunes its bucket.
+
 ### Added
 
 - **A lexical arm on recall, fused with the dense arm by reciprocal rank fusion.**
