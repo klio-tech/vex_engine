@@ -53,7 +53,7 @@ def _content_embedding(content: str) -> list[float]:
 
 
 def _mock_embed():
-    async def _embed(content):
+    async def _embed(content, **_kwargs):
         return _content_embedding(content)
 
     return patch("shared.memory.embed_text", new=AsyncMock(side_effect=_embed))

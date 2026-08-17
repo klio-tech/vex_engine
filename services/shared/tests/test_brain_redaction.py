@@ -38,7 +38,7 @@ class FakeDB:
 def fake_embed(monkeypatch):
     captured = {}
 
-    async def _embed(text_input):
+    async def _embed(text_input, **_kwargs):
         captured["text"] = text_input
         return [0.1, 0.2, 0.3]
 
@@ -140,7 +140,7 @@ async def test_dedup_path_receives_masked_content(fake_embed, monkeypatch):
     # Patch find_similar_memory so it records what it was called with.
     dedup_embedded: dict = {}
 
-    async def _embed_capturing(text_input):
+    async def _embed_capturing(text_input, **_kwargs):
         dedup_embedded["last"] = text_input
         return [0.1, 0.2, 0.3]
 

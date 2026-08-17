@@ -9,6 +9,7 @@ skipping.
 import pytest
 
 import shared.memory as memory_mod
+from shared import ranking
 
 
 @pytest.mark.asyncio
@@ -22,7 +23,7 @@ async def test_recall_sql_excludes_hidden_and_inactive(monkeypatch):
     """
     captured = {}
 
-    async def _embed(_):
+    async def _embed(_, **_kwargs):
         return [0.1, 0.2]
 
     monkeypatch.setattr(memory_mod, "embed_text", _embed)
@@ -59,7 +60,7 @@ async def _run_recall_sql_capture(monkeypatch, **kwargs):
     """
     captured = {"sqls": []}
 
-    async def _embed(_):
+    async def _embed(_, **_kwargs):
         return [0.1, 0.2]
 
     monkeypatch.setattr(memory_mod, "embed_text", _embed)
@@ -95,9 +96,10 @@ async def _run_recall_sql_capture(monkeypatch, **kwargs):
 @pytest.mark.asyncio
 async def test_blended_score_in_order_by(monkeypatch):
     """recall SQL must use the ANN-inner / re-rank-outer shape:
-    - inner ORDER BY embedding <=> :embedding (HNSW-friendly)
+    - inner ORDER BY <vector column> <=> :embedding (HNSW-friendly)
     - inner LIMIT :candidate_pool (bounded candidate pool)
-    - outer ORDER BY with 0.85/0.15 blended score
+    - outer ORDER BY a blended score whose similarity term is NORMALISED
+      inside the candidate pool and whose weights are bound parameters
     The old ``blended_score`` alias must NOT appear as a selected column."""
     captured = await _run_recall_sql_capture(monkeypatch)
     sql = captured["vector"][0][0]
@@ -105,12 +107,19 @@ async def test_blended_score_in_order_by(monkeypatch):
     assert "ORDER BY embedding <=> :embedding" in sql
     assert "LIMIT :candidate_pool" in sql
     # Outer blended re-rank (not a column alias — lives only in ORDER BY)
-    assert "0.85" in sql and "0.15" in sql
+    assert ":similarity_weight" in sql and ":recency_weight" in sql
+    # The similarity term is min-max normalised over the pool. Without this the
+    # weight is a lie: absolute cosine spans 0.069 across the whole corpus
+    # while the recency term spans its full weight.
+    assert "MIN(relevance) OVER ()" in sql
+    assert "MAX(relevance) OVER ()" in sql
     # blended_score must NOT be a selected column alias
     assert "blended_score" not in sql
-    # params must include candidate_pool
+    # params must include candidate_pool and both weights
     params = captured["vector"][0][1]
     assert "candidate_pool" in params
+    # Recency is a tie-break, not the ranking.
+    assert params["recency_weight"] < params["similarity_weight"]
 
 
 @pytest.mark.asyncio
@@ -168,7 +177,9 @@ async def test_lexical_arm_is_bounded_by_the_same_candidate_pool(monkeypatch):
     lexical_sql, lexical_params = captured["lexical"][-1]
 
     assert "LIMIT :candidate_pool" in lexical_sql
-    assert lexical_params["candidate_pool"] == lexical_params["limit"] * 4
+    assert lexical_params["candidate_pool"] == ranking.candidate_pool(
+        lexical_params["limit"]
+    )
 
 
 @pytest.mark.asyncio
@@ -196,7 +207,7 @@ async def test_relevance_populated_on_records(monkeypatch):
     import uuid
     from datetime import datetime, timezone
 
-    async def _embed(_):
+    async def _embed(_, **_kwargs):
         return [0.1, 0.2]
 
     monkeypatch.setattr(memory_mod, "embed_text", _embed)

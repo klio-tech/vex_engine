@@ -24,7 +24,8 @@ import litellm
 from litellm import acompletion, aembedding
 from sqlalchemy import text
 
-from shared import lexical, metrics, stale
+from shared import embedding_prompt, lexical, metrics, ranking, stale
+from shared.embedding_prompt import ROLE_PASSAGE, ROLE_QUERY
 from shared.env_config import parse_float, parse_int
 from shared.redaction import redact
 
@@ -343,7 +344,7 @@ _embed_memo: "OrderedDict[tuple[str, str], tuple[list[float], float]]" = Ordered
 _embed_memo_lock = threading.Lock()
 
 
-def _memo_get(key: tuple[str, str]) -> Optional[list[float]]:
+def _memo_get(key: tuple[str, str, str]) -> Optional[list[float]]:
     """The memoized vector for *key*, or ``None`` if absent or expired."""
     now = time.monotonic()
     with _embed_memo_lock:
@@ -358,7 +359,7 @@ def _memo_get(key: tuple[str, str]) -> Optional[list[float]]:
         return vector
 
 
-def _memo_put(key: tuple[str, str], vector: list[float]) -> None:
+def _memo_put(key: tuple[str, str, str], vector: list[float]) -> None:
     """Memoize *vector*, evicting oldest-first at :data:`EMBED_MEMO_MAX_ENTRIES`."""
     with _embed_memo_lock:
         _embed_memo[key] = (vector, time.monotonic())
@@ -379,8 +380,14 @@ def embedding_memo_size() -> int:
         return len(_embed_memo)
 
 
-async def _aembedding_call(text_input: str) -> list[float]:
+async def _aembedding_call(text_input: str, prefix: str = "") -> list[float]:
     """Perform a single embedding-backend call via ``litellm.aembedding()``.
+
+    *prefix* is prepended to *text_input* immediately before the call and is
+    never counted against the caller's truncation budget. That ordering is the
+    point: the caller truncates its own text, and ``passage: `` is added to
+    whatever survived, so a progressive-retry shrink can never eat the prefix
+    and silently embed a document into the query half of the space.
 
     Reads the model name from the ``MEMORY_EMBEDDING_MODEL`` env var, falling
     back to :data:`DEFAULT_EMBEDDING_MODEL`, and optional gateway credentials
@@ -410,7 +417,7 @@ async def _aembedding_call(text_input: str) -> list[float]:
     api_base = os.environ.get("LITELLM_API_URL") or os.environ.get("OPENAI_API_BASE")
     api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
 
-    kwargs: dict[str, Any] = {"model": model, "input": [text_input]}
+    kwargs: dict[str, Any] = {"model": model, "input": [prefix + text_input]}
     if api_base:
         kwargs["api_base"] = api_base
         kwargs["custom_llm_provider"] = "openai"
@@ -456,11 +463,27 @@ async def _aembedding_call(text_input: str) -> list[float]:
     return item["embedding"] if isinstance(item, dict) else item.embedding
 
 
-async def embed_text(text_input: str) -> Optional[list[float]]:
+async def embed_text(
+    text_input: str,
+    *,
+    role: str = ROLE_PASSAGE,
+) -> Optional[list[float]]:
     """Generate an embedding vector via ``litellm.aembedding()``.
 
     Reads the model name from the ``MEMORY_EMBEDDING_MODEL`` env var, falling
     back to :data:`DEFAULT_EMBEDDING_MODEL`.
+
+    Asymmetry — *role* says which side of the retrieval pair this text is.
+    ``passage`` is stored content and is NEVER prefixed (see
+    :mod:`shared.embedding_prompt`: that is both the ``-instruct`` model's
+    convention and what every vector already in the corpus is). ``query`` is a
+    search string, and may be wrapped in the model's ``Instruct:`` template
+    depending on :func:`shared.embedding_prompt.active_template`.
+
+    Getting the role wrong is silent — the text embeds fine, into the wrong
+    side, and the only symptom is recall quality nobody can attribute. It
+    defaults to ``passage`` because most callers embed content; every call site
+    that embeds a *search string* passes ``query`` explicitly.
 
     Robustness — progressive truncation so a long/dense note never fails a
     write: :data:`MAX_EMBED_CHARS` is only a *char* proxy for the model's 512
@@ -492,10 +515,17 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
         A list of floats representing the embedding, or ``None`` only when the
         embedding backend fails at every attempted size.
     """
+    prefix = embedding_prompt.prefix_for(role)
+
     # The memo is keyed on the ORIGINAL input, not the truncated candidate: two
     # callers passing the same content must collapse to one call regardless of
     # which truncation path each would have taken (they take the same one).
-    memo_key = (_embed_model(), text_input)
+    #
+    # The prefix is part of the key, not decoration. The same string embedded
+    # as a passage and as a query is two different vectors, and a key that
+    # ignored the prefix would serve one where the other was asked for — which
+    # is invisible, because both are perfectly well-formed vectors.
+    memo_key = (_embed_model(), prefix, text_input)
     memoized = _memo_get(memo_key)
     if memoized is not None:
         # A single write embeds the same string twice — once to probe for a
@@ -519,7 +549,7 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
 
     while True:
         try:
-            vector = await _aembedding_call(candidate)
+            vector = await _aembedding_call(candidate, prefix)
             # Only successes are memoized. Memoizing a failure would pin a
             # transient gateway blip to that content for the whole TTL, so a
             # retry that would have worked returns None instead.
@@ -571,6 +601,49 @@ async def embed_text(text_input: str) -> Optional[list[float]]:
                 exc_info=True,
             )
             return None
+
+
+# ---------------------------------------------------------------------------
+# Recall tuning helpers
+# ---------------------------------------------------------------------------
+
+
+def _apply_ef_search(db_session: Any, candidate_pool: int) -> None:
+    """Raise ``hnsw.ef_search`` for this transaction, best-effort.
+
+    pgvector's HNSW scan cannot return more rows than its search list held, and
+    the default list is 40. Asking for a candidate pool of 64 without raising
+    ``ef_search`` therefore buys nothing — the query returns 40-ish rows and
+    the deeper pool is a fiction. This is the other half of
+    :func:`shared.ranking.candidate_pool`.
+
+    ``SET LOCAL`` and not ``SET``: the value must die with the transaction, or
+    it leaks onto whatever the pooled connection does next. Safe under Neon's
+    transaction-mode pooler for exactly that reason — it is scoped to the
+    transaction PgBouncer already keeps together, and it is a GUC assignment
+    rather than a libpq startup parameter, which is the thing that endpoint
+    refuses.
+
+    Every failure is swallowed, because a tuning hint must never be the reason
+    a recall fails. A failed statement aborts the transaction, so the rollback
+    is not optional — without it the recall's own SELECT would fail next with
+    an error about a statement it never issued.
+    """
+    target = ranking.ef_search()
+    if target <= 0:
+        return
+    try:
+        db_session.execute(
+            text(f"SET LOCAL hnsw.ef_search = {int(max(target, candidate_pool))}")
+        )
+    except Exception:
+        logger.warning(
+            "recall: could not raise hnsw.ef_search; using the default", exc_info=True
+        )
+        try:
+            db_session.rollback()
+        except Exception:
+            logger.warning("rollback after a failed ef_search hint also failed")
 
 
 # ---------------------------------------------------------------------------
@@ -875,7 +948,7 @@ async def write_memory(
     # Availability: return the pooled connection BEFORE awaiting the
     # embedding. See :func:`release_connection` for the measurements.
     release_connection(db_session)
-    embedding = await embed_text(content)
+    embedding = await embed_text(content, role=ROLE_PASSAGE)
     if embedding is None:
         return None
 
@@ -996,8 +1069,17 @@ async def retrieve_memories(
     """
     # Availability: return the pooled connection BEFORE awaiting the
     # embedding. See :func:`release_connection` for the measurements.
+    # The vector column and the query prefix are resolved together, from the
+    # SAME space, and never independently: a ``query: ``-prefixed vector
+    # compared against the unprefixed v1 column is not a slightly-stale
+    # comparison, it is a different space, and it ranks worse than either
+    # space used consistently. Resolved BEFORE the release, because the probe
+    # behind it is a query.
     release_connection(db_session)
-    embedding = await embed_text(query_text)
+    # ``query``, not the default ``passage``: this text is a search string, and
+    # the two sides of an E5 retrieval pair are phrased differently. See
+    # :mod:`shared.embedding_prompt`.
+    embedding = await embed_text(query_text, role=ROLE_QUERY)
     if embedding is None:
         return []
 
@@ -1126,8 +1208,14 @@ async def find_similar_memory(
 
     # Availability: return the pooled connection BEFORE awaiting the
     # embedding. See :func:`release_connection` for the measurements.
+    # ``passage``, not ``query``: dedup compares a candidate DOCUMENT against
+    # stored DOCUMENTS. Both sides of this comparison are the same kind of
+    # text, so both take the same prefix — and giving the candidate the query
+    # prefix here would shift the whole similarity distribution against a
+    # fixed 0.95 threshold, which is how a dedup threshold silently stops
+    # deduplicating. Resolved before the release; see :func:`write_memory`.
     release_connection(db_session)
-    embedding = await embed_text(content)
+    embedding = await embed_text(content, role=ROLE_PASSAGE)
     if embedding is None:
         return None
 
@@ -1317,7 +1405,11 @@ def record_write_conflict() -> None:
     metrics.record(metrics.WRITE_CONFLICTS.inc)
 
 
-def _embed_text_sync(text_input: str) -> Optional[list[float]]:
+def _embed_text_sync(
+    text_input: str,
+    *,
+    role: str = ROLE_PASSAGE,
+) -> Optional[list[float]]:
     """Synchronous embedding, for the one write path that cannot ``await``.
 
     :func:`supersede_with_revision` is the server side of Mukta's
@@ -1337,6 +1429,10 @@ def _embed_text_sync(text_input: str) -> Optional[list[float]]:
     here blocks only that one CAS write rather than the event loop every other
     write path shares.
 
+    *role* means exactly what it means on :func:`embed_text`; this function
+    is phrased the same way so a CAS-superseded row lands on the same side of
+    the retrieval pair as the row it replaces.
+
     Returns:
         The embedding vector, or ``None`` if the backend call fails.
     """
@@ -1344,6 +1440,7 @@ def _embed_text_sync(text_input: str) -> Optional[list[float]]:
         candidate = text_input[:MAX_EMBED_CHARS]
     else:
         candidate = text_input
+    candidate = embedding_prompt.prefix_for(role) + candidate
 
     model = _embed_model()
     api_base = os.environ.get("LITELLM_API_URL") or os.environ.get("OPENAI_API_BASE")
@@ -1587,7 +1684,7 @@ def _prepare_cas_write(
             meta = dict(meta or {})
             meta["redactions"] = redaction_kinds
 
-    embedding = _embed_text_sync(content)
+    embedding = _embed_text_sync(content, role=ROLE_PASSAGE)
     return content, meta, embedding, redacted, redaction_kinds
 
 
@@ -2287,9 +2384,11 @@ async def retrieve_memories_scoped(
     and sees the org tier only.
 
     NOTE: HNSW candidate-pool trade-off — the inner query fetches
-    ``candidate_pool = limit * 4`` approximate nearest neighbours, then the
-    outer query re-ranks them by the blended score and returns the top
-    ``limit``.  A relevant-but-stale row that falls outside the top-4× ANN
+    :func:`shared.ranking.candidate_pool` approximate nearest neighbours, then
+    the outer query re-ranks them by the blended score and returns the top
+    ``limit``. Rows below :func:`shared.ranking.apply_relevance_floor`'s bar
+    are then dropped, so the result can be SHORTER than ``limit`` and can be
+    EMPTY — see *Returns*.  A relevant-but-stale row that falls outside the top-4× ANN
     candidates will not be rescued by the recency bonus; this is accepted,
     matching the v1 under-fill acceptance documented below.
 
@@ -2307,7 +2406,8 @@ async def retrieve_memories_scoped(
         org_id: Tenant whose memories to search. Always enforced — results are
             never returned from another org.
         query_text: Natural-language query; embedded and ranked by a blended
-            score (``0.85 * similarity + 0.15 * recency_norm``) over a 30-day
+            score (see :mod:`shared.ranking`: a pool-normalised similarity
+            term at 0.95 plus a recency term at 0.05) over a 30-day
             recency window (recency_norm clamped to [0, 1]) so that stale
             near-duplicates are demoted relative to recent relevant memories.
             Each returned :class:`MemoryRecord` has its ``relevance`` field
@@ -2338,7 +2438,10 @@ async def retrieve_memories_scoped(
 
     Returns:
         A list of :class:`MemoryRecord` ordered by blended score (descending),
-        or an empty list if embedding generation fails. Vector-matched records
+        or an empty list if embedding generation fails **or if nothing cleared
+        the relevance floor**. The second case is not a degradation: recall
+        returning nothing is the designed answer when the brain holds nothing
+        relevant, and every caller must handle it. Vector-matched records
         carry a rounded cosine-similarity score (0–1) in ``relevance``.
 
         **The list can be longer than ``limit``.** After the vector stage,
@@ -2380,7 +2483,10 @@ async def retrieve_memories_scoped(
     # Availability: return the pooled connection BEFORE awaiting the
     # embedding. See :func:`release_connection` for the measurements.
     release_connection(db_session)
-    embedding = await embed_text(query_text)
+    # ``query``, not the default ``passage``. Documents are never prefixed —
+    # see :mod:`shared.embedding_prompt` for why that asymmetry is the right
+    # way round for this model, and for the measurement that chose it.
+    embedding = await embed_text(query_text, role=ROLE_QUERY)
     if embedding is None:
         return []
 
@@ -2395,12 +2501,18 @@ async def retrieve_memories_scoped(
         "superseded_by IS NULL",
         "recall_hidden = FALSE",
     ]
+    similarity_weight = ranking.similarity_weight()
+    recency_weight = ranking.recency_weight()
     params: dict[str, Any] = {
         "org_id": org_id,
         "embedding": embedding_str,
         "limit": limit,
-        "candidate_pool": limit * 4,
+        "candidate_pool": ranking.candidate_pool(limit),
+        "similarity_weight": similarity_weight,
+        "recency_weight": recency_weight,
+        "recency_window": ranking.RECENCY_WINDOW_SECONDS,
     }
+    _apply_ef_search(db_session, params["candidate_pool"])
 
     # ---- the visibility ladder -------------------------------------------
     # Built as a single OR-group of scope arms. Every arm that reaches beyond
@@ -2443,7 +2555,8 @@ async def retrieve_memories_scoped(
     #   Inner query — HNSW-accelerated cosine-distance ORDER BY fetches a
     #     bounded candidate pool (:candidate_pool = limit * 4).
     #   Outer query — re-ranks the candidates by blended score:
-    #     0.85 * similarity + 0.15 * recency_norm, where recency_norm is the
+    #     :similarity_weight * normalised_similarity
+    #       + :recency_weight * recency_norm, where recency_norm is the
     #     fraction of the 30-day window still remaining, clamped to [0, 1].
     # The outer SELECT * preserves the record columns plus relevance as the
     # LAST column.  blended_score is used only in the ORDER BY and is not a
@@ -2472,6 +2585,30 @@ async def retrieve_memories_scoped(
     # the vector order, and taking its first ``limit`` rows is byte-for-byte
     # what ``LIMIT :limit`` returned before. When the arm is off,
     # ``vector_limit`` IS ``limit`` and the statement is unchanged.
+    #
+    # The blend itself changed in this commit, and the reason is measured
+    # rather than aesthetic. ``0.85 * relevance`` reads as similarity
+    # dominating, but similarity's whole dynamic range over the production
+    # corpus is 0.069 while the recency term's is the full 0.15 — freshness
+    # outweighed relevance outright, and each day of age was worth 0.0059 of
+    # cosine. Two fixes, and neither works without the other:
+    #
+    #   * the similarity term is **normalised inside the candidate pool**
+    #     (``(relevance - MIN) / (MAX - MIN)`` as window functions over the
+    #     ANN result). Absolute cosine in a corpus this compressed carries
+    #     almost no information; relative cosine among the nearest neighbours
+    #     carries all of it, and normalising is what makes the weight mean
+    #     what it says;
+    #   * the weights come from :mod:`shared.ranking` and default to
+    #     0.95/0.05 — recency demoted to the tie-break it should always have
+    #     been.
+    #
+    # ``NULLIF(MAX - MIN, 0)`` guards the degenerate pool where every
+    # candidate scores identically (one row, or exact duplicates): the
+    # division would be by zero, and ``COALESCE(..., 1.0)`` makes every such
+    # row score equally at the top of its own pool, leaving recency to order
+    # them. That is the same answer normalisation gives in the limit, so the
+    # guard changes no ranking — it only stops the statement raising.
     select_sql = """
         SELECT * FROM (
             SELECT id, session_id, org_id, agent_id, execution_id,
@@ -2485,10 +2622,14 @@ async def retrieve_memories_scoped(
             ORDER BY embedding <=> :embedding
             LIMIT :candidate_pool
         ) candidates
-        ORDER BY (0.85 * relevance
-                  + 0.15 * LEAST(1, GREATEST(
+        ORDER BY (:similarity_weight * COALESCE(
+                      (relevance - MIN(relevance) OVER ())
+                      / NULLIF(MAX(relevance) OVER () - MIN(relevance) OVER (), 0),
+                      1.0
+                  )
+                  + :recency_weight * LEAST(1, GREATEST(
                       0, 1 - EXTRACT(EPOCH FROM (NOW() - created_at))
-                             / (30 * 86400)
+                             / :recency_window
                     ))) DESC
         LIMIT :vector_limit
     """
@@ -2537,6 +2678,13 @@ async def retrieve_memories_scoped(
     # tier-2 fetch: the failed statement has already aborted the transaction.
     lexical_state = {"live": skip_reason is None, "seconds": 0.0}
     stats = {"rows": 0, "novel": 0, "errors": 0}
+    # Ids the lexical arm returned, across every tier. These are exempt from
+    # the relevance floor: a lexical hit means the row contains every word of
+    # the query (``websearch_to_tsquery`` ANDs its terms), and that evidence
+    # arrives through a channel a cosine floor cannot see. Without this the
+    # floor deletes exactly the rows the lexical arm exists to promote — the
+    # rare literal whose row ranks LAST by cosine.
+    lexical_hits: set[str] = set()
 
     def _to_records(rows: list, *, via: Optional[str], scored: bool) -> list:
         out = []
@@ -2609,6 +2757,7 @@ async def retrieve_memories_scoped(
         vector_ids = [str(row[0]) for row in vector_rows]
         lexical_ids = [str(row[0]) for row in lexical_rows]
         lexical_only = {row_id: row for row_id, row in zip(lexical_ids, lexical_rows)}
+        lexical_hits.update(lexical_ids)
 
         stats["rows"] += 1
         if any(row_id not in by_id for row_id in lexical_ids):
@@ -2642,13 +2791,40 @@ async def retrieve_memories_scoped(
             # the inner ANN pool is proportional to the actual remaining slots.
             tier2 = _fetch(
                 "project_id IS NULL",
-                {"limit": remaining, "candidate_pool": remaining * 4},
+                {
+                    "limit": remaining,
+                    "candidate_pool": ranking.candidate_pool(remaining),
+                },
             )
         records = list(tier1) + list(tier2)
     else:
         records = _fetch("TRUE", {})
 
     _report_lexical(skip_reason, stats, lexical_state)
+
+    # ---- the relevance floor ---------------------------------------------
+    # Applied BEFORE graph expansion, not after, and the ordering is the whole
+    # point: expansion walks outward from the rows the vector stage returned,
+    # so filtering first means it walks out from rows that were actually
+    # relevant. Filtering afterwards would let a row that failed the floor
+    # still drag five of its neighbours into the answer.
+    #
+    # This is the step that can return NOTHING, and that is the intended
+    # behaviour rather than a failure: a session about the Klio proxy handed
+    # four memories about an unrelated project is worse than a session handed
+    # none, because the agent that gets nothing asks and the agent that gets
+    # four wrong things builds on them. Every caller must handle an empty
+    # list — the proxy already reports ``reason: "empty"``.
+    kept = ranking.apply_relevance_floor(records, exempt_ids=lexical_hits)
+    if len(kept) != len(records):
+        logger.debug(
+            "recall floor dropped %d of %d rows",
+            len(records) - len(kept),
+            len(records),
+        )
+    records = kept
+    if not records:
+        return []
 
     # Stage B+C (knowledge graph): one-hop, ladder-scoped expansion around the
     # vector entry points, then the blended re-rank. Adds at most

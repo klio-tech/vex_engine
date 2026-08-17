@@ -107,7 +107,7 @@ from typing import Any, Callable, NamedTuple, Optional
 
 from sqlalchemy import text
 
-from shared import graph_store, metrics
+from shared import embedding_prompt, graph_store, metrics
 from shared.brain import write_scoped_memory
 from shared.env_config import parse_int
 from shared.memory import (
@@ -923,7 +923,15 @@ async def _synthesize_and_store(
                 # what it might supersede, and nothing said so.
                 record_budget_exhausted("reconcile")
             if reconcile.remaining > 0:
-                fact_embedding = await embed_text(fact)
+                # ``passage``, explicitly: reconciliation compares a new
+                # fact against STORED facts, so both sides of the comparison
+                # are documents and neither is phrased as a search. Wrapping
+                # this one in the query template would shift every similarity
+                # against a fixed 0.90 threshold — either no reconciliation at
+                # all, or an LLM judge asked to arbitrate random pairs.
+                fact_embedding = await embed_text(
+                    fact, role=embedding_prompt.ROLE_PASSAGE
+                )
                 if fact_embedding is not None:
                     superseded, judged = await reconcile_fact(
                         db_session,

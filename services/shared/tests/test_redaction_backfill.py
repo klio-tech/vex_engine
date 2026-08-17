@@ -37,7 +37,7 @@ class FakeDB:
         pass
 
 
-async def _fake_embed(text_input):
+async def _fake_embed(text_input, **_kwargs):
     return [0.0, 0.1]
 
 
@@ -63,7 +63,7 @@ async def test_apply_masks_and_reembeds():
 
 
 async def test_embed_failure_leaves_row_unmodified():
-    async def _fail(_):
+    async def _fail(_, **_kwargs):
         return None
 
     db = FakeDB()
