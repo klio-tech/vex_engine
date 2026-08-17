@@ -7,7 +7,7 @@ the ``app.capture`` module boundary:
 * ``app.capture.SessionLocal`` → a ``MagicMock`` so ``SessionLocal()`` yields a
   fake session that is ``.close()``-d in the ``finally``.
 * ``app.capture.brain.write_scoped_memory`` → an ``AsyncMock`` capturing kwargs.
-* ``app.capture.extract_facts`` / ``generate_summary`` /
+* ``app.capture.extract_typed_memories`` / ``generate_summary`` /
   ``retrieve_memories_scoped`` → ``AsyncMock``s with canned returns.
 * ``app.capture.brain.ensure_project`` / ``find_project_id`` / ``find_space_id``
   → ``MagicMock``s.
@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 import app.capture as capture
 from app.main import create_app
 from fastapi.testclient import TestClient
+from shared.taxonomy import ExtractedMemory
 
 
 def _memrow(id="m1", memory_type="observation", content="hi", created_at=None):
@@ -157,8 +158,11 @@ def test_event_write_exception_returns_clean_error(client):
 # ---------------------------------------------------------------------------
 
 
-def test_transcript_extracts_facts_and_summary(client):
-    """Transcript distils to one summary + N facts, each stored; counts returned."""
+def test_transcript_extracts_typed_memories_and_summary(client):
+    """Transcript distils to one summary + N typed items, each stored as its
+    own kind. The kinds are what the Context workspace groups by, so a
+    ``decision`` must reach the write path AS a decision rather than being
+    flattened to ``fact`` the way the old facts-only extraction did."""
     write = AsyncMock(return_value={"stored": True})
     db_patch, session = _patch_db()
     with (
@@ -166,7 +170,15 @@ def test_transcript_extracts_facts_and_summary(client):
         patch.object(capture.brain, "write_scoped_memory", write),
         patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
         patch("app.capture.generate_summary", AsyncMock(return_value="a summary")),
-        patch("app.capture.extract_facts", AsyncMock(return_value=["f1", "f2"])),
+        patch(
+            "app.capture.extract_typed_memories",
+            AsyncMock(
+                return_value=[
+                    ExtractedMemory("decision", "deploys run from GitHub source"),
+                    ExtractedMemory("fact", "the pooled endpoint refuses params"),
+                ]
+            ),
+        ),
     ):
         resp = client.post(
             "/capture/transcript",
@@ -174,9 +186,14 @@ def test_transcript_extracts_facts_and_summary(client):
         )
 
     body = resp.json()
-    assert body == {"stored": 3, "facts": 2, "summary": True}
+    assert body == {
+        "stored": 3,
+        "facts": 2,
+        "by_kind": {"decision": 1, "fact": 1},
+        "summary": True,
+    }
     types = [c.kwargs["memory_type"] for c in write.await_args_list]
-    assert types == ["summary", "fact", "fact"]
+    assert types == ["summary", "decision", "fact"]
     session.close.assert_called_once()
 
 
@@ -188,7 +205,7 @@ def test_transcript_empty_messages_short_circuits(client):
         patch("app.capture.SessionLocal", sl),
         patch.object(capture.brain, "write_scoped_memory", write),
         patch("app.capture.generate_summary", AsyncMock()) as gs,
-        patch("app.capture.extract_facts", AsyncMock()) as ef,
+        patch("app.capture.extract_typed_memories", AsyncMock()) as ef,
     ):
         resp = client.post(
             "/capture/transcript", json={"messages": [{"content": "  "}]}
@@ -201,8 +218,8 @@ def test_transcript_empty_messages_short_circuits(client):
     sl.assert_not_called()
 
 
-def test_transcript_summary_failure_still_stores_facts(client):
-    """A summary-extraction failure does not block fact storage (independent)."""
+def test_transcript_summary_failure_still_stores_memories(client):
+    """A summary-extraction failure does not block item storage (independent)."""
     write = AsyncMock(return_value={"stored": True})
     db_patch, _ = _patch_db()
     with (
@@ -210,7 +227,10 @@ def test_transcript_summary_failure_still_stores_facts(client):
         patch.object(capture.brain, "write_scoped_memory", write),
         patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
         patch("app.capture.generate_summary", AsyncMock(side_effect=RuntimeError())),
-        patch("app.capture.extract_facts", AsyncMock(return_value=["only-fact"])),
+        patch(
+            "app.capture.extract_typed_memories",
+            AsyncMock(return_value=[ExtractedMemory("plan", "next: wire the UI")]),
+        ),
     ):
         resp = client.post(
             "/capture/transcript",
@@ -218,8 +238,13 @@ def test_transcript_summary_failure_still_stores_facts(client):
         )
 
     body = resp.json()
-    assert body == {"stored": 1, "facts": 1, "summary": False}
-    assert write.await_args.kwargs["memory_type"] == "fact"
+    assert body == {
+        "stored": 1,
+        "facts": 1,
+        "by_kind": {"plan": 1},
+        "summary": False,
+    }
+    assert write.await_args.kwargs["memory_type"] == "plan"
 
 
 # ---------------------------------------------------------------------------

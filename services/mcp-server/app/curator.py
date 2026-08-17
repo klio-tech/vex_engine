@@ -5,7 +5,9 @@ time. Periodically it reads one user's RAW private memories — the passive hook
 captures and discrete writes (``observation`` / ``note`` / ``memory`` /
 ``plan`` / ``decision``), **including the ``recall_hidden`` ones**, which in
 practice are nearly all of them — and synthesises higher-level memories back into the
-**same user's private scope**: a single ``summary`` plus discrete ``fact`` rows.
+**same user's private scope**: a single ``summary`` plus discrete typed rows
+(``decision`` / ``plan`` / ``fact`` / ``note`` / ``observation``, the taxonomy
+in :mod:`shared.taxonomy` that the Context workspace groups by).
 It reuses the existing LLM helpers (:func:`shared.memory.generate_summary` and
 the extended :func:`extract_graph` pass, which subsumed the old facts-only
 extraction) and the brain write path
@@ -38,10 +40,16 @@ Separation from verification:
 
 No self-reprocessing:
     The curator reads only the RAW input types
-    (``observation``/``note``/``memory``/``plan``/``decision``) and never its
-    own outputs (``summary``/``fact``). Combined with the per-org keyset cursor
-    (it only reads rows *past* the cursor), this makes a tick unable to loop on
-    its own synthesised memories.
+    (``observation``/``note``/``memory``/``plan``/``decision``) **and only rows
+    that are not ``INFERRED``**. The second half is load-bearing since the
+    taxonomy change: the curator now emits ``decision`` / ``plan`` / ``note``
+    as well as ``fact``, and three of those are RAW types. A type list alone
+    would therefore have closed exactly the feedback loop it was written to
+    prevent — the curator re-digesting its own deductions, forever, because a
+    freshly written row's ``created_at`` is always past the cursor. Provenance
+    is the honest separator: this module distils what was *captured*, never
+    what a model *concluded*. Combined with the per-org keyset cursor (it only
+    reads rows past the cursor), a tick cannot loop on its own output.
 
 Hidden rows are fuel, not noise:
     The input predicate deliberately does NOT filter on ``recall_hidden``.
@@ -51,7 +59,8 @@ Hidden rows are fuel, not noise:
     stayed empty: migration 026 backfilled ``recall_hidden=TRUE`` onto every
     passive capture, so ``recall_hidden = FALSE`` AND a RAW-only type list
     intersected to the empty set on real data. The separation of input from
-    output now rests entirely on :data:`RAW_MEMORY_TYPES` and the cursor.
+    output now rests on :data:`RAW_MEMORY_TYPES`, the provenance predicate, and
+    the cursor.
 
 Reconciliation:
     After storing each new ``fact`` the curator runs a bounded reconciliation
@@ -116,6 +125,12 @@ from shared.memory import (
     embed_text,
     generate_summary,
     supersede_memory,
+)
+from shared.taxonomy import (
+    DURABILITY_RULE,
+    TAXONOMY_RULE,
+    ExtractedMemory,
+    parse_typed_items,
 )
 
 logger = logging.getLogger("agentguard.mcp.curator")
@@ -340,20 +355,26 @@ def _undo_failed_item(db_session: Any, savepoint: Any, what: str, org_id: str) -
 
 
 async def extract_graph(combined: str) -> dict[str, Any]:
-    """One extended LLM pass: facts PLUS the entities and edges they evidence.
+    """One extended LLM pass: typed memories PLUS the entities they evidence.
 
     This replaces the old facts-only extraction call in the tick — same single
     ``call_llm`` round trip, extended prompt (spec decision 2: the curator is
     the graph builder precisely because it already reads every memory; no new
     LLM pass, no new cost centre).
 
+    Since the taxonomy change the item list is ``memories`` rather than
+    ``facts``, and each surviving element is a
+    :class:`shared.taxonomy.ExtractedMemory` carrying its own kind. Two rules
+    from :mod:`shared.taxonomy` ride in the same prompt: the durability test
+    (drop session exhaust outright) and the kind definitions.
+
     Output contract (always all three keys, empty lists on any failure)::
 
-        {"facts": ["..."],
+        {"memories": [ExtractedMemory("decision", "..."), None, ...],
          "entities": [{"name": "auth service", "kind": "system"}],
          "edges": [{"src": 0, "relation": "about", "entity": "auth service"}]}
 
-    Edge parsing accepts the spec's wire shape — ``{"src": <fact idx>,
+    Edge parsing accepts the spec's wire shape — ``{"src": <item idx>,
     "<relation>": "<entity name>"}`` — and NORMALIZES it to the explicit form
     above. Only :data:`_EXTRACTABLE_RELATIONS` survive: an extractor claiming
     ``supersedes`` or ``derived_from`` is inventing history, and a
@@ -362,21 +383,27 @@ async def extract_graph(combined: str) -> dict[str, Any]:
     """
     kinds = "|".join(sorted(graph_store.ENTITY_KINDS))
     prompt = (
-        "Extract discrete, verifiable facts from the following notes, AND the "
-        "named entities those facts concern. "
+        "Extract the durable knowledge from the following notes, classify each "
+        "item, AND name the entities those items concern. "
         + _NO_CREDENTIALS_RULE
-        + "Entities must be specific named things (a service, a person, a "
+        + "\n\n"
+        + DURABILITY_RULE
+        + "\n\n"
+        + TAXONOMY_RULE
+        + "\nEach item must be one short, self-contained statement.\n"
+        "Entities must be specific named things (a service, a person, a "
         "project, a tool, a decision subject) — NEVER generic terms like "
         "'the code', 'the user', 'the system', weekdays, or bare programming "
         "language names. Prefer few precise entities over many vague ones."
         "\n\n" + combined + "\n\nRespond with JSON exactly of this shape:\n"
-        '{"facts": ["<fact>", ...],\n'
+        '{"memories": [{"kind": "<decision|plan|fact|note|observation>",'
+        ' "content": "<statement>"}, ...],\n'
         f' "entities": [{{"name": "<name>", "kind": "<{kinds}>"}}, ...],\n'
-        ' "edges": [{"src": <fact index>, "about": "<entity name>"},\n'
-        '           {"src": <fact index>, "relates_to": "<entity name>"}, ...]}'
+        ' "edges": [{"src": <item index>, "about": "<entity name>"},\n'
+        '           {"src": <item index>, "relates_to": "<entity name>"}, ...]}'
     )
 
-    empty: dict[str, Any] = {"facts": [], "entities": [], "edges": []}
+    empty: dict[str, Any] = {"memories": [], "entities": [], "edges": []}
     try:
         result = await call_llm(prompt)
     except Exception:
@@ -385,23 +412,26 @@ async def extract_graph(combined: str) -> dict[str, Any]:
     if not isinstance(result, dict):
         return empty
 
-    facts_raw = result.get("facts", [])
-    # Invalid elements are REPLACED, never removed. ``src`` on an edge is an
-    # index into this list, so the list's positions are part of the wire
-    # contract: compacting it slides every later fact down a slot while the
-    # edges keep pointing at the old numbers, and an edge that meant fact 2
-    # silently becomes an edge to fact 1. That is not a dropped edge — those
-    # are safe and happen all over this pipeline — it is an edge drawn to the
-    # WRONG memory, stamped INFERRED and indistinguishable from a correct one.
+    items_raw = result.get("memories", [])
+    # Invalid and non-durable elements are REPLACED by ``None``, never removed.
+    # ``src`` on an edge is an index into this list, so the list's positions
+    # are part of the wire contract: compacting it slides every later item down
+    # a slot while the edges keep pointing at the old numbers, and an edge that
+    # meant item 2 silently becomes an edge to item 1. That is not a dropped
+    # edge — those are safe and happen all over this pipeline — it is an edge
+    # drawn to the WRONG memory, stamped INFERRED and indistinguishable from a
+    # correct one.
     #
-    # The replacement is an empty string, which is falsy: the fact loop in
-    # ``_synthesize_and_store`` skips it, so no memory is written, its index
-    # never enters ``fact_row_ids``, and any edge naming it takes the existing
-    # missing-src branch and is skipped. The numbering survives; nothing is
-    # invented to fill it.
-    facts = (
-        [f if isinstance(f, str) else "" for f in facts_raw]
-        if isinstance(facts_raw, list)
+    # ``None`` is what the item loop in ``_synthesize_and_store`` skips, so no
+    # memory is written, its index never enters ``item_row_ids``, and any edge
+    # naming it takes the existing missing-src branch and is skipped. The
+    # numbering survives; nothing is invented to fill it.
+    #
+    # ``parse_typed_items`` compacts, so it is applied per element here rather
+    # than to the whole list — the positions matter more than the batching.
+    memories: list[Optional[ExtractedMemory]] = (
+        [(parse_typed_items([item]) or [None])[0] for item in items_raw]
+        if isinstance(items_raw, list)
         else []
     )
 
@@ -431,7 +461,7 @@ async def extract_graph(combined: str) -> dict[str, Any]:
                 continue
             edges.append({"src": src, "relation": relation, "entity": edge[relation]})
 
-    return {"facts": facts, "entities": entities, "edges": edges}
+    return {"memories": memories, "entities": entities, "edges": edges}
 
 
 def _store_graph(
@@ -718,6 +748,7 @@ def _read_new_raw_rows(
               AND user_id = :user_id
               AND status = 'active'
               AND memory_type IN ({_RAW_TYPES_SQL})
+              AND provenance <> 'INFERRED'
               AND (
                 :cursor_ts IS NULL
                 OR created_at > :cursor_ts
@@ -883,32 +914,32 @@ async def _synthesize_and_store(
     else:
         logger.info("curator: no summary produced for org %s", org_id)
 
-    # --- facts + graph (ONE extended LLM pass) ---------------------------
+    # --- typed memories + graph (ONE extended LLM pass) -------------------
     try:
         graph = await extract_graph(combined)
     except Exception:
         logger.warning(
-            "curator: extract_graph raised for org %s; no facts stored",
+            "curator: extract_graph raised for org %s; nothing distilled",
             org_id,
             exc_info=True,
         )
-        graph = {"facts": [], "entities": [], "edges": []}
-    facts = graph.get("facts", [])
+        graph = {"memories": [], "entities": [], "edges": []}
+    memories = graph.get("memories", [])
 
-    # Fact index -> newly stored row id. Dedup hits are deliberately ABSENT:
+    # Item index -> newly stored row id. Dedup hits are deliberately ABSENT:
     # their edges are skipped rather than attached to somebody else's row.
     fact_row_ids: dict[int, str] = {}
 
-    for fact_idx, fact in enumerate(facts):
-        if not fact:
+    for fact_idx, item in enumerate(memories):
+        if item is None or not item.content:
             continue
         new_id = await _store_one(
             db_session,
             org_id=org_id,
             user_id=user_id,
             agent_id=agent_id,
-            content=fact,
-            memory_type="fact",
+            content=item.content,
+            memory_type=item.memory_type,
             session_id=session_id,
             metadata=base_meta,
             space_id=space_id,
@@ -917,6 +948,14 @@ async def _synthesize_and_store(
         if new_id:
             stored += 1
             fact_row_ids[fact_idx] = new_id
+            # Reconciliation is fact-only on purpose. ``reconcile_fact``
+            # searches ``memory_type = 'fact'`` candidates, and superseding a
+            # decision or a plan is a different judgment from superseding a
+            # discovered constraint — a plan that is now done is not a plan
+            # that was wrong. Leaving those alone keeps the conservative
+            # posture this pass was built with.
+            if item.memory_type != "fact":
+                continue
             if reconcile.remaining <= 0:
                 # Reconciliation skipped because the budget ran out. Previously
                 # silent: the fact is stored without ever being checked against
@@ -930,7 +969,7 @@ async def _synthesize_and_store(
                 # against a fixed 0.90 threshold — either no reconciliation at
                 # all, or an LLM judge asked to arbitrate random pairs.
                 fact_embedding = await embed_text(
-                    fact, role=embedding_prompt.ROLE_PASSAGE
+                    item.content, role=embedding_prompt.ROLE_PASSAGE
                 )
                 if fact_embedding is not None:
                     superseded, judged = await reconcile_fact(
@@ -938,7 +977,7 @@ async def _synthesize_and_store(
                         org_id=org_id,
                         user_id=user_id,
                         new_fact_id=new_id,
-                        new_fact_content=fact,
+                        new_fact_content=item.content,
                         embedding=fact_embedding,
                         max_judgments=reconcile.remaining,
                     )
@@ -1247,6 +1286,7 @@ async def run_curator_once(
                   AND user_id IS NOT NULL
                   AND status = 'active'
                   AND memory_type IN ({_RAW_TYPES_SQL})
+                  AND provenance <> 'INFERRED'
                 """
             )
         ).fetchall()

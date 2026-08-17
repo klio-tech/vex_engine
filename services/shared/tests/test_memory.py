@@ -884,3 +884,88 @@ async def test_ordinary_input_is_passed_through_untouched():
     assert "wrote the migration" in captured["prompt"]
     assert "ship phase 2" in captured["prompt"]
     assert "[truncated]" not in captured["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# extract_typed_memories — the typed successor to extract_facts
+# ---------------------------------------------------------------------------
+#
+# The defect these cover: transcript distillation could only ever emit `fact`
+# and the curator only `fact`, so `decision` and `plan` were reachable only
+# through an agent explicitly calling the `decide` / `plan` MCP tools. On the
+# reference org that produced 0 decisions and 0 plans against 5,197 rows of
+# everything else, and three of the Context workspace's four sections rendered
+# empty.
+
+
+@pytest.mark.asyncio
+async def test_extract_typed_memories_preserves_the_kind_the_model_chose():
+    payload = {
+        "memories": [
+            {"kind": "decision", "content": "Deploys run from GitHub source builds."},
+            {"kind": "plan", "content": "Next the proposals UI gets wired up."},
+            {"kind": "fact", "content": "The health endpoint is /healthz not /health."},
+        ]
+    }
+    with patch("shared.memory.call_llm", new=AsyncMock(return_value=payload)):
+        items = await memory_module.extract_typed_memories("a transcript")
+
+    assert [i.memory_type for i in items] == ["decision", "plan", "fact"]
+
+
+@pytest.mark.asyncio
+async def test_extract_typed_memories_drops_session_exhaust():
+    """The durability rule is enforced in code, not only asked for in prose."""
+    payload = {
+        "memories": [
+            {"kind": "observation", "content": 'Used tool Bash input: {"cmd":"ls"}'},
+            {"kind": "observation", "content": "A container is running on port 54422."},
+            {"kind": "fact", "content": "Recall is fenced to the resolved project."},
+        ]
+    }
+    with patch("shared.memory.call_llm", new=AsyncMock(return_value=payload)):
+        items = await memory_module.extract_typed_memories("a transcript")
+
+    assert [i.content for i in items] == ["Recall is fenced to the resolved project."]
+
+
+@pytest.mark.asyncio
+async def test_extract_typed_memories_prompt_carries_both_rules():
+    captured = {}
+
+    async def _fake_llm(prompt, system=None):
+        captured["prompt"] = prompt
+        return {"memories": []}
+
+    with patch("shared.memory.call_llm", new=_fake_llm):
+        await memory_module.extract_typed_memories("some output")
+
+    assert "Never reproduce credentials" in captured["prompt"]
+    assert "DURABILITY TEST" in captured["prompt"]
+    assert "KINDS" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_extract_typed_memories_bounds_every_interpolated_field():
+    from shared.memory import MAX_PROMPT_INPUT_CHARS
+
+    captured = {}
+
+    async def _fake_llm(prompt, system=None):
+        captured["prompt"] = prompt
+        return {"memories": []}
+
+    huge = "y" * (MAX_PROMPT_INPUT_CHARS * 3)
+    with patch("shared.memory.call_llm", new=_fake_llm):
+        await memory_module.extract_typed_memories(huge, task=huge, input_data=huge)
+
+    assert len(captured["prompt"]) < 3 * MAX_PROMPT_INPUT_CHARS + 4_000, (
+        f"prompt was {len(captured['prompt'])} chars"
+    )
+    assert "[truncated]" in captured["prompt"]
+
+
+@pytest.mark.asyncio
+async def test_extract_typed_memories_is_empty_on_llm_failure():
+    with patch("shared.memory.call_llm", new=AsyncMock(return_value=None)):
+        assert await memory_module.extract_typed_memories("anything") == []

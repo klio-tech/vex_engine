@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.curator import curator_tick
+from shared.taxonomy import ExtractedMemory
 
 _BASE = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
 USER = "11111111-2222-3333-4444-555555555555"
@@ -54,7 +55,13 @@ def _patched(*, facts, reconcile):
         patch("app.curator.generate_summary", AsyncMock(return_value=None)),
         patch(
             "app.curator.extract_graph",
-            AsyncMock(return_value={"facts": facts, "entities": [], "edges": []}),
+            AsyncMock(
+                return_value={
+                    "memories": [ExtractedMemory("fact", f) for f in facts],
+                    "entities": [],
+                    "edges": [],
+                }
+            ),
         ),
         patch(
             "app.curator.write_scoped_memory",

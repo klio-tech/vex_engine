@@ -2,7 +2,7 @@
 
 Mock-based, mirroring ``tests/test_capture.py``: no live Postgres, no real
 LLM calls. ``app.capture.SessionLocal`` is patched to a fake session;
-``generate_summary`` / ``extract_facts`` / ``ensure_project`` are patched so
+``generate_summary`` / ``extract_typed_memories`` / ``ensure_project`` are patched so
 the distillation path is deterministic; ``app.capture.enqueue_trace_outbox``
 is the mockable seam for the evidence publish (patched directly rather than
 reaching into the Redis client, per the module's docstring).
@@ -38,7 +38,7 @@ def _distillation_mocks():
     return (
         patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
         patch("app.capture.generate_summary", AsyncMock(return_value=None)),
-        patch("app.capture.extract_facts", AsyncMock(return_value=[])),
+        patch("app.capture.extract_typed_memories", AsyncMock(return_value=[])),
     )
 
 

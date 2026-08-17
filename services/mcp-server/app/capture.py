@@ -13,7 +13,9 @@ Four endpoints, all mounted under ``/capture``:
 * ``POST /capture/event`` — store one passive memory (default an
   ``observation``), e.g. from a ``UserPromptSubmit`` hook.
 * ``POST /capture/transcript`` — distil a finished session: extract discrete
-  ``fact`` rows and one ``summary`` from the transcript, e.g. from a ``Stop``
+  memory rows, each classified into the product taxonomy
+  (``decision`` / ``plan`` / ``fact`` / ``note`` / ``observation``, see
+  :mod:`shared.taxonomy`), plus one ``summary``, e.g. from a ``Stop``
   hook.  The transcript is the richest source and only exists at session end,
   so we mine it then rather than storing the whole thing.  Secrets and PII in
   the transcript are redacted via :func:`shared.redaction.redact` BEFORE the
@@ -81,7 +83,7 @@ from pydantic import BaseModel, Field
 from shared import brain, claims
 from shared.auth import KeyInfo
 from shared.memory import (
-    extract_facts,
+    extract_typed_memories,
     generate_summary,
     retract_memory,
     retrieve_memories_scoped,
@@ -235,7 +237,7 @@ class TranscriptMessage(BaseModel):
 
 
 class CaptureTranscriptRequest(BaseModel):
-    """A finished session's transcript to distil into facts + a summary."""
+    """A finished session's transcript to distil into typed memories + a summary."""
 
     messages: list[TranscriptMessage] = Field(
         default_factory=list, description="Ordered session messages."
@@ -822,10 +824,10 @@ async def capture_transcript(
     principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """Distil a finished session into discrete ``fact`` rows and one ``summary``.
+    """Distil a finished session into typed memory rows and one ``summary``.
 
     Extraction failures are tolerated independently: a failed summary still
-    allows facts to be stored and vice-versa.  Each synthesised memory is written
+    allows the distilled memories to be stored and vice-versa.  Each synthesised memory is written
     via :func:`shared.brain.write_scoped_memory` (dedup on), so re-sending the
     same transcript is idempotent.  The curator never reprocesses these (it reads
     only RAW types, not ``fact`` / ``summary``).
@@ -887,20 +889,25 @@ async def capture_transcript(
                     lambda: record_usage(db, org_id, "memory", over_cap=over_cap)
                 )
 
+        # Typed distillation. Each item carries its own ``memory_type`` from
+        # the taxonomy the Context workspace groups by, instead of every item
+        # landing as ``fact`` because that was the only thing the old
+        # facts-only prompt could return. Items that fail the durability rule
+        # never reach this loop — see :mod:`shared.taxonomy`.
         try:
-            facts = await extract_facts(combined)
+            memories = await extract_typed_memories(combined)
         except Exception:
-            logger.warning("capture: extract_facts raised for org %s", org_id)
-            facts = []
-        for fact in facts:
-            if not fact:
+            logger.warning("capture: extract_typed_memories raised for org %s", org_id)
+            memories = []
+        for item in memories:
+            if not item.content:
                 continue
             result = await brain.write_scoped_memory(
                 db,
                 org_id=org_id,
                 agent_id=agent_id,
-                content=fact,
-                memory_type="fact",
+                content=item.content,
+                memory_type=item.memory_type,
                 session_id=session_id,
                 project_id=project_id,
                 metadata=base_meta,
@@ -942,7 +949,19 @@ async def capture_transcript(
         except Exception:
             logger.warning("evidence publish failed; capture unaffected", exc_info=True)
 
-        return {"stored": stored, "facts": len(facts), "summary": bool(summary)}
+        # ``facts`` stays in the response for wire compatibility with hook
+        # clients already in the field: it is the count of distilled items,
+        # which is exactly what it always was. ``by_kind`` is the additive
+        # breakdown across the taxonomy.
+        by_kind: dict[str, int] = {}
+        for item in memories:
+            by_kind[item.memory_type] = by_kind.get(item.memory_type, 0) + 1
+        return {
+            "stored": stored,
+            "facts": len(memories),
+            "by_kind": by_kind,
+            "summary": bool(summary),
+        }
     except HTTPException:
         raise
     except Exception:
