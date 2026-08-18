@@ -56,13 +56,24 @@ OWNERSHIP_SWEEP_MAX_TRANSFERS_PER_RUN = parse_int(
 )
 
 #: The dreamer (``app.dreamer.dream_for_org``) runs for an org once it has
-#: accumulated this many newly-graded sessions since its last dream pass —
-#: "newly graded" tracked per-process (see ``app.main``'s in-memory dream
-#: state), reset on restart, matching the ownership sweep's own
-#: no-persisted-cursor contract for the analogous case.
+#: accumulated this many newly-graded sessions since its last dream pass.
+#: "Newly graded" is counted in ``dream_state.sessions_since`` (migration
+#: 046) — PERSISTED, not per-process. The previous in-memory counter reset on
+#: every redeploy, which is why this threshold was never reached in
+#: production and ``memory_proposals`` held zero rows.
+#:
+#: WHY 10, NOT 25. The old default of 25 was set against no measurement. At
+#: the time this was diagnosed the entire production corpus was 19
+#: ``session_traces`` rows and 10 ``session_outcomes`` rows org-wide, so a
+#: 25-session threshold was indistinguishable from "never" — it could not be
+#: crossed even by grading every session that had ever existed. 10 is chosen
+#: to be reachable by a real young org within days of normal use while still
+#: requiring a genuine cluster of sessions rather than firing on one. The
+#: interval trigger below remains the backstop for an org that grades more
+#: slowly than that.
 DREAM_MIN_GRADED_SESSIONS = parse_int(
     os.environ.get("DREAM_MIN_GRADED_SESSIONS"),
-    default=25,
+    default=10,
     name="DREAM_MIN_GRADED_SESSIONS",
     minimum=1,
 )
@@ -70,9 +81,37 @@ DREAM_MIN_GRADED_SESSIONS = parse_int(
 #: ...or this many hours have elapsed since its last dream pass, whichever
 #: comes first — so a low-traffic org still gets dreamed for occasionally
 #: rather than waiting indefinitely for DREAM_MIN_GRADED_SESSIONS sessions.
+#: Persisted in ``dream_state.last_run_at`` (migration 046) and, since the
+#: periodic tick below exists, this is now a real timer rather than a
+#: condition only evaluated when a grading event happens to arrive.
 DREAM_INTERVAL_HOURS = parse_int(
     os.environ.get("DREAM_INTERVAL_HOURS"),
     default=24,
     name="DREAM_INTERVAL_HOURS",
+    minimum=1,
+)
+
+#: How often the periodic dream tick asks the DATABASE which orgs are past
+#: their ``DREAM_INTERVAL_HOURS`` clock. This is not the dream cadence — it
+#: is only the polling rate for the timer; ``DREAM_INTERVAL_HOURS`` still
+#: decides when an org is actually due. Cheap (one indexed query per tick),
+#: so it defaults to a few minutes: the interval trigger should fire close to
+#: when it comes due rather than whenever traffic next happens to arrive.
+DREAM_TICK_SECONDS = parse_int(
+    os.environ.get("DREAM_TICK_SECONDS"),
+    default=300,
+    name="DREAM_TICK_SECONDS",
+    minimum=10,
+)
+
+#: A ceiling on how many orgs ONE periodic tick will dream for, matching the
+#: ownership sweep's per-pass cap convention: a backlog (e.g. the first tick
+#: after this migration lands, when every org's clock is seeded from its
+#: oldest trace and many are immediately due) drains over several ticks
+#: instead of blocking one worker thread on every org at once.
+DREAM_MAX_ORGS_PER_TICK = parse_int(
+    os.environ.get("DREAM_MAX_ORGS_PER_TICK"),
+    default=5,
+    name="DREAM_MAX_ORGS_PER_TICK",
     minimum=1,
 )

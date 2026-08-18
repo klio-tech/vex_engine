@@ -15,10 +15,18 @@ each other's messages):
    ``session_outcomes`` row, and per-memory attribution in
    ``recall_outcomes``. See ``app.outcome_grader`` for why the verdict is
    written exactly once per session rather than once per recall. This loop
-   also drives the dreamer (``app.dreamer.dream_for_org``) per org, once
-   ``DREAM_MIN_GRADED_SESSIONS`` new graded sessions have accumulated for
-   that org or ``DREAM_INTERVAL_HOURS`` have elapsed since its last pass —
-   see ``_maybe_dream_for_org``.
+   also drives the dreamer (``app.dreamer.dream_for_org``) per org on two
+   independent triggers, both of which read PERSISTED state
+   (``dream_state``, migration 046) rather than process memory:
+   ``DREAM_MIN_GRADED_SESSIONS`` new graded sessions accumulated for that org
+   (``_maybe_dream_for_org``, driven by grading events), or
+   ``DREAM_INTERVAL_HOURS`` elapsed since its last pass (``_run_dream_tick``,
+   driven by this loop's idle wakeup every ``DREAM_TICK_SECONDS``).
+
+   Both of those used to live in a process-local dict, so every redeploy
+   reset the counter and the interval clock and neither trigger was ever
+   reached — the dreamer produced zero proposals for the entire life of the
+   feature. See ``app.dream_state``.
 
 Both loops ACK on success; failures are logged but never crash the loop,
 matching storage-worker's resilience contract for malformed/failing
@@ -30,7 +38,6 @@ import json
 import logging
 import os
 import time
-from typing import Any
 
 import anyio
 import redis.asyncio as aioredis
@@ -40,6 +47,7 @@ from shared.models import IngestEvent
 from shared.redis_config import REDIS_CLIENT_OPTIONS
 
 from app import config
+from app import dream_state
 from app import dreamer
 from app.db import SessionLocal
 from app.outcome_grader import grade_stored_session
@@ -238,38 +246,22 @@ async def _consume_executions(redis_client: aioredis.Redis) -> None:
             await asyncio.sleep(1)
 
 
-async def _maybe_dream_for_org(
-    s3_client: object, org_id: str, dream_state: dict[str, dict[str, Any]]
+async def _run_claimed_dream_pass(
+    s3_client: object, claim: dream_state.DreamClaim
 ) -> None:
-    """Run the dreamer for ``org_id`` once this org has crossed either dream
-    threshold, then reset its counters.
+    """Run one ALREADY-CLAIMED dream pass and record its result.
 
-    ``dream_state`` is process-local (``{org_id: {"sessions_since": int,
-    "last_run": float}}``, keyed by ``time.monotonic()``) — reset on
-    restart, matching the ownership sweep's own no-persisted-cursor
-    contract for the analogous per-org cadence. A short-lived process (a
-    quick restart) never runs a real dream pass for an org it barely saw;
-    the first real pass after a fresh deploy waits for a real threshold
-    crossing rather than firing immediately, same idiom as the ownership
-    sweep's ``next_sweep_at`` above.
+    The caller has won the claim (``app.dream_state.claim_dream_pass``),
+    which already reset this org's counters and interval clock — so a pass
+    that fails here is not retried until the next threshold crossing. That is
+    deliberate and unchanged from the original in-memory behaviour: a
+    persistently-failing org (a bad LLM config, unreachable S3) must get one
+    attempt per threshold crossing, not one per graded session.
 
-    A failed dream pass is logged and swallowed — it must never take down
-    the grading loop sharing this coroutine — and its org's counters are
-    reset regardless of outcome, so a persistently-failing org (e.g. a bad
-    LLM config) does not retry every single graded session; it gets one
-    attempt per threshold crossing.
+    A failed dream pass is logged and swallowed — it must never take down the
+    grading loop sharing this coroutine.
     """
-    state = dream_state.setdefault(
-        org_id, {"sessions_since": 0, "last_run": time.monotonic()}
-    )
-    state["sessions_since"] += 1
-    elapsed_hours = (time.monotonic() - state["last_run"]) / 3600.0
-    if (
-        state["sessions_since"] < config.DREAM_MIN_GRADED_SESSIONS
-        and elapsed_hours < config.DREAM_INTERVAL_HOURS
-    ):
-        return
-
+    org_id = claim.org_id
     dream_db = SessionLocal()
     try:
         # dream_for_org is a plain (synchronous) function on purpose — it does
@@ -282,19 +274,125 @@ async def _maybe_dream_for_org(
         written = await anyio.to_thread.run_sync(
             lambda: dreamer.dream_for_org(dream_db, s3_client, org_id=org_id)
         )
+        await anyio.to_thread.run_sync(
+            lambda: dream_state.record_dream_result(
+                dream_db, org_id=org_id, written=written
+            )
+        )
         logger.info(
-            "dreamer: org=%s wrote %d proposals (sessions_since=%d elapsed_hours=%.1f)",
+            "dreamer: org=%s wrote %d proposals (trigger=%s sessions_since=%d "
+            "elapsed_hours=%.1f)",
             org_id,
             written,
-            state["sessions_since"],
-            elapsed_hours,
+            claim.reason,
+            claim.sessions_since,
+            claim.elapsed_hours,
         )
     except Exception:
         logger.error("dreamer: pass failed org=%s", org_id, exc_info=True)
     finally:
         dream_db.close()
-        state["sessions_since"] = 0
-        state["last_run"] = time.monotonic()
+
+
+async def _maybe_dream_for_org(s3_client: object, org_id: str) -> None:
+    """Count one graded session for ``org_id`` and run a dream pass if that
+    crossed a threshold.
+
+    The counter and the interval clock live in ``dream_state`` (migration
+    046), NOT in this process. That is the fix for the original bug: both
+    triggers used to be tracked in a process-local dict keyed by
+    ``time.monotonic()``, so every ``async-worker`` redeploy — which happens
+    routinely, sometimes several times a day — reset the graded-session count
+    to zero AND restarted the interval clock. Neither threshold was ever
+    reached in production and ``memory_proposals`` held zero rows for the
+    entire life of the feature.
+
+    Both statements run on a worker thread: they are synchronous
+    psycopg2 calls and this coroutine shares its event loop with the
+    verification consumer.
+    """
+    db = SessionLocal()
+    try:
+        await anyio.to_thread.run_sync(
+            lambda: dream_state.record_graded_session(db, org_id=org_id)
+        )
+        claim = await anyio.to_thread.run_sync(
+            lambda: dream_state.claim_dream_pass(
+                db,
+                org_id=org_id,
+                min_graded_sessions=config.DREAM_MIN_GRADED_SESSIONS,
+                interval_hours=config.DREAM_INTERVAL_HOURS,
+            )
+        )
+    except Exception:
+        logger.error(
+            "dreamer: trigger bookkeeping failed org=%s", org_id, exc_info=True
+        )
+        return
+    finally:
+        db.close()
+
+    if claim is None:
+        return
+    await _run_claimed_dream_pass(s3_client, claim)
+
+
+async def _run_dream_tick(s3_client: object) -> None:
+    """One periodic pass of the INTERVAL trigger.
+
+    This exists because ``DREAM_INTERVAL_HOURS`` was never actually a timer.
+    It was a condition evaluated only inside ``_maybe_dream_for_org``, which
+    only runs when a session is graded — so an org with a real trace corpus
+    but few graded sessions could reach NEITHER trigger: not enough grading
+    events to cross the count threshold, and no grading events with which to
+    evaluate the interval. Persisting the state fixes the redeploy reset;
+    this tick is what gives the interval a wakeup of its own.
+
+    Piggybacks on the sessions-stored consumer's existing idle wakeup
+    (``block=5000``), the same "reuse a loop that already ticks" shape
+    ``_consume_executions`` uses for the ownership sweep, rather than opening
+    a third loop just to sleep on an interval.
+
+    Every org found here is claimed through the SAME atomic
+    ``claim_dream_pass`` statement the grading path uses, so this tick and a
+    concurrent graded session can never both dream for one org.
+    """
+    db = SessionLocal()
+    try:
+        due = await anyio.to_thread.run_sync(
+            lambda: dream_state.orgs_due_for_dream(
+                db,
+                interval_hours=config.DREAM_INTERVAL_HOURS,
+                limit=config.DREAM_MAX_ORGS_PER_TICK,
+            )
+        )
+        claims: list[dream_state.DreamClaim] = []
+        for org_id in due:
+            # An org can be due on the interval while having no state row at
+            # all — it has produced traces but never had a graded session, so
+            # nothing ever created its row, and claim_dream_pass's UPDATE
+            # cannot claim a row that does not exist.
+            await anyio.to_thread.run_sync(
+                lambda oid=org_id: dream_state.ensure_state_row(db, org_id=oid)
+            )
+            claim = await anyio.to_thread.run_sync(
+                lambda oid=org_id: dream_state.claim_dream_pass(
+                    db,
+                    org_id=oid,
+                    min_graded_sessions=config.DREAM_MIN_GRADED_SESSIONS,
+                    interval_hours=config.DREAM_INTERVAL_HOURS,
+                )
+            )
+            if claim is not None:
+                claims.append(claim)
+    except Exception:
+        logger.error("dreamer: periodic tick failed to select orgs", exc_info=True)
+        return
+    finally:
+        db.close()
+
+    for claim in claims:
+        await _run_claimed_dream_pass(s3_client, claim)
 
 
 async def _consume_sessions_stored(
@@ -310,21 +408,42 @@ async def _consume_sessions_stored(
     unknown rather than raising), so a failure surfacing here means the
     entry itself was malformed or the DB write failed outright.
 
-    Also drives the dreamer (``app.dreamer.dream_for_org``): every
-    successfully-graded session increments that org's counter
-    (``_maybe_dream_for_org``), which fires a dream pass once the org
-    crosses ``DREAM_MIN_GRADED_SESSIONS`` new graded sessions or
-    ``DREAM_INTERVAL_HOURS`` have elapsed since its last pass — the same
-    "piggyback on a loop that already has the recurring wakeup" shape
-    ``_consume_executions`` uses for the ownership sweep, except keyed off
-    real grading events rather than a fixed timer alone, since the
-    threshold is explicitly "N new graded sessions OR M hours".
+    Also drives the dreamer (``app.dreamer.dream_for_org``) on BOTH of its
+    triggers, which are now genuinely independent:
+
+    * count — every successfully-graded session increments that org's
+      PERSISTED counter (``_maybe_dream_for_org`` ->
+      ``dream_state.record_graded_session``), firing a pass once the org
+      crosses ``DREAM_MIN_GRADED_SESSIONS``;
+    * interval — a periodic tick (``_run_dream_tick``, every
+      ``DREAM_TICK_SECONDS``) asks the database which orgs are past
+      ``DREAM_INTERVAL_HOURS`` and dreams for them, regardless of whether any
+      session was graded. Before this, the interval was only ever evaluated
+      as a side condition of a grading event, so an org that graded slowly
+      reached neither trigger.
+
+    The tick uses this loop's existing recurring wakeup (``block=5000``), the
+    same "piggyback on a loop that already ticks" shape
+    ``_consume_executions`` uses for the ownership sweep.
     """
     await _ensure_consumer_group(redis_client, SESSIONS_STORED, SESSIONS_CONSUMER_GROUP)
 
-    logger.info("Outcome grader started. Listening on %s", SESSIONS_STORED)
+    logger.info(
+        "Outcome grader started. Listening on %s (dreamer: min_graded_sessions=%d "
+        "interval_hours=%d tick=%ss max_orgs_per_tick=%d)",
+        SESSIONS_STORED,
+        config.DREAM_MIN_GRADED_SESSIONS,
+        config.DREAM_INTERVAL_HOURS,
+        config.DREAM_TICK_SECONDS,
+        config.DREAM_MAX_ORGS_PER_TICK,
+    )
 
-    dream_state: dict[str, dict[str, Any]] = {}
+    # Sleep-before-tick, same idiom as the ownership sweep's ``next_sweep_at``:
+    # a process that restarts immediately does not fire a dream tick on the
+    # way up. Unlike the old in-memory dream state, this delays only the
+    # POLL — the interval clock it polls lives in ``dream_state`` and is
+    # unaffected by the restart, so nothing is lost by waiting one tick.
+    next_dream_tick_at = time.monotonic() + config.DREAM_TICK_SECONDS
 
     while True:
         try:
@@ -335,6 +454,16 @@ async def _consume_sessions_stored(
                 count=10,
                 block=5000,
             )
+
+            # Checked every iteration — including the idle ones, which are the
+            # common case at ``block=5000`` — so the interval trigger's cadence
+            # does not depend on stream traffic. That independence is the whole
+            # point: the previous design could only evaluate the interval when
+            # traffic arrived.
+            if time.monotonic() >= next_dream_tick_at:
+                next_dream_tick_at = time.monotonic() + config.DREAM_TICK_SECONDS
+                await _run_dream_tick(s3_client)
+
             if not messages:
                 continue
 
@@ -375,7 +504,7 @@ async def _consume_sessions_stored(
                         # duplicate re-delivery (see grade_stored_session's
                         # docstring), neither of which is new evidence.
                         if result.get("session_outcome_id") is not None:
-                            await _maybe_dream_for_org(s3_client, org_id, dream_state)
+                            await _maybe_dream_for_org(s3_client, org_id)
                     except Exception:
                         logger.error(
                             "Failed to grade session message %s",
