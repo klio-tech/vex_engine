@@ -51,7 +51,15 @@ from fastapi import HTTPException
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
-from shared import artifact_storage, artifacts, brain, claims, graph_store, projects
+from shared import (
+    artifact_storage,
+    artifacts,
+    brain,
+    claims,
+    graph_store,
+    project_scope,
+    projects,
+)
 from shared.compression.router import compress as route_compress
 from shared.compression.router import estimate_tokens
 from shared.compression.structural import compress_payload
@@ -122,6 +130,7 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "project_list",
     "project_members",
     "project_grant",
+    "project_scope",
     "klio_retrieve",
     "compress",
     "explore",
@@ -3120,6 +3129,182 @@ async def _perform_project_grant(
         db.close()
 
 
+async def _perform_project_scope(
+    ctx: Context,
+    *,
+    project: str,
+    default: Optional[str],
+    my_captures: Optional[str],
+) -> dict[str, Any]:
+    """Read or change where a project's captures land.
+
+    With neither ``default`` nor ``my_captures``, this only reports — which is
+    the common call, because an agent should be able to tell a person where
+    their work is going before it goes there.
+
+    TWO SEPARATE PERMISSIONS, deliberately asymmetric:
+
+    * ``default`` changes the project for EVERYONE. Widening it (to ``project``
+      or ``org``) requires ADMIN, because it publishes every member's future
+      captures in this project. Narrowing back to ``private`` needs only
+      ``manage``: making something less visible is always allowed to the wider
+      group, and requiring admin to stop publishing would be a trap.
+
+    * ``my_captures`` is the caller's OWN opt-out and is never accepted for
+      anybody else. There is no argument to name another user, which is the
+      point: an admin who could clear a colleague's override would be able to
+      publish that colleague's context, breaking the user silo's promise that
+      private is a real boundary INCLUDING from admins.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        return {"ok": False, "error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
+
+    try:
+        org_id, _agent_id = resolve_principal(request)
+    except HTTPException as exc:
+        return {"ok": False, "error": "unauthorized", "detail": str(exc.detail)}
+
+    caller = resolve_request_user_id(request)
+    if not caller:
+        return {
+            "ok": False,
+            "error": "unattributed_caller",
+            "detail": "Changing capture scope requires a caller we can attribute.",
+        }
+
+    if default is not None and project_scope.normalize_default_scope(default) is None:
+        return {
+            "ok": False,
+            "error": "invalid_scope",
+            "detail": "default must be one of: private, project, org.",
+        }
+    if my_captures is not None and my_captures not in (
+        project_scope.SCOPE_PRIVATE,
+        "default",
+    ):
+        return {
+            "ok": False,
+            "error": "invalid_override",
+            "detail": (
+                "my_captures may only be 'private' (narrowing) or 'default' to "
+                "clear it."
+            ),
+        }
+
+    db = SessionLocal()
+    try:
+        project_id = brain.find_project_id(db, org_id=org_id, identifier=project)
+        if project_id is None:
+            return {
+                "ok": False,
+                "error": "not_found",
+                "detail": f"unknown project: {project}",
+            }
+
+        # Same existence-oracle protection as project_grant / project_members:
+        # a non-member gets the shape a missing project gets.
+        if not projects.is_member(
+            db, org_id=org_id, project_id=project_id, user_id=caller
+        ):
+            return {
+                "ok": False,
+                "error": "not_found",
+                "detail": f"unknown project: {project}",
+            }
+
+        if default is not None:
+            normalized = project_scope.normalize_default_scope(default)
+            widening = normalized != project_scope.SCOPE_PRIVATE
+            allowed = (
+                projects.is_admin(
+                    db, org_id=org_id, project_id=project_id, user_id=caller
+                )
+                if widening
+                else projects.can_manage(
+                    db, org_id=org_id, project_id=project_id, user_id=caller
+                )
+            )
+            if not allowed:
+                return {
+                    "ok": False,
+                    "error": "forbidden",
+                    "detail": (
+                        "Only a project admin can share this project's captures."
+                        if widening
+                        else "You cannot change this project's capture scope."
+                    ),
+                }
+
+            previous = project_scope.set_project_default_scope(
+                db, org_id=org_id, project_id=project_id, scope=normalized
+            )
+            if previous is None:
+                return {"ok": False, "error": "not_found"}
+
+            logger.info(
+                "project_scope: %s changed project %s default %s -> %s via mcp",
+                caller,
+                project_id,
+                previous,
+                normalized,
+            )
+
+        if my_captures is not None:
+            override = None if my_captures == "default" else project_scope.SCOPE_PRIVATE
+            changed = project_scope.set_member_scope_override(
+                db,
+                org_id=org_id,
+                project_id=project_id,
+                user_id=caller,
+                override=override,
+            )
+            if not changed:
+                return {"ok": False, "error": "not_found"}
+
+            logger.info(
+                "project_scope: %s set own override on project %s to %s via mcp",
+                caller,
+                project_id,
+                override,
+            )
+
+        effective = project_scope.resolve_capture_scope(
+            db, org_id=org_id, project_id=project_id, user_id=caller
+        )
+        row = (
+            db.execute(
+                text(
+                    """
+                    SELECT p.default_scope, m.scope_override
+                    FROM projects p
+                    LEFT JOIN project_members m
+                           ON m.project_id = p.id AND m.user_id = :user_id
+                    WHERE p.id = :project_id AND p.org_id = :org_id
+                    """
+                ),
+                {"project_id": project_id, "org_id": org_id, "user_id": caller},
+            )
+            .mappings()
+            .first()
+        )
+
+        return {
+            "ok": True,
+            "project_id": project_id,
+            "default": (row["default_scope"] if row else project_scope.SCOPE_PRIVATE),
+            "my_override": (row["scope_override"] if row else None),
+            "your_captures_land_at": effective,
+        }
+    except Exception:
+        logger.exception("project_scope failed")
+        return {"ok": False, "error": "project_scope_failed"}
+    finally:
+        db.close()
+
+
 def build_mcp_server() -> FastMCP:
     """Construct a fresh :class:`FastMCP` with the eight Klio tools.
 
@@ -3807,6 +3992,49 @@ def _register_tools(mcp: FastMCP) -> None:
         ] = "write",
     ) -> dict[str, Any]:
         return await _perform_project_grant(ctx, project=project, user=user, role=role)
+
+    @mcp.tool(
+        name="project_scope",
+        description=(
+            "Where this project's captures land — read it, or change it. With "
+            "no arguments it just reports, so you can tell the user where "
+            "their work is going before it goes there. `default` sets it for "
+            "EVERYONE in the project: 'private' (each person's captures stay "
+            "their own), 'project' (project members can read them), 'org' (the "
+            "whole team). Sharing requires project admin. `my_captures` is "
+            "your OWN opt-out and only ever yours: 'private' keeps your "
+            "captures private whatever the project says, 'default' follows the "
+            "project again. Only affects captures filed under this project, "
+            "and only from now on — nothing already stored ever changes."
+        ),
+    )
+    async def project_scope_tool(
+        ctx: Context,
+        project: Annotated[
+            str, Field(description="Project name, git remote, repo path, or id.")
+        ],
+        default: Annotated[
+            Optional[Literal["private", "project", "org"]],
+            Field(
+                description=(
+                    "Set the project-wide default. Omit to leave it unchanged."
+                )
+            ),
+        ] = None,
+        my_captures: Annotated[
+            Optional[Literal["private", "default"]],
+            Field(
+                description=(
+                    "Your own captures in this project: 'private' to opt out of "
+                    "the project default, 'default' to follow it again. Applies "
+                    "to you only."
+                )
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        return await _perform_project_scope(
+            ctx, project=project, default=default, my_captures=my_captures
+        )
 
     @mcp.tool(
         name="init",

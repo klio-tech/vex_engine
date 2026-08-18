@@ -93,6 +93,7 @@ from shared.evidence_stream import build_captured_payload, publish_captured
 from shared.redaction import redact
 from shared.plan_limits import get_plan_config
 from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
+from shared import project_scope
 from sqlalchemy import text
 
 from app.auth import resolve_principal_dep, verify_api_key
@@ -775,6 +776,17 @@ async def capture_event(
                 user_id=user_id,
             )
         )
+        # The project's default capture scope, applied only now that a project
+        # has actually resolved. `_hook_write_scope` already returned the safe
+        # answer; this can only widen it, and only when the project says so and
+        # the member has not opted out. Unfiled captures never reach here with
+        # a project, so they stay private.
+        if user_id:
+            scope = await anyio.to_thread.run_sync(
+                lambda: project_scope.resolve_capture_scope(
+                    db, org_id=org_id, project_id=project_id, user_id=user_id
+                )
+            )
         over_cap = await anyio.to_thread.run_sync(
             lambda: _check_memory_quota_402(
                 db, org_id, key_info.plan, "memory", key_info.plan_overrides
@@ -854,6 +866,15 @@ async def capture_transcript(
                 user_id=user_id,
             )
         )
+        # Same rule as /capture/event: the project's default is applied only
+        # after a project has resolved, and can only widen the safe answer
+        # `_hook_write_scope` already produced.
+        if user_id:
+            scope = await anyio.to_thread.run_sync(
+                lambda: project_scope.resolve_capture_scope(
+                    db, org_id=org_id, project_id=project_id, user_id=user_id
+                )
+            )
         session_id = _capture_session_id(
             org_id, agent_id, req.session_id, user_id=user_id
         )
