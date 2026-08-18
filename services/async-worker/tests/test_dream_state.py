@@ -44,9 +44,6 @@ pytestmark = requires_db("the dream_state trigger tests")
 
 ORG = "org-dream-test"
 
-#: The columns migration 046 creates, restated here rather than imported from
-#: the migration: a test that builds its fixture by running the code under
-#: test cannot detect the migration disagreeing with the queries.
 #: A dedicated Postgres schema for this file's tables.
 #:
 #: CI runs `alembic upgrade head` and then the suites against that migrated
@@ -57,6 +54,9 @@ ORG = "org-dream-test"
 #: untouched.
 TEST_SCHEMA = "test_dream_state"
 
+#: The columns are restated here rather than imported from migration 046: a
+#: test that builds its fixture by running the code under test cannot detect
+#: the migration disagreeing with the queries.
 SCHEMA = f"""
 DROP SCHEMA IF EXISTS {TEST_SCHEMA} CASCADE;
 CREATE SCHEMA {TEST_SCHEMA};
@@ -79,8 +79,6 @@ CREATE TABLE session_traces (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 """
-
-
 
 
 def _engine():
