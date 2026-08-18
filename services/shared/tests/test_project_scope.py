@@ -47,9 +47,20 @@ BOB = "22222222-2222-2222-2222-222222222222"
 PROJECT = "aaaaaaaa-0000-0000-0000-00000000ab01"
 OTHER_PROJECT = "aaaaaaaa-0000-0000-0000-00000000ab02"
 
-SCHEMA = """
-DROP TABLE IF EXISTS project_members;
-DROP TABLE IF EXISTS projects;
+#: A dedicated Postgres schema for this file's tables.
+#:
+#: CI runs `alembic upgrade head` and then the suites against that migrated
+#: database. These fixtures need to CREATE tables, and creating them in
+#: `public` means dropping the real ones first — which would destroy the
+#: migrated schema for every test that runs afterwards. Namespacing keeps the
+#: tables real (the predicates under test are the point) while leaving `public`
+#: untouched.
+TEST_SCHEMA = "test_project_scope"
+
+SCHEMA = f"""
+DROP SCHEMA IF EXISTS {TEST_SCHEMA} CASCADE;
+CREATE SCHEMA {TEST_SCHEMA};
+SET search_path TO {TEST_SCHEMA};
 
 CREATE TABLE projects (
   id uuid PRIMARY KEY,
@@ -70,8 +81,14 @@ CREATE TABLE project_members (
 """
 
 
+
+
 def _engine():
-    return sa.create_engine(database_url())
+    """An engine whose connections resolve unqualified names to TEST_SCHEMA."""
+    return sa.create_engine(
+        database_url(),
+        connect_args={"options": f"-csearch_path={TEST_SCHEMA}"},
+    )
 
 
 def _session(engine):

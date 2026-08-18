@@ -44,12 +44,23 @@ pytestmark = requires_db("the dream_state trigger tests")
 
 ORG = "org-dream-test"
 
-#: The columns migration 046 creates, restated here rather than imported from
-#: the migration: a test that builds its fixture by running the code under
-#: test cannot detect the migration disagreeing with the queries.
-SCHEMA = """
-DROP TABLE IF EXISTS dream_state;
-DROP TABLE IF EXISTS session_traces;
+#: A dedicated Postgres schema for this file's tables.
+#:
+#: CI runs `alembic upgrade head` and then the suites against that migrated
+#: database. These fixtures need to CREATE tables, and creating them in
+#: `public` means dropping the real ones first — which would destroy the
+#: migrated schema for every test that runs afterwards. Namespacing keeps the
+#: tables real (the predicates under test are the point) while leaving `public`
+#: untouched.
+TEST_SCHEMA = "test_dream_state"
+
+#: The columns are restated here rather than imported from migration 046: a
+#: test that builds its fixture by running the code under test cannot detect
+#: the migration disagreeing with the queries.
+SCHEMA = f"""
+DROP SCHEMA IF EXISTS {TEST_SCHEMA} CASCADE;
+CREATE SCHEMA {TEST_SCHEMA};
+SET search_path TO {TEST_SCHEMA};
 
 CREATE TABLE dream_state (
   org_id varchar(64) PRIMARY KEY,
@@ -71,7 +82,11 @@ CREATE TABLE session_traces (
 
 
 def _engine():
-    return sa.create_engine(database_url())
+    """An engine whose connections resolve unqualified names to TEST_SCHEMA."""
+    return sa.create_engine(
+        database_url(),
+        connect_args={"options": f"-csearch_path={TEST_SCHEMA}"},
+    )
 
 
 def _reset(engine, *, org=ORG, sessions_since=0, last_run_hours_ago=0.0):

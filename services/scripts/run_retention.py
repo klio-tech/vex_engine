@@ -271,7 +271,22 @@ def sweep_evidence_for_org(conn, *, org_id: str, retention_days: int) -> dict[st
     }
 
 
-def _contained(sweep, conn, *, org_id: str, what: str) -> None:
+def _contained(sweep, conn, *, org_id: str, what: str, dry_run: bool = False) -> None:
+    """Run one per-org sweep, containing its failure to that org.
+
+    ``dry_run`` skips the sweep entirely rather than attempting a read-only
+    variant: these sweeps are DELETEs behind a seam and have no counting form,
+    so the honest thing under --dry-run is to run none of them and say so. A
+    flag named "dry run" that still deletes four things is worse than no flag.
+    """
+    if dry_run:
+        logger.info("DRY RUN: skipping %s for org %s", what, org_id)
+        return
+
+    return _contained_impl(sweep, conn, org_id=org_id, what=what)
+
+
+def _contained_impl(sweep, conn, *, org_id: str, what: str) -> None:
     """Run one org's sweep so that its failure stays its own.
 
     Hygiene, not the job: a sweep that blows up must not leave every later
@@ -293,6 +308,14 @@ def _contained(sweep, conn, *, org_id: str, what: str) -> None:
 
 
 def main() -> None:
+    # --dry-run reports what the observation sweep would remove and what it is
+    # holding back, and issues no DELETE. A fleet-wide, no-org-predicate DELETE
+    # that cannot be rehearsed is a job nobody can safely schedule for the
+    # first time, which is part of why this one never was.
+    dry_run = "--dry-run" in sys.argv[1:]
+    if dry_run:
+        logger.info("DRY RUN: no rows will be deleted")
+
     database_url = os.environ.get("DATABASE_URL")
     supabase_url = os.environ.get("SUPABASE_DATABASE_URL")
 
@@ -423,12 +446,14 @@ def main() -> None:
                     tsdb_conn,
                     org_id=org_id,
                     what="orphan graph edges",
+                    dry_run=dry_run,
                 )
                 _contained(
                     graph_store.sweep_orphan_entities,
                     tsdb_conn,
                     org_id=org_id,
                     what="orphan graph entities",
+                    dry_run=dry_run,
                 )
                 # 3. Compression originals. Not anchored to a memory at all —
                 #    these expire on their own short TTL and, until now, were
@@ -438,6 +463,7 @@ def main() -> None:
                     tsdb_conn,
                     org_id=org_id,
                     what="expired compression originals",
+                    dry_run=dry_run,
                 )
                 # 4. Evidence: session_traces / session_outcomes /
                 #    recall_outcomes. These are the dreamer's raw material,
@@ -457,6 +483,7 @@ def main() -> None:
                     tsdb_conn,
                     org_id=org_id,
                     what="expired evidence (traces/outcomes)",
+                    dry_run=dry_run,
                 )
 
             # Hidden raw captures are curator fuel with a short shelf life:
@@ -464,27 +491,87 @@ def main() -> None:
             # the one DELETE here with no org_id predicate — global by design,
             # age its only bound — which is why ``raw_ttl_days`` was validated
             # before the first statement of the run.
+            #
+            # AGE ALONE IS NOT A SAFE BOUND, and measuring it proved that.
+            # These rows are fuel: the curator distils them into facts,
+            # decisions and plans, and until it has read a row that row is the
+            # only copy of what happened. The curator can fall behind the TTL —
+            # it is a periodic job over a per-user cursor, and on 2026-08-18 it
+            # was six days behind for the fleet's largest org. Sweeping on age
+            # alone that day would have deleted 10,580 observations nobody had
+            # ever distilled, 9,848 of them from one org.
+            #
+            # So the sweep is bounded by BOTH: older than the TTL, and already
+            # passed by the curator's cursor for that row's own (org, user).
+            # A row whose owner has no cursor at all is never swept — the
+            # curator has not run for them even once, so every row is still
+            # fuel.
+            #
+            # The cost of being wrong in each direction is asymmetric, which is
+            # what settles the design. Keeping a row too long costs storage.
+            # Deleting one early destroys the only record of a session, with no
+            # way to know what was lost.
             if raw_ttl_days is None:
                 logger.info(
                     "RAW_OBSERVATION_TTL_DAYS is off; skipping the hidden raw "
                     "observation sweep"
                 )
             else:
-                deleted = tsdb_conn.execute(
-                    text(
-                        """
-                        DELETE FROM session_memories
-                        WHERE recall_hidden = TRUE
-                          AND created_at < NOW() - (:days || ' days')::interval
-                        """
-                    ),
-                    {"days": raw_ttl_days},
-                )
-                logger.info(
-                    "Swept hidden raw observations older than %d days (%s rows)",
-                    raw_ttl_days,
-                    getattr(deleted, "rowcount", "?"),
-                )
+                sweep_sql = """
+                        DELETE FROM session_memories m
+                        WHERE m.recall_hidden = TRUE
+                          AND m.created_at < NOW() - (:days || ' days')::interval
+                          AND EXISTS (
+                                SELECT 1 FROM brain_curator_state c
+                                WHERE c.org_id = m.org_id
+                                  AND c.user_id IS NOT DISTINCT FROM m.user_id
+                                  AND c.last_processed_at IS NOT NULL
+                                  AND c.last_processed_at >= m.created_at
+                          )
+                """
+                if dry_run:
+                    held = tsdb_conn.execute(
+                        text(
+                            """
+                            SELECT count(*) FROM session_memories m
+                            WHERE m.recall_hidden = TRUE
+                              AND m.created_at
+                                  < NOW() - (:days || ' days')::interval
+                              AND NOT EXISTS (
+                                    SELECT 1 FROM brain_curator_state c
+                                    WHERE c.org_id = m.org_id
+                                      AND c.user_id IS NOT DISTINCT FROM m.user_id
+                                      AND c.last_processed_at IS NOT NULL
+                                      AND c.last_processed_at >= m.created_at
+                              )
+                            """
+                        ),
+                        {"days": raw_ttl_days},
+                    ).scalar()
+                    would = tsdb_conn.execute(
+                        text(
+                            sweep_sql.replace(
+                                "DELETE FROM session_memories m",
+                                "SELECT count(*) FROM session_memories m",
+                            )
+                        ),
+                        {"days": raw_ttl_days},
+                    ).scalar()
+                    logger.info(
+                        "DRY RUN: would sweep %s hidden raw observations older "
+                        "than %d days; holding %s the curator has not read yet",
+                        would,
+                        raw_ttl_days,
+                        held,
+                    )
+                else:
+                    deleted = tsdb_conn.execute(text(sweep_sql), {"days": raw_ttl_days})
+                    logger.info(
+                        "Swept hidden raw observations older than %d days "
+                        "and already curated (%s rows)",
+                        raw_ttl_days,
+                        getattr(deleted, "rowcount", "?"),
+                    )
 
             tsdb_conn.commit()
 
