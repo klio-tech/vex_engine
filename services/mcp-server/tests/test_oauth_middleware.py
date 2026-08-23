@@ -35,7 +35,7 @@ def _restore_modules():
     importlib.reload(main)
 
 
-def _client(monkeypatch, *, enabled, verify=None, resolve=None):
+def _client(monkeypatch, *, enabled, verify=None, resolve=None, check_key=None):
     """Build a TestClient with the given OAuth flag state and optional seams."""
     monkeypatch.setenv("MCP_OAUTH_ENABLED", "1" if enabled else "0")
     monkeypatch.setenv("SUPABASE_AUTH_ISSUER", "https://proj.supabase.co/auth/v1")
@@ -54,6 +54,10 @@ def _client(monkeypatch, *, enabled, verify=None, resolve=None):
         monkeypatch.setattr(om, "_verify_token", verify)
     if resolve is not None:
         monkeypatch.setattr(om, "_resolve_grant", resolve)
+    # Default the key check to "accepts everything" so the many tests that
+    # only care about the Bearer rungs never reach a real KeyValidator (which
+    # would need a database). Tests about key auth pass their own.
+    monkeypatch.setattr(om, "_check_key", check_key or (lambda api_key: None))
     return TestClient(main.create_app(), raise_server_exceptions=False)
 
 
@@ -91,8 +95,8 @@ def test_unauthenticated_mcp_gets_401_challenge(monkeypatch):
     assert "/.well-known/oauth-protected-resource/mcp" in challenge
 
 
-def test_key_header_passes_through(monkeypatch):
-    """Legacy X-Vex-Key requests bypass Bearer enforcement entirely."""
+def test_valid_key_header_passes_through(monkeypatch):
+    """A LIVE X-Vex-Key bypasses Bearer enforcement entirely."""
     client = _client(monkeypatch, enabled=True)
     resp = client.post("/mcp", json={}, headers={"X-Vex-Key": "ag_test"})
     # Reaches the MCP transport (which rejects the malformed MCP body itself,
@@ -100,6 +104,69 @@ def test_key_header_passes_through(monkeypatch):
     assert resp.status_code != 401 or "resource_metadata" not in resp.headers.get(
         "WWW-Authenticate", ""
     )
+
+
+def _deny_key(status, detail):
+    from shared.auth import AuthError
+
+    def check(api_key):
+        raise AuthError(status, detail)
+
+    return check
+
+
+@pytest.mark.parametrize(
+    "detail",
+    ["Invalid API key", "API key has been revoked", "API key has expired"],
+)
+def test_stale_key_gets_401_challenge(monkeypatch, detail):
+    """THE REGRESSION THIS PINS.
+
+    A key that is unknown, revoked or expired used to pass this rung and fail
+    at the tool layer, which reports failure as an error string inside a 200
+    JSON-RPC result. `initialize` succeeded, a session was issued, and
+    `tools/list` returned the full inventory — so a client holding a stale
+    credential was never told, and could not know to re-authenticate. It just
+    became a connector that looked healthy and did nothing.
+    """
+    client = _client(monkeypatch, enabled=True, check_key=_deny_key(401, detail))
+    resp = client.post("/mcp", json={}, headers={"X-Vex-Key": "ag_stale"})
+
+    assert resp.status_code == 401
+    assert "resource_metadata=" in resp.headers["WWW-Authenticate"]
+
+
+def test_key_store_down_returns_503_not_401(monkeypatch):
+    """A database outage must never read as "your credential is wrong".
+
+    Same contract as the JWKS and grant-store branches: retryable, and it does
+    not send a correctly-configured client off to re-authenticate.
+    """
+    client = _client(
+        monkeypatch,
+        enabled=True,
+        check_key=_deny_key(500, "Internal authentication error"),
+    )
+    resp = client.post("/mcp", json={}, headers={"X-Vex-Key": "ag_test"})
+
+    assert resp.status_code == 503
+    assert resp.headers["Retry-After"] == "5"
+
+
+def test_403_still_belongs_to_the_tool_layer(monkeypatch):
+    """Scope and membership are authorization, not authentication.
+
+    Re-authenticating cannot fix either, so this rung must not convert them
+    into a 401 challenge that sends the client round a login loop.
+    """
+    client = _client(
+        monkeypatch,
+        enabled=True,
+        check_key=_deny_key(403, "API key missing required scope: memory"),
+    )
+    resp = client.post("/mcp", json={}, headers={"X-Vex-Key": "ag_test"})
+
+    assert resp.status_code != 401
 
 
 def test_invalid_bearer_gets_401(monkeypatch):
