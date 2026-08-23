@@ -271,23 +271,17 @@ class KeyValidator:
     # Public API
     # ------------------------------------------------------------------
 
-    def validate(self, api_key: str, agent_id: str | None = None) -> KeyInfo:
-        """Validate an API key and return org information.
+    def _live_entry(self, api_key: str) -> "_CachedKey":
+        """Resolve a key to its cache entry, rejecting dead credentials.
 
-        This method is synchronous.  When used as a FastAPI dependency
-        in an async route, FastAPI automatically runs it in a thread
-        pool so it does not block the event loop.
+        AUTHENTICATION ONLY — "is this a real, live key?". Every failure here
+        is a 401, meaning the caller should present a different credential.
+        Deliberately free of the metering in ``validate`` (rate limit, quota,
+        agent limit, usage tracking) so it can be called from a layer in front
+        of a ``validate`` that will run anyway; see ``check_credential``.
 
-        Args:
-            api_key: The raw API key from the ``X-Vex-Key`` header
-                (falls back to ``X-AgentGuard-Key`` for backward compatibility).
-
-        Returns:
-            A ``KeyInfo`` with the resolved org_id, key_id, and scopes.
-
-        Raises:
-            AuthError: On any validation failure (invalid, revoked,
-                expired, wrong scope, rate limited).
+        Populates the cache on a miss, so a caller in front of ``validate``
+        warms it rather than doubling database load.
         """
         key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()
 
@@ -310,6 +304,44 @@ class KeyValidator:
             now = datetime.now(tz=timezone.utc)
             if now > entry.expires_at:
                 raise AuthError(401, "API key has expired")
+
+        return entry
+
+    def check_credential(self, api_key: str) -> None:
+        """Raise ``AuthError(401)`` unless this key exists and is still live.
+
+        Exists so the TRANSPORT layer can answer a stale credential with a
+        real 401 instead of letting it through to fail later. Without that,
+        an MCP client holding an expired or revoked key sees a healthy
+        handshake, a full tool list, and an error only in the body of a 200 —
+        so it never learns to re-authenticate, and degrades into a connector
+        that looks connected and does nothing.
+
+        Calls nothing that meters: ``validate`` still owns rate limiting,
+        quota, agent limits and usage tracking, and running those twice per
+        request would halve every caller's effective RPM.
+        """
+        self._live_entry(api_key)
+
+    def validate(self, api_key: str, agent_id: str | None = None) -> KeyInfo:
+        """Validate an API key and return org information.
+
+        This method is synchronous.  When used as a FastAPI dependency
+        in an async route, FastAPI automatically runs it in a thread
+        pool so it does not block the event loop.
+
+        Args:
+            api_key: The raw API key from the ``X-Vex-Key`` header
+                (falls back to ``X-AgentGuard-Key`` for backward compatibility).
+
+        Returns:
+            A ``KeyInfo`` with the resolved org_id, key_id, and scopes.
+
+        Raises:
+            AuthError: On any validation failure (invalid, revoked,
+                expired, wrong scope, rate limited).
+        """
+        entry = self._live_entry(api_key)
 
         # 4.5. Check the owner is still a member of the workspace.
         #

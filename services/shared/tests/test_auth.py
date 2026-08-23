@@ -1306,3 +1306,146 @@ class TestOwnerMembershipGate:
             validator.validate(raw_key)
 
         assert exc_info.value.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# check_credential — authentication only, no metering
+# ---------------------------------------------------------------------------
+#
+# The transport layer calls this in front of a `validate` that will run
+# anyway. If it ever acquires `validate`'s side effects, every request is
+# charged twice and everyone's effective RPM halves — silently. These pin
+# both halves: it must reject dead credentials, and it must touch nothing
+# that meters.
+
+
+def _validator_with_key(monkeypatch, **entry_kwargs):
+    """A KeyValidator whose cache is pre-seeded with one key."""
+    import hashlib
+
+    from shared.auth import KeyValidator, _CachedKey
+
+    validator = KeyValidator.__new__(KeyValidator)
+    validator._required_scope = "memory"
+
+    defaults = dict(
+        org_id="org-1",
+        key_id="key-1",
+        scopes=["memory"],
+        rate_limit_rpm=1000,
+        expires_at=None,
+        revoked=False,
+        plan="free",
+        plan_overrides=None,
+        user_id=None,
+        is_member=None,
+    )
+    defaults.update(entry_kwargs)
+    entry = _CachedKey(**defaults)
+
+    key = "ag_live_testkey"
+    key_hash = hashlib.sha256(key.encode()).hexdigest()
+
+    monkeypatch.setattr(
+        validator, "_cache_get", lambda h: entry if h == key_hash else None
+    )
+    monkeypatch.setattr(validator, "_cache_put", lambda h, e: None)
+    monkeypatch.setattr(
+        validator, "_query_db", lambda h: (_ for _ in ()).throw(AssertionError("db"))
+    )
+
+    return validator, key
+
+
+def test_check_credential_accepts_a_live_key(monkeypatch):
+    validator, key = _validator_with_key(monkeypatch)
+
+    validator.check_credential(key)  # must not raise
+
+
+def test_check_credential_rejects_a_revoked_key(monkeypatch):
+    from shared.auth import AuthError
+
+    validator, key = _validator_with_key(monkeypatch, revoked=True)
+
+    with pytest.raises(AuthError) as exc:
+        validator.check_credential(key)
+
+    assert exc.value.status_code == 401
+
+
+def test_check_credential_rejects_an_expired_key(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    from shared.auth import AuthError
+
+    validator, key = _validator_with_key(
+        monkeypatch,
+        expires_at=datetime.now(tz=timezone.utc) - timedelta(days=1),
+    )
+
+    with pytest.raises(AuthError) as exc:
+        validator.check_credential(key)
+
+    assert exc.value.status_code == 401
+
+
+def test_check_credential_rejects_an_unknown_key(monkeypatch):
+    from shared.auth import AuthError, KeyValidator
+
+    validator = KeyValidator.__new__(KeyValidator)
+    validator._required_scope = "memory"
+    monkeypatch.setattr(validator, "_cache_get", lambda h: None)
+    monkeypatch.setattr(validator, "_query_db", lambda h: None)
+
+    with pytest.raises(AuthError) as exc:
+        validator.check_credential("ag_live_nosuchkey")
+
+    assert exc.value.status_code == 401
+
+
+def test_check_credential_does_not_meter(monkeypatch):
+    """The whole reason this method exists instead of reusing `validate`."""
+    validator, key = _validator_with_key(monkeypatch)
+
+    called: list[str] = []
+    for name in (
+        "_check_rate_limit",
+        "_check_quota",
+        "_check_agent_limit",
+        "_track_usage",
+    ):
+        monkeypatch.setattr(
+            validator, name, lambda *a, _n=name, **k: called.append(_n)
+        )
+
+    validator.check_credential(key)
+
+    assert called == [], f"check_credential metered: {called}"
+
+
+def test_validate_still_meters(monkeypatch):
+    """Positive control: if metering moved out of `validate` too, the cap and
+    quota would stop being enforced anywhere and the test above would still
+    pass."""
+    validator, key = _validator_with_key(monkeypatch)
+
+    called: list[str] = []
+    for name in (
+        "_check_rate_limit",
+        "_check_quota",
+        "_check_agent_limit",
+        "_track_usage",
+    ):
+        monkeypatch.setattr(
+            validator, name, lambda *a, _n=name, **k: called.append(_n)
+        )
+
+    validator.validate(key)
+
+    assert set(called) == {
+        "_check_rate_limit",
+        "_check_quota",
+        "_check_agent_limit",
+        "_track_usage",
+    }

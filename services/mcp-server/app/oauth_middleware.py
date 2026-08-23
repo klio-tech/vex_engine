@@ -108,6 +108,19 @@ def _resolve_grant(identity: OAuthIdentity) -> Optional[OAuthPrincipal]:
     return _get_resolver().resolve(identity)
 
 
+def _check_key(api_key: str) -> None:
+    """Authentication-only check for an ``X-Vex-Key``. Raises ``AuthError``.
+
+    Deliberately NOT ``validate`` — that meters (rate limit, quota, agent
+    limit, usage), and the tool layer calls it on every request already.
+    Running it here too would charge each request twice and halve everyone's
+    effective RPM.
+    """
+    from app.auth import get_validator
+
+    get_validator().check_credential(api_key)
+
+
 def protected_resource_metadata() -> dict[str, Any]:
     """RFC 9728 payload advertising Supabase as the authorization server.
 
@@ -151,8 +164,10 @@ class OAuthLadderMiddleware:
       1. ``Authorization: Bearer`` -> verify + resolve grant; attach principal.
          Invalid token -> 401 challenge. Valid token, no grant -> 403
          ``not_connected``.
-      2. ``X-Vex-Key`` / ``X-AgentGuard-Key`` present -> pass through
-         (existing in-tool key validation, unchanged).
+      2. ``X-Vex-Key`` / ``X-AgentGuard-Key`` present -> authentication-only
+         check. Unknown/revoked/expired -> 401 challenge, so a stale
+         credential can drive re-auth. Everything else passes through to the
+         existing in-tool validation, which still owns scope and metering.
       3. Neither -> 401 challenge (drives OAuth discovery).
     """
 
@@ -234,7 +249,46 @@ class OAuthLadderMiddleware:
             await self._app(scope, receive, send)
             return
 
-        if key_header(request):
+        api_key = key_header(request)
+        if api_key:
+            # A key that is unknown, revoked or expired must be answered with
+            # a real 401 HERE.
+            #
+            # This rung used to pass every key straight through, leaving
+            # validation to the tool layer — which reports failure as an error
+            # string inside a 200 JSON-RPC result. The consequence is not a
+            # leak (the tool layer does refuse), it is that the client is never
+            # TOLD. `initialize` succeeds, a session is issued, `tools/list`
+            # returns the full inventory, and only the eventual tool call comes
+            # back empty. An OAuth client holding an expired token therefore
+            # has no signal to refresh it, and settles into a connector that
+            # looks healthy and does nothing.
+            #
+            # Only the 401 class is handled here. 403 (missing scope, owner no
+            # longer a member) is an authorization answer that re-authenticating
+            # cannot change, and it stays with the tool layer that owns it.
+            from shared.auth import AuthError
+
+            try:
+                await anyio.to_thread.run_sync(_check_key, api_key)
+            except AuthError as exc:
+                if exc.status_code == 401:
+                    await _challenge()(scope, receive, send)
+                    return
+                if exc.status_code >= 500:
+                    # The key store is unreachable, not the key bad. Same shape
+                    # as the JWKS and grant-store branches above: retryable,
+                    # never a 401 that tells a correctly-configured client its
+                    # credential is wrong.
+                    logger.warning("auth: key store unavailable; returning 503")
+                    response = JSONResponse(
+                        status_code=503,
+                        content={"error": "key_store_unavailable"},
+                        headers={"Retry-After": "5"},
+                    )
+                    await response(scope, receive, send)
+                    return
+                # 403 and anything else: unchanged, the tool layer answers it.
             await self._app(scope, receive, send)
             return
 
