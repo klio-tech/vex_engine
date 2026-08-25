@@ -41,11 +41,14 @@ async def test_capture_event_quota_exceeded_raises_402():
         ),
         patch.object(capture, "SessionLocal", return_value=MagicMock()),
         patch.object(capture, "_ensure_project_id", return_value=None),
+        patch.object(
+            capture,
+            "resolve_active_principal",
+            return_value=("org-1", "a1", "free", None),
+        ),
     ):
         with pytest.raises(HTTPException) as exc:
-            await capture.capture_event(
-                _request(), req, principal=("org-1", "a1"), key_info=info
-            )
+            await capture.capture_event(_request(), req, key_info=info)
     assert exc.value.status_code == 402
     assert exc.value.detail["suggested_plan"] == "starter"
 
@@ -66,8 +69,11 @@ async def test_capture_event_records_when_stored():
         ),
         patch.object(capture, "SessionLocal", return_value=MagicMock()),
         patch.object(capture, "_ensure_project_id", return_value=None),
+        patch.object(
+            capture,
+            "resolve_active_principal",
+            return_value=("org-1", "a1", "free", None),
+        ),
     ):
-        await capture.capture_event(
-            _request(), req, principal=("org-1", "a1"), key_info=info
-        )
+        await capture.capture_event(_request(), req, key_info=info)
     rec.assert_called_once()

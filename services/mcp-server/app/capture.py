@@ -33,8 +33,13 @@ Four endpoints, all mounted under ``/capture``:
   for cross-agent scope='agent' rows.
 
 Auth reuses the same ``X-Vex-Key`` (+ optional ``X-Vex-Agent``) bridge as the
-MCP tools, via :func:`app.auth.resolve_principal_dep`, so capture is scoped to
-exactly the org/agent the key authorises.  Nothing here modifies ``shared/*``:
+MCP tools: the key is validated by ``Depends(verify_api_key)`` (threadpool +
+the ``dependency_overrides`` test seam), and each route body then resolves its
+principal through :func:`app.identity.resolve_active_principal` — the ONE
+resolver — after seeding the validated key into the per-request memo
+(:func:`app.identity.seed_request_key_info`), so an ``X-Klio-Node`` header
+scopes every capture to the SELECTED node and no second validation token is
+spent.  Nothing here modifies ``shared/*``:
 writes reuse :func:`shared.brain.write_scoped_memory`, reads reuse
 :func:`shared.memory.retrieve_memories_scoped`, and project tagging reuses
 :func:`shared.brain.ensure_project` / ``find_project_id`` — the exact same
@@ -96,9 +101,13 @@ from shared.usage import MemoryQuotaExceeded, check_memory_quota, record_usage
 from shared import project_scope
 from sqlalchemy import text
 
-from app.auth import resolve_principal_dep, verify_api_key
+from app.auth import verify_api_key
 from app.db import SessionLocal
-from app.identity import resolve_user_id
+from app.identity import (
+    resolve_active_principal,
+    resolve_user_id,
+    seed_request_key_info,
+)
 from app.recall_log import log_recall_event
 
 logger = logging.getLogger("agentguard.mcp.capture")
@@ -739,7 +748,6 @@ async def enqueue_trace_outbox(*, payload: dict[str, Any]) -> None:
 async def capture_event(
     request: Request,
     req: CaptureEventRequest,
-    principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Store one passive memory (default ``observation``).
@@ -753,8 +761,6 @@ async def capture_event(
     attributable hook capture is the author's private memory. Provenance stays
     ``EXTRACTED`` — a hook records what was said or done; it deduces nothing.
     """
-    org_id, agent_id = principal
-    scope, user_id = _hook_write_scope(request, key_info, req.scope)
     memory_type = (
         req.memory_type
         if req.memory_type in _CAPTURE_EVENT_TYPES
@@ -765,6 +771,14 @@ async def capture_event(
 
     db = SessionLocal()
     try:
+        # The ONE resolver (see app.identity): the dependency-validated key is
+        # seeded into the per-request memo so this costs no second validation,
+        # and the org that comes back is the ACTIVE node — an X-Klio-Node
+        # header redirects the whole capture, and an unreachable node is a
+        # 404 before anything is written.
+        seed_request_key_info(request, key_info)
+        org_id, agent_id, _plan, _overrides = resolve_active_principal(request, db)
+        scope, user_id = _hook_write_scope(request, key_info, req.scope)
         # ensure_project is synchronous (blocking psycopg2); run it off the
         # event loop per its documented threading contract (shared.brain).
         project_id = await anyio.to_thread.run_sync(
@@ -833,7 +847,6 @@ async def capture_event(
 async def capture_transcript(
     request: Request,
     req: CaptureTranscriptRequest,
-    principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Distil a finished session into typed memory rows and one ``summary``.
@@ -848,15 +861,26 @@ async def capture_transcript(
     transcript is the richest passive capture there is, and publishing one to
     the team on a ``Stop`` hook is the exact thing decision 3 forbids.
     """
-    org_id, agent_id = principal
-    scope, user_id = _hook_write_scope(request, key_info, "org")
-    combined = _combine_messages(req.messages)
-    if not combined:
-        record_capture("rejected")
-        return {"stored": 0, "facts": 0, "summary": False, "reason": "empty_transcript"}
-
     db = SessionLocal()
     try:
+        # Resolution comes FIRST, before even the empty-transcript check: a
+        # hook firing with an unreachable X-Klio-Node header must get the 404
+        # refusal regardless of payload, never a success-shaped answer.
+        # SessionLocal connects lazily, so an empty transcript still does no
+        # session work.
+        seed_request_key_info(request, key_info)
+        org_id, agent_id, _plan, _overrides = resolve_active_principal(request, db)
+        scope, user_id = _hook_write_scope(request, key_info, "org")
+        combined = _combine_messages(req.messages)
+        if not combined:
+            record_capture("rejected")
+            return {
+                "stored": 0,
+                "facts": 0,
+                "summary": False,
+                "reason": "empty_transcript",
+            }
+
         project_id = await anyio.to_thread.run_sync(
             lambda: _ensure_project_id(
                 db,
@@ -997,7 +1021,6 @@ async def capture_transcript(
 async def capture_recall(
     request: Request,
     req: RecallRequest,
-    principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Return memories for context injection.
@@ -1031,24 +1054,28 @@ async def capture_recall(
     ``scope='private'`` from an unattributable caller is refused rather than
     quietly widened to the org: see the guard below.
     """
-    org_id, agent_id = principal
-    user_id = resolve_user_id(request, key_info)
-    if req.scope == "private" and not user_id:
-        # retrieve_memories_scoped would raise; answer honestly instead of
-        # letting a 500 look like "you have no private memories".
-        return {
-            "memories": [],
-            "count": 0,
-            "error": "unattributed_caller",
-            "detail": (
-                "scope='private' needs a caller we can attribute to a person. "
-                "This request resolved to no user."
-            ),
-        }
     limit = min(req.limit, _MAX_RECALL_LIMIT)
 
     db = SessionLocal()
     try:
+        # Same ordering as the capture writes: the active node is resolved
+        # first, so a selected node scopes the read and an unreachable one is
+        # a 404 rather than a quiet fallback to the key's org.
+        seed_request_key_info(request, key_info)
+        org_id, agent_id, _plan, _overrides = resolve_active_principal(request, db)
+        user_id = resolve_user_id(request, key_info)
+        if req.scope == "private" and not user_id:
+            # retrieve_memories_scoped would raise; answer honestly instead of
+            # letting a 500 look like "you have no private memories".
+            return {
+                "memories": [],
+                "count": 0,
+                "error": "unattributed_caller",
+                "detail": (
+                    "scope='private' needs a caller we can attribute to a "
+                    "person. This request resolved to no user."
+                ),
+            }
         # The synchronous brain/recency reads run off the event loop per the
         # shared.brain threading contract (blocking psycopg2 I/O).
         project_id = await anyio.to_thread.run_sync(
@@ -1172,7 +1199,6 @@ class ForgetRequest(BaseModel):
 async def capture_forget(
     request: Request,
     req: ForgetRequest,
-    principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Retract a memory. 404 unknown/cross-org/other-user-private, 403 cross-agent.
@@ -1187,10 +1213,14 @@ async def capture_forget(
     looks unowned to ``retract_memory``, and a teammate could delete memories
     they are not permitted to even read.
     """
-    org_id, agent_id = principal
-    user_id = resolve_user_id(request, key_info)
     db = SessionLocal()
     try:
+        # Active-node resolution, same as every other capture route: a forget
+        # aimed at a selected node retracts THERE, and an unreachable node is
+        # a 404 before the retraction is attempted.
+        seed_request_key_info(request, key_info)
+        org_id, agent_id, _plan, _overrides = resolve_active_principal(request, db)
+        user_id = resolve_user_id(request, key_info)
         result = await anyio.to_thread.run_sync(
             lambda: retract_memory(
                 db,

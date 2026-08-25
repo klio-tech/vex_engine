@@ -178,7 +178,7 @@ def test_each_request_is_validated_on_its_own():
 # ---------------------------------------------------------------------------
 #
 # ``mcp_app`` is not the only module with tool bodies. ``app.onboarding``
-# resolves the caller with exactly the same two calls, and it kept importing
+# resolves the caller with exactly the same two calls, and it once imported
 # ``resolve_principal_plan`` from ``app.auth`` — the un-memoized copy — while
 # taking ``resolve_request_user_id`` from ``app.identity``. That pairing is
 # precisely the shape the memoization exists to remove: the auth-module
@@ -187,16 +187,20 @@ def test_each_request_is_validated_on_its_own():
 # request, and on the token that trips it is the SECOND call that raises —
 # the one that decides whether the caller is a person or nobody.
 #
-# Spelled as ``onboarding``'s bound names for the same reason the block above
-# is spelled as ``mcp_app``'s: the test follows the import, so re-pointing it
-# at the un-memoized module fails here rather than in production.
+# Since the node wiring (Task B2) onboarding's bound name is
+# ``resolve_active_principal``, same as ``mcp_app``'s, and the contract is
+# unchanged: the wrapper's internal double-consultation must still cost ONE
+# validation. Spelled as ``onboarding``'s bound names for the same reason the
+# block above is spelled as ``mcp_app``'s: the test follows the import, so
+# re-pointing it at an un-memoized resolver fails here rather than in
+# production.
 
 
 def _init_tool_call(request):
     """Exactly what ``perform_init`` does to resolve its caller."""
     from app import onboarding
 
-    principal = onboarding.resolve_principal_plan(request)
+    principal = onboarding.resolve_active_principal(request, MagicMock())
     user_id = onboarding.resolve_request_user_id(request)
     return principal, user_id
 
@@ -210,7 +214,7 @@ def test_init_validates_the_key_once():
 
     assert validator.calls == 1, (
         f"init validated the key {validator.calls} times for one request; "
-        "app.onboarding must import resolve_principal_plan from app.identity "
+        "app.onboarding must import resolve_active_principal from app.identity "
         "so both questions share one validation"
     )
     # Positive control: one validation still answers both questions correctly.

@@ -139,6 +139,26 @@ def request_key_info(request: Request) -> KeyInfo:
     return key_info
 
 
+def seed_request_key_info(request: Request, key_info: KeyInfo) -> None:
+    """Memoize a route-validated :class:`~shared.auth.KeyInfo` for this request.
+
+    The REST routes (``app.capture``, ``app.proposals``) validate the key
+    through ``Depends(verify_api_key)`` — which runs in FastAPI's threadpool
+    and stays overridable via ``app.dependency_overrides`` in tests — and then
+    resolve their principal inline through :func:`resolve_active_principal`.
+    Seeding the dependency's answer into the per-request memo keeps that at
+    ONE validation (one rate-limit token) and keeps the dependency the
+    authoritative validator: :func:`request_key_info` finds the memo and never
+    reaches for :func:`app.auth.verify_api_key` a second time.
+
+    Only a real ``KeyInfo`` is worth seeding; the memo read side already
+    refuses anything else, so this mirrors that check rather than trusting the
+    caller.
+    """
+    if isinstance(key_info, KeyInfo):
+        _memoize(getattr(request, "state", None), _KEY_INFO_ATTR, key_info)
+
+
 def _memoize(state: Any, attr: str, value: Any) -> None:
     """Best-effort per-request memo.
 
