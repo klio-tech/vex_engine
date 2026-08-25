@@ -56,7 +56,7 @@ from app.headers import agent_header
 from typing import Any, Optional
 
 from fastapi import HTTPException, Request
-from shared.auth import KeyInfo
+from shared.auth import KeyInfo, normalize_agent_id
 
 logger = logging.getLogger(__name__)
 
@@ -247,11 +247,21 @@ def resolve_principal_plan(request: Request) -> tuple[str, str, str, Optional[di
 
     principal = _oauth_principal_from(request)
     if principal is not None:
-        agent_id = agent_header(request) or _oauth_agent_id(request, principal)
+        # normalize_agent_id, not `or DEFAULT`: agents.agent_id is VARCHAR(128)
+        # and a primary key, the header is client-declared, and the derived
+        # oauth:<user8>/<slug> id is built from the client-declared
+        # clientInfo.name -- so both arms are caller-influenced and unbounded
+        # without it. A blank header also has to fall through to the default,
+        # which `or` cannot do: "   " is truthy and would become the principal
+        # that dedup and agent-scoped recall then key on.
+        agent_id = normalize_agent_id(
+            agent_header(request) or _oauth_agent_id(request, principal),
+            default=DEFAULT_AGENT_ID,
+        )
         return principal.org_id, agent_id, principal.plan, principal.plan_overrides
 
     key_info = request_key_info(request)
-    agent_id = agent_header(request) or DEFAULT_AGENT_ID
+    agent_id = normalize_agent_id(agent_header(request), default=DEFAULT_AGENT_ID)
     return key_info.org_id, agent_id, key_info.plan, key_info.plan_overrides
 
 
