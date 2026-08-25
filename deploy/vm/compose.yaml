@@ -1,0 +1,66 @@
+# The engine's memory core, co-located with the workspace on the GCP VM.
+#
+# Why this exists: the engine ran on Railway while the workspace database ran
+# in Docker on this VM — two hosts with no route between them, so
+# WORKSPACE_DATABASE_URL (the switch that turns the whole context network on)
+# could never be set. Co-locating makes that connection a docker-network hop:
+# nothing exposed, nothing tunnelled, no credential that leaves the box.
+#
+# Only the memory core moves: mcp (the MCP API), worker (curator/dreamer) and
+# a fresh redis. Neon stays remote as the engine database. The Vex-era
+# services (dashboard-api, ingestion, sync-gateway, alert, storage-worker)
+# stay on Railway until retirement.
+#
+# Runbook (on the VM):
+#   cd ~/klio-engine
+#   docker compose pull && docker compose up -d
+#   docker compose logs -f mcp
+# Env lives in ./.env (never committed). ENGINE_TAG pins the image; set it to
+# the commit SHA you mean to run, exactly like the workspace's KLIO_TAG.
+
+name: klio-engine
+
+services:
+  mcp:
+    image: ${ENGINE_REGISTRY:?set ENGINE_REGISTRY}/klio-engine-mcp:${ENGINE_TAG:?set ENGINE_TAG}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # The payoff of co-location: the workspace database is the container
+      # next door on the workspace stack's network.
+      WORKSPACE_DATABASE_URL: ${WORKSPACE_DATABASE_URL:?set WORKSPACE_DATABASE_URL}
+      REDIS_URL: redis://engine-redis:6379/0
+    networks:
+      - engine
+      - klio_default
+    depends_on:
+      engine-redis:
+        condition: service_started
+
+  worker:
+    image: ${ENGINE_REGISTRY:?set ENGINE_REGISTRY}/klio-engine-worker:${ENGINE_TAG:?set ENGINE_TAG}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REDIS_URL: redis://engine-redis:6379/0
+    networks:
+      - engine
+
+  engine-redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks:
+      - engine
+    volumes:
+      - engine-redis-data:/data
+
+networks:
+  engine: {}
+  # The workspace stack's network (compose project "klio"), joined so `mcp`
+  # can resolve `klio-db` — and so the workspace's Caddy can resolve `mcp`
+  # to serve mcp.klio.tech once DNS points here.
+  klio_default:
+    external: true
+
+volumes:
+  engine-redis-data: {}
