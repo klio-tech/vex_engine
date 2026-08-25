@@ -1415,9 +1415,7 @@ def test_check_credential_does_not_meter(monkeypatch):
         "_check_agent_limit",
         "_track_usage",
     ):
-        monkeypatch.setattr(
-            validator, name, lambda *a, _n=name, **k: called.append(_n)
-        )
+        monkeypatch.setattr(validator, name, lambda *a, _n=name, **k: called.append(_n))
 
     validator.check_credential(key)
 
@@ -1437,9 +1435,7 @@ def test_validate_still_meters(monkeypatch):
         "_check_agent_limit",
         "_track_usage",
     ):
-        monkeypatch.setattr(
-            validator, name, lambda *a, _n=name, **k: called.append(_n)
-        )
+        monkeypatch.setattr(validator, name, lambda *a, _n=name, **k: called.append(_n))
 
     validator.validate(key)
 
