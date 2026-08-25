@@ -66,6 +66,7 @@ def personal_fixture():
                 CREATE TABLE workspaces (
                     id uuid PRIMARY KEY,
                     slug text UNIQUE,
+                    owner_id uuid,
                     is_personal boolean NOT NULL DEFAULT false,
                     deleted_at timestamptz
                 )

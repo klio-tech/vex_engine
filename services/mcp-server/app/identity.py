@@ -396,10 +396,74 @@ def resolve_active_org(
     user_id = resolve_request_user_id(request)
     if user_id:
         with _workspace_connection(workspace_db) as conn:
-            if conn is not None and may_reach(
-                conn, db, user_id=user_id, org_id=requested
-            ):
-                return requested
+            if conn is not None:
+                if may_reach(conn, db, user_id=user_id, org_id=requested):
+                    return requested
+                provisioned = _provision_selected_workspace(
+                    conn, db, user_id=user_id, requested=requested
+                )
+                if provisioned is not None:
+                    return provisioned
 
     logger.info("node selection refused: the caller may not reach the node they named")
     raise HTTPException(status_code=404, detail="unknown node")
+
+
+def _provision_selected_workspace(
+    workspace_db: Any, db: Any, *, user_id: str, requested: str
+) -> Optional[str]:
+    """Selection is the provisioning moment.
+
+    ``reachable_orgs`` omits a workspace with no ``organizations`` row — the
+    engine cannot store memory for a node it has no id for — so a header that
+    names such a workspace falls through ``may_reach``. When the workspace DB
+    says the caller is an active member of it, the engine org is created (or
+    a legacy org with the same slug adopted) here, on this first selection.
+
+    The header may name the workspace three ways, all matched against the
+    caller's OWN memberships fetched from the workspace DB — never used as a
+    cross-database join key: the workspace UUID, the predicted engine org id
+    (``ws_<uuid>``), or the workspace slug (the address a human actually
+    knows).
+
+    Returns ``None`` when the header names no workspace the caller is a member
+    of — the caller then sees the same 404 as any other refusal. A refusal
+    from the ensure itself (a slug held by an org linked elsewhere, a second
+    personal node) is also answered as ``None`` → 404 rather than a 500: to
+    this caller the node is simply not available, and the conflict detail
+    belongs in the log, not in an existence oracle.
+    """
+    from shared.membership import (  # noqa: PLC0415
+        ensure_org_for_workspace,
+        member_workspaces,
+    )
+
+    matched = None
+    for workspace in member_workspaces(workspace_db, user_id=user_id):
+        candidates = (
+            workspace["workspace_id"],
+            f"ws_{workspace['workspace_id']}",
+            workspace["slug"],
+        )
+        if requested in candidates:
+            matched = workspace
+            break
+    if matched is None:
+        return None
+
+    try:
+        return ensure_org_for_workspace(
+            db,
+            workspace_id=matched["workspace_id"],
+            slug=matched["slug"],
+            is_personal=matched["is_personal"],
+            owner_user_id=matched["owner_user_id"],
+        )
+    except ValueError:
+        logger.warning(
+            "node selection: workspace %s is reachable but could not be "
+            "provisioned; refusing the selection",
+            matched["workspace_id"],
+            exc_info=True,
+        )
+        return None

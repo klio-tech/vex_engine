@@ -42,6 +42,13 @@ KEY_WORKSPACE_ID = "bbbbbbbb-0000-0000-0000-000000000001"
 PERSONAL_WORKSPACE_ID = "bbbbbbbb-0000-0000-0000-000000000002"
 STRANGER_WORKSPACE_ID = "bbbbbbbb-0000-0000-0000-000000000003"
 
+# A workspace the subject can reach that has NO org row yet: the provisioning
+# moment. And one of the stranger's in the same state, to prove selection by
+# workspace id does not bypass membership.
+ORGLESS_SLUG = "node-orgless"
+ORGLESS_WORKSPACE_ID = "bbbbbbbb-0000-0000-0000-000000000004"
+STRANGER_ORGLESS_WORKSPACE_ID = "bbbbbbbb-0000-0000-0000-000000000005"
+
 
 class _State:
     def __init__(self, **kw):
@@ -85,6 +92,7 @@ def node_fixture(monkeypatch):
                 CREATE TABLE workspaces (
                     id uuid PRIMARY KEY,
                     slug text UNIQUE,
+                    owner_id uuid,
                     is_personal boolean NOT NULL DEFAULT false,
                     deleted_at timestamptz
                 )
@@ -104,23 +112,32 @@ def node_fixture(monkeypatch):
             )
         )
 
-        for workspace_id, slug, is_personal in (
-            (KEY_WORKSPACE_ID, KEY_SLUG, False),
-            (PERSONAL_WORKSPACE_ID, OTHER_NODE_SLUG, True),
-            (STRANGER_WORKSPACE_ID, STRANGER_SLUG, False),
+        for workspace_id, slug, is_personal, owner_id in (
+            (KEY_WORKSPACE_ID, KEY_SLUG, False, SUBJECT_USER),
+            (PERSONAL_WORKSPACE_ID, OTHER_NODE_SLUG, True, SUBJECT_USER),
+            (STRANGER_WORKSPACE_ID, STRANGER_SLUG, False, OTHER_USER),
+            (ORGLESS_WORKSPACE_ID, ORGLESS_SLUG, False, SUBJECT_USER),
+            (STRANGER_ORGLESS_WORKSPACE_ID, "node-stranger-orgless", False, OTHER_USER),
         ):
             conn.execute(
                 text(
-                    "INSERT INTO workspaces (id, slug, is_personal) "
-                    "VALUES (:id, :slug, :personal)"
+                    "INSERT INTO workspaces (id, slug, owner_id, is_personal) "
+                    "VALUES (:id, :slug, :owner, :personal)"
                 ),
-                {"id": workspace_id, "slug": slug, "personal": is_personal},
+                {
+                    "id": workspace_id,
+                    "slug": slug,
+                    "owner": owner_id,
+                    "personal": is_personal,
+                },
             )
 
         for workspace_id, member_id in (
             (KEY_WORKSPACE_ID, SUBJECT_USER),
             (PERSONAL_WORKSPACE_ID, SUBJECT_USER),
             (STRANGER_WORKSPACE_ID, OTHER_USER),
+            (ORGLESS_WORKSPACE_ID, SUBJECT_USER),
+            (STRANGER_ORGLESS_WORKSPACE_ID, OTHER_USER),
         ):
             conn.execute(
                 text(
@@ -314,5 +331,117 @@ def test_an_unconfigured_workspace_db_fails_closed(node_fixture, monkeypatch):
     with pytest.raises(HTTPException) as exc:
         identity_module.resolve_active_org(
             _Req({"X-Klio-Node": node_fixture.other_org}), node_fixture.db
+        )
+    assert exc.value.status_code == 404
+
+
+def _org_row(db, org_id):
+    return db.execute(
+        text(
+            "SELECT org_id, account_slug, workspace_id FROM organizations "
+            "WHERE org_id = :org_id"
+        ),
+        {"org_id": org_id},
+    ).first()
+
+
+@needs_db
+def test_selecting_an_orgless_workspace_provisions_its_org(node_fixture):
+    """Selection is the provisioning moment.
+
+    The header names a workspace the caller can reach that has no org row;
+    the resolver must mint one and return it — linked, so the very next
+    membership resolution can see it.
+    """
+    got = identity_module.resolve_active_org(
+        _Req({"X-Klio-Node": ORGLESS_WORKSPACE_ID}),
+        node_fixture.db,
+        workspace_db=node_fixture.db,
+    )
+    assert got == f"ws_{ORGLESS_WORKSPACE_ID}"
+    row = _org_row(node_fixture.db, got)
+    assert row is not None
+    assert row.account_slug == ORGLESS_SLUG
+    assert str(row.workspace_id) == ORGLESS_WORKSPACE_ID
+
+
+@needs_db
+def test_the_workspace_may_be_named_by_its_future_org_id(node_fixture):
+    got = identity_module.resolve_active_org(
+        _Req({"X-Klio-Node": f"ws_{ORGLESS_WORKSPACE_ID}"}),
+        node_fixture.db,
+        workspace_db=node_fixture.db,
+    )
+    assert got == f"ws_{ORGLESS_WORKSPACE_ID}"
+
+
+@needs_db
+def test_the_workspace_may_be_named_by_its_slug(node_fixture):
+    # The slug is the address the caller actually knows. It is matched against
+    # the caller's OWN memberships (fetched from the workspace DB), never used
+    # as a cross-database join key.
+    got = identity_module.resolve_active_org(
+        _Req({"X-Klio-Node": ORGLESS_SLUG}),
+        node_fixture.db,
+        workspace_db=node_fixture.db,
+    )
+    assert got == f"ws_{ORGLESS_WORKSPACE_ID}"
+
+
+@needs_db
+def test_provisioning_adopts_a_legacy_org_by_slug(node_fixture):
+    # An org row with the workspace's slug but no link joins the handshake.
+    node_fixture.db.execute(
+        text(
+            "INSERT INTO organizations (org_id, name, account_slug) "
+            "VALUES ('org_legacy_node', 'org_legacy_node', :slug)"
+        ),
+        {"slug": ORGLESS_SLUG},
+    )
+    got = identity_module.resolve_active_org(
+        _Req({"X-Klio-Node": ORGLESS_WORKSPACE_ID}),
+        node_fixture.db,
+        workspace_db=node_fixture.db,
+    )
+    assert got == "org_legacy_node"
+    assert str(_org_row(node_fixture.db, got).workspace_id) == ORGLESS_WORKSPACE_ID
+
+
+@needs_db
+def test_a_strangers_orgless_workspace_is_not_provisioned(node_fixture):
+    # Membership gates provisioning exactly as it gates selection.
+    for named in (
+        STRANGER_ORGLESS_WORKSPACE_ID,
+        f"ws_{STRANGER_ORGLESS_WORKSPACE_ID}",
+        "node-stranger-orgless",
+    ):
+        with pytest.raises(HTTPException) as exc:
+            identity_module.resolve_active_org(
+                _Req({"X-Klio-Node": named}),
+                node_fixture.db,
+                workspace_db=node_fixture.db,
+            )
+        assert exc.value.status_code == 404
+    # And nothing was minted for it.
+    assert _org_row(node_fixture.db, f"ws_{STRANGER_ORGLESS_WORKSPACE_ID}") is None
+
+
+@needs_db
+def test_a_refused_ensure_is_a_404_not_a_500(node_fixture):
+    # The workspace's slug is already held by an org linked elsewhere: the
+    # ensure refuses, and the caller sees the same shape as any other refusal.
+    node_fixture.db.execute(
+        text(
+            "INSERT INTO organizations (org_id, name, account_slug, workspace_id) "
+            "VALUES ('org_conflicting', 'org_conflicting', :slug, "
+            "'bbbbbbbb-0000-0000-0000-00000000ffff')"
+        ),
+        {"slug": ORGLESS_SLUG},
+    )
+    with pytest.raises(HTTPException) as exc:
+        identity_module.resolve_active_org(
+            _Req({"X-Klio-Node": ORGLESS_WORKSPACE_ID}),
+            node_fixture.db,
+            workspace_db=node_fixture.db,
         )
     assert exc.value.status_code == 404

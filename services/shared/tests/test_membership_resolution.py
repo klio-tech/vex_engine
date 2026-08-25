@@ -76,6 +76,7 @@ def membership_fixture():
                 CREATE TABLE workspaces (
                     id uuid PRIMARY KEY,
                     slug text UNIQUE,
+                    owner_id uuid,
                     is_personal boolean NOT NULL DEFAULT false,
                     deleted_at timestamptz
                 )
@@ -346,7 +347,7 @@ def test_the_two_databases_are_queried_separately():
     fixture legitimately puts both in one database.
     """
     workspace_db = _RecordingConn(
-        [_Row(workspace_id="ws-1", slug="acme", is_personal=False)]
+        [_Row(workspace_id="ws-1", slug="acme", is_personal=False, owner_id=None)]
     )
     tsdb = _RecordingConn([_Row(org_id="org_acme", workspace_id="ws-1")])
 
