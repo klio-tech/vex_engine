@@ -17,6 +17,7 @@ from app.capture import router as capture_router
 from app.observability import log_remote_write_state
 from app.observability import router as observability_router
 from app.db import SessionLocal
+from app.internal_api import router as internal_api_router
 from app.mcp_app import build_mcp_server
 from app.proposals import router as proposals_router
 from app.scheduler import (
@@ -171,6 +172,11 @@ def create_app() -> FastAPI:
     # same reason as the capture routes: the mount is a catch-all and would
     # otherwise swallow them.
     app.include_router(observability_router)
+
+    # Read-only ``/internal/*`` status endpoints for the workspace web app,
+    # gated by INTERNAL_API_SECRET (unset ⇒ every route 404s). Registered
+    # before the catch-all MCP mount like every other REST surface.
+    app.include_router(internal_api_router)
 
     # Mount the MCP Streamable-HTTP ASGI app at the application root.
     # ``/healthz`` / ``/verify`` / ``/capture/*`` are registered above, so they
