@@ -44,6 +44,7 @@ to scope memory to a distinct agent.
 import functools
 import hashlib
 import logging
+import uuid
 from typing import Annotated, Any, Literal, Optional
 
 import anyio
@@ -58,6 +59,7 @@ from shared import (
     branches,
     claims,
     graph_store,
+    project_link,
     project_scope,
     projects,
 )
@@ -90,6 +92,7 @@ from app.config import (
     MCP_DNS_REBINDING_PROTECTION,
 )
 from app.db import SessionLocal
+from app.workspace_db import workspace_engine
 from app.directory import resolve_org_member_by_email
 from app.compression_cache import (
     OriginalTooLarge,
@@ -132,6 +135,7 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "project_members",
     "project_grant",
     "project_scope",
+    "project_link",
     "klio_retrieve",
     "compress",
     "explore",
@@ -286,11 +290,83 @@ def _explicit_write_scope(
     """
     if requested_scope == "agent":
         return "agent"
-    if project_id and projects.can_write(
+    if project_id and _can_write_project_or_linked(
         db, org_id=org_id, project_id=project_id, user_id=user_id
     ):
         return "project"
     return "org"
+
+
+def _can_write_project_or_linked(
+    db: Any, *, org_id: str, project_id: str, user_id: Optional[str]
+) -> bool:
+    """Engine ``can_write``, widened by the workspace link (Task L1).
+
+    Engine membership answers first and alone when it says yes. A caller who
+    is not an engine member may still land a ``project`` write when the
+    project is LINKED (``projects.plane_project_id``) and their plane role is
+    member or above (≥ 15) — :func:`shared.project_link.can_write_linked`.
+    No workspace engine, no attributable caller, or any workspace-DB failure
+    keeps today's engine-only answer: the link is a UNION on top of engine
+    membership, never a replacement, and never a reason a write errors.
+    """
+    if projects.can_write(db, org_id=org_id, project_id=project_id, user_id=user_id):
+        return True
+    if not user_id:
+        return False
+    try:
+        engine = workspace_engine()
+        if engine is None:
+            return False
+        with engine.connect() as ws:
+            return project_link.can_write_linked(
+                ws, db, org_id=org_id, project_id=project_id, user_id=user_id
+            )
+    except Exception:
+        logger.warning(
+            "linked-write check failed; keeping the engine-only answer",
+            exc_info=True,
+        )
+        return False
+
+
+def _linked_project_reach(db: Any, *, org_id: str, user_id: str) -> Optional[list[str]]:
+    """Engine project ids this caller reaches through the workspace link.
+
+    The recall half of Task L1, two queries joined in Python: the workspace
+    DB answers "which plane projects is this user an active member of (role
+    ≥ 5)", the engine DB answers "which of those are linked to THIS org's
+    projects". Sorted for a deterministic SQL parameter.
+
+    Best-effort by design, like the personal-node lookup beside it: ``None``
+    — today's behaviour byte-identical — when no workspace engine is
+    configured, when the caller has no memberships or no links, and on any
+    workspace-DB failure. A reach lookup must never be the reason a recall
+    fails.
+    """
+    try:
+        engine = workspace_engine()
+        if engine is None:
+            return None
+        with engine.connect() as ws:
+            memberships = project_link.plane_project_memberships(ws, user_id=user_id)
+        plane_ids = [
+            pid
+            for pid, role in memberships.items()
+            if role >= project_link.PLANE_READ_ROLE
+        ]
+        if not plane_ids:
+            return None
+        linked = project_link.linked_engine_projects(
+            db, org_id=org_id, plane_ids=plane_ids
+        )
+        return sorted(linked) or None
+    except Exception:
+        logger.warning(
+            "recall: linked-project reach lookup failed; recalling without it",
+            exc_info=True,
+        )
+        return None
 
 
 async def _perform_write(
@@ -2088,6 +2164,18 @@ async def _perform_recall(
             if personal_row is not None and personal_row.org_id != org_id:
                 extra_org_id = personal_row.org_id
 
+        # The linked-project reach (Task L1): engine ids of this org's
+        # projects whose plane_project_id sits in the caller's active
+        # workspace memberships. Attributable callers only, and best-effort
+        # like the personal-node lookup above — None is today's behaviour,
+        # byte-identical. Two databases, joined in Python; the workspace
+        # connection is borrowed inside the helper.
+        extra_project_ids: Optional[list[str]] = None
+        if user_id:
+            extra_project_ids = await anyio.to_thread.run_sync(
+                lambda: _linked_project_reach(db, org_id=org_id, user_id=user_id)
+            )
+
         # agent_id is always forwarded; retrieve_memories_scoped ignores it
         # unless scope == "agent".
         records = await retrieve_memories_scoped(
@@ -2102,6 +2190,7 @@ async def _perform_recall(
             limit=min(max(limit, 1), 50),
             extra_org_id=extra_org_id,
             branch_id=branch_row["id"] if branch_row is not None else None,
+            extra_project_ids=extra_project_ids,
         )
         # Best-effort recall activity log; it swallows its own errors so a
         # logging failure can never break the recall. Offloaded like every
@@ -3470,6 +3559,195 @@ async def _perform_project_grant(
         db.close()
 
 
+async def _perform_project_link(
+    ctx: Context, *, project: str, workspace_project: str
+) -> dict[str, Any]:
+    """Join an engine project to its workspace (Plane) project.
+
+    One project, two faces: once linked, the WORKSPACE project's membership
+    grants read reach over the engine project's memories (and explicit-write
+    permission at plane role ≥ 15) — the GitHub-repo model. Linking is a
+    boundary change, so the gates mirror ``project_grant``'s severity, in
+    order and each failing closed:
+
+    1. The caller must resolve to a person.
+    2. The engine project must resolve within the caller's own org, and the
+       caller must be able to WRITE it (or be its creator) — not merely
+       belong to the org.
+    3. The caller must be an ACTIVE member (role ≥ 15) of the plane project
+       in the workspace DB. A non-member — and an unknown plane project,
+       which is indistinguishable from one — gets the ``not_found`` shape,
+       the existence-oracle convention.
+    4. Neither side may already be linked elsewhere: a link is NEVER
+       re-pointed (the ``6ad63ae`` lesson), and the refusal names nothing
+       about where the existing link points.
+
+    The write itself is :func:`shared.project_link.link_engine_project`'s
+    guarded UPDATE (``WHERE plane_project_id IS NULL … RETURNING``); a lost
+    race re-reads and wins only if the winner is us. No workspace engine
+    configured is a clear, distinct error — this tool cannot run without
+    the workspace DB, unlike recall, which simply proceeds unwidened.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        return {
+            "linked": False,
+            "error": "unauthorized",
+            "detail": "no request context",
+        }
+
+    _attach_client_name(ctx, request)
+
+    db = SessionLocal()
+    try:
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
+    except HTTPException as exc:
+        db.close()
+        return {"linked": False, "error": "unauthorized", "detail": str(exc.detail)}
+
+    caller = resolve_request_user_id(request)
+    if not caller:
+        db.close()
+        return {
+            "linked": False,
+            "error": "unattributed_caller",
+            "detail": (
+                "Linking a project requires a caller we can attribute to a person."
+            ),
+        }
+
+    # A malformed workspace project id gets the same shape an unknown one
+    # gets: there is nothing it could name.
+    try:
+        plane_id = str(uuid.UUID(str(workspace_project).strip()))
+    except (ValueError, AttributeError, TypeError):
+        db.close()
+        return {
+            "linked": False,
+            "error": "not_found",
+            "detail": f"unknown workspace project: {workspace_project}",
+        }
+
+    try:
+        ws_engine = workspace_engine()
+        if ws_engine is None:
+            return {
+                "linked": False,
+                "error": "workspace_unavailable",
+                "detail": (
+                    "No workspace database is configured, so workspace "
+                    "projects cannot be linked here."
+                ),
+            }
+
+        project_id = await anyio.to_thread.run_sync(
+            lambda: brain.find_project_id(db, org_id=org_id, identifier=project)
+        )
+        if project_id is None:
+            return {
+                "linked": False,
+                "error": "not_found",
+                "detail": f"unknown project: {project}",
+            }
+
+        # Engine-side standing: write access or creatorship. A caller with
+        # neither gets the missing-project shape — same existence-oracle
+        # protection as project_grant/project_members.
+        def _engine_standing() -> bool:
+            if projects.can_write(
+                db, org_id=org_id, project_id=project_id, user_id=caller
+            ):
+                return True
+            row = db.execute(
+                text(
+                    "SELECT created_by FROM projects "
+                    "WHERE id = :id AND org_id = :org_id"
+                ),
+                {"id": project_id, "org_id": org_id},
+            ).fetchone()
+            return row is not None and row.created_by == caller
+
+        if not await anyio.to_thread.run_sync(_engine_standing):
+            return {
+                "linked": False,
+                "error": "not_found",
+                "detail": f"unknown project: {project}",
+            }
+
+        # Plane-side standing: an active membership at role >= 15. A
+        # non-member and an unknown plane project answer identically.
+        def _plane_role() -> Optional[int]:
+            with ws_engine.connect() as ws:
+                return project_link.plane_project_memberships(ws, user_id=caller).get(
+                    plane_id
+                )
+
+        role = await anyio.to_thread.run_sync(_plane_role)
+        if role is None or role < project_link.PLANE_WRITE_ROLE:
+            return {
+                "linked": False,
+                "error": "not_found",
+                "detail": f"unknown workspace project: {workspace_project}",
+            }
+
+        # The plane id must not already be linked to a DIFFERENT engine
+        # project — checked across ALL orgs (the partial unique index is
+        # global), but the refusal says nothing about where it points.
+        taken = await anyio.to_thread.run_sync(
+            lambda: db.execute(
+                text(
+                    "SELECT 1 FROM projects "
+                    "WHERE plane_project_id = CAST(:plane_id AS uuid) "
+                    "AND id != CAST(:project_id AS uuid) LIMIT 1"
+                ),
+                {"plane_id": plane_id, "project_id": project_id},
+            ).fetchone()
+        )
+        if taken is not None:
+            return {
+                "linked": False,
+                "error": "already_linked",
+                "detail": "That workspace project is already linked.",
+            }
+
+        result = await anyio.to_thread.run_sync(
+            lambda: project_link.link_engine_project(
+                db,
+                org_id=org_id,
+                project_id=project_id,
+                plane_project_id=plane_id,
+            )
+        )
+        if not result.get("linked"):
+            error = result.get("error", "link_failed")
+            detail = (
+                "This project is already linked to a different workspace project."
+                if error == "already_linked"
+                else f"unknown project: {project}"
+            )
+            return {"linked": False, "error": error, "detail": detail}
+
+        await anyio.to_thread.run_sync(db.commit)
+        logger.info(
+            "project_link: %s linked project %s to workspace project %s "
+            "in org %s via mcp",
+            caller,
+            project_id,
+            plane_id,
+            org_id,
+        )
+        return {
+            "linked": True,
+            "project_id": project_id,
+            "workspace_project": plane_id,
+        }
+    except Exception:
+        logger.exception("project_link failed")
+        return {"linked": False, "error": "project_link_failed"}
+    finally:
+        db.close()
+
+
 async def _perform_project_scope(
     ctx: Context,
     *,
@@ -4439,6 +4717,31 @@ def _register_tools(mcp: FastMCP) -> None:
     ) -> dict[str, Any]:
         return await _perform_project_scope(
             ctx, project=project, default=default, my_captures=my_captures
+        )
+
+    @mcp.tool(
+        name="project_link",
+        description=(
+            "Join this org's project to its workspace project, so workspace "
+            "membership reaches through: anyone added to the workspace "
+            "project can recall this project's memories, and workspace "
+            "members can write. You must be able to write the engine project "
+            "(or have created it) AND be a member of the workspace project. "
+            "A link is permanent — it is never re-pointed."
+        ),
+    )
+    async def project_link_tool(
+        ctx: Context,
+        project: Annotated[
+            str, Field(description="Project name, git remote, repo path, or id.")
+        ],
+        workspace_project: Annotated[
+            str,
+            Field(description="The workspace project's UUID."),
+        ],
+    ) -> dict[str, Any]:
+        return await _perform_project_link(
+            ctx, project=project, workspace_project=workspace_project
         )
 
     @mcp.tool(

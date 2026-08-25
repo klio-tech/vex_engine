@@ -2414,6 +2414,7 @@ async def retrieve_memories_scoped(
     limit: int = 10,
     extra_org_id: Optional[str] = None,
     branch_id: Optional[str] = None,
+    extra_project_ids: Optional[list[str]] = None,
 ) -> list[MemoryRecord]:
     """Brain recall across sessions, scoped to an org (and optionally an
     agent / space / project / context branch).
@@ -2534,6 +2535,18 @@ async def retrieve_memories_scoped(
             read there. This is a READ-ONLY widening; no write path accepts
             it. Graph expansion is NOT widened: it walks outward inside the
             active org alone, exactly as before.
+        extra_project_ids: Precomputed linked-project reach (Task L1: engine
+            projects whose ``plane_project_id`` sits in the caller's active
+            workspace memberships). When non-empty, the ACTIVE org's ladder
+            gains one arm — ``(scope = 'project' AND project_id =
+            ANY(:extra_project_ids))`` — a UNION on top of engine
+            ``project_members``, never a replacement. The list is
+            PRECOMPUTED by the caller from the caller's OWN workspace
+            memberships (two databases, joined in Python; see
+            :mod:`shared.project_link`), already tenant-scoped to the active
+            org. ``None`` or empty means the arm is simply absent — today's
+            behaviour byte-identical. The extra (personal) org's ladder
+            never gains this arm: links live under org projects.
         branch_id: Context-branch opt-in (Track C). ``None`` — the default,
             and the load-bearing one — reads MAIN only: every arm gains
             ``branch_id IS NULL``, so a half-formed branch conclusion can
@@ -2673,6 +2686,16 @@ async def retrieve_memories_scoped(
                     f"AND p.org_id = :{org_param} "
                     "WHERE m.user_id = :user_id))"
                 )
+            if extra_project_ids and org_param == "org_id":
+                # The linked-project arm (Task L1): engine projects reached
+                # through the caller's WORKSPACE memberships, precomputed by
+                # the caller from their own memberships (never all org
+                # links). Active org only — links live under org projects,
+                # so the personal-node arm never widens on it.
+                arms.append(
+                    "(scope = 'project' AND project_id = "
+                    "ANY(CAST(:extra_project_ids AS uuid[])))"
+                )
             ladder = " OR ".join(arms)
         # The branch filter composes PER-ORG, exactly like the ladder: the
         # active org opts into a named branch, the extra (personal) org NEVER
@@ -2688,6 +2711,8 @@ async def retrieve_memories_scoped(
 
     if branch_id is not None:
         params["branch_id"] = branch_id
+    if extra_project_ids:
+        params["extra_project_ids"] = [str(p) for p in extra_project_ids]
 
     if extra_org_id is None:
         tenancy_clause = _tenancy_and_ladder("org_id")

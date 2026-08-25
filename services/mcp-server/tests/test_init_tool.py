@@ -60,12 +60,12 @@ def _principal_patches(user_id=USER):
 # ---------------------------------------------------------------------------
 
 
-def test_tool_inventory_is_twenty_three_and_includes_init():
+def test_tool_inventory_is_twenty_four_and_includes_init():
     """18 -> 19 tools; `init` asserted by name (spec acceptance). Build 4
     later added claim + release, taking the count to 21; Track C's
-    `branch` tool takes it to 23."""
+    `branch` tool takes it to 23; Task L1's `project_link` to 24."""
     assert "init" in EXPECTED_TOOL_NAMES
-    assert len(EXPECTED_TOOL_NAMES) == 23
+    assert len(EXPECTED_TOOL_NAMES) == 24
     server = build_mcp_server()
     assert server._tool_manager.get_tool("init") is not None
 

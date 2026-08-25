@@ -47,6 +47,7 @@ _REQUIRED_SCHEMA_FIELD = {
     "project_members": "project",
     "project_grant": "project",
     "project_scope": "project",
+    "project_link": "project",
     "klio_retrieve": "handle",
     "compress": "content",
     "explore": "entity",
