@@ -163,6 +163,20 @@ _ENSURE_PERSONAL_SQL = text(
 )
 
 
+def _personal_org_id(user_id: str) -> str:
+    """The org_id a personal node is minted at.
+
+    One definition because the adoption guard and the insert must agree: if
+    they drift, the guard stops recognising rows this module created and
+    provisioning fails for the users it is supposed to serve.
+
+    The whole user id, not a prefix -- 8 hex chars collide at birthday odds
+    around 65k users, and org_id is String(64) while "personal_" plus a UUID
+    is 45 characters.
+    """
+    return f"personal_{user_id}"
+
+
 def ensure_personal_org(tsdb: Any, *, user_id: str, account_slug: str) -> str:
     """The org row backing this user's personal node, created if absent.
 
@@ -207,6 +221,17 @@ def ensure_personal_org(tsdb: Any, *, user_id: str, account_slug: str) -> str:
             raise ValueError(
                 f"account_slug {cleaned_slug!r} is already another user's personal node"
             )
+        # An unowned row is not automatically ours to take. Every org that
+        # predates the personal_owner_user_id column has it NULL, team orgs
+        # included, so adopting on "unowned" alone would stamp a company's
+        # memory as one person's personal node. Only a row already sitting at
+        # the id we mint can be one of ours -- anything else is a real org that
+        # happens to share the slug.
+        if owner is None and by_slug.org_id != _personal_org_id(cleaned_user):
+            raise ValueError(
+                f"account_slug {cleaned_slug!r} already belongs to org "
+                f"{by_slug.org_id!r}, which is not a personal node"
+            )
         adopted = tsdb.execute(
             _ADOPT_PERSONAL_SQL,
             {"org_id": by_slug.org_id, "user_id": cleaned_user},
@@ -222,7 +247,7 @@ def ensure_personal_org(tsdb: Any, *, user_id: str, account_slug: str) -> str:
     # An 8-hex-char prefix collides at birthday odds around 65k users, and the
     # partial unique index would then reject the second user's personal node --
     # a signup failure with no obvious cause.
-    org_id = f"personal_{cleaned_user}"
+    org_id = _personal_org_id(cleaned_user)
     row = tsdb.execute(
         _ENSURE_PERSONAL_SQL,
         {

@@ -214,3 +214,31 @@ def test_a_blank_identity_provisions_nothing(personal_fixture):
         {"slug": slug},
     ).first()
     assert count.n == 0, "a blank identity created an org row"
+
+
+def test_an_existing_team_org_is_never_adopted(personal_fixture):
+    """A team org must not become somebody's personal node.
+
+    Every pre-existing org has personal_owner_user_id IS NULL, so "adopt any
+    unowned row for this slug" would stamp a whole company's memory as one
+    person's private node. Unreachable today only because Supabase slugs are
+    unique -- an invariant held in a different database, which is not a thing
+    to depend on at a tenancy boundary.
+    """
+    db = personal_fixture.db
+    db.execute(
+        text(
+            "INSERT INTO organizations (org_id, name, account_slug) "
+            "VALUES ('org_real_team', 'Real Team', 'shared-slug')"
+        )
+    )
+    with pytest.raises(ValueError):
+        ensure_personal_org(db, user_id=SUBJECT_USER, account_slug="shared-slug")
+
+    still_unowned = db.execute(
+        text(
+            "SELECT personal_owner_user_id FROM organizations "
+            "WHERE org_id = 'org_real_team'"
+        )
+    ).scalar()
+    assert still_unowned is None, "a team org was stamped as a personal node"
