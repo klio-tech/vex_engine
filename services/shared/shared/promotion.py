@@ -29,9 +29,9 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
-logger = logging.getLogger("agentguard.shared.promotion")
+from shared.scopes import PROMOTABLE_SCOPES  # noqa: F401  (re-exported)
 
-PROMOTABLE_SCOPES = ("org", "project")
+logger = logging.getLogger("agentguard.shared.promotion")
 
 
 def promote_memory(

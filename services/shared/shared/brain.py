@@ -20,6 +20,7 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
+from shared import scopes
 from shared.memory import find_similar_memory, write_memory
 from shared.redaction import redact
 
@@ -758,7 +759,7 @@ async def write_scoped_memory(
             ``user_id``; if ``scope='project'`` without a ``project_id``; or if
             ``provenance`` is not one of the three labels.
     """
-    if scope not in ("org", "project", "private", "agent"):
+    if scope not in scopes.WRITABLE_SCOPES:
         raise ValueError(
             f"unsupported scope: {scope!r} (write_scoped_memory accepts "
             "'org', 'project', 'private' or 'agent')"
