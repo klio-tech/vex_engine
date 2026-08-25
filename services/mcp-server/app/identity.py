@@ -53,6 +53,8 @@ from __future__ import annotations
 import logging
 
 from app.headers import agent_header
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Optional
 
 from fastapi import HTTPException, Request
@@ -292,3 +294,112 @@ def _oauth_principal(request: Request) -> Optional[Any]:
         )
         return None
     return candidate if isinstance(candidate, OAuthPrincipal) else None
+
+
+@contextmanager
+def _supabase_connection(supplied: Optional[Any]) -> Iterator[Optional[Any]]:
+    """Yield a Supabase connection for the membership check.
+
+    ``supplied`` is honoured as-is and NOT closed — it belongs to the caller.
+    Otherwise one is borrowed from :mod:`app.directory`'s pooled engine and
+    returned to the pool on the way out.
+
+    Yields ``None`` when no directory is configured, or when the connection
+    could not be opened. Both are "the check cannot run", which every caller
+    must read as "not reachable" rather than "assume yes".
+    """
+    if supplied is not None:
+        yield supplied
+        return
+
+    from app.directory import supabase_engine  # noqa: PLC0415
+
+    try:
+        engine = supabase_engine()
+    except Exception:
+        logger.warning(
+            "node selection: the Supabase engine could not be built; "
+            "treating every selected node as unreachable",
+            exc_info=True,
+        )
+        yield None
+        return
+
+    if engine is None:
+        logger.warning(
+            "node selection: SUPABASE_DATABASE_URL is not configured; "
+            "no node can be selected (fail closed)"
+        )
+        yield None
+        return
+
+    try:
+        with engine.connect() as conn:
+            yield conn
+    except Exception:
+        logger.warning(
+            "node selection: the Supabase connection failed; treating the "
+            "selected node as unreachable",
+            exc_info=True,
+        )
+        yield None
+
+
+def resolve_active_org(
+    request: Request, db: Any, *, supabase: Optional[Any] = None
+) -> str:
+    """The org node this request acts in.
+
+    No selection means the key's own org, so every existing caller keeps
+    today's behaviour exactly and a deployment with no Supabase directory is
+    untouched — that path never reaches for one.
+
+    A selection is checked against the caller's membership HERE, on this call.
+    Not remembered from a switch, and not memoized on ``request.state``: a
+    session outlives a revocation, so a remembered answer is the same as no
+    answer. The cost is one round trip per selecting call; the cost of the
+    alternative is one tenant reading another's memory.
+
+    Args:
+        request: The inbound request. The node is read from ``X-Klio-Node``
+            (or the legacy ``X-Vex-Node``) via :mod:`app.headers`.
+        db: A connection or Session against the engine's own database, where
+            ``organizations`` lives — normally the tool body's ``SessionLocal()``.
+        supabase: A connection against the Supabase database, where
+            ``accounts`` and ``accounts_memberships`` live. Defaults to one
+            borrowed from :mod:`app.directory`. The two are separate servers in
+            production, which is why this cannot be one connection.
+
+    Returns:
+        The ``org_id`` to act in.
+
+    Raises:
+        HTTPException: 404 when the caller may not reach the named node, when
+            they cannot be attributed to a person, or when the membership check
+            could not run. Not 403: a 403 confirms the node exists, which tells
+            an outsider what an org is called. The project tools answer the
+            same way (``mcp_app.py:2929-2933``).
+        HTTPException: 429 propagated from identity resolution — a rate-limited
+            caller holds a valid key and must not be reported as nobody.
+    """
+    from shared.membership import may_reach  # noqa: PLC0415
+
+    from app.headers import node_header  # noqa: PLC0415
+
+    org_id, _agent_id, _plan, _overrides = resolve_principal_plan(request)
+
+    requested = node_header(request)
+    requested = requested.strip() if requested else None
+    if not requested or requested == org_id:
+        return org_id
+
+    user_id = resolve_request_user_id(request)
+    if user_id:
+        with _supabase_connection(supabase) as conn:
+            if conn is not None and may_reach(
+                conn, db, user_id=user_id, org_id=requested
+            ):
+                return requested
+
+    logger.info("node selection refused: the caller may not reach the node they named")
+    raise HTTPException(status_code=404, detail="unknown node")

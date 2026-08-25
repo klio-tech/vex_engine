@@ -22,6 +22,7 @@ from typing import Any, Optional
 _KEY_HEADERS = ("X-Klio-Key", "X-Vex-Key", "X-AgentGuard-Key")
 _AGENT_HEADERS = ("X-Klio-Agent", "X-Vex-Agent")
 _PROJECT_HEADERS = ("X-Klio-Project", "X-Vex-Project")
+_NODE_HEADERS = ("X-Klio-Node", "X-Vex-Node")
 
 
 def _first(request: Any, names: tuple[str, ...]) -> Optional[str]:
@@ -45,3 +46,13 @@ def agent_header(request: Any) -> Optional[str]:
 def project_header(request: Any) -> Optional[str]:
     """The caller's project hint. Resolution of it still fails open."""
     return _first(request, _PROJECT_HEADERS)
+
+
+def node_header(request: Any) -> Optional[str]:
+    """The org node the caller wants to act in, if they named one.
+
+    ``None`` means "no selection", which resolves to the key's own org — the
+    behaviour every caller has today. Unlike the project hint, resolution of
+    this one fails CLOSED: it names a tenancy boundary.
+    """
+    return _first(request, _NODE_HEADERS)
