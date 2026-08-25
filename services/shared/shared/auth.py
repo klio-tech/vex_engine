@@ -50,6 +50,56 @@ VALID_SCOPES = frozenset({"ingest", "verify", "read", "memory"})
 # COUNT over a reliability table their tenant may never write to.
 RELIABILITY_SCOPES = frozenset({"ingest", "verify", "read"})
 
+#: Scopes granted to a workspace personal access token. A PAT is minted in
+#: the workspace UI for the memory product; it deliberately never carries
+#: the reliability scopes (``ingest`` / ``verify``), which stay engine-key
+#: territory.
+PAT_SCOPES = ("memory", "read")
+
+#: Workspace DB: the PAT row itself. Plane stores the token PLAINTEXT and
+#: UNIQUE (format ``plane_api_<32hex>``), so the lookup is by the raw value —
+#: unlike engine keys, which are matched by SHA-256 hash.
+_PAT_TOKEN_SQL = text(
+    """
+    SELECT id, user_id, workspace_id, is_active, expired_at, deleted_at
+    FROM api_tokens
+    WHERE token = :token
+    LIMIT 1
+    """
+)
+
+#: Workspace DB: the living workspace a workspace-bound token belongs to.
+_PAT_WORKSPACE_SQL = text(
+    """
+    SELECT id, slug, is_personal, owner_id
+    FROM workspaces
+    WHERE id = CAST(:ws AS uuid)
+      AND deleted_at IS NULL
+    LIMIT 1
+    """
+)
+
+#: Workspace DB: a workspace-less (user-level) token resolves to its user's
+#: living personal workspace.
+_PAT_PERSONAL_WORKSPACE_SQL = text(
+    """
+    SELECT id, slug, is_personal, owner_id
+    FROM workspaces
+    WHERE owner_id = CAST(:uid AS uuid)
+      AND is_personal = true
+      AND deleted_at IS NULL
+    LIMIT 1
+    """
+)
+
+#: Workspace DB: best-effort usage stamp (see ``_touch_pat_last_used``).
+_PAT_TOUCH_SQL = text("UPDATE api_tokens SET last_used = now() WHERE id = :id")
+
+#: Engine DB: the slug the org-plan lookup keys on, read back after ensure.
+_PAT_ORG_SLUG_SQL = text(
+    "SELECT account_slug FROM organizations WHERE org_id = :org_id LIMIT 1"
+)
+
 
 # --- agent_id, the one unbounded client string on the write path ------
 #
@@ -298,9 +348,14 @@ class KeyValidator:
         # 1. Cache lookup
         entry = self._cache_get(key_hash)
 
-        # 2. Cache miss -> DB query
+        # 2. Cache miss -> DB query. Engine keys FIRST, always; the
+        # workspace-PAT arm runs only on an engine-keys miss, so an engine
+        # key can never be shadowed by a workspace token that happens to
+        # hold the same string.
         if entry is None:
             entry = self._query_db(key_hash)
+            if entry is None:
+                entry = self._query_workspace_pat(api_key)
             if entry is None:
                 raise AuthError(401, "Invalid API key")
             self._cache_put(key_hash, entry)
@@ -763,6 +818,160 @@ class KeyValidator:
             user_id=user_id,
             is_member=is_member,
         )
+
+    # ------------------------------------------------------------------
+    # Workspace personal access tokens (PATs)
+    # ------------------------------------------------------------------
+
+    def _query_workspace_pat(self, raw_key: str) -> _CachedKey | None:
+        """Resolve a workspace personal access token to a cached entry.
+
+        A PAT is a USER credential: ``user_id`` is the token's workspace
+        user, and the org is the token's workspace org (or the user's
+        personal workspace for a workspace-less token), ensured via
+        :func:`shared.membership.ensure_org_for_workspace` on first use.
+        Everything downstream — the membership guard, node selection,
+        project reach — already keys off those two fields, so NO authz is
+        duplicated here.
+
+        Runs only on an engine-keys miss (see ``_live_entry``); the caller
+        caches the result exactly like a key entry, so revocation latency
+        is the same ``cache_ttl_s`` window.
+
+        Returns ``None`` — which the caller turns into the SAME 401 as an
+        unknown key — for: no workspace engine configured, unknown token,
+        inactive/expired/soft-deleted token, or a token whose workspace
+        (or personal workspace) cannot be resolved. No oracle distinguishes
+        "revoked" from "never existed".
+
+        Two databases, joined in Python: the workspace connection answers
+        only about ``api_tokens`` / ``workspaces``; the engine connection
+        answers only about ``organizations``. A workspace-DB failure is a
+        503, not a 401 — an outage must not read as "invalid credential".
+        """
+        if self._workspace_engine is None:
+            return None
+
+        try:
+            with self._workspace_engine.connect() as conn:
+                token_row = conn.execute(_PAT_TOKEN_SQL, {"token": raw_key}).fetchone()
+                if token_row is None:
+                    return None
+                if not self._pat_token_alive(token_row):
+                    return None
+                if token_row.workspace_id is not None:
+                    ws_row = conn.execute(
+                        _PAT_WORKSPACE_SQL,
+                        {"ws": str(token_row.workspace_id)},
+                    ).fetchone()
+                else:
+                    ws_row = conn.execute(
+                        _PAT_PERSONAL_WORKSPACE_SQL,
+                        {"uid": str(token_row.user_id)},
+                    ).fetchone()
+                if ws_row is None:
+                    return None
+        except Exception:
+            logger.error("workspace database error during PAT lookup", exc_info=True)
+            raise AuthError(
+                503, "Authentication backend temporarily unavailable"
+            ) from None
+
+        entry = self._pat_cached_key(token_row, ws_row)
+        self._touch_pat_last_used(str(token_row.id))
+        return entry
+
+    @staticmethod
+    def _pat_token_alive(token_row) -> bool:
+        """Whether this ``api_tokens`` row is a live credential."""
+        if not token_row.is_active or token_row.deleted_at is not None:
+            return False
+        if token_row.expired_at is not None:
+            expired_at = token_row.expired_at
+            if expired_at.tzinfo is None:
+                expired_at = expired_at.replace(tzinfo=timezone.utc)
+            if datetime.now(tz=timezone.utc) > expired_at:
+                return False
+        return True
+
+    def _pat_cached_key(self, token_row, ws_row) -> _CachedKey:
+        """Build the cache entry for a live PAT: ensure org, resolve plan."""
+        # Lazy import: membership is a sibling with no dependency back on
+        # this module, but auth.py is imported by every service at startup
+        # and must not grow import weight for the non-PAT path.
+        from shared.membership import ensure_org_for_workspace  # noqa: PLC0415
+
+        workspace_id = str(ws_row.id)
+        user_id = str(token_row.user_id)
+        try:
+            with self._engine.connect() as conn:
+                org_id = ensure_org_for_workspace(
+                    conn,
+                    workspace_id=workspace_id,
+                    slug=ws_row.slug,
+                    is_personal=bool(ws_row.is_personal),
+                    owner_user_id=(
+                        str(ws_row.owner_id) if ws_row.owner_id is not None else None
+                    ),
+                )
+                slug_row = conn.execute(
+                    _PAT_ORG_SLUG_SQL, {"org_id": org_id}
+                ).fetchone()
+                conn.commit()
+        except Exception:
+            logger.error(
+                "engine database error while provisioning the org for a PAT "
+                "(workspace %s)",
+                workspace_id,
+                exc_info=True,
+            )
+            raise AuthError(500, "Internal authentication error") from None
+
+        account_slug = (
+            slug_row.account_slug if slug_row and slug_row.account_slug else org_id
+        )
+        # The existing org-plan path, exactly as the key arm resolves it.
+        plan_val, plan_overrides_val, _ = self._query_plan_from_supabase(
+            account_slug, org_id
+        )
+        plan_config = get_plan_config(plan_val, plan_overrides_val)
+
+        # Same membership computation as the key path for a workspace-linked
+        # org: a PAT user of the token's own workspace passes naturally.
+        is_member = self._query_membership_from_workspace(workspace_id, user_id)
+
+        # ``expires_at`` stays None on purpose: expiry was already answered
+        # above as the oracle-free 401, and the cache TTL bounds how long a
+        # newly-expired token can linger — the same latency as revocation.
+        return _CachedKey(
+            org_id=org_id,
+            key_id=str(token_row.id),
+            scopes=list(PAT_SCOPES),
+            rate_limit_rpm=plan_config.max_rpm,
+            expires_at=None,
+            revoked=False,
+            plan=plan_val,
+            plan_overrides=plan_overrides_val,
+            user_id=user_id,
+            is_member=is_member,
+        )
+
+    def _touch_pat_last_used(self, token_id: str) -> None:
+        """Best-effort ``last_used`` stamp; NEVER fails the request.
+
+        Throttled by construction: the PAT arm only runs on a cache miss,
+        so this executes at most once per ``cache_ttl_s`` per token.
+        """
+        if self._workspace_engine is None:  # pragma: no cover - guarded upstream
+            return
+        try:
+            with self._workspace_engine.connect() as conn:
+                conn.execute(_PAT_TOUCH_SQL, {"id": token_id})
+                conn.commit()
+        except Exception:
+            logger.warning(
+                "failed to stamp last_used for PAT %s", token_id, exc_info=True
+            )
 
     def _check_agent_limit(self, entry: _CachedKey, agent_id: str | None) -> None:
         """Enforce per-plan agent limit."""

@@ -1395,6 +1395,9 @@ def test_check_credential_rejects_an_unknown_key(monkeypatch):
 
     validator = KeyValidator.__new__(KeyValidator)
     validator._required_scope = "memory"
+    # No workspace engine: an engine-keys miss must not detour into the
+    # PAT arm — it is the terminal 401.
+    validator._workspace_engine = None
     monkeypatch.setattr(validator, "_cache_get", lambda h: None)
     monkeypatch.setattr(validator, "_query_db", lambda h: None)
 
