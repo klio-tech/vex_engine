@@ -63,7 +63,10 @@ async def test_claim_happy_path_forwards_principal_and_project():
     )
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.resolve_request_user_id", return_value="user-1"),
         patch("app.mcp_app.SessionLocal", session_local),
         patch("app.mcp_app.resolve_project_from_request", return_value="proj-7"),
@@ -90,7 +93,10 @@ async def test_claim_forwards_custom_ttl():
     create_mock = AsyncMock(return_value={"claim_id": "c-1", "collisions": []})
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.resolve_request_user_id", return_value=None),
         patch("app.mcp_app.SessionLocal", session_local),
         patch("app.mcp_app.resolve_project_from_request", return_value=None),
@@ -105,7 +111,7 @@ async def test_claim_forwards_custom_ttl():
 async def test_claim_auth_failure_returns_clean_error():
     fn = _get_tool_fn("claim")
     with patch(
-        "app.mcp_app.resolve_principal",
+        "app.mcp_app.resolve_active_principal",
         side_effect=HTTPException(status_code=401, detail="bad key"),
     ):
         result = await fn(_fake_ctx(), "fix login token expiry")
@@ -129,7 +135,10 @@ async def test_claim_storage_failure_returns_clean_error():
     session_local = MagicMock(return_value=MagicMock())
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.resolve_request_user_id", return_value=None),
         patch("app.mcp_app.SessionLocal", session_local),
         patch("app.mcp_app.resolve_project_from_request", return_value=None),
@@ -155,7 +164,10 @@ async def test_release_happy_path_forwards_principal_and_claim_id():
     session_local = MagicMock(return_value=session)
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", session_local),
         patch("app.mcp_app.claims.release_claim", return_value=True) as release_mock,
     ):
@@ -174,7 +186,10 @@ async def test_release_not_owned_returns_false():
     session_local = MagicMock(return_value=MagicMock())
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("org-x", "agent-y")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("org-x", "agent-y", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", session_local),
         patch("app.mcp_app.claims.release_claim", return_value=False),
     ):
@@ -187,7 +202,7 @@ async def test_release_not_owned_returns_false():
 async def test_release_auth_failure_returns_clean_error():
     fn = _get_tool_fn("release")
     with patch(
-        "app.mcp_app.resolve_principal",
+        "app.mcp_app.resolve_active_principal",
         side_effect=HTTPException(status_code=401, detail="bad key"),
     ):
         result = await fn(_fake_ctx(), "c-1")
@@ -223,7 +238,7 @@ async def test_recall_injects_active_claims():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", session_local),
@@ -251,7 +266,7 @@ async def test_recall_active_claims_failure_does_not_break_recall():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", session_local),

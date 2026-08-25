@@ -92,7 +92,7 @@ async def test_recall_forwards_the_credentialed_user_not_the_header():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("acme", PRIYA, "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -118,7 +118,7 @@ async def test_private_recall_by_an_unattributed_caller_is_refused():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("acme", "agent-x", "free", None),
         ),
         patch("app.mcp_app.resolve_request_user_id", return_value=None),
@@ -151,7 +151,10 @@ async def test_share_forwards_the_caller_as_owner_so_promotion_can_refuse():
     request = _request(headers={"X-Vex-Agent": PRIYA}, oauth_principal=_principal(DEV))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("acme", "agent-x", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.promote_memory", promote),
     ):
@@ -169,7 +172,10 @@ async def test_an_unattributed_caller_cannot_share_anything():
     request = _request()
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("acme", "agent-x", "free", None),
+        ),
         patch("app.mcp_app.resolve_request_user_id", return_value=None),
         patch("app.mcp_app.promote_memory", promote),
     ):
@@ -192,7 +198,10 @@ async def test_sharing_to_a_project_requires_membership_of_it():
     request = _request(oauth_principal=_principal(DEV))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("acme", "agent-x", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=db)),
         patch("app.mcp_app.projects.can_write", return_value=False),
         patch("app.mcp_app.promote_memory", promote),
@@ -225,7 +234,10 @@ async def test_a_non_admin_cannot_grant_even_to_themselves():
     request = _request(oauth_principal=_principal(DEV))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("acme", "agent-x", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
         patch("app.mcp_app.projects.is_member", return_value=True),
@@ -259,7 +271,10 @@ async def test_a_non_member_cannot_grant_even_if_they_can_name_the_project():
     request = _request(oauth_principal=_principal(DEV))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("acme", "agent-x", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
         patch("app.mcp_app.projects.is_member", return_value=False),
@@ -287,7 +302,10 @@ async def test_a_raw_user_id_is_refused_where_an_email_belongs():
     request = _request(oauth_principal=_principal(DEV))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("acme", "agent-x", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.projects.is_admin", return_value=True),
         patch("app.mcp_app.projects.add_member", add_member),
@@ -307,7 +325,10 @@ async def test_an_email_outside_the_org_cannot_be_granted():
     request = _request(oauth_principal=_principal(DEV))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("acme", "agent-x", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
         patch("app.mcp_app.projects.is_member", return_value=True),
@@ -332,7 +353,10 @@ async def test_a_successful_grant_is_audited_with_who_what_and_surface():
     request = _request(oauth_principal=_principal(DEV))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("acme", "agent-x", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
         patch("app.mcp_app.projects.is_member", return_value=True),
@@ -377,7 +401,10 @@ async def test_a_non_member_gets_not_found_for_a_project_member_list():
     request = _request(oauth_principal=_principal(DEV))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("acme", "agent-x", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.find_project_id", return_value="proj-1"),
         patch("app.mcp_app.projects.is_member", return_value=False),
@@ -395,7 +422,10 @@ async def test_a_project_someone_else_administers_cannot_be_claimed():
     request = _request(oauth_principal=_principal(DEV))
 
     with (
-        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-x")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("acme", "agent-x", "free", None),
+        ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
         patch("app.mcp_app.brain.ensure_project", return_value="proj-1"),
         patch("app.mcp_app.projects.member_count", return_value=2),

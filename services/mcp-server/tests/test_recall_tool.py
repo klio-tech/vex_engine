@@ -101,7 +101,7 @@ async def test_recall_happy_path_serializes_without_embedding():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", session_local),
@@ -158,7 +158,7 @@ async def test_recall_stringifies_uuid_space_and_project_ids():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -191,7 +191,7 @@ async def test_recall_serializes_null_space_and_project_ids():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -224,7 +224,7 @@ async def test_recall_serializes_null_created_at():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -257,7 +257,7 @@ async def test_recall_logs_event():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=session)),
@@ -292,7 +292,7 @@ async def test_recall_org_isolation_uses_resolved_principal():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-secure", "agent-z", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -320,7 +320,7 @@ async def test_recall_agent_scope_forwards_agent_id():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -346,7 +346,7 @@ async def test_recall_resolves_space_filter():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -366,7 +366,7 @@ async def test_recall_unknown_space_returns_warning_without_retrieve():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -397,7 +397,7 @@ async def test_recall_space_slug_is_stripped():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -421,7 +421,7 @@ async def test_recall_blank_space_resolves_to_org_wide():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -450,7 +450,7 @@ async def test_recall_resolves_project_filter():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -470,7 +470,7 @@ async def test_recall_unknown_project_returns_warning_without_retrieve():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -499,7 +499,7 @@ async def test_recall_project_any_is_cross_project_no_lookup():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -523,7 +523,7 @@ async def test_recall_project_any_case_insensitive():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -549,7 +549,7 @@ async def test_recall_no_filters_passes_none():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -577,7 +577,7 @@ async def test_recall_auth_failure_returns_clean_error():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             side_effect=HTTPException(
                 status_code=401, detail="Missing X-Vex-Key header"
             ),
@@ -590,7 +590,10 @@ async def test_recall_auth_failure_returns_clean_error():
     assert result["error"] == "unauthorized"
     assert "Missing X-Vex-Key header" in result["detail"]
     retrieve_mock.assert_not_called()
-    session_local.assert_not_called()
+    # The session opens before resolution now (the active-node resolver
+    # needs it); the guarantee on a refusal is that it was CLOSED, unused.
+    session_local.assert_called_once()
+    session_local.return_value.close.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -602,7 +605,7 @@ async def test_recall_no_request_context_returns_unauthorized():
     ctx = SimpleNamespace(request_context=SimpleNamespace(request=None))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan") as resolve_mock,
+        patch("app.mcp_app.resolve_active_principal") as resolve_mock,
         patch("app.mcp_app.SessionLocal", session_local),
         patch("app.mcp_app.retrieve_memories_scoped", retrieve_mock),
     ):

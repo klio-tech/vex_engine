@@ -345,6 +345,39 @@ def _workspace_connection(supplied: Optional[Any]) -> Iterator[Optional[Any]]:
         yield None
 
 
+def resolve_active_principal(
+    request: Request, db: Any, *, workspace_db: Optional[Any] = None
+) -> tuple[str, str, str, Optional[dict]]:
+    """``(active_org_id, agent_id, plan, plan_overrides)``: the principal, in the selected node.
+
+    The ONE resolver every tool body goes through. It is
+    :func:`resolve_principal_plan` with the org swapped for the org
+    :func:`resolve_active_org` says this request acts in, so a body swaps one
+    call for another and cannot rewire half the surface (the two-copies-drift
+    lesson, d6f53ce). Both callees share the request's KeyInfo memo, so the
+    key is validated once and the caller spends one rate-limit token.
+
+    Args:
+        request: The inbound request; the selection is read from
+            ``X-Klio-Node`` (or the legacy ``X-Vex-Node``).
+        db: The tool body's session against the engine's own database. Open it
+            BEFORE resolving — ``SessionLocal()`` is cheap and connects lazily,
+            so an unselected request still does no session work here.
+        workspace_db: Forwarded to :func:`resolve_active_org`.
+
+    Returns:
+        The :func:`resolve_principal_plan` tuple with ``org_id`` replaced by
+        the active org. Without a selection that IS the key's org, so every
+        existing caller is byte-identical.
+
+    Raises:
+        HTTPException: 404/429 propagated from :func:`resolve_active_org`.
+    """
+    _key_org, agent_id, plan, plan_overrides = resolve_principal_plan(request)
+    active_org = resolve_active_org(request, db, workspace_db=workspace_db)
+    return active_org, agent_id, plan, plan_overrides
+
+
 def resolve_active_org(
     request: Request, db: Any, *, workspace_db: Optional[Any] = None
 ) -> str:

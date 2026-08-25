@@ -125,7 +125,9 @@ def _live(db, org_id):
     """Patch only the transport seams; the DB is real."""
     return patch.multiple(
         mcp_app,
-        resolve_principal=MagicMock(return_value=(org_id, "agent-x")),
+        resolve_active_principal=MagicMock(
+            return_value=(org_id, "agent-x", "free", None)
+        ),
         SessionLocal=MagicMock(return_value=_KeepOpen(db)),
     )
 

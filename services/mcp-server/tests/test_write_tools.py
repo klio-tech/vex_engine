@@ -96,7 +96,7 @@ async def test_write_tool_maps_memory_type_and_scopes_org(tool_name, expected_ty
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", session_local),
@@ -125,7 +125,7 @@ async def test_decide_with_rationale_sets_metadata():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -148,7 +148,7 @@ async def test_decide_without_rationale_omits_rationale_metadata():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -169,7 +169,7 @@ async def test_session_id_falls_back_to_principal_without_header():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -190,7 +190,7 @@ async def test_write_tool_no_request_context_returns_unauthorized():
     ctx = SimpleNamespace(request_context=SimpleNamespace(request=None))
 
     with (
-        patch("app.mcp_app.resolve_principal_plan") as resolve_mock,
+        patch("app.mcp_app.resolve_active_principal") as resolve_mock,
         patch("app.mcp_app.SessionLocal", session_local),
         patch.object(mcp_app.brain, "write_scoped_memory", write_mock),
     ):
@@ -214,7 +214,7 @@ async def test_write_tool_auth_failure_returns_clean_error():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             side_effect=HTTPException(
                 status_code=401, detail="Missing X-Vex-Key header"
             ),
@@ -229,7 +229,10 @@ async def test_write_tool_auth_failure_returns_clean_error():
     assert "Missing X-Vex-Key header" in result["detail"]
     write_mock.assert_not_called()
     # No DB session should be opened when auth fails before session creation.
-    session_local.assert_not_called()
+    # The session opens before resolution now (the active-node resolver
+    # needs it); the guarantee on a refusal is that it was CLOSED, unused.
+    session_local.assert_called_once()
+    session_local.return_value.close.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -240,7 +243,7 @@ async def test_write_tool_scope_agent_forwarded():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -259,7 +262,7 @@ async def test_write_tool_scope_defaults_to_org():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -292,7 +295,7 @@ async def test_write_files_under_header_project(monkeypatch):
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -344,7 +347,7 @@ async def test_write_with_space_resolves_and_threads_space_id(tool_name, expecte
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -377,7 +380,7 @@ async def test_write_without_space_leaves_space_id_none(tool_name):
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -401,7 +404,7 @@ async def test_write_space_resolved_under_resolved_principal_org():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-secure", "agent-z", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -426,7 +429,7 @@ async def test_write_same_space_slug_is_idempotent_reuses_space():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -455,7 +458,7 @@ async def test_write_blank_space_treated_as_no_space():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -480,7 +483,7 @@ async def test_write_space_slug_is_stripped():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -527,7 +530,7 @@ async def test_base_revision_present_skips_plain_write_and_calls_cas(tool_name):
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -576,7 +579,7 @@ async def test_base_revision_auth_refusal_is_passed_through_as_stored_false():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -618,7 +621,7 @@ async def test_base_revision_conflict_returns_tool_error_payload():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -659,7 +662,7 @@ async def test_base_revision_without_memory_id_is_refused_before_any_write():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -685,7 +688,7 @@ async def test_absent_base_revision_is_unaffected_by_the_cas_wiring():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),

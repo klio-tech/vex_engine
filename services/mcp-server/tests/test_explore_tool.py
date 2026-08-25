@@ -91,7 +91,7 @@ def _patched(brief, *, user_id=DEV, summary_result={"summary": "a synthesis"}):
     return (
         patch.object(
             mcp_app,
-            "resolve_principal_plan",
+            "resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch.object(mcp_app, "resolve_request_user_id", return_value=user_id),
@@ -137,7 +137,7 @@ async def test_not_found_is_one_opaque_payload():
 async def test_unauthorized_is_a_clean_error():
     with patch.object(
         mcp_app,
-        "resolve_principal_plan",
+        "resolve_active_principal",
         side_effect=HTTPException(status_code=401, detail="bad key"),
     ):
         result = await _explore_fn()(_fake_ctx(), entity="pricing")
@@ -290,7 +290,7 @@ def _metered(brief, *, user_id=DEV, summary_result={"summary": "a synthesis"}, d
     return (
         patch.object(
             mcp_app,
-            "resolve_principal_plan",
+            "resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch.object(mcp_app, "resolve_request_user_id", return_value=user_id),

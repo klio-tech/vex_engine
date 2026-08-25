@@ -35,14 +35,17 @@ def seams():
     )
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("acme", "agent-1", "free", None),
         ),
         # ``forget`` resolves the principal via the plain ``resolve_principal``
         # (shared with the older single-memory path), not ``resolve_principal_plan``
         # used by the rest of the artifact tools — patch both so ``_ctx()``
         # (which carries no ``X-Vex-Key``) authenticates for every tool.
-        patch("app.mcp_app.resolve_principal", return_value=("acme", "agent-1")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=("acme", "agent-1", "free", None),
+        ),
         patch("app.mcp_app.get_plan_config", return_value=plan),
         patch("app.mcp_app.SessionLocal", MagicMock()) as session_local,
         patch("app.mcp_app.artifacts") as af,
@@ -153,7 +156,7 @@ async def test_auth_failure_returns_a_clean_error_not_an_exception():
     from fastapi import HTTPException
 
     with patch(
-        "app.mcp_app.resolve_principal_plan",
+        "app.mcp_app.resolve_active_principal",
         side_effect=HTTPException(status_code=401, detail="bad key"),
     ):
         result = await _tool("artifact_put")(

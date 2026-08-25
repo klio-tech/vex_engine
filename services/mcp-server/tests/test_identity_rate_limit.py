@@ -1,7 +1,7 @@
 """One key validation per request, and a 429 that stays a 429.
 
 A key-path MCP tool body resolves the caller twice: once for the tenant
-principal (``resolve_principal_plan``) and once for the human
+principal (now ``resolve_active_principal``) and once for the human
 (``resolve_request_user_id``). Both used to reach ``verify_api_key``
 independently, and ``KeyValidator.validate`` appends to the sliding-window
 rate counter on EVERY call — the entry cache short-circuits the database
@@ -26,7 +26,7 @@ follows the tool bodies wherever those names are imported from.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -68,8 +68,15 @@ class _CountingValidator:
 
 
 def _tool_call(request):
-    """Exactly what a key-path MCP tool body does to resolve its caller."""
-    principal = mcp_app.resolve_principal_plan(request)
+    """Exactly what a key-path MCP tool body does to resolve its caller.
+
+    The bound name is ``resolve_active_principal`` since the node wiring: the
+    wrapper consults the principal twice internally (once directly, once
+    inside ``resolve_active_org``), which is exactly why this test matters --
+    the per-request memo must keep that at ONE key validation. The session is
+    a stand-in: without a node header it is never touched.
+    """
+    principal = mcp_app.resolve_active_principal(request, MagicMock())
     user_id = mcp_app.resolve_request_user_id(request)
     return principal, user_id
 
@@ -128,7 +135,7 @@ def test_a_second_resolution_reuses_the_first_answer():
     with patch("app.auth.get_validator", return_value=validator):
         first = mcp_app.resolve_request_user_id(request)
         second = mcp_app.resolve_request_user_id(request)
-        third = mcp_app.resolve_principal_plan(request)
+        third = mcp_app.resolve_active_principal(request, MagicMock())
 
     assert first == second == USER
     assert third[0] == "acme"

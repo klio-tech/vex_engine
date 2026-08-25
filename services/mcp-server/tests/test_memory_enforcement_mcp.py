@@ -20,7 +20,7 @@ async def test_write_blocked_returns_error_dict():
     with (
         patch.object(
             mcp_app,
-            "resolve_principal_plan",
+            "resolve_active_principal",
             return_value=("org-1", "a1", "free", None),
         ),
         patch.object(
@@ -44,7 +44,7 @@ async def test_write_records_only_when_stored():
     with (
         patch.object(
             mcp_app,
-            "resolve_principal_plan",
+            "resolve_active_principal",
             return_value=("org-1", "a1", "free", None),
         ),
         patch.object(mcp_app, "check_memory_quota", return_value=False),
@@ -65,7 +65,7 @@ async def test_write_skips_record_when_deduped():
     with (
         patch.object(
             mcp_app,
-            "resolve_principal_plan",
+            "resolve_active_principal",
             return_value=("org-1", "a1", "free", None),
         ),
         patch.object(mcp_app, "check_memory_quota", return_value=False),
@@ -86,7 +86,7 @@ async def test_recall_blocked_returns_error_dict():
     with (
         patch.object(
             mcp_app,
-            "resolve_principal_plan",
+            "resolve_active_principal",
             return_value=("org-1", "a1", "free", None),
         ),
         patch.object(
@@ -111,7 +111,7 @@ async def test_recall_records_usage_on_success():
     with (
         patch.object(
             mcp_app,
-            "resolve_principal_plan",
+            "resolve_active_principal",
             return_value=("org-1", "a1", "free", None),
         ),
         patch.object(mcp_app, "check_memory_quota", return_value=False),
