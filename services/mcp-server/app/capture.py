@@ -882,20 +882,20 @@ async def capture_event(
                     db, org_id=org_id, project_id=project_id, user_id=user_id
                 )
             )
-        branch_id = await anyio.to_thread.run_sync(
-            lambda: _capture_branch_id(
-                db,
-                org_id=org_id,
-                project_id=project_id,
-                user_id=user_id,
-                git_branch=req.git_branch,
+        # See the transcript route: branch binding only where the project
+        # opted into project-visible capture. The branch must never widen a
+        # private capture.
+        branch_id = None
+        if scope == "project":
+            branch_id = await anyio.to_thread.run_sync(
+                lambda: _capture_branch_id(
+                    db,
+                    org_id=org_id,
+                    project_id=project_id,
+                    user_id=user_id,
+                    git_branch=req.git_branch,
+                )
             )
-        )
-        if branch_id is not None:
-            # Branch rows carry scope='project' (global constraint, enforced
-            # by write_scoped_memory): a branch is pushed-branch visible to
-            # project members — a draft OF THE PROJECT, not a private note.
-            scope = "project"
         over_cap = await anyio.to_thread.run_sync(
             lambda: _check_memory_quota_402(
                 db, org_id, key_info.plan, "memory", key_info.plan_overrides
@@ -995,18 +995,25 @@ async def capture_transcript(
                     db, org_id=org_id, project_id=project_id, user_id=user_id
                 )
             )
-        branch_id = await anyio.to_thread.run_sync(
-            lambda: _capture_branch_id(
-                db,
-                org_id=org_id,
-                project_id=project_id,
-                user_id=user_id,
-                git_branch=req.git_branch,
+        # Branch binding is gated on the project having OPTED INTO
+        # project-visible capture (default_scope='project', migration 047).
+        # Nearly every developer is on a git feature branch nearly all the
+        # time, so letting the branch's presence force scope='project' would
+        # silently widen every private hook capture to the whole project --
+        # the declared-scope-discarded defect class, again. A private capture
+        # stays private and unbranched; a branch is a draft OF THE PROJECT,
+        # and only exists where captures are project-visible to begin with.
+        branch_id = None
+        if scope == "project":
+            branch_id = await anyio.to_thread.run_sync(
+                lambda: _capture_branch_id(
+                    db,
+                    org_id=org_id,
+                    project_id=project_id,
+                    user_id=user_id,
+                    git_branch=req.git_branch,
+                )
             )
-        )
-        if branch_id is not None:
-            # Same rule as /capture/event: branch rows carry scope='project'.
-            scope = "project"
         session_id = _capture_session_id(
             org_id, agent_id, req.session_id, user_id=user_id
         )

@@ -321,7 +321,7 @@ def _post_transcript(client, **extra):
     return client.post("/capture/transcript", json=payload)
 
 
-def test_transcript_git_branch_binds_writes_to_the_branch():
+def test_transcript_branch_never_widens_a_private_capture():
     write = AsyncMock(return_value={"stored": True})
     ensure_branch = MagicMock(return_value=dict(BRANCH_ROW))
 
@@ -339,17 +339,14 @@ def test_transcript_git_branch_binds_writes_to_the_branch():
         resp = _post_transcript(_client(user_id=USER), git_branch="feat/x")
 
     assert resp.status_code == 200
-    ensure_branch.assert_called_once()
-    kwargs = ensure_branch.call_args.kwargs
-    assert kwargs["org_id"] == "test-org"
-    assert kwargs["project_id"] == "proj-1"
-    assert kwargs["name"] == "feat/x"
-    assert kwargs["created_by"] == USER
+    # The fixture's project resolves capture scope to 'private' (the 047
+    # default). A git branch must NOT widen that: nearly every developer
+    # is on a feature branch nearly all the time, and forcing 'project'
+    # here silently publishes private hook captures to the whole team.
+    ensure_branch.assert_not_called()
     for call in write.await_args_list:
-        assert call.kwargs["branch_id"] == BRANCH_ROW["id"]
-        # Branch rows carry scope='project' (global constraint): a branch is
-        # pushed-branch visible to project members, not a private draft.
-        assert call.kwargs["scope"] == "project"
+        assert call.kwargs["branch_id"] is None
+        assert call.kwargs["scope"] == "private"
 
 
 @pytest.mark.parametrize("default_branch", ["main", "Main", "master", "MASTER"])
@@ -437,7 +434,12 @@ def test_event_git_branch_binds_the_write():
     write = AsyncMock(return_value={"stored": True})
     ensure_branch = MagicMock(return_value=dict(BRANCH_ROW))
 
-    patches = _capture_patches(write, ensure_branch)
+    patches = list(_capture_patches(write, ensure_branch))
+    patches[5] = patch.object(
+        capture.project_scope,
+        "resolve_capture_scope",
+        MagicMock(return_value="project"),
+    )
     with (
         patches[0],
         patches[1],
@@ -483,3 +485,71 @@ def test_event_without_git_branch_is_byte_identical(client):
     assert resp.status_code == 200
     ensure_branch.assert_not_called()
     assert write.await_args.kwargs["branch_id"] is None
+
+
+def test_transcript_binds_the_branch_when_the_project_opted_into_project_scope():
+    """The legitimate case: default_scope='project' (the project opted in via
+    migration 047), so the capture is project-visible anyway and the branch
+    binds -- a draft of the project, on the project's context branch."""
+    write = AsyncMock(return_value={"stored": True})
+    ensure_branch = MagicMock(return_value=BRANCH_ROW)
+
+    patches = list(_capture_patches(write, ensure_branch))
+    patches[5] = patch.object(
+        capture.project_scope,
+        "resolve_capture_scope",
+        MagicMock(return_value="project"),
+    )
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patches[5],
+        patches[6],
+        patches[7],
+    ):
+        resp = _post_transcript(_client(user_id=USER), git_branch="feat/x")
+
+    assert resp.status_code == 200
+    ensure_branch.assert_called_once()
+    assert ensure_branch.call_args.kwargs["name"] == "feat/x"
+    for call in write.await_args_list:
+        assert call.kwargs["branch_id"] == BRANCH_ROW["id"]
+        assert call.kwargs["scope"] == "project"
+
+
+def test_event_branch_never_widens_a_private_capture():
+    """The event-route twin of the transcript privacy fence. The two routes
+    have separate gate sites in capture.py; a mutation at either one must be
+    caught by its own test, not its sibling's."""
+    write = AsyncMock(return_value={"stored": True})
+    ensure_branch = MagicMock(return_value=BRANCH_ROW)
+
+    patches = _capture_patches(write, ensure_branch)
+    with (
+        patches[0],
+        patches[1],
+        patches[2],
+        patches[3],
+        patches[4],
+        patches[5],
+        patches[6],
+        patches[7],
+    ):
+        resp = _client(user_id=USER).post(
+            "/capture/event",
+            json={
+                "content": "decided to use the pooled endpoint",
+                "memory_type": "decision",
+                "git_remote": "git@example.com:klio.git",
+                "git_branch": "feat/x",
+            },
+        )
+
+    assert resp.status_code == 200
+    ensure_branch.assert_not_called()
+    for call in write.await_args_list:
+        assert call.kwargs["branch_id"] is None
+        assert call.kwargs["scope"] == "private"
