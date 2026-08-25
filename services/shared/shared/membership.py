@@ -115,3 +115,121 @@ def may_reach(
         o["org_id"] == cleaned_org
         for o in reachable_orgs(supabase, tsdb, user_id=cleaned_user)
     )
+
+
+#: Is there already a personal node for this user?
+_PERSONAL_BY_OWNER_SQL = text(
+    """
+    SELECT org_id
+    FROM organizations
+    WHERE personal_owner_user_id = :user_id
+    LIMIT 1
+    """
+)
+
+#: ``account_slug`` is UNIQUE, so a row may already exist for this slug from
+#: some earlier path. Look before inserting rather than catching IntegrityError.
+_ORG_BY_SLUG_SQL = text(
+    """
+    SELECT org_id, personal_owner_user_id
+    FROM organizations
+    WHERE account_slug = :account_slug
+    LIMIT 1
+    """
+)
+
+#: Adopt an existing, unowned org row for this slug as the user's personal node.
+#: The ``IS NULL`` guard is repeated in SQL so a concurrent claim loses rather
+#: than being overwritten between the SELECT and the UPDATE.
+_ADOPT_PERSONAL_SQL = text(
+    """
+    UPDATE organizations
+       SET personal_owner_user_id = :user_id,
+           updated_at = now()
+     WHERE org_id = :org_id
+       AND personal_owner_user_id IS NULL
+    RETURNING org_id
+    """
+)
+
+_ENSURE_PERSONAL_SQL = text(
+    """
+    INSERT INTO organizations (org_id, name, account_slug, personal_owner_user_id)
+    VALUES (:org_id, :name, :account_slug, :user_id)
+    ON CONFLICT (org_id) DO UPDATE
+        SET personal_owner_user_id = EXCLUDED.personal_owner_user_id
+    RETURNING org_id
+    """
+)
+
+
+def ensure_personal_org(tsdb: Any, *, user_id: str, account_slug: str) -> str:
+    """The org row backing this user's personal node, created if absent.
+
+    Takes the engine connection only: it writes ``organizations``, which is
+    engine-side. Membership lives in Supabase and is not consulted here — the
+    caller has already established who the user is.
+
+    Idempotent, and enforced as such by the partial unique index migration 048
+    puts on ``personal_owner_user_id``. A second personal node for one user
+    would split their own memory in two, which is invisible until they notice
+    something they wrote is gone.
+
+    Args:
+        tsdb: A connection to the engine's own database.
+        user_id: The Supabase user UUID.
+        account_slug: The slug of that user's personal Supabase account.
+
+    Returns:
+        The ``org_id`` of the personal node.
+
+    Raises:
+        ValueError: If either identifier is blank, or if the slug already
+            belongs to somebody else's personal node.
+    """
+    cleaned_user = _clean(user_id)
+    cleaned_slug = _clean(account_slug)
+    if cleaned_user is None or cleaned_slug is None:
+        raise ValueError("ensure_personal_org needs a user_id and an account_slug")
+
+    existing = tsdb.execute(_PERSONAL_BY_OWNER_SQL, {"user_id": cleaned_user}).first()
+    if existing is not None:
+        return existing.org_id
+
+    # A row may already exist for this slug — account_slug is UNIQUE, so
+    # inserting a second one would fail outright. Adopt it if it is unowned;
+    # refuse if it is somebody else's, because handing this caller that row
+    # would hand them another person's memory.
+    by_slug = tsdb.execute(_ORG_BY_SLUG_SQL, {"account_slug": cleaned_slug}).first()
+    if by_slug is not None:
+        owner = _clean(by_slug.personal_owner_user_id)
+        if owner is not None and owner != cleaned_user:
+            raise ValueError(
+                f"account_slug {cleaned_slug!r} is already another user's personal node"
+            )
+        adopted = tsdb.execute(
+            _ADOPT_PERSONAL_SQL,
+            {"org_id": by_slug.org_id, "user_id": cleaned_user},
+        ).first()
+        if adopted is None:
+            raise ValueError(
+                f"account_slug {cleaned_slug!r} was claimed by another user concurrently"
+            )
+        return adopted.org_id
+
+    # The whole user id, not a prefix: "personal_" + a 36-char UUID is 45
+    # characters and org_id is String(64), so there is no reason to truncate.
+    # An 8-hex-char prefix collides at birthday odds around 65k users, and the
+    # partial unique index would then reject the second user's personal node --
+    # a signup failure with no obvious cause.
+    org_id = f"personal_{cleaned_user}"
+    row = tsdb.execute(
+        _ENSURE_PERSONAL_SQL,
+        {
+            "org_id": org_id,
+            "name": cleaned_slug,
+            "account_slug": cleaned_slug,
+            "user_id": cleaned_user,
+        },
+    ).first()
+    return row.org_id
