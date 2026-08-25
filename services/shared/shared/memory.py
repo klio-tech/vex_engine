@@ -245,6 +245,14 @@ class MemoryRecord:
     absence costs them nothing. A caller that DOES read this back and pass it
     to :func:`supersede_with_revision` gets the optimistic-concurrency
     guarantee; one that ignores it keeps writing exactly as before."""
+    branch_id: Optional[str] = None
+    """The context branch this row lives on (migration 050), or ``None`` for
+    main — ``branch_id IS NULL`` *is* main, so ``None`` here is the normal
+    state of almost every row, not an absence of information. Populated only
+    by callers that select the column (branch-aware recall and its graph
+    expansion); ``None`` for records built by paths that never did, which is
+    indistinguishable from main on purpose: those paths only ever read main
+    rows."""
 
 
 # ---------------------------------------------------------------------------
@@ -917,7 +925,7 @@ def _row_to_record(row: tuple) -> MemoryRecord:
     Optional trailing columns (additive, read only if present so existing
     16-column callers are unaffected):
         space_id (index 16), project_id (index 17), user_id (index 18),
-        provenance (index 19), revision (index 20)
+        provenance (index 19), revision (index 20), branch_id (index 21)
 
     ``user_id`` and ``provenance`` are read positionally like the two before
     them, and every caller that selects them appends them in this order. A
@@ -926,7 +934,8 @@ def _row_to_record(row: tuple) -> MemoryRecord:
     falls back to the column's own default, ``EXTRACTED``. ``revision``
     (migration 043) follows the identical convention: absent → ``None``,
     present → stringified so it round-trips as JSON without a caller having to
-    know it started life as a ``UUID``.
+    know it started life as a ``UUID``. ``branch_id`` (migration 050) again
+    follows it: absent → ``None`` (main), present → stringified.
     """
     return MemoryRecord(
         id=row[0],
@@ -950,6 +959,7 @@ def _row_to_record(row: tuple) -> MemoryRecord:
         user_id=row[18] if len(row) > 18 else None,
         provenance=(row[19] if len(row) > 19 and row[19] is not None else "EXTRACTED"),
         revision=(str(row[20]) if len(row) > 20 and row[20] is not None else None),
+        branch_id=(str(row[21]) if len(row) > 21 and row[21] is not None else None),
     )
 
 
@@ -2234,14 +2244,16 @@ def _expand_via_graph(
     user_id: Optional[str],
     space_id: Optional[str],
     project_id: Optional[str],
+    branch_id: Optional[str] = None,
 ) -> list[MemoryRecord]:
     """Recall stage B+C: one-hop graph expansion, then the blended re-rank.
 
     Stage B calls :func:`shared.graph_store.neighbors` ONCE over the stage-A
     entry ids. Every argument that shapes visibility — scope, viewer, agent,
-    space/project filters — is forwarded verbatim, so the expansion evaluates
-    the SAME ladder in SQL and can never introduce a row the vector stage
-    would have been forbidden to return. Volume is bounded by
+    space/project filters, and the context-branch filter (main-only by
+    default; branch + main when the caller named one) — is forwarded
+    verbatim, so the expansion evaluates the SAME ladder in SQL and can never
+    introduce a row the vector stage would have been forbidden to return. Volume is bounded by
     :data:`GRAPH_EXPANSION_CAP` extra rows.
 
     Stage C re-ranks the merged set by ``0.70·similarity + 0.15·recency +
@@ -2280,6 +2292,7 @@ def _expand_via_graph(
             agent_id=agent_id,
             space_id=space_id,
             project_id=project_id,
+            branch_id=branch_id,
             limit=GRAPH_EXPANSION_CAP,
         )
     except Exception:
@@ -2400,9 +2413,10 @@ async def retrieve_memories_scoped(
     project_id: Optional[str] = None,
     limit: int = 10,
     extra_org_id: Optional[str] = None,
+    branch_id: Optional[str] = None,
 ) -> list[MemoryRecord]:
     """Brain recall across sessions, scoped to an org (and optionally an
-    agent / space / project).
+    agent / space / project / context branch).
 
     ``limit`` bounds the vector stage, NOT the returned list: graph expansion
     can append up to :data:`GRAPH_EXPANSION_CAP` connected records on top of
@@ -2520,6 +2534,20 @@ async def retrieve_memories_scoped(
             read there. This is a READ-ONLY widening; no write path accepts
             it. Graph expansion is NOT widened: it walks outward inside the
             active org alone, exactly as before.
+        branch_id: Context-branch opt-in (Track C). ``None`` — the default,
+            and the load-bearing one — reads MAIN only: every arm gains
+            ``branch_id IS NULL``, so a half-formed branch conclusion can
+            never surface as project truth. Naming a branch widens the
+            ACTIVE org's arm to ``(branch_id IS NULL OR branch_id =
+            :branch_id)`` — branch and main both live, never OTHER branches —
+            while the ``extra_org_id`` (personal) arm ALWAYS stays on main:
+            branches live under org projects, and a personal-node branch row
+            is a corruption, not a contribution. The filter is a row filter,
+            never an access path: every visibility-ladder arm still binds
+            unchanged, and the graph-expansion hop carries the same
+            predicate. The value is a resolved ``context_branches.id`` — the
+            caller (see ``_perform_recall``) has already resolved the name
+            against the project and checked it is open.
 
     Returns:
         A list of :class:`MemoryRecord` ordered by blended score (descending),
@@ -2646,7 +2674,20 @@ async def retrieve_memories_scoped(
                     "WHERE m.user_id = :user_id))"
                 )
             ladder = " OR ".join(arms)
-        return f"(org_id = :{org_param} AND ({ladder}))"
+        # The branch filter composes PER-ORG, exactly like the ladder: the
+        # active org opts into a named branch, the extra (personal) org NEVER
+        # does — branches live under org projects, so a branch-tagged row in
+        # the personal node is a corruption that must stay invisible. With no
+        # branch named, every arm reads main only (``branch_id IS NULL``):
+        # this clause is the load-bearing default the mutation check targets.
+        if branch_id is not None and org_param == "org_id":
+            branch_clause = "(branch_id IS NULL OR branch_id = :branch_id)"
+        else:
+            branch_clause = "branch_id IS NULL"
+        return f"(org_id = :{org_param} AND ({ladder}) AND {branch_clause})"
+
+    if branch_id is not None:
+        params["branch_id"] = branch_id
 
     if extra_org_id is None:
         tenancy_clause = _tenancy_and_ladder("org_id")
@@ -2735,7 +2776,7 @@ async def retrieve_memories_scoped(
                    memory_type, content, embedding, confidence,
                    sequence_number, scope, status, superseded_by,
                    metadata, created_at, updated_at, space_id, project_id,
-                   user_id, provenance, revision,
+                   user_id, provenance, revision, branch_id,
                    (1 - (embedding <=> :embedding)) AS relevance
             FROM session_memories
             WHERE {where}
@@ -2775,7 +2816,7 @@ async def retrieve_memories_scoped(
                memory_type, content, embedding, confidence,
                sequence_number, scope, status, superseded_by,
                metadata, created_at, updated_at, space_id, project_id,
-               user_id, provenance, revision,
+               user_id, provenance, revision, branch_id,
                ts_rank({document}, {query}) AS lexical_rank
         FROM session_memories
         WHERE {where}
@@ -2959,4 +3000,5 @@ async def retrieve_memories_scoped(
         user_id=user_id,
         space_id=space_id,
         project_id=project_id,
+        branch_id=branch_id,
     )

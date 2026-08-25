@@ -267,3 +267,33 @@ def test_the_fence_does_not_widen_the_scope_ladder(db):
         db, org_id=db.org_id, project_id=klio, limit=12, user_id=USER
     )
     assert rows == []
+
+
+# ── the SessionStart branch fence (Track C, Task C2) ──────────────────────
+
+
+def test_session_start_never_returns_branch_rows(db):
+    """The recency path carries the same main-only default as recall.
+
+    A branch row is a half-formed draft by definition, and this path has no
+    relevance signal at all — ``ORDER BY created_at DESC`` would surface the
+    freshest draft first, at the top of every session. ``branch_id IS NULL``
+    is the fence; no opt-in exists here on purpose (session start reads main,
+    always). No registry row is needed to prove it: the clause reads the
+    column, and ``branch_id`` is deliberately un-FK'd (the repo's cross-ref
+    convention), so a bare uuid stamps a branch row exactly as production
+    writes do.
+    """
+    klio = _project(db, name="Klio", path="/Users/x/Code/klio")
+    on_main = _memory(db, content="the proxy injects at SessionStart", project_id=klio)
+    on_branch = _memory(db, content="half-formed branch draft", project_id=klio)
+    db.execute(
+        text("UPDATE session_memories SET branch_id = :b WHERE id = :id"),
+        {"b": str(uuid.uuid4()), "id": on_branch},
+    )
+    db.commit()
+
+    rows = _recent_memories(
+        db, org_id=db.org_id, project_id=klio, limit=12, user_id=USER
+    )
+    assert [r["id"] for r in rows] == [on_main]

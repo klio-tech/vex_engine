@@ -634,6 +634,10 @@ def _recent_memories(
     observations stored as curator fuel and must not surface to agents at
     session start (mirrors the hidden-row contract of
     :func:`shared.memory.retrieve_memories_scoped`).
+    Context-branch rows (``branch_id IS NOT NULL``, Track C) are excluded the
+    same way — session start reads MAIN only, with no opt-in here on purpose:
+    this path ranks by nothing but the clock, so a branch's freshest
+    half-formed draft would otherwise open every session.
     When ``project_id`` is given, rows for that project OR unfiled (``NULL``)
     rows surface — the same NULL-surfacing semantics as
     :func:`shared.memory.retrieve_memories_scoped`.
@@ -716,6 +720,7 @@ def _recent_memories(
               AND {scope_sql}
               AND status = 'active'
               AND recall_hidden = FALSE
+              AND branch_id IS NULL
               AND {project_sql}
             ORDER BY created_at DESC
             LIMIT :limit

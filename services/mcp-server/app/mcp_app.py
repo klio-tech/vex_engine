@@ -55,6 +55,7 @@ from shared import (
     artifact_storage,
     artifacts,
     brain,
+    branches,
     claims,
     graph_store,
     project_scope,
@@ -1639,7 +1640,7 @@ def _serialize_record(
     ``remember``/``decide``/``note``/``observe`` call gets the
     optimistic-concurrency guarantee (:func:`shared.memory.
     supersede_with_revision`); ``None`` when the record was built by a path
-    that never selected the column (graph-expanded rows, for one), which
+    that never selected the column, which
     structural compression's null-key strip erases from the wire the same way
     it erases an absent ``relevance``.
     """
@@ -1824,6 +1825,7 @@ async def _perform_recall(
     scope: str,
     space: Optional[str],
     project: Optional[str],
+    branch: Optional[str] = None,
     limit: int = 10,
 ) -> dict[str, Any]:
     """Shared body for the Klio ``recall`` read tool.
@@ -1856,6 +1858,17 @@ async def _perform_recall(
             fail-open fallback (unresolvable header yields org-wide recall, not
             an error — explicit ``project`` args keep their strict warn-and-empty
             semantics).
+        branch: Optional context-branch name (Track C). ``None``, blank, or
+            ``main`` (case-insensitive) is the DEFAULT read — main only,
+            because main is the absence of a branch and never a registry row.
+            Any other name resolves via :func:`shared.branches.get_branch`
+            against the RESOLVED project, mirroring ``space``'s strict
+            semantics: no project resolvable → warn-and-empty (a branch
+            always belongs to a project), unknown/closed branch →
+            warn-and-empty. Strict on purpose — silently dropping the filter
+            would answer from main while the caller believes it is reading
+            the branch, the exact inversion of the main-only default's
+            failure mode.
         limit: How many SEARCH MATCHES to return (clamped to 1–50). It is not
             a bound on the response: :func:`shared.memory.retrieve_memories_scoped`
             adds up to :data:`shared.memory.GRAPH_EXPANSION_CAP` further
@@ -2001,6 +2014,48 @@ async def _perform_recall(
                 lambda: resolve_project_from_request(request, db, org_id=org_id)
             )
 
+        # Resolve the optional context-branch filter (Track C). ``main``
+        # (case-insensitive) and blank are the DEFAULT read, not a lookup:
+        # main is the absence of a branch (``branch_id IS NULL``), never a
+        # registry row, so naming it must neither error nor consult the
+        # registry. Any other name is strict like ``space``: a branch always
+        # belongs to a project, so no resolved project is warn-and-empty, and
+        # so is a name with no OPEN branch behind it — silently dropping the
+        # filter would answer from main while the caller believes it is
+        # reading the branch. Membership is NOT checked here: the branch id
+        # is a row filter inside retrieve_memories_scoped, whose visibility
+        # ladder still decides — in SQL — whether the caller may see any
+        # project row at all (pushed-branch visibility rides that arm).
+        stripped_branch = branch.strip() if branch is not None else ""
+        branch_row: Optional[dict[str, Any]] = None
+        if stripped_branch and stripped_branch.lower() != "main":
+            if project_id is None:
+                return {
+                    "memories": [],
+                    "count": 0,
+                    "warning": (
+                        f"branch '{stripped_branch}' needs a project: pass "
+                        "project= or send the X-Vex-Project header"
+                    ),
+                    "guidance": RECALL_WRITE_NUDGE,
+                }
+            resolved_project_id = project_id
+            branch_row = await anyio.to_thread.run_sync(
+                lambda: branches.get_branch(
+                    db,
+                    org_id=org_id,
+                    project_id=resolved_project_id,
+                    name=stripped_branch,
+                )
+            )
+            if branch_row is None:
+                return {
+                    "memories": [],
+                    "count": 0,
+                    "warning": f"unknown branch: {stripped_branch}",
+                    "guidance": RECALL_WRITE_NUDGE,
+                }
+
         # The personal-node union (Track B, Task B3): stack the caller's
         # personal org under the active org so an agent attached to a team
         # still recalls its human's own memories, READ-ONLY. Three conditions,
@@ -2045,6 +2100,7 @@ async def _perform_recall(
             project_id=project_id,
             limit=min(max(limit, 1), 50),
             extra_org_id=extra_org_id,
+            branch_id=branch_row["id"] if branch_row is not None else None,
         )
         # Best-effort recall activity log; it swallows its own errors so a
         # logging failure can never break the recall. Offloaded like every
@@ -2100,6 +2156,17 @@ async def _perform_recall(
                 memory["source"] = (
                     "personal" if record.org_id == extra_org_id else "active"
                 )
+            if (
+                branch_row is not None
+                and record.branch_id is not None
+                and record.branch_id == branch_row["id"]
+            ):
+                # Which side of the fork the row came from, by NAME (the id
+                # is an internal reference the agent never asked for). Only
+                # rows on the named branch are tagged; main rows stay
+                # untagged, and a no-branch recall's payload is
+                # byte-identical to before this field existed.
+                memory["source_branch"] = branch_row["name"]
             memories.append(memory)
         payload = {
             "memories": memories,
@@ -3440,8 +3507,8 @@ def _register_tools(mcp: FastMCP) -> None:
         description=(
             "Retrieve relevant memories for the current org/team. "
             "Args: query (required); optional scope ('org' default | "
-            "'agent' | 'private'), space, project, limit. Set the X-Vex-Agent "
-            "header to scope by agent. "
+            "'agent' | 'private'), space, project, branch, limit. Set the "
+            "X-Vex-Agent header to scope by agent. "
             "Search combines meaning and exact wording, so a rare literal — an "
             "identifier, an error string, a flag name — can be quoted verbatim "
             "and a paraphrase still works. "
@@ -3481,6 +3548,21 @@ def _register_tools(mcp: FastMCP) -> None:
             Optional[str],
             Field(description="Optional project identifier to scope the search."),
         ] = None,
+        branch: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    "Optional context-branch name to read alongside main. "
+                    "Default (omitted, blank, or 'main') reads main only — "
+                    "branch drafts never surface unless named. Naming a "
+                    "branch needs a project (project= or the X-Vex-Project "
+                    "header) and returns branch + main together, with branch "
+                    "rows tagged `source_branch`. An unknown or closed "
+                    "branch returns empty with a warning rather than "
+                    "silently reading main."
+                )
+            ),
+        ] = None,
         limit: Annotated[
             int,
             Field(
@@ -3501,7 +3583,13 @@ def _register_tools(mcp: FastMCP) -> None:
         ] = 10,
     ) -> dict[str, Any]:
         return await _perform_recall(
-            ctx, query=query, scope=scope, space=space, project=project, limit=limit
+            ctx,
+            query=query,
+            scope=scope,
+            space=space,
+            project=project,
+            branch=branch,
+            limit=limit,
         )
 
     @mcp.tool(
