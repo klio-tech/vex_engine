@@ -272,8 +272,14 @@ The answer already exists in the OAuth path (`oauth.py:389-402`) but is buried i
 **Interfaces:**
 - Consumes: `shared.scopes` (not directly, but Task 1 must land first so the tree is stable).
 - Produces:
-  - `reachable_orgs(db, *, user_id: str) -> list[dict]` — each `{"org_id": str, "account_slug": str, "is_personal": bool}`, ordered personal-first then by slug.
-  - `may_reach(db, *, user_id: str, org_id: str) -> bool`.
+  - `reachable_orgs(supabase, tsdb, *, user_id: str) -> list[dict]` — each `{"org_id": str, "account_slug": str, "is_personal": bool}`, ordered personal-first then by slug.
+  - `may_reach(supabase, tsdb, *, user_id: str, org_id: str) -> bool`.
+
+  **Corrected after implementation (`bc7759d`).** `public.accounts*` live behind
+  `SUPABASE_DATABASE_URL`; `organizations` lives behind `DATABASE_URL`. They are
+  different servers, so these take two connections and join in Python, as
+  `app.oauth.GrantResolver` does. The original single-JOIN version passed its
+  tests only because the local fixture puts both in one database.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -478,7 +484,7 @@ Four call sites hardcode `is_personal_account = false`, so a user's personal acc
 
 **Interfaces:**
 - Consumes: `shared.membership.reachable_orgs` from Task 2.
-- Produces: `shared.membership.ensure_personal_org(db, *, user_id: str, account_slug: str) -> str` returning the `org_id`.
+- Produces: `shared.membership.ensure_personal_org(tsdb, *, user_id: str, account_slug: str) -> str` returning the `org_id`. Takes the **engine** connection only — it writes `organizations`, which is engine-side.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -785,6 +791,8 @@ def resolve_active_org(request: Request, db: Any) -> str:
             an org is called. The project tools answer the same way.
     """
     from shared.membership import may_reach  # noqa: PLC0415
+
+    # may_reach takes (supabase, tsdb): see bc7759d. The caller supplies both.
 
     from app.headers import node_header  # noqa: PLC0415
 
