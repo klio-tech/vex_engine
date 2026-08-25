@@ -75,6 +75,21 @@ def _engines() -> tuple[Optional[Any], Optional[Any]]:
     return _supabase_engine, _tsdb_engine
 
 
+def supabase_engine() -> Optional[Any]:
+    """The Supabase engine, or ``None`` when no directory is configured.
+
+    Membership resolution (``shared.membership``) needs a Supabase connection
+    and this module already owns the only bounded, pooled one in the process.
+    A second ``create_engine`` for the same URL elsewhere would double the
+    connection footprint and give the boundary check its own, differently
+    configured timeouts.
+
+    ``None`` is not "skip the check": every caller must fail closed on it.
+    """
+    supabase, _tsdb = _engines()
+    return supabase
+
+
 def shutdown_directory() -> None:
     """Dispose both engines. Called at app shutdown."""
     global _supabase_engine, _tsdb_engine

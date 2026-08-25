@@ -53,10 +53,12 @@ from __future__ import annotations
 import logging
 
 from app.headers import agent_header
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any, Optional
 
 from fastapi import HTTPException, Request
-from shared.auth import KeyInfo
+from shared.auth import KeyInfo, normalize_agent_id
 
 logger = logging.getLogger(__name__)
 
@@ -247,11 +249,21 @@ def resolve_principal_plan(request: Request) -> tuple[str, str, str, Optional[di
 
     principal = _oauth_principal_from(request)
     if principal is not None:
-        agent_id = agent_header(request) or _oauth_agent_id(request, principal)
+        # normalize_agent_id, not `or DEFAULT`: agents.agent_id is VARCHAR(128)
+        # and a primary key, the header is client-declared, and the derived
+        # oauth:<user8>/<slug> id is built from the client-declared
+        # clientInfo.name -- so both arms are caller-influenced and unbounded
+        # without it. A blank header also has to fall through to the default,
+        # which `or` cannot do: "   " is truthy and would become the principal
+        # that dedup and agent-scoped recall then key on.
+        agent_id = normalize_agent_id(
+            agent_header(request) or _oauth_agent_id(request, principal),
+            default=DEFAULT_AGENT_ID,
+        )
         return principal.org_id, agent_id, principal.plan, principal.plan_overrides
 
     key_info = request_key_info(request)
-    agent_id = agent_header(request) or DEFAULT_AGENT_ID
+    agent_id = normalize_agent_id(agent_header(request), default=DEFAULT_AGENT_ID)
     return key_info.org_id, agent_id, key_info.plan, key_info.plan_overrides
 
 
@@ -282,3 +294,176 @@ def _oauth_principal(request: Request) -> Optional[Any]:
         )
         return None
     return candidate if isinstance(candidate, OAuthPrincipal) else None
+
+
+@contextmanager
+def _workspace_connection(supplied: Optional[Any]) -> Iterator[Optional[Any]]:
+    """Yield a workspace DB connection for the membership check.
+
+    ``supplied`` is honoured as-is and NOT closed — it belongs to the caller.
+    Otherwise one is borrowed from :mod:`app.workspace_db`'s pooled engine and
+    returned to the pool on the way out.
+
+    Yields ``None`` when no workspace DB is configured, or when the connection
+    could not be opened. Both are "the check cannot run", which every caller
+    must read as "not reachable" rather than "assume yes".
+    """
+    if supplied is not None:
+        yield supplied
+        return
+
+    from app.workspace_db import workspace_engine  # noqa: PLC0415
+
+    try:
+        engine = workspace_engine()
+    except Exception:
+        logger.warning(
+            "node selection: the workspace DB engine could not be built; "
+            "treating every selected node as unreachable",
+            exc_info=True,
+        )
+        yield None
+        return
+
+    if engine is None:
+        logger.warning(
+            "node selection: WORKSPACE_DATABASE_URL is not configured; "
+            "no node can be selected (fail closed)"
+        )
+        yield None
+        return
+
+    try:
+        with engine.connect() as conn:
+            yield conn
+    except Exception:
+        logger.warning(
+            "node selection: the workspace DB connection failed; treating the "
+            "selected node as unreachable",
+            exc_info=True,
+        )
+        yield None
+
+
+def resolve_active_org(
+    request: Request, db: Any, *, workspace_db: Optional[Any] = None
+) -> str:
+    """The org node this request acts in.
+
+    No selection means the key's own org, so every existing caller keeps
+    today's behaviour exactly and a deployment with no Supabase directory is
+    untouched — that path never reaches for one.
+
+    A selection is checked against the caller's membership HERE, on this call.
+    Not remembered from a switch, and not memoized on ``request.state``: a
+    session outlives a revocation, so a remembered answer is the same as no
+    answer. The cost is one round trip per selecting call; the cost of the
+    alternative is one tenant reading another's memory.
+
+    Args:
+        request: The inbound request. The node is read from ``X-Klio-Node``
+            (or the legacy ``X-Vex-Node``) via :mod:`app.headers`.
+        db: A connection or Session against the engine's own database, where
+            ``organizations`` lives — normally the tool body's ``SessionLocal()``.
+        workspace_db: A connection against the workspace database, where
+            ``workspaces`` and ``workspace_members`` live. Defaults to one
+            borrowed from :mod:`app.workspace_db`. The two are separate servers
+            in production, which is why this cannot be one connection.
+
+    Returns:
+        The ``org_id`` to act in.
+
+    Raises:
+        HTTPException: 404 when the caller may not reach the named node, when
+            they cannot be attributed to a person, or when the membership check
+            could not run. Not 403: a 403 confirms the node exists, which tells
+            an outsider what an org is called. The project tools answer the
+            same way (``mcp_app.py:2929-2933``).
+        HTTPException: 429 propagated from identity resolution — a rate-limited
+            caller holds a valid key and must not be reported as nobody.
+    """
+    from shared.membership import may_reach  # noqa: PLC0415
+
+    from app.headers import node_header  # noqa: PLC0415
+
+    org_id, _agent_id, _plan, _overrides = resolve_principal_plan(request)
+
+    requested = node_header(request)
+    requested = requested.strip() if requested else None
+    if not requested or requested == org_id:
+        return org_id
+
+    user_id = resolve_request_user_id(request)
+    if user_id:
+        with _workspace_connection(workspace_db) as conn:
+            if conn is not None:
+                if may_reach(conn, db, user_id=user_id, org_id=requested):
+                    return requested
+                provisioned = _provision_selected_workspace(
+                    conn, db, user_id=user_id, requested=requested
+                )
+                if provisioned is not None:
+                    return provisioned
+
+    logger.info("node selection refused: the caller may not reach the node they named")
+    raise HTTPException(status_code=404, detail="unknown node")
+
+
+def _provision_selected_workspace(
+    workspace_db: Any, db: Any, *, user_id: str, requested: str
+) -> Optional[str]:
+    """Selection is the provisioning moment.
+
+    ``reachable_orgs`` omits a workspace with no ``organizations`` row — the
+    engine cannot store memory for a node it has no id for — so a header that
+    names such a workspace falls through ``may_reach``. When the workspace DB
+    says the caller is an active member of it, the engine org is created (or
+    a legacy org with the same slug adopted) here, on this first selection.
+
+    The header may name the workspace three ways, all matched against the
+    caller's OWN memberships fetched from the workspace DB — never used as a
+    cross-database join key: the workspace UUID, the predicted engine org id
+    (``ws_<uuid>``), or the workspace slug (the address a human actually
+    knows).
+
+    Returns ``None`` when the header names no workspace the caller is a member
+    of — the caller then sees the same 404 as any other refusal. A refusal
+    from the ensure itself (a slug held by an org linked elsewhere, a second
+    personal node) is also answered as ``None`` → 404 rather than a 500: to
+    this caller the node is simply not available, and the conflict detail
+    belongs in the log, not in an existence oracle.
+    """
+    from shared.membership import (  # noqa: PLC0415
+        ensure_org_for_workspace,
+        member_workspaces,
+    )
+
+    matched = None
+    for workspace in member_workspaces(workspace_db, user_id=user_id):
+        candidates = (
+            workspace["workspace_id"],
+            f"ws_{workspace['workspace_id']}",
+            workspace["slug"],
+        )
+        if requested in candidates:
+            matched = workspace
+            break
+    if matched is None:
+        return None
+
+    try:
+        return ensure_org_for_workspace(
+            db,
+            workspace_id=matched["workspace_id"],
+            slug=matched["slug"],
+            is_personal=matched["is_personal"],
+            owner_user_id=matched["owner_user_id"],
+        )
+    except ValueError:
+        logger.warning(
+            "node selection: workspace %s is reachable but could not be "
+            "provisioned; refusing the selection",
+            matched["workspace_id"],
+            exc_info=True,
+        )
+        return None

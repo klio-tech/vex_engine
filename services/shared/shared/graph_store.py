@@ -33,6 +33,7 @@ from typing import Any, NamedTuple, Optional
 
 from sqlalchemy import text
 
+from shared import scopes
 from shared.memory import MemoryRecord, _row_to_record
 
 logger = logging.getLogger("agentguard.shared.graph_store")
@@ -386,7 +387,7 @@ def _ladder_clause(
         )
     if scope == "agent" and agent_id is None:
         raise ValueError("agent_id is required when scope='agent'")
-    if scope not in ("org", "agent"):
+    if scope not in scopes.GRAPH_SCOPES:
         raise ValueError(f"unknown scope: {scope!r}")
 
     params: dict[str, Any] = {}

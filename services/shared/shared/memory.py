@@ -24,7 +24,7 @@ import litellm
 from litellm import acompletion, aembedding
 from sqlalchemy import text
 
-from shared import embedding_prompt, lexical, metrics, ranking, stale
+from shared import embedding_prompt, lexical, metrics, ranking, scopes, stale
 from shared.embedding_prompt import ROLE_PASSAGE, ROLE_QUERY
 from shared.env_config import parse_float, parse_int
 from shared.redaction import redact
@@ -1708,7 +1708,7 @@ def _prepare_cas_write(
         Exception: whatever the redactor / metadata screener raise, re-raised
             after logging (fail closed — unscreened content is never stored).
     """
-    if scope not in ("org", "project", "private", "agent"):
+    if scope not in scopes.WRITABLE_SCOPES:
         raise ValueError(
             f"unsupported scope: {scope!r} (supersede_with_revision accepts "
             "'org', 'project', 'private' or 'agent')"
@@ -2520,24 +2520,23 @@ async def retrieve_memories_scoped(
             unknown value.
     """
     # Validate scope BEFORE the (expensive) embed call so bad input fails fast.
-    if scope == "org":
-        pass
-    elif scope == "private":
-        if not user_id:
-            # Fail rather than fall back to org: a caller asking for "mine"
-            # and silently receiving the team's brain is the wrong kind of
-            # surprise, and there is no correct owner to guess.
-            raise ValueError("user_id is required when scope='private'")
-    elif scope == "agent":
-        if agent_id is None:
-            raise ValueError("agent_id is required when scope='agent'")
-    elif scope == "session":
+    if scope == "session":
+        # Kept ahead of the set test: 'session' is a real column value, so it
+        # earns its own message pointing at retrieve_memories rather than the
+        # generic "unknown scope".
         raise ValueError(
             "scope='session' is not supported by retrieve_memories_scoped; "
             "use retrieve_memories for session-scoped reads"
         )
-    else:
+    if scope not in scopes.RECALL_SCOPES:
         raise ValueError(f"unknown scope: {scope!r}")
+    if scope == "private" and not user_id:
+        # Fail rather than fall back to org: a caller asking for "mine"
+        # and silently receiving the team's brain is the wrong kind of
+        # surprise, and there is no correct owner to guess.
+        raise ValueError("user_id is required when scope='private'")
+    if scope == "agent" and agent_id is None:
+        raise ValueError("agent_id is required when scope='agent'")
 
     # Availability: return the pooled connection BEFORE awaiting the
     # embedding. See :func:`release_connection` for the measurements.

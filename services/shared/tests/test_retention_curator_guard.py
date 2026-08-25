@@ -89,8 +89,6 @@ WHERE m.recall_hidden = TRUE
 """
 
 
-
-
 def _engine():
     """An engine whose connections resolve unqualified names to TEST_SCHEMA."""
     return sa.create_engine(
