@@ -207,6 +207,7 @@ class KeyValidator:
         database_url: str,
         required_scope: str,
         supabase_database_url: str | None = None,
+        workspace_database_url: str | None = None,
         cache_ttl_s: float = 60.0,
         flush_interval_s: float = 60.0,
     ) -> None:
@@ -226,6 +227,14 @@ class KeyValidator:
             pool_pre_ping=True,
             **engine_bounds(),
         )
+        self._workspace_engine: Engine | None = None
+        if workspace_database_url:
+            self._workspace_engine = create_engine(
+                workspace_database_url,
+                pool_size=2,
+                max_overflow=2,
+                pool_pre_ping=True,
+            )
         self._supabase_engine: Engine | None = None
         if supabase_database_url:
             self._supabase_engine = create_engine(
@@ -265,6 +274,7 @@ class KeyValidator:
         # validated with no Supabase engine configured, so the membership
         # check is silently skipped. See ``_query_plan_from_supabase``.
         self._warned_supabase_unconfigured = False
+        self._warned_workspace_unconfigured = False
         self._warn_lock = Lock()
 
     # ------------------------------------------------------------------
@@ -443,10 +453,71 @@ class KeyValidator:
         self._engine.dispose()
         if self._supabase_engine:
             self._supabase_engine.dispose()
+        if self._workspace_engine:
+            self._workspace_engine.dispose()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _query_membership_from_workspace(
+        self, workspace_id: str, user_id: str | None
+    ) -> bool | None:
+        """Is the key's owner an active member of the org's linked workspace?
+
+        ``None`` means "could not check, skip the guard": an unattributed key
+        (no uuid ``created_by``) or an unconfigured workspace engine -- the
+        Railway dark spare has no ``WORKSPACE_DATABASE_URL``, and a linked
+        org's key must not brick there. Same fail-open contract the Supabase
+        arm documents for its own unconfigured state.
+
+        A query FAILURE is different from an absent configuration: the
+        engine is configured and cannot answer, and treating that as
+        "member" would turn every workspace-DB outage into an authz bypass.
+        503, mirroring ``_query_plan_from_supabase``'s membership contract.
+        """
+        if user_id is None or not _is_uuid(user_id):
+            return None
+        if self._workspace_engine is None:
+            self._warn_workspace_unconfigured_once(workspace_id)
+            return None
+        try:
+            with self._workspace_engine.connect() as conn:
+                row = conn.execute(
+                    text(
+                        "SELECT EXISTS ("
+                        "SELECT 1 FROM workspace_members m "
+                        "JOIN workspaces w ON w.id = m.workspace_id "
+                        "WHERE w.id = CAST(:ws AS uuid) "
+                        "AND m.member_id = CAST(:uid AS uuid) "
+                        "AND m.is_active = true "
+                        "AND m.deleted_at IS NULL "
+                        "AND w.deleted_at IS NULL)"
+                    ),
+                    {"ws": workspace_id, "uid": user_id},
+                ).fetchone()
+            return bool(row[0]) if row is not None else False
+        except Exception:
+            logger.error(
+                "workspace membership check failed for workspace %s",
+                workspace_id,
+                exc_info=True,
+            )
+            raise AuthError(
+                503, "Authentication backend temporarily unavailable"
+            ) from None
+
+    def _warn_workspace_unconfigured_once(self, workspace_id: str) -> None:
+        with self._warn_lock:
+            if self._warned_workspace_unconfigured:
+                return
+            self._warned_workspace_unconfigured = True
+        logger.warning(
+            "org linked to workspace %s but WORKSPACE_DATABASE_URL is not "
+            "configured; the key-owner membership guard is skipped for "
+            "workspace-linked orgs on this process",
+            workspace_id,
+        )
 
     def _query_plan_from_supabase(
         self,
@@ -622,7 +693,7 @@ class KeyValidator:
                 result = conn.execute(
                     text(
                         """
-                        SELECT org_id, api_keys, account_slug
+                        SELECT org_id, api_keys, account_slug, workspace_id
                         FROM organizations
                         WHERE api_keys @> CAST(:filter AS jsonb)
                         """
@@ -657,6 +728,18 @@ class KeyValidator:
         plan_val, plan_overrides_val, is_member = self._query_plan_from_supabase(
             account_slug, org_id, user_id
         )
+        # A workspace-linked org answers membership from the workspace DB,
+        # not Supabase. The two disagree by construction: a key minted with a
+        # WORKSPACE user uuid does not exist in Supabase at all, so the
+        # legacy answer for every such key is "not a member" -- a 403 on a
+        # valid credential. Workspace truth therefore OVERRIDES, not
+        # supplements, on linked orgs; Supabase keeps answering only for
+        # orgs the handshake has not touched.
+        workspace_id = row[3] if len(row) > 3 else None
+        if workspace_id is not None:
+            is_member = self._query_membership_from_workspace(
+                str(workspace_id), user_id
+            )
         plan_config = get_plan_config(plan_val, plan_overrides_val)
 
         expires_at = None
