@@ -448,6 +448,7 @@ def neighbors(
     agent_id: Optional[str] = None,
     space_id: Optional[str] = None,
     project_id: Optional[str] = None,
+    branch_id: Optional[str] = None,
     depth: int = 1,
     limit: int = 5,
 ) -> dict[str, Any]:
@@ -471,6 +472,13 @@ def neighbors(
     * ``space_id`` / ``project_id`` mirror recall's relevance filters so a
       filtered recall cannot be widened by its own expansion: with a
       ``project_id``, rows filed under OTHER projects never surface.
+    * ``branch_id`` mirrors recall's context-branch filter (Track C) for the
+      same reason. ``None`` — the default — admits MAIN rows only
+      (``m.branch_id IS NULL``): an edge from a main entry row into a branch
+      row must not drag the branch draft into a no-branch recall. A named
+      branch widens the hop to ``(m.branch_id IS NULL OR m.branch_id =
+      :branch_id)``, exactly the predicate the vector stage used, and never
+      to any OTHER branch.
 
     ``depth`` is hard-capped at 1 in v1 — a value other than 1 raises rather
     than silently truncating, so a future depth-2 caller cannot believe it
@@ -505,6 +513,14 @@ def neighbors(
     if project_id is not None:
         clauses.append("(m.project_id = :project_id OR m.project_id IS NULL)")
         params["project_id"] = project_id
+    if branch_id is not None:
+        clauses.append("(m.branch_id IS NULL OR m.branch_id = :branch_id)")
+        params["branch_id"] = branch_id
+    else:
+        # Main-only by default — the same load-bearing clause as recall's
+        # base_clauses: without it a graph edge is a tunnel from main into a
+        # half-formed branch conclusion.
+        clauses.append("m.branch_id IS NULL")
 
     where_sql = "\n              AND ".join(clauses)
     rows = db.execute(
@@ -520,7 +536,8 @@ def neighbors(
                    m.memory_type, m.content, m.embedding, m.confidence,
                    m.sequence_number, m.scope, m.status, m.superseded_by,
                    m.metadata, m.created_at, m.updated_at, m.space_id,
-                   m.project_id, m.user_id, m.provenance,
+                   m.project_id, m.user_id, m.provenance, m.revision,
+                   m.branch_id,
                    scored.connections
             FROM scored
             JOIN session_memories m
@@ -602,7 +619,12 @@ def entity_brief(
 
     # The visible evidence: memories tied to this entity by an edge, passing
     # the caller's ladder, in THIS org (the org check rides on the memory row
-    # — a tampered edge grants nothing).
+    # — a tampered edge grants nothing). ``branch_id IS NULL`` is the context-
+    # branch default fence (Track C): ``explore`` has no branch parameter, so
+    # the brief is a MAIN-only view — an edge into a branch row must not drag
+    # a half-formed draft into the evidence, the same rule ``neighbors``
+    # enforces on the recall expansion. The supersession query below carries
+    # the same fence for the same reason: it returns row CONTENT.
     evidence_rows = db.execute(
         text(
             f"""
@@ -621,6 +643,7 @@ def entity_brief(
               AND e.dst_id = ANY(CAST(:entity_ids AS uuid[]))
               AND m.status = 'active'
               AND m.recall_hidden = FALSE
+              AND m.branch_id IS NULL
               AND {ladder_sql}
             ORDER BY m.created_at DESC, m.id DESC
             LIMIT :limit
@@ -716,6 +739,7 @@ def entity_brief(
               AND e.src_id = ANY(CAST(:evidence_ids AS uuid[]))
               AND m.status != 'retracted'
               AND m.recall_hidden = FALSE
+              AND m.branch_id IS NULL
               AND {ladder_sql}
             ORDER BY e.created_at ASC
             """

@@ -85,7 +85,7 @@ from typing import Any, Literal, Optional
 import anyio
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from shared import brain, claims
+from shared import brain, branches, claims
 from shared.auth import KeyInfo
 from shared.memory import (
     extract_typed_memories,
@@ -237,6 +237,15 @@ class CaptureEventRequest(BaseModel):
     repo_root: Optional[str] = Field(
         default=None, description="Filesystem repo root (e.g. the hook's cwd)."
     )
+    git_branch: Optional[str] = Field(
+        default=None,
+        description=(
+            "The repo's current git branch, best-effort. Binds the capture to "
+            "the project's context branch of the same name (auto-created). "
+            "'main'/'master' (any case), blank, or omitted mean main. Ignored "
+            "unless a project resolves and the caller is attributable."
+        ),
+    )
 
 
 class TranscriptMessage(BaseModel):
@@ -264,6 +273,13 @@ class CaptureTranscriptRequest(BaseModel):
     )
     git_remote: Optional[str] = Field(default=None)
     repo_root: Optional[str] = Field(default=None)
+    git_branch: Optional[str] = Field(
+        default=None,
+        description=(
+            "The repo's current git branch, best-effort; same contract as "
+            "CaptureEventRequest.git_branch."
+        ),
+    )
 
 
 class RecallRequest(BaseModel):
@@ -484,6 +500,66 @@ def _ensure_project_id(
         return None
 
 
+#: Git default-branch names that ARE main: they map to ``branch_id = NULL``
+#: (main is the absence of a branch), never to a registry row. Compared
+#: case-insensitively.
+_MAIN_GIT_BRANCHES = frozenset({"main", "master"})
+
+
+def _capture_branch_id(
+    db: Any,
+    *,
+    org_id: str,
+    project_id: Optional[str],
+    user_id: Optional[str],
+    git_branch: Optional[str],
+) -> Optional[str]:
+    """The context-branch id a hook capture should land on, or ``None``.
+
+    The hook auto-bind (Track C): inside a git repo the hook sends the branch
+    it is standing on, and the capture lands on the project's context branch
+    of the same name — auto-created via :func:`shared.branches.ensure_branch`.
+
+    ``None`` — the write stays on main — in every guarded case, each a plan
+    rule rather than a convenience:
+
+    * no ``git_branch``, or it is ``main``/``master`` (case-insensitive): the
+      repo's default branch IS main;
+    * no project resolved: a branch always belongs to a project (global
+      constraint), so the write falls through to its normal scope;
+    * unattributable caller (``user_id`` is ``None``): auto-creating registry
+      rows on behalf of nobody would mint branches no one owns — the same
+      caller whose captures cannot be private cannot bind branches either.
+
+    Best-effort, never raises: capture must not fail because branch tagging
+    did (the same contract as :func:`_ensure_project_id`). A refused name
+    (over-long, say) or a database error logs and lands the write on main.
+    """
+    if not git_branch or not project_id or not user_id:
+        return None
+    stripped = git_branch.strip()
+    if not stripped or stripped.lower() in _MAIN_GIT_BRANCHES:
+        return None
+    try:
+        row = branches.ensure_branch(
+            db,
+            org_id=org_id,
+            project_id=project_id,
+            name=stripped,
+            created_by=user_id,
+        )
+        return row["id"]
+    except Exception:
+        _rollback(db, "ensure_branch", org_id)
+        logger.warning(
+            "capture: ensure_branch(%r) failed for org %s; writing on main",
+            stripped,
+            org_id,
+            exc_info=True,
+        )
+        return None
+
+
 def _find_project_id(
     db: Any,
     *,
@@ -634,6 +710,10 @@ def _recent_memories(
     observations stored as curator fuel and must not surface to agents at
     session start (mirrors the hidden-row contract of
     :func:`shared.memory.retrieve_memories_scoped`).
+    Context-branch rows (``branch_id IS NOT NULL``, Track C) are excluded the
+    same way — session start reads MAIN only, with no opt-in here on purpose:
+    this path ranks by nothing but the clock, so a branch's freshest
+    half-formed draft would otherwise open every session.
     When ``project_id`` is given, rows for that project OR unfiled (``NULL``)
     rows surface — the same NULL-surfacing semantics as
     :func:`shared.memory.retrieve_memories_scoped`.
@@ -716,6 +796,7 @@ def _recent_memories(
               AND {scope_sql}
               AND status = 'active'
               AND recall_hidden = FALSE
+              AND branch_id IS NULL
               AND {project_sql}
             ORDER BY created_at DESC
             LIMIT :limit
@@ -801,6 +882,20 @@ async def capture_event(
                     db, org_id=org_id, project_id=project_id, user_id=user_id
                 )
             )
+        # See the transcript route: branch binding only where the project
+        # opted into project-visible capture. The branch must never widen a
+        # private capture.
+        branch_id = None
+        if scope == "project":
+            branch_id = await anyio.to_thread.run_sync(
+                lambda: _capture_branch_id(
+                    db,
+                    org_id=org_id,
+                    project_id=project_id,
+                    user_id=user_id,
+                    git_branch=req.git_branch,
+                )
+            )
         over_cap = await anyio.to_thread.run_sync(
             lambda: _check_memory_quota_402(
                 db, org_id, key_info.plan, "memory", key_info.plan_overrides
@@ -819,6 +914,7 @@ async def capture_event(
                 org_id, agent_id, req.session_id, user_id=user_id
             ),
             project_id=project_id,
+            branch_id=branch_id,
             metadata=metadata,
             scope=scope,
             user_id=user_id,
@@ -899,6 +995,25 @@ async def capture_transcript(
                     db, org_id=org_id, project_id=project_id, user_id=user_id
                 )
             )
+        # Branch binding is gated on the project having OPTED INTO
+        # project-visible capture (default_scope='project', migration 047).
+        # Nearly every developer is on a git feature branch nearly all the
+        # time, so letting the branch's presence force scope='project' would
+        # silently widen every private hook capture to the whole project --
+        # the declared-scope-discarded defect class, again. A private capture
+        # stays private and unbranched; a branch is a draft OF THE PROJECT,
+        # and only exists where captures are project-visible to begin with.
+        branch_id = None
+        if scope == "project":
+            branch_id = await anyio.to_thread.run_sync(
+                lambda: _capture_branch_id(
+                    db,
+                    org_id=org_id,
+                    project_id=project_id,
+                    user_id=user_id,
+                    git_branch=req.git_branch,
+                )
+            )
         session_id = _capture_session_id(
             org_id, agent_id, req.session_id, user_id=user_id
         )
@@ -924,6 +1039,7 @@ async def capture_transcript(
                 memory_type="summary",
                 session_id=session_id,
                 project_id=project_id,
+                branch_id=branch_id,
                 metadata=base_meta,
                 scope=scope,
                 user_id=user_id,
@@ -955,6 +1071,7 @@ async def capture_transcript(
                 memory_type=item.memory_type,
                 session_id=session_id,
                 project_id=project_id,
+                branch_id=branch_id,
                 metadata=base_meta,
                 scope=scope,
                 user_id=user_id,

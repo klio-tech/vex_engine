@@ -55,6 +55,7 @@ from shared import (
     artifact_storage,
     artifacts,
     brain,
+    branches,
     claims,
     graph_store,
     project_scope,
@@ -123,6 +124,7 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "artifact_put",
     "artifact_get",
     "space",
+    "branch",
     "forget",
     "share",
     "project_create",
@@ -1639,7 +1641,7 @@ def _serialize_record(
     ``remember``/``decide``/``note``/``observe`` call gets the
     optimistic-concurrency guarantee (:func:`shared.memory.
     supersede_with_revision`); ``None`` when the record was built by a path
-    that never selected the column (graph-expanded rows, for one), which
+    that never selected the column, which
     structural compression's null-key strip erases from the wire the same way
     it erases an absent ``relevance``.
     """
@@ -1824,6 +1826,7 @@ async def _perform_recall(
     scope: str,
     space: Optional[str],
     project: Optional[str],
+    branch: Optional[str] = None,
     limit: int = 10,
 ) -> dict[str, Any]:
     """Shared body for the Klio ``recall`` read tool.
@@ -1856,6 +1859,17 @@ async def _perform_recall(
             fail-open fallback (unresolvable header yields org-wide recall, not
             an error — explicit ``project`` args keep their strict warn-and-empty
             semantics).
+        branch: Optional context-branch name (Track C). ``None``, blank, or
+            ``main`` (case-insensitive) is the DEFAULT read — main only,
+            because main is the absence of a branch and never a registry row.
+            Any other name resolves via :func:`shared.branches.get_branch`
+            against the RESOLVED project, mirroring ``space``'s strict
+            semantics: no project resolvable → warn-and-empty (a branch
+            always belongs to a project), unknown/closed branch →
+            warn-and-empty. Strict on purpose — silently dropping the filter
+            would answer from main while the caller believes it is reading
+            the branch, the exact inversion of the main-only default's
+            failure mode.
         limit: How many SEARCH MATCHES to return (clamped to 1–50). It is not
             a bound on the response: :func:`shared.memory.retrieve_memories_scoped`
             adds up to :data:`shared.memory.GRAPH_EXPANSION_CAP` further
@@ -2001,6 +2015,48 @@ async def _perform_recall(
                 lambda: resolve_project_from_request(request, db, org_id=org_id)
             )
 
+        # Resolve the optional context-branch filter (Track C). ``main``
+        # (case-insensitive) and blank are the DEFAULT read, not a lookup:
+        # main is the absence of a branch (``branch_id IS NULL``), never a
+        # registry row, so naming it must neither error nor consult the
+        # registry. Any other name is strict like ``space``: a branch always
+        # belongs to a project, so no resolved project is warn-and-empty, and
+        # so is a name with no OPEN branch behind it — silently dropping the
+        # filter would answer from main while the caller believes it is
+        # reading the branch. Membership is NOT checked here: the branch id
+        # is a row filter inside retrieve_memories_scoped, whose visibility
+        # ladder still decides — in SQL — whether the caller may see any
+        # project row at all (pushed-branch visibility rides that arm).
+        stripped_branch = branch.strip() if branch is not None else ""
+        branch_row: Optional[dict[str, Any]] = None
+        if stripped_branch and stripped_branch.lower() != "main":
+            if project_id is None:
+                return {
+                    "memories": [],
+                    "count": 0,
+                    "warning": (
+                        f"branch '{stripped_branch}' needs a project: pass "
+                        "project= or send the X-Vex-Project header"
+                    ),
+                    "guidance": RECALL_WRITE_NUDGE,
+                }
+            resolved_project_id = project_id
+            branch_row = await anyio.to_thread.run_sync(
+                lambda: branches.get_branch(
+                    db,
+                    org_id=org_id,
+                    project_id=resolved_project_id,
+                    name=stripped_branch,
+                )
+            )
+            if branch_row is None:
+                return {
+                    "memories": [],
+                    "count": 0,
+                    "warning": f"unknown branch: {stripped_branch}",
+                    "guidance": RECALL_WRITE_NUDGE,
+                }
+
         # The personal-node union (Track B, Task B3): stack the caller's
         # personal org under the active org so an agent attached to a team
         # still recalls its human's own memories, READ-ONLY. Three conditions,
@@ -2045,6 +2101,7 @@ async def _perform_recall(
             project_id=project_id,
             limit=min(max(limit, 1), 50),
             extra_org_id=extra_org_id,
+            branch_id=branch_row["id"] if branch_row is not None else None,
         )
         # Best-effort recall activity log; it swallows its own errors so a
         # logging failure can never break the recall. Offloaded like every
@@ -2100,6 +2157,17 @@ async def _perform_recall(
                 memory["source"] = (
                     "personal" if record.org_id == extra_org_id else "active"
                 )
+            if (
+                branch_row is not None
+                and record.branch_id is not None
+                and record.branch_id == branch_row["id"]
+            ):
+                # Which side of the fork the row came from, by NAME (the id
+                # is an internal reference the agent never asked for). Only
+                # rows on the named branch are tagged; main rows stay
+                # untagged, and a no-branch recall's payload is
+                # byte-identical to before this field existed.
+                memory["source_branch"] = branch_row["name"]
             memories.append(memory)
         payload = {
             "memories": memories,
@@ -3017,6 +3085,203 @@ async def _perform_project_members(ctx: Context, *, project: str) -> dict[str, A
         db.close()
 
 
+def _serialize_branch(row: dict[str, Any]) -> dict[str, Any]:
+    """A branch dict with wire-safe timestamps (and computed fields kept)."""
+    serialized = {
+        "id": row["id"],
+        "project_id": row["project_id"],
+        "name": row["name"],
+        "status": row["status"],
+        "created_at": (
+            row["created_at"].isoformat() if row.get("created_at") else None
+        ),
+        "closed_at": row["closed_at"].isoformat() if row.get("closed_at") else None,
+    }
+    if "unmerged_count" in row:
+        serialized["unmerged_count"] = row["unmerged_count"]
+        serialized["last_activity"] = (
+            row["last_activity"].isoformat() if row.get("last_activity") else None
+        )
+    return serialized
+
+
+async def _perform_branch(
+    ctx: Context,
+    *,
+    action: str,
+    name: Optional[str],
+    project: Optional[str],
+) -> dict[str, Any]:
+    """Shared body for the ``branch`` tool: a project's context branches.
+
+    A branch always belongs to a project (global constraint), so EVERY action
+    resolves one first — an explicit ``project`` argument strictly (unknown →
+    ``not_found``), else the X-Vex-Project header exactly as ``_perform_recall``
+    does, and neither resolving is an explicit ``project_required`` refusal
+    rather than a guess.
+
+    Member-gated like the project tools: a non-member gets the same opaque
+    ``not_found`` as an unknown project — membership is precisely what hides a
+    project's existence, and its branch list doubly so (branch names describe
+    unfinished work). The MUTATING actions (create/merge/discard) additionally
+    require ``projects.can_write``: they answer ``forbidden``, which discloses
+    nothing to a caller who, being a member, already knows the project exists.
+
+    Idempotence at this surface: after a merge/discard the name no longer
+    resolves as OPEN, so a retry would miss the registry row — the closed-name
+    fallback answers ``already_<status>`` (the same no-op shape
+    ``branches.merge_branch`` returns for an id-level retry), never an error.
+    """
+    request = ctx.request_context.request
+    if request is None:
+        return {"error": "unauthorized", "detail": "no request context"}
+
+    _attach_client_name(ctx, request)
+
+    db = SessionLocal()
+    try:
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
+    except HTTPException as exc:
+        db.close()
+        return {"error": "unauthorized", "detail": str(exc.detail)}
+
+    user_id = resolve_request_user_id(request)
+
+    try:
+        # Threading contract (shared/projects.py): every blocking helper below
+        # runs via to_thread, matching capture.py's discipline.
+        if project is not None:
+            project_id = await anyio.to_thread.run_sync(
+                lambda: brain.find_project_id(db, org_id=org_id, identifier=project)
+            )
+            if project_id is None:
+                return {"error": "not_found", "detail": f"unknown project: {project}"}
+        else:
+            project_id = await anyio.to_thread.run_sync(
+                lambda: resolve_project_from_request(request, db, org_id=org_id)
+            )
+            if project_id is None:
+                return {
+                    "error": "project_required",
+                    "detail": (
+                        "A branch always belongs to a project: pass project= "
+                        "or send the X-Vex-Project header."
+                    ),
+                }
+
+        resolved_project_id = project_id
+        member = await anyio.to_thread.run_sync(
+            lambda: projects.is_member(
+                db, org_id=org_id, project_id=resolved_project_id, user_id=user_id
+            )
+        )
+        if not member:
+            return {
+                "error": "not_found",
+                "detail": f"unknown project: {project or resolved_project_id}",
+            }
+
+        if action in ("create", "merge", "discard"):
+            writer = await anyio.to_thread.run_sync(
+                lambda: projects.can_write(
+                    db, org_id=org_id, project_id=resolved_project_id, user_id=user_id
+                )
+            )
+            if not writer:
+                return {
+                    "error": "forbidden",
+                    "detail": "This needs write access to the project.",
+                }
+
+        if action == "list":
+            rows = await anyio.to_thread.run_sync(
+                lambda: branches.list_branches(
+                    db, org_id=org_id, project_id=resolved_project_id
+                )
+            )
+            return {
+                "branches": [_serialize_branch(r) for r in rows],
+                "count": len(rows),
+            }
+
+        stripped_name = (name or "").strip()
+        if not stripped_name:
+            return {
+                "error": "name_required",
+                "detail": f"branch {action} needs a name.",
+            }
+
+        if action == "create":
+            try:
+                row = await anyio.to_thread.run_sync(
+                    lambda: branches.ensure_branch(
+                        db,
+                        org_id=org_id,
+                        project_id=resolved_project_id,
+                        name=stripped_name,
+                        created_by=user_id,
+                    )
+                )
+            except ValueError as exc:
+                return {"error": "invalid_name", "detail": str(exc)}
+            return {"created": True, "branch": _serialize_branch(row)}
+
+        # info/merge/discard operate on the OPEN branch by this name.
+        row = await anyio.to_thread.run_sync(
+            lambda: branches.get_branch(
+                db,
+                org_id=org_id,
+                project_id=resolved_project_id,
+                name=stripped_name,
+            )
+        )
+        if row is None and action in ("merge", "discard"):
+            # The closed-name fallback (idempotence — see the docstring):
+            # newest first, so the most recent lifecycle of the name answers.
+            closed = await anyio.to_thread.run_sync(
+                lambda: branches.list_branches(
+                    db, org_id=org_id, project_id=resolved_project_id
+                )
+            )
+            for candidate in closed:
+                if candidate["name"] == stripped_name:
+                    verb = "merged" if action == "merge" else "discarded"
+                    return {
+                        verb: False,
+                        "reason": f"already_{candidate['status']}",
+                    }
+        if row is None:
+            return {"error": "not_found", "detail": f"unknown branch: {stripped_name}"}
+
+        if action == "info":
+            return {"branch": _serialize_branch(row)}
+
+        branch_id = row["id"]
+        if action == "merge":
+            return await anyio.to_thread.run_sync(
+                lambda: branches.merge_branch(
+                    db,
+                    org_id=org_id,
+                    project_id=resolved_project_id,
+                    branch_id=branch_id,
+                    merged_by=user_id,
+                )
+            )
+        return await anyio.to_thread.run_sync(
+            lambda: branches.discard_branch(
+                db,
+                org_id=org_id,
+                branch_id=branch_id,
+                discarded_by=user_id,
+            )
+        )
+    except Exception:
+        logger.exception("branch %s failed", action)
+        return {"error": "branch_failed"}
+    finally:
+        db.close()
+
+
 async def _perform_project_grant(
     ctx: Context, *, project: str, user: str, role: str
 ) -> dict[str, Any]:
@@ -3440,8 +3705,8 @@ def _register_tools(mcp: FastMCP) -> None:
         description=(
             "Retrieve relevant memories for the current org/team. "
             "Args: query (required); optional scope ('org' default | "
-            "'agent' | 'private'), space, project, limit. Set the X-Vex-Agent "
-            "header to scope by agent. "
+            "'agent' | 'private'), space, project, branch, limit. Set the "
+            "X-Vex-Agent header to scope by agent. "
             "Search combines meaning and exact wording, so a rare literal — an "
             "identifier, an error string, a flag name — can be quoted verbatim "
             "and a paraphrase still works. "
@@ -3481,6 +3746,21 @@ def _register_tools(mcp: FastMCP) -> None:
             Optional[str],
             Field(description="Optional project identifier to scope the search."),
         ] = None,
+        branch: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    "Optional context-branch name to read alongside main. "
+                    "Default (omitted, blank, or 'main') reads main only — "
+                    "branch drafts never surface unless named. Naming a "
+                    "branch needs a project (project= or the X-Vex-Project "
+                    "header) and returns branch + main together, with branch "
+                    "rows tagged `source_branch`. An unknown or closed "
+                    "branch returns empty with a warning rather than "
+                    "silently reading main."
+                )
+            ),
+        ] = None,
         limit: Annotated[
             int,
             Field(
@@ -3501,7 +3781,13 @@ def _register_tools(mcp: FastMCP) -> None:
         ] = 10,
     ) -> dict[str, Any]:
         return await _perform_recall(
-            ctx, query=query, scope=scope, space=space, project=project, limit=limit
+            ctx,
+            query=query,
+            scope=scope,
+            space=space,
+            project=project,
+            branch=branch,
+            limit=limit,
         )
 
     @mcp.tool(
@@ -3811,6 +4097,45 @@ def _register_tools(mcp: FastMCP) -> None:
         ] = None,
     ) -> dict[str, Any]:
         return await _perform_space(ctx, action=action, name=name, slug=slug)
+
+    @mcp.tool(
+        name="branch",
+        description=(
+            "Manage a project's context branches — git-shaped draft spaces: "
+            "work accumulates on a branch, main stays clean, merge promotes "
+            "it (near-duplicates supersede the main version), discard "
+            "retracts it. Args: action (create|list|info|merge|discard), "
+            "name (the branch; not needed for 'list'), optional project "
+            "(defaults to the X-Vex-Project header). You must be a member of "
+            "the project; create/merge/discard need write access."
+        ),
+    )
+    async def branch(
+        ctx: Context,
+        action: Annotated[
+            Literal["create", "list", "info", "merge", "discard"],
+            Field(description="The branch operation to perform."),
+        ],
+        name: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    "Branch name (e.g. 'feat/x'). 'main' is not a branch — "
+                    "it is the absence of one. Not needed for 'list'."
+                )
+            ),
+        ] = None,
+        project: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    "Project name, git remote, repo path, or id. Omit to use "
+                    "the X-Vex-Project header."
+                )
+            ),
+        ] = None,
+    ) -> dict[str, Any]:
+        return await _perform_branch(ctx, action=action, name=name, project=project)
 
     @mcp.tool(
         name="forget",
