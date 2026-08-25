@@ -2383,6 +2383,7 @@ async def retrieve_memories_scoped(
     space_id: Optional[str] = None,
     project_id: Optional[str] = None,
     limit: int = 10,
+    extra_org_id: Optional[str] = None,
 ) -> list[MemoryRecord]:
     """Brain recall across sessions, scoped to an org (and optionally an
     agent / space / project).
@@ -2494,6 +2495,15 @@ async def retrieve_memories_scoped(
               the old flat ``(project_id = X OR project_id IS NULL)`` filter.
         limit: Maximum number of records the VECTOR SEARCH may return. It is
             NOT a bound on the length of the returned list — see below.
+        extra_org_id: Optional SECOND tenant to union into the read (Track B:
+            the caller's personal node stacked under the active org). When
+            set, the tenancy predicate widens to both orgs — but the
+            visibility ladder binds PER-ORG: each org's arm carries its own
+            full ladder (owner predicate, membership subquery keyed to THAT
+            org), so the extra org contributes only rows the caller could
+            read there. This is a READ-ONLY widening; no write path accepts
+            it. Graph expansion is NOT widened: it walks outward inside the
+            active org alone, exactly as before.
 
     Returns:
         A list of :class:`MemoryRecord` ordered by blended score (descending),
@@ -2553,12 +2563,6 @@ async def retrieve_memories_scoped(
     # accepts directly with the cosine-distance operator (<=>).
     embedding_str = str(embedding)
 
-    base_clauses = [
-        "org_id = :org_id",
-        "status = 'active'",
-        "superseded_by IS NULL",
-        "recall_hidden = FALSE",
-    ]
     similarity_weight = ranking.similarity_weight()
     recency_weight = ranking.recency_weight()
     params: dict[str, Any] = {
@@ -2573,37 +2577,79 @@ async def retrieve_memories_scoped(
     _apply_ef_search(db_session, params["candidate_pool"])
 
     # ---- the visibility ladder -------------------------------------------
-    # Built as a single OR-group of scope arms. Every arm that reaches beyond
-    # 'org' carries its own owner/membership predicate in SQL; there is no
-    # arm that admits a row on the strength of project_id alone.
+    # Built as a single OR-group of scope arms PER ORG. Every arm that reaches
+    # beyond 'org' carries its own owner/membership predicate in SQL; there is
+    # no arm that admits a row on the strength of project_id alone.
+    #
+    # The ladder is a function of WHICH org parameter it binds against so the
+    # personal-node union (``extra_org_id``) cannot exist as a bare tenancy
+    # widening: each org's group is ``(org_id = :param AND <full ladder for
+    # that org>)``, and the project arm's membership subquery is keyed to the
+    # SAME parameter. Widening tenancy without re-binding the ladder would let
+    # the extra org's rows through on the ACTIVE org's entitlements (and vice
+    # versa) — the exact leak the adversarial tests in
+    # ``test_recall_personal_union.py`` seed.
     if scope == "private":
-        # Narrowed read: mine, and only mine. No org arm, no project arm.
-        base_clauses.append("scope = 'private' AND user_id = :user_id")
         params["user_id"] = user_id
     else:
-        arms = ["scope = 'org'"]
         if scope == "agent":  # validated above; agent_id is not None
-            arms.append("(scope = 'agent' AND agent_id = :agent_id)")
             params["agent_id"] = agent_id
         if user_id:
-            arms.append("(scope = 'private' AND user_id = :user_id)")
-            # Membership is a subquery rather than a pre-fetched Python list
-            # so the entitlement is evaluated by the same statement that
-            # returns the rows — a stale or mis-passed list cannot widen it.
-            # The JOIN to projects is not decoration. project_members has no
-            # org_id of its own, so without it a membership row in ANOTHER
-            # tenant would satisfy this arm for a row in THIS one — the outer
-            # org_id filter constrains the memory, not the entitlement. An
-            # adversarial test seeds exactly that shape.
-            arms.append(
-                "(scope = 'project' AND project_id IN ("
-                "SELECT m.project_id FROM project_members m "
-                "JOIN projects p ON p.id = m.project_id "
-                "AND p.org_id = :org_id "
-                "WHERE m.user_id = :user_id))"
-            )
             params["user_id"] = user_id
-        base_clauses.append("(" + " OR ".join(arms) + ")")
+
+    def _tenancy_and_ladder(org_param: str) -> str:
+        """The full tenancy + visibility-ladder group for ONE org.
+
+        ``org_param`` is a code-controlled parameter NAME (``"org_id"`` or
+        ``"extra_org_id"``), interpolated into the SQL text; the VALUES stay
+        bound parameters throughout.
+        """
+        if scope == "private":
+            # Narrowed read: mine, and only mine. No org arm, no project arm.
+            ladder = "scope = 'private' AND user_id = :user_id"
+        else:
+            arms = ["scope = 'org'"]
+            if scope == "agent":
+                arms.append("(scope = 'agent' AND agent_id = :agent_id)")
+            if user_id:
+                arms.append("(scope = 'private' AND user_id = :user_id)")
+                # Membership is a subquery rather than a pre-fetched Python
+                # list so the entitlement is evaluated by the same statement
+                # that returns the rows — a stale or mis-passed list cannot
+                # widen it. The JOIN to projects is not decoration.
+                # project_members has no org_id of its own, so without it a
+                # membership row in ANOTHER tenant would satisfy this arm for
+                # a row in THIS one — the outer org_id filter constrains the
+                # memory, not the entitlement. An adversarial test seeds
+                # exactly that shape.
+                arms.append(
+                    "(scope = 'project' AND project_id IN ("
+                    "SELECT m.project_id FROM project_members m "
+                    "JOIN projects p ON p.id = m.project_id "
+                    f"AND p.org_id = :{org_param} "
+                    "WHERE m.user_id = :user_id))"
+                )
+            ladder = " OR ".join(arms)
+        return f"(org_id = :{org_param} AND ({ladder}))"
+
+    if extra_org_id is None:
+        tenancy_clause = _tenancy_and_ladder("org_id")
+    else:
+        params["extra_org_id"] = extra_org_id
+        tenancy_clause = (
+            "("
+            + _tenancy_and_ladder("org_id")
+            + " OR "
+            + _tenancy_and_ladder("extra_org_id")
+            + ")"
+        )
+
+    base_clauses = [
+        tenancy_clause,
+        "status = 'active'",
+        "superseded_by IS NULL",
+        "recall_hidden = FALSE",
+    ]
 
     if space_id is not None:
         base_clauses.append("(space_id = :space_id OR space_id IS NULL)")

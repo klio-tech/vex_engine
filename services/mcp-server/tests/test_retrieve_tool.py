@@ -87,7 +87,7 @@ def _live(db, *, org_id: str, user_id: str | None):
     live.close = MagicMock()
     return (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=(org_id, "agent-y", "free", None),
         ),
         patch("app.mcp_app.resolve_request_user_id", return_value=user_id),
@@ -244,7 +244,7 @@ async def test_retrieve_auth_failure_returns_clean_error():
     session_local = MagicMock()
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             side_effect=HTTPException(status_code=401, detail="Missing X-Vex-Key"),
         ),
         patch("app.mcp_app.SessionLocal", session_local),
@@ -252,7 +252,10 @@ async def test_retrieve_auth_failure_returns_clean_error():
         result = await _retrieve_fn()(_fake_ctx(), "kc_abc")
 
     assert result["error"] == "unauthorized"
-    session_local.assert_not_called()
+    # The session opens before resolution now (the active-node resolver
+    # needs it); the guarantee on a refusal is that it was CLOSED, unused.
+    session_local.assert_called_once()
+    session_local.return_value.close.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -272,7 +275,7 @@ async def test_a_cache_failure_is_an_internal_error_not_a_crash():
     session = MagicMock()
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.resolve_request_user_id", return_value=ALICE),

@@ -86,7 +86,7 @@ async def _run_recall():
     retrieve_mock = AsyncMock(return_value=records)
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -180,7 +180,7 @@ async def test_recall_empty_result_is_untouched():
     spy = MagicMock(side_effect=mcp_app.compress_payload)
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -204,7 +204,7 @@ async def test_compression_failure_does_not_break_recall():
     retrieve_mock = AsyncMock(return_value=records)
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),

@@ -142,7 +142,7 @@ def _live(db, *, org_id: str, user_id: str | None):
     live.close = MagicMock()
     return (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=(org_id, "agent-y", "free", None),
         ),
         patch("app.mcp_app.resolve_request_user_id", return_value=user_id),
@@ -330,7 +330,7 @@ async def test_auth_failure_returns_a_clean_error():
     from fastapi import HTTPException
 
     with patch(
-        "app.mcp_app.resolve_principal_plan",
+        "app.mcp_app.resolve_active_principal",
         side_effect=HTTPException(status_code=401, detail="bad key"),
     ):
         result = await _tool_fn("compress")(_fake_ctx(), LONG_PYTHON)

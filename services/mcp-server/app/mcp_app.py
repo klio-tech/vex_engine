@@ -103,8 +103,7 @@ from app import onboarding
 # than two. Fronting only some of them would leave the double count in place on
 # whichever tools used the others. See app.identity's module docstring.
 from app.identity import (
-    resolve_principal,
-    resolve_principal_plan,
+    resolve_active_principal,
     resolve_request_user_id,
 )
 from app.recall_log import log_recall_event
@@ -383,9 +382,11 @@ async def _perform_write(
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
+        org_id, agent_id, plan, plan_overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"stored": False, "error": "unauthorized", "detail": str(exc.detail)}
 
     # Authorship, not visibility: an explicit write is shared either way, and
@@ -395,7 +396,6 @@ async def _perform_write(
 
     session_id = brain_session_id(request, org_id, agent_id)
 
-    db = SessionLocal()
     try:
         # Enforce the org's monthly memory quota BEFORE doing any write work.
         # ``check_memory_quota`` raises ``MemoryQuotaExceeded`` for a hard block
@@ -830,9 +830,11 @@ async def _perform_artifact_put(
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
+        org_id, agent_id, plan, plan_overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"stored": False, "error": "unauthorized", "detail": str(exc.detail)}
 
     cfg = get_plan_config(plan, plan_overrides)
@@ -843,9 +845,12 @@ async def _perform_artifact_put(
     # takes both from its pending row — is not forced to repeat them. An
     # artifact created with neither is discoverable by nothing, since the card
     # built from them IS the discovery mechanism, so the other two branches
-    # still refuse. Refusing before ``SessionLocal()`` does any work, and with
-    # an explanation rather than a schema error.
+    # still refuse. The session is already open (resolution needs it) but has
+    # done no work yet -- ``SessionLocal()`` connects lazily -- so this still
+    # refuses before any session work, with an explanation rather than a
+    # schema error.
     if artifact_id is None and not ((title or "").strip() and (summary or "").strip()):
+        db.close()
         return {
             "stored": False,
             "error": "title_and_summary_required",
@@ -857,7 +862,6 @@ async def _perform_artifact_put(
             ),
         }
 
-    db = SessionLocal()
     try:
         # ``supersedes`` RETIRES an existing artifact, so it is a write to a row
         # the caller named rather than one they own. Checked here — before any
@@ -1388,14 +1392,15 @@ async def _perform_artifact_get(
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, _agent_id, _plan, _overrides = resolve_principal_plan(request)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
     user_id = resolve_request_user_id(request)
 
-    db = SessionLocal()
     try:
         row = artifacts.get_artifact(db, org_id=org_id, artifact_id=artifact_id)
         if row is None or row["status"] not in ("active", "superseded"):
@@ -1738,12 +1743,13 @@ async def _perform_space(
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, _agent_id = resolve_principal(request)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
-    db = SessionLocal()
     try:
         if action == "list":
             spaces = brain.list_spaces(db, org_id=org_id)
@@ -1865,6 +1871,11 @@ async def _perform_recall(
         number of memories actually returned and may EXCEED ``limit`` by up to
         ``GRAPH_EXPANSION_CAP`` graph-expanded rows (each marked
         ``via: graph``, with no ``relevance``).
+
+        When the personal-node union is active (attributable caller, personal
+        org exists, active org is not the personal org), each memory also
+        carries ``source: "personal" | "active"`` saying which node it came
+        from; without the union the payload is unchanged.
     """
     request = ctx.request_context.request
     if request is None:
@@ -1880,9 +1891,11 @@ async def _perform_recall(
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
+        org_id, agent_id, plan, plan_overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {
             "error": "unauthorized",
             "detail": str(exc.detail),
@@ -1894,6 +1907,7 @@ async def _perform_recall(
     # own private captures and their project memberships.
     user_id = resolve_request_user_id(request)
     if scope == "private" and not user_id:
+        db.close()
         return {
             "memories": [],
             "count": 0,
@@ -1906,7 +1920,6 @@ async def _perform_recall(
             "guidance": RECALL_WRITE_NUDGE,
         }
 
-    db = SessionLocal()
     try:
         # Enforce the org's monthly recall quota BEFORE any retrieval work, so a
         # capped tenant is blocked cleanly rather than after spending an
@@ -1988,6 +2001,37 @@ async def _perform_recall(
                 lambda: resolve_project_from_request(request, db, org_id=org_id)
             )
 
+        # The personal-node union (Track B, Task B3): stack the caller's
+        # personal org under the active org so an agent attached to a team
+        # still recalls its human's own memories, READ-ONLY. Three conditions,
+        # all required: the caller is attributable, a personal org exists
+        # (``organizations.personal_owner_user_id``, migration 048 — at most
+        # one, by partial unique index), and the active org is not already the
+        # personal org (stacking a tenant under itself would double-read it).
+        # Best-effort by design: a failed lookup degrades to the plain
+        # single-org recall rather than failing the read.
+        extra_org_id: Optional[str] = None
+        if user_id:
+            try:
+                personal_row = await anyio.to_thread.run_sync(
+                    lambda: db.execute(
+                        text(
+                            "SELECT org_id FROM organizations "
+                            "WHERE personal_owner_user_id = :user_id"
+                        ),
+                        {"user_id": user_id},
+                    ).fetchone()
+                )
+            except Exception:
+                logger.warning(
+                    "recall: personal-org lookup failed; recalling the active "
+                    "org alone",
+                    exc_info=True,
+                )
+                personal_row = None
+            if personal_row is not None and personal_row.org_id != org_id:
+                extra_org_id = personal_row.org_id
+
         # agent_id is always forwarded; retrieve_memories_scoped ignores it
         # unless scope == "agent".
         records = await retrieve_memories_scoped(
@@ -2000,6 +2044,7 @@ async def _perform_recall(
             space_id=space_id,
             project_id=project_id,
             limit=min(max(limit, 1), 50),
+            extra_org_id=extra_org_id,
         )
         # Best-effort recall activity log; it swallows its own errors so a
         # logging failure can never break the recall. Offloaded like every
@@ -2045,7 +2090,17 @@ async def _perform_recall(
             )
             if row is not None:
                 project_label = {"id": project_id, "name": row.display_name}
-        memories = [_serialize_record(r, project_label=project_label) for r in records]
+        memories = []
+        for record in records:
+            memory = _serialize_record(record, project_label=project_label)
+            if extra_org_id is not None:
+                # Which node the row came from, derived from the org_id every
+                # returned row carries. Tagged only while the union is active
+                # so a plain single-org recall's payload stays byte-identical.
+                memory["source"] = (
+                    "personal" if record.org_id == extra_org_id else "active"
+                )
+            memories.append(memory)
         payload = {
             "memories": memories,
             "count": len(memories),
@@ -2121,9 +2176,11 @@ async def _perform_compress(
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, _agent_id, _plan, _overrides = resolve_principal_plan(request)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
     user_id = resolve_request_user_id(request)
@@ -2140,12 +2197,14 @@ async def _perform_compress(
         }
 
     if not isinstance(content, str) or not content:
+        db.close()
         return _unchanged()
 
     try:
         result = route_compress(content, allow_lossy=lossy)
     except Exception:
         logger.exception("compression failed; returning the content unchanged")
+        db.close()
         return _unchanged()
 
     # `compressor` is what ran; `selected_compressor` is what the router chose.
@@ -2173,9 +2232,9 @@ async def _perform_compress(
             "the content."
         )
     if not result.lossy:
+        db.close()
         return payload
 
-    db = SessionLocal()
     try:
         payload["handle"] = store_original(
             db, org_id=org_id, user_id=user_id, text=content
@@ -2212,14 +2271,15 @@ async def _perform_klio_retrieve(
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, _agent_id, _plan, _overrides = resolve_principal_plan(request)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
     user_id = resolve_request_user_id(request)
 
-    db = SessionLocal()
     try:
         original = load_original(db, org_id=org_id, user_id=user_id, handle=handle)
         if original is None:
@@ -2279,16 +2339,17 @@ async def _perform_forget(ctx: Context, *, memory_id: str) -> dict[str, Any]:
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, agent_id = resolve_principal(request)
+        org_id, agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"forgotten": False, "error": "unauthorized", "detail": str(exc.detail)}
 
     # Resolved once, before the session opens: both arms below need it, and the
     # project arm must not decide entitlement from a value fetched later.
     user_id = resolve_request_user_id(request)
 
-    db = SessionLocal()
     try:
         # An id may name an artifact or a memory. Try the artifact first: a hit
         # must retract the bytes AND hide the card, or recall keeps surfacing a
@@ -2358,13 +2419,16 @@ async def _perform_share(ctx: Context, *, memory_id: str, to: str) -> dict[str, 
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, _agent_id = resolve_principal(request)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"shared": False, "error": "unauthorized", "detail": str(exc.detail)}
 
     user_id = resolve_request_user_id(request)
     if not user_id:
+        db.close()
         return {
             "shared": False,
             "error": "unattributed_caller",
@@ -2374,7 +2438,6 @@ async def _perform_share(ctx: Context, *, memory_id: str, to: str) -> dict[str, 
             ),
         }
 
-    db = SessionLocal()
     try:
         if to == "project":
             row = db.execute(
@@ -2442,14 +2505,15 @@ async def _perform_claim(
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, agent_id = resolve_principal(request)
+        org_id, agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"claim_id": None, "error": "unauthorized", "detail": str(exc.detail)}
 
     user_id = resolve_request_user_id(request)
 
-    db = SessionLocal()
     try:
         project_id = await anyio.to_thread.run_sync(
             lambda: resolve_project_from_request(request, db, org_id=org_id)
@@ -2489,12 +2553,13 @@ async def _perform_release(ctx: Context, *, claim_id: str) -> dict[str, Any]:
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, agent_id = resolve_principal(request)
+        org_id, agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"released": False, "error": "unauthorized", "detail": str(exc.detail)}
 
-    db = SessionLocal()
     try:
         released = await anyio.to_thread.run_sync(
             lambda: claims.release_claim(
@@ -2596,14 +2661,15 @@ async def _perform_explore(ctx: Context, *, entity: str) -> dict[str, Any]:
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
+        org_id, agent_id, plan, plan_overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
     user_id = resolve_request_user_id(request)
 
-    db = SessionLocal()
     try:
         # Before the graph read and before the LLM call: a cap enforced after
         # the spend is a receipt, not a cap. ``check_memory_quota`` raises on
@@ -2748,13 +2814,16 @@ async def _perform_project_create(
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, _agent_id = resolve_principal(request)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"created": False, "error": "unauthorized", "detail": str(exc.detail)}
 
     user_id = resolve_request_user_id(request)
     if not user_id:
+        db.close()
         return {
             "created": False,
             "error": "unattributed_caller",
@@ -2766,8 +2835,10 @@ async def _perform_project_create(
 
     stripped = (name or "").strip()
     if not stripped:
+        db.close()
         return {"created": False, "error": "name is required"}
     if not git_remote and not repo_root_path:
+        db.close()
         # Mirrors ck_projects_has_identity: a project with neither is
         # unrepresentable and, worse, unresolvable by every later lookup.
         return {
@@ -2779,7 +2850,6 @@ async def _perform_project_create(
             ),
         }
 
-    db = SessionLocal()
     try:
         project_id = brain.ensure_project(
             db,
@@ -2871,14 +2941,15 @@ async def _perform_project_list(ctx: Context) -> dict[str, Any]:
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, _agent_id = resolve_principal(request)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
     user_id = resolve_request_user_id(request)
 
-    db = SessionLocal()
     try:
         rows = projects.list_projects(db, org_id=org_id, user_id=user_id)
         return {
@@ -2906,14 +2977,15 @@ async def _perform_project_members(ctx: Context, *, project: str) -> dict[str, A
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, _agent_id = resolve_principal(request)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
     user_id = resolve_request_user_id(request)
 
-    db = SessionLocal()
     try:
         project_id = brain.find_project_id(db, org_id=org_id, identifier=project)
         if project_id is None:
@@ -2978,13 +3050,16 @@ async def _perform_project_grant(
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, _agent_id = resolve_principal(request)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"granted": False, "error": "unauthorized", "detail": str(exc.detail)}
 
     caller = resolve_request_user_id(request)
     if not caller:
+        db.close()
         return {
             "granted": False,
             "error": "unattributed_caller",
@@ -2996,6 +3071,7 @@ async def _perform_project_grant(
 
     email = (user or "").strip()
     if "@" not in email:
+        db.close()
         return {
             "granted": False,
             "error": "email_required",
@@ -3006,9 +3082,9 @@ async def _perform_project_grant(
         }
     role = projects.normalize_role(role)
     if role not in projects.ROLES:
+        db.close()
         return {"granted": False, "error": "invalid_role"}
 
-    db = SessionLocal()
     try:
         project_id = brain.find_project_id(db, org_id=org_id, identifier=project)
         if project_id is None:
@@ -3162,13 +3238,16 @@ async def _perform_project_scope(
 
     _attach_client_name(ctx, request)
 
+    db = SessionLocal()
     try:
-        org_id, _agent_id = resolve_principal(request)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"ok": False, "error": "unauthorized", "detail": str(exc.detail)}
 
     caller = resolve_request_user_id(request)
     if not caller:
+        db.close()
         return {
             "ok": False,
             "error": "unattributed_caller",
@@ -3176,6 +3255,7 @@ async def _perform_project_scope(
         }
 
     if default is not None and project_scope.normalize_default_scope(default) is None:
+        db.close()
         return {
             "ok": False,
             "error": "invalid_scope",
@@ -3185,6 +3265,7 @@ async def _perform_project_scope(
         project_scope.SCOPE_PRIVATE,
         "default",
     ):
+        db.close()
         return {
             "ok": False,
             "error": "invalid_override",
@@ -3194,7 +3275,6 @@ async def _perform_project_scope(
             ),
         }
 
-    db = SessionLocal()
     try:
         project_id = brain.find_project_id(db, org_id=org_id, identifier=project)
         if project_id is None:

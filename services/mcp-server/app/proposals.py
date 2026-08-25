@@ -41,9 +41,12 @@ both believe they own the decision. If the underlying apply then fails
 ``status='open'`` so the proposal stays reviewable rather than stuck
 half-decided with nothing actually written.
 
-Auth mirrors ``app.capture``: the same ``X-Vex-Key`` (+ optional
-``X-Vex-Agent``) bridge via :func:`app.auth.resolve_principal_dep`, so every
-query and write here is scoped to exactly the org the key authorises.
+Auth mirrors ``app.capture``: the key is validated by
+``Depends(verify_api_key)`` and each route body resolves its principal
+through :func:`app.identity.resolve_active_principal` (after seeding the
+validated key via :func:`app.identity.seed_request_key_info`), so every query
+and write here is scoped to the ACTIVE node — the org an ``X-Klio-Node``
+header selects, or the key's own org when no node is selected.
 """
 
 import logging
@@ -57,9 +60,13 @@ from shared.auth import KeyInfo
 from shared.memory import retract_memory, supersede_with_revision
 from sqlalchemy import text
 
-from app.auth import resolve_principal_dep, verify_api_key
+from app.auth import verify_api_key
 from app.db import SessionLocal
-from app.identity import resolve_user_id
+from app.identity import (
+    resolve_active_principal,
+    resolve_user_id,
+    seed_request_key_info,
+)
 
 logger = logging.getLogger("agentguard.mcp.proposals")
 
@@ -223,16 +230,20 @@ def _target_row(db: Any, *, org_id: str, memory_id: str) -> Optional[dict[str, A
 
 @router.get("")
 async def list_proposals(
+    request: Request,
     status: Optional[str] = Query("open"),
     limit: int = Query(_DEFAULT_LIST_LIMIT, ge=1, le=_MAX_LIST_LIMIT),
-    principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
-    """``GET /proposals?status=open&limit=50`` — org-scoped, status-filtered,
+    """``GET /proposals?status=open&limit=50`` — node-scoped, status-filtered,
     capped."""
-    org_id, _agent_id = principal
     db = SessionLocal()
     try:
+        # The ONE resolver (see app.identity): review is node-scoped, so an
+        # X-Klio-Node header lists the SELECTED node's proposals and an
+        # unreachable node is a 404 before any query runs.
+        seed_request_key_info(request, key_info)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
         rows = await anyio.to_thread.run_sync(
             lambda: _list_proposals(db, org_id=org_id, status=status, limit=limit)
         )
@@ -245,20 +256,24 @@ async def list_proposals(
 async def approve_proposal(
     proposal_id: str,
     request: Request,
-    principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Apply a proposal: ``add``/``revise`` write via ``proposed_content``,
     ``retire`` retracts. See module docstring for the full contract.
     """
     _validate_uuid(proposal_id)
-    org_id, agent_id = principal
-    user_id = resolve_user_id(request, key_info)
-    if not user_id:
-        raise HTTPException(status_code=403, detail="attribution_required")
-
     db = SessionLocal()
     try:
+        # Node resolution precedes the attribution gate: an unreachable node
+        # is a 404 (the same shape as an id that was never issued) before the
+        # caller learns anything else, and an approved write lands in the
+        # SELECTED node.
+        seed_request_key_info(request, key_info)
+        org_id, agent_id, _plan, _overrides = resolve_active_principal(request, db)
+        user_id = resolve_user_id(request, key_info)
+        if not user_id:
+            raise HTTPException(status_code=403, detail="attribution_required")
+
         proposal = await anyio.to_thread.run_sync(
             lambda: _load_proposal(db, org_id=org_id, proposal_id=proposal_id)
         )
@@ -425,7 +440,6 @@ async def approve_proposal(
 async def reject_proposal(
     proposal_id: str,
     request: Request,
-    principal: tuple[str, str] = Depends(resolve_principal_dep),
     key_info: KeyInfo = Depends(verify_api_key),
 ) -> dict[str, Any]:
     """Mark a proposal rejected. Same attribution/claim-before-decide
@@ -433,13 +447,16 @@ async def reject_proposal(
     record.
     """
     _validate_uuid(proposal_id)
-    org_id, _agent_id = principal
-    user_id = resolve_user_id(request, key_info)
-    if not user_id:
-        raise HTTPException(status_code=403, detail="attribution_required")
-
     db = SessionLocal()
     try:
+        # Same node resolution and ordering as approve — a reject is a
+        # decision recorded in the SELECTED node.
+        seed_request_key_info(request, key_info)
+        org_id, _agent_id, _plan, _overrides = resolve_active_principal(request, db)
+        user_id = resolve_user_id(request, key_info)
+        if not user_id:
+            raise HTTPException(status_code=403, detail="attribution_required")
+
         proposal = await anyio.to_thread.run_sync(
             lambda: _load_proposal(db, org_id=org_id, proposal_id=proposal_id)
         )

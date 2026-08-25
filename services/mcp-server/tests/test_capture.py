@@ -198,7 +198,13 @@ def test_transcript_extracts_typed_memories_and_summary(client):
 
 
 def test_transcript_empty_messages_short_circuits(client):
-    """No usable message text → nothing stored, no LLM call, no DB session."""
+    """No usable message text → nothing stored, no LLM call, no session work.
+
+    Since the node wiring the session is OPENED before the empty check — the
+    active-node resolution needs it, and ``SessionLocal`` connects lazily so
+    an unselected request still touches no database — but it must be closed
+    on this path and no query, write, or LLM call may happen.
+    """
     write = AsyncMock()
     sl = MagicMock()
     with (
@@ -215,7 +221,8 @@ def test_transcript_empty_messages_short_circuits(client):
     write.assert_not_called()
     gs.assert_not_called()
     ef.assert_not_called()
-    sl.assert_not_called()
+    sl.return_value.execute.assert_not_called()
+    sl.return_value.close.assert_called_once()
 
 
 def test_transcript_summary_failure_still_stores_memories(client):

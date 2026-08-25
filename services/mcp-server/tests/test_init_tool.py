@@ -47,7 +47,7 @@ def _principal_patches(user_id=USER):
     """Patch the two identity seams at the onboarding module boundary."""
     return (
         patch(
-            "app.onboarding.resolve_principal_plan",
+            "app.onboarding.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.onboarding.resolve_request_user_id", return_value=user_id),
@@ -151,7 +151,7 @@ async def test_start_is_refused_cleanly_on_auth_failure():
 
     fn = _get_tool().fn
     with patch(
-        "app.onboarding.resolve_principal_plan",
+        "app.onboarding.resolve_active_principal",
         side_effect=HTTPException(status_code=401, detail="bad key"),
     ):
         result = await fn(_fake_ctx(), phase="start")
@@ -572,7 +572,7 @@ async def _init_call(org_id, user_id, phase, candidates=None, git_remote=None):
     )
     with (
         patch(
-            "app.onboarding.resolve_principal_plan",
+            "app.onboarding.resolve_active_principal",
             return_value=(org_id, "agent-init", "free", None),
         ),
         patch("app.onboarding.resolve_request_user_id", return_value=user_id),

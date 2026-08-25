@@ -86,7 +86,7 @@ async def test_remember_does_not_run_its_db_work_on_the_event_loop():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),
@@ -125,7 +125,7 @@ async def test_recall_does_not_run_its_db_work_on_the_event_loop():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=("org-x", "agent-y", "free", None),
         ),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=MagicMock())),

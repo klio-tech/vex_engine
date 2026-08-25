@@ -51,12 +51,17 @@ from app.db import SessionLocal
 # Both halves of the caller's identity come from ``app.identity``, never one
 # from here and one from ``app.auth``. ``app.identity.request_key_info``
 # memoizes the validated KeyInfo on ``request.state``, and only the identity
-# module's ``resolve_principal_plan`` writes that memo. Pairing ``app.auth``'s
-# copy with ``resolve_request_user_id`` left the memo empty, so ``init``
-# validated the key twice per request — two rate-limit tokens for one call, and
-# on the token that trips it is the SECOND call that raises, the one deciding
-# whether this request has a person behind it.
-from app.identity import resolve_principal_plan, resolve_request_user_id
+# module's resolvers write that memo. Pairing ``app.auth``'s copy with
+# ``resolve_request_user_id`` left the memo empty, so ``init`` validated the
+# key twice per request — two rate-limit tokens for one call, and on the token
+# that trips it is the SECOND call that raises, the one deciding whether this
+# request has a person behind it.
+#
+# ``resolve_active_principal`` (not the plain plan resolver) since the node
+# wiring: init seeds the workplace the caller has SELECTED, so an X-Klio-Node
+# header redirects the whole run and an unreachable node refuses before
+# anything is written.
+from app.identity import resolve_active_principal, resolve_request_user_id
 
 logger = logging.getLogger("agentguard.mcp.init")
 
@@ -262,17 +267,23 @@ async def perform_init(
         logger.error("init got no transport request; cannot authenticate")
         return {"error": "unauthorized", "detail": "no request context"}
 
+    # The session is opened BEFORE resolution because the active-node
+    # membership check may need it; SessionLocal connects lazily, so an
+    # unselected request still does no session work here (the pattern
+    # mcp_app's tool bodies use).
+    db = SessionLocal()
     try:
-        org_id, agent_id, plan, plan_overrides = resolve_principal_plan(request)
+        org_id, agent_id, plan, plan_overrides = resolve_active_principal(request, db)
     except HTTPException as exc:
+        db.close()
         return {"error": "unauthorized", "detail": str(exc.detail)}
 
     # The ONLY identity source. Never a header, never the payload.
     user_id = resolve_request_user_id(request)
     if not user_id:
+        db.close()
         return _unattributed()
 
-    db = SessionLocal()
     try:
         if phase == "start":
             return _phase_start(db, org_id=org_id, user_id=user_id)

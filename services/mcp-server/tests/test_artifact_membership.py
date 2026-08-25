@@ -193,10 +193,13 @@ def _as(db, user_id: str | None, *, org_id: str):
     )
     with (
         patch(
-            "app.mcp_app.resolve_principal_plan",
+            "app.mcp_app.resolve_active_principal",
             return_value=(org_id, "agent-1", "free", None),
         ),
-        patch("app.mcp_app.resolve_principal", return_value=(org_id, "agent-1")),
+        patch(
+            "app.mcp_app.resolve_active_principal",
+            return_value=(org_id, "agent-1", "free", None),
+        ),
         patch("app.mcp_app.resolve_request_user_id", return_value=user_id),
         patch("app.mcp_app.get_plan_config", return_value=plan),
         patch("app.mcp_app.SessionLocal", lambda: _NoCloseSession(db)),

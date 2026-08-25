@@ -59,11 +59,11 @@ def _fake_space(*, id=None, name="Research", slug="research", embedding_model=No
     }
 
 
-def _patches(*, resolve=("org-x", "agent-y"), session=None):
+def _patches(*, resolve=("org-x", "agent-y", "free", None), session=None):
     """Return the common (resolve_principal, SessionLocal) patch context pair."""
     session = session if session is not None else MagicMock()
     return (
-        patch("app.mcp_app.resolve_principal", return_value=resolve),
+        patch("app.mcp_app.resolve_active_principal", return_value=resolve),
         patch("app.mcp_app.SessionLocal", MagicMock(return_value=session)),
     )
 
@@ -101,7 +101,7 @@ async def test_space_list_org_isolation_uses_resolved_principal():
     resolve_principal — never anything caller-supplied."""
     fn = _space_fn()
     list_mock = MagicMock(return_value=[])
-    resolve_p, session_p = _patches(resolve=("org-secure", "agent-z"))
+    resolve_p, session_p = _patches(resolve=("org-secure", "agent-z", "free", None))
 
     with resolve_p, session_p, patch.object(mcp_app.brain, "list_spaces", list_mock):
         await fn(_fake_ctx(), "list")
@@ -121,7 +121,7 @@ async def test_space_create_happy_calls_ensure_with_resolved_org():
     name + slug, and returns created==True with the new id."""
     fn = _space_fn()
     ensure_mock = MagicMock(return_value="sp-1")
-    resolve_p, session_p = _patches(resolve=("org-x", "agent-y"))
+    resolve_p, session_p = _patches(resolve=("org-x", "agent-y", "free", None))
 
     with resolve_p, session_p, patch.object(mcp_app.brain, "ensure_space", ensure_mock):
         result = await fn(_fake_ctx(), "create", name="Research", slug="research")
@@ -331,7 +331,7 @@ async def test_space_info_org_isolation_uses_resolved_principal():
     """get_space receives the resolved org_id, never a tool arg."""
     fn = _space_fn()
     get_mock = MagicMock(return_value=None)
-    resolve_p, session_p = _patches(resolve=("org-secure", "agent-z"))
+    resolve_p, session_p = _patches(resolve=("org-secure", "agent-z", "free", None))
 
     with resolve_p, session_p, patch.object(mcp_app.brain, "get_space", get_mock):
         await fn(_fake_ctx(), "info", slug="research")
@@ -354,7 +354,7 @@ async def test_space_auth_failure_returns_clean_error():
 
     with (
         patch(
-            "app.mcp_app.resolve_principal",
+            "app.mcp_app.resolve_active_principal",
             side_effect=HTTPException(
                 status_code=401, detail="Missing X-Vex-Key header"
             ),
@@ -367,7 +367,10 @@ async def test_space_auth_failure_returns_clean_error():
     assert result["error"] == "unauthorized"
     assert "Missing X-Vex-Key header" in result["detail"]
     list_mock.assert_not_called()
-    session_local.assert_not_called()
+    # The session opens before resolution now (the active-node resolver
+    # needs it); the guarantee on a refusal is that it was CLOSED, unused.
+    session_local.assert_called_once()
+    session_local.return_value.close.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -379,7 +382,7 @@ async def test_space_no_request_context_returns_unauthorized():
     ctx = SimpleNamespace(request_context=SimpleNamespace(request=None))
 
     with (
-        patch("app.mcp_app.resolve_principal") as resolve_mock,
+        patch("app.mcp_app.resolve_active_principal") as resolve_mock,
         patch("app.mcp_app.SessionLocal", session_local),
         patch.object(mcp_app.brain, "list_spaces", list_mock),
     ):
