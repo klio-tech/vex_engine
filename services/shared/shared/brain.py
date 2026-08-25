@@ -642,6 +642,7 @@ async def write_scoped_memory(
     session_id: str,
     space_id: Optional[str] = None,
     project_id: Optional[str] = None,
+    branch_id: Optional[str] = None,
     metadata: Optional[dict] = None,
     dedup: bool = True,
     scope: str = "org",
@@ -713,6 +714,16 @@ async def write_scoped_memory(
             string is acceptable; it scopes the dedup lookup.
         space_id: Optional space the memory belongs to.
         project_id: Optional project the memory belongs to.
+        branch_id: Optional context branch (``context_branches.id``) the row
+            lands on. ``None`` (the default) IS main — the column stays NULL
+            and nothing changes for any existing caller. Requires
+            ``scope='project'``: a branch always belongs to a project, so a
+            branch id on any other scope is structurally impossible and
+            refused. The caller is responsible for having resolved the id via
+            :mod:`shared.branches` (this layer does not re-verify the row
+            exists, matching how ``project_id`` is treated). Dedup becomes
+            branch-aware: the write compares only against rows on the SAME
+            branch — see :func:`shared.memory.find_similar_memory`.
         metadata: Optional metadata dict persisted on the row.
         dedup: When ``True`` (default), suppress the write if a sufficiently
             similar active memory already exists in the dedup window (see Scope).
@@ -770,6 +781,11 @@ async def write_scoped_memory(
         raise ValueError("user_id is required when scope='private'")
     if scope == "project" and not project_id:
         raise ValueError("project_id is required when scope='project'")
+    if branch_id and scope != "project":
+        # A branch always belongs to a project (a branch row carries
+        # scope='project' + project_id + branch_id). Anything else would be a
+        # branch memory no branch-aware reader can ever reach.
+        raise ValueError("branch_id requires scope='project'")
     if provenance not in ("EXTRACTED", "INFERRED", "AMBIGUOUS"):
         raise ValueError(f"unsupported provenance: {provenance!r}")
 
@@ -814,6 +830,9 @@ async def write_scoped_memory(
             scope=scope if scope in ("agent", "private") else None,
             agent_id=agent_id if scope == "agent" else None,
             user_id=user_id if scope == "private" else None,
+            # Branch-aware window: a branch write dedups only against its own
+            # branch, and a main write (branch_id=None) only against main.
+            branch_id=branch_id,
         )
         if existing is not None:
             return {
@@ -856,6 +875,7 @@ async def write_scoped_memory(
             SET scope = :scope,
                 space_id = :space_id,
                 project_id = :project_id,
+                branch_id = :branch_id,
                 updated_at = NOW()
             WHERE id = :id
             """
@@ -864,6 +884,7 @@ async def write_scoped_memory(
             "scope": scope,
             "space_id": space_id,
             "project_id": project_id,
+            "branch_id": branch_id,
             "id": str(record.id),
         },
     )

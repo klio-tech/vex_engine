@@ -1223,6 +1223,7 @@ async def find_similar_memory(
     scope: Optional[str] = None,
     agent_id: Optional[str] = None,
     user_id: Optional[str] = None,
+    branch_id: Optional[str] = None,
 ) -> Optional[MemoryRecord]:
     """Find the closest existing memory and return it if above *threshold*.
 
@@ -1252,6 +1253,15 @@ async def find_similar_memory(
           ``user_id = :user_id`` that guards recall. ``user_id`` is mandatory
           here: without an owner there is no window that can be safely
           searched, so the call raises rather than silently widening.
+
+    Every window additionally carries ``branch_id IS NOT DISTINCT FROM
+    :branch_id``: a write dedups only against rows on the SAME context branch.
+    ``IS NOT DISTINCT FROM`` is exactly the NULL-is-main semantics — two NULLs
+    match (main keeps deduping against main, byte-identical to the
+    pre-branch behaviour), while NULL vs a value does not, so a branch never
+    dedups against main and main never against a branch. A branch is a draft
+    of main; the same belief legitimately exists on both sides until merge
+    decides.
 
     Raises:
         ValueError: If ``scope='private'`` is requested without a ``user_id``.
@@ -1288,12 +1298,14 @@ async def find_similar_memory(
             "org_id = :org_id\n"
             "              AND scope = 'private'\n"
             "              AND user_id = :user_id\n"
-            "              AND status = 'active'"
+            "              AND status = 'active'\n"
+            "              AND branch_id IS NOT DISTINCT FROM :branch_id"
         )
         params: dict[str, Any] = {
             "org_id": org_id,
             "user_id": user_id,
             "embedding": embedding_str,
+            "branch_id": branch_id,
         }
     elif scope == "agent":
         # Agent-private dedup: compare only against this agent's own private
@@ -1302,24 +1314,28 @@ async def find_similar_memory(
             "org_id = :org_id\n"
             "              AND scope = 'agent'\n"
             "              AND agent_id = :agent_id\n"
-            "              AND status = 'active'"
+            "              AND status = 'active'\n"
+            "              AND branch_id IS NOT DISTINCT FROM :branch_id"
         )
         params = {
             "org_id": org_id,
             "agent_id": agent_id,
             "embedding": embedding_str,
+            "branch_id": branch_id,
         }
     else:
         # Default session-scoped dedup (historical behavior; unchanged).
         where_clause = (
             "session_id = :session_id\n"
             "              AND org_id = :org_id\n"
-            "              AND status = 'active'"
+            "              AND status = 'active'\n"
+            "              AND branch_id IS NOT DISTINCT FROM :branch_id"
         )
         params = {
             "session_id": session_id,
             "org_id": org_id,
             "embedding": embedding_str,
+            "branch_id": branch_id,
         }
 
     def _nearest():
