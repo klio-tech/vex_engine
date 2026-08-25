@@ -1871,6 +1871,11 @@ async def _perform_recall(
         number of memories actually returned and may EXCEED ``limit`` by up to
         ``GRAPH_EXPANSION_CAP`` graph-expanded rows (each marked
         ``via: graph``, with no ``relevance``).
+
+        When the personal-node union is active (attributable caller, personal
+        org exists, active org is not the personal org), each memory also
+        carries ``source: "personal" | "active"`` saying which node it came
+        from; without the union the payload is unchanged.
     """
     request = ctx.request_context.request
     if request is None:
@@ -1996,6 +2001,37 @@ async def _perform_recall(
                 lambda: resolve_project_from_request(request, db, org_id=org_id)
             )
 
+        # The personal-node union (Track B, Task B3): stack the caller's
+        # personal org under the active org so an agent attached to a team
+        # still recalls its human's own memories, READ-ONLY. Three conditions,
+        # all required: the caller is attributable, a personal org exists
+        # (``organizations.personal_owner_user_id``, migration 048 — at most
+        # one, by partial unique index), and the active org is not already the
+        # personal org (stacking a tenant under itself would double-read it).
+        # Best-effort by design: a failed lookup degrades to the plain
+        # single-org recall rather than failing the read.
+        extra_org_id: Optional[str] = None
+        if user_id:
+            try:
+                personal_row = await anyio.to_thread.run_sync(
+                    lambda: db.execute(
+                        text(
+                            "SELECT org_id FROM organizations "
+                            "WHERE personal_owner_user_id = :user_id"
+                        ),
+                        {"user_id": user_id},
+                    ).fetchone()
+                )
+            except Exception:
+                logger.warning(
+                    "recall: personal-org lookup failed; recalling the active "
+                    "org alone",
+                    exc_info=True,
+                )
+                personal_row = None
+            if personal_row is not None and personal_row.org_id != org_id:
+                extra_org_id = personal_row.org_id
+
         # agent_id is always forwarded; retrieve_memories_scoped ignores it
         # unless scope == "agent".
         records = await retrieve_memories_scoped(
@@ -2008,6 +2044,7 @@ async def _perform_recall(
             space_id=space_id,
             project_id=project_id,
             limit=min(max(limit, 1), 50),
+            extra_org_id=extra_org_id,
         )
         # Best-effort recall activity log; it swallows its own errors so a
         # logging failure can never break the recall. Offloaded like every
@@ -2053,7 +2090,17 @@ async def _perform_recall(
             )
             if row is not None:
                 project_label = {"id": project_id, "name": row.display_name}
-        memories = [_serialize_record(r, project_label=project_label) for r in records]
+        memories = []
+        for record in records:
+            memory = _serialize_record(record, project_label=project_label)
+            if extra_org_id is not None:
+                # Which node the row came from, derived from the org_id every
+                # returned row carries. Tagged only while the union is active
+                # so a plain single-org recall's payload stays byte-identical.
+                memory["source"] = (
+                    "personal" if record.org_id == extra_org_id else "active"
+                )
+            memories.append(memory)
         payload = {
             "memories": memories,
             "count": len(memories),
