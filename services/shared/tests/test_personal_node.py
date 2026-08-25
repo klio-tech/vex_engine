@@ -6,13 +6,13 @@ of the model that must always exist: it is where solo agent work accumulates
 before any team is involved.
 
 The fixture follows ``test_membership_resolution.py`` and creates the two
-Supabase-side tables (``public.accounts``, ``public.accounts_memberships``) for
-real inside a transaction that is always rolled back. A stubbed session would
-match SQL by substring and return canned rows, which cannot catch the thing
-this file exists to catch -- a second call minting a second personal node.
+workspace-DB tables (``workspaces``, ``workspace_members``) for real inside a
+transaction that is always rolled back. A stubbed session would match SQL by
+substring and return canned rows, which cannot catch the thing this file
+exists to catch -- a second call minting a second personal node.
 
-``reachable_orgs`` takes two connections because the accounts tables live
-behind ``SUPABASE_DATABASE_URL`` in production while ``organizations`` lives
+``reachable_orgs`` takes two connections because the workspace tables live
+behind ``WORKSPACE_DATABASE_URL`` in production while ``organizations`` lives
 behind ``DATABASE_URL``. Locally one connection stands in for both.
 """
 
@@ -32,8 +32,8 @@ TEAM_SLUG = "team-beta"
 
 TEAM_ORG = "org_team_beta"
 
-PERSONAL_ACCOUNT_ID = "bbbbbbbb-0000-0000-0000-000000000001"
-TEAM_ACCOUNT_ID = "bbbbbbbb-0000-0000-0000-000000000002"
+PERSONAL_WORKSPACE_ID = "cccccccc-0000-0000-0000-000000000001"
+TEAM_WORKSPACE_ID = "cccccccc-0000-0000-0000-000000000002"
 
 
 class _Personal:
@@ -50,7 +50,7 @@ class _Personal:
 
 @pytest.fixture()
 def personal_fixture():
-    """Real Supabase-shaped tables, in a transaction that is always rolled back.
+    """Real workspace-DB-shaped tables, in a transaction always rolled back.
 
     Postgres DDL is transactional, so both the CREATE TABLEs and every row
     written by the code under test vanish on rollback -- including any
@@ -63,10 +63,11 @@ def personal_fixture():
         conn.execute(
             text(
                 """
-                CREATE TABLE public.accounts (
+                CREATE TABLE workspaces (
                     id uuid PRIMARY KEY,
                     slug text UNIQUE,
-                    is_personal_account boolean NOT NULL DEFAULT false
+                    is_personal boolean NOT NULL DEFAULT false,
+                    deleted_at timestamptz
                 )
                 """
             )
@@ -74,42 +75,50 @@ def personal_fixture():
         conn.execute(
             text(
                 """
-                CREATE TABLE public.accounts_memberships (
-                    account_id uuid NOT NULL REFERENCES public.accounts(id),
-                    user_id text NOT NULL
+                CREATE TABLE workspace_members (
+                    workspace_id uuid NOT NULL REFERENCES workspaces(id),
+                    member_id uuid NOT NULL,
+                    is_active boolean NOT NULL DEFAULT true,
+                    deleted_at timestamptz
                 )
                 """
             )
         )
 
-        for account_id, slug, is_personal in (
-            (PERSONAL_ACCOUNT_ID, PERSONAL_SLUG, True),
-            (TEAM_ACCOUNT_ID, TEAM_SLUG, False),
+        for workspace_id, slug, is_personal in (
+            (PERSONAL_WORKSPACE_ID, PERSONAL_SLUG, True),
+            (TEAM_WORKSPACE_ID, TEAM_SLUG, False),
         ):
             conn.execute(
                 text(
-                    "INSERT INTO public.accounts (id, slug, is_personal_account) "
+                    "INSERT INTO workspaces (id, slug, is_personal) "
                     "VALUES (:id, :slug, :personal)"
                 ),
-                {"id": account_id, "slug": slug, "personal": is_personal},
+                {"id": workspace_id, "slug": slug, "personal": is_personal},
             )
-        for account_id in (PERSONAL_ACCOUNT_ID, TEAM_ACCOUNT_ID):
+        for workspace_id in (PERSONAL_WORKSPACE_ID, TEAM_WORKSPACE_ID):
             conn.execute(
                 text(
-                    "INSERT INTO public.accounts_memberships (account_id, user_id) "
-                    "VALUES (:account_id, :user_id)"
+                    "INSERT INTO workspace_members (workspace_id, member_id) "
+                    "VALUES (:workspace_id, :member_id)"
                 ),
-                {"account_id": account_id, "user_id": SUBJECT_USER},
+                {"workspace_id": workspace_id, "member_id": SUBJECT_USER},
             )
 
-        # The team already has an org row; the personal account deliberately
+        # The team already has an org row; the personal workspace deliberately
         # does not, because provisioning it is what is under test.
         conn.execute(
             text(
-                "INSERT INTO organizations (org_id, name, account_slug) "
-                "VALUES (:org_id, :name, :slug)"
+                "INSERT INTO organizations "
+                "(org_id, name, account_slug, workspace_id) "
+                "VALUES (:org_id, :name, :slug, :workspace_id)"
             ),
-            {"org_id": TEAM_ORG, "name": TEAM_ORG, "slug": TEAM_SLUG},
+            {
+                "org_id": TEAM_ORG,
+                "name": TEAM_ORG,
+                "slug": TEAM_SLUG,
+                "workspace_id": TEAM_WORKSPACE_ID,
+            },
         )
 
         yield _Personal(conn, SUBJECT_USER, PERSONAL_SLUG)
@@ -167,10 +176,28 @@ def test_the_whole_user_id_is_in_the_org_id(personal_fixture):
     assert len(org_id) <= 64
 
 
+def _link_workspace(db, org_id, workspace_id):
+    """Stamp the join key onto an org row.
+
+    ``ensure_personal_org`` predates ``organizations.workspace_id`` and does
+    not set it -- the workspace-aware ensure (Task E3) owns that linking.
+    These reachability tests exercise ``reachable_orgs``, which joins by the
+    id, so the tests perform the link the ensure will later perform itself.
+    """
+    db.execute(
+        text(
+            "UPDATE organizations SET workspace_id = :workspace_id "
+            "WHERE org_id = :org_id"
+        ),
+        {"workspace_id": workspace_id, "org_id": org_id},
+    )
+
+
 @requires_db("the personal node tests")
 def test_the_personal_node_is_reachable_and_sorts_first(personal_fixture):
     db, user_id, slug = personal_fixture
     org_id = ensure_personal_org(db, user_id=user_id, account_slug=slug)
+    _link_workspace(db, org_id, PERSONAL_WORKSPACE_ID)
     orgs = reachable_orgs(db, db, user_id=user_id)
     assert orgs, "personal node did not appear in reachable_orgs"
     assert orgs[0]["is_personal"] is True
@@ -184,6 +211,7 @@ def test_the_personal_node_is_reachable_and_sorts_first(personal_fixture):
 def test_a_personal_node_belongs_to_exactly_one_user(personal_fixture):
     db, user_id, slug = personal_fixture
     org_id = ensure_personal_org(db, user_id=user_id, account_slug=slug)
+    _link_workspace(db, org_id, PERSONAL_WORKSPACE_ID)
     other = reachable_orgs(db, db, user_id=STRANGER_USER)
     assert org_id not in {o["org_id"] for o in other}
 

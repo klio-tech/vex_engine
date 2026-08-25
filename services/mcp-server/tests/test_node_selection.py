@@ -10,9 +10,9 @@ since that is today's behaviour for every existing caller -- so a revocation
 test written against it would pass against a resolver that never checks
 anything at all.
 
-The two Supabase-side tables (``public.accounts``, ``public.accounts_memberships``)
-do not exist in the engine's database, so the fixture creates them for real
-inside a transaction that is always rolled back, exactly as
+The two workspace-DB tables (``workspaces``, ``workspace_members``) do not
+exist in the engine's database, so the fixture creates them for real inside a
+transaction that is always rolled back, exactly as
 ``services/shared/tests/test_membership_resolution.py`` does. Stubbing the
 session instead would match SQL by substring and could not catch a wrong JOIN.
 """
@@ -38,7 +38,9 @@ KEY_ORG = "org_node_team"
 OTHER_NODE_ORG = "org_node_personal"
 STRANGER_ORG = "org_node_stranger"
 
-PERSONAL_ACCOUNT_ID = "bbbbbbbb-0000-0000-0000-000000000002"
+KEY_WORKSPACE_ID = "bbbbbbbb-0000-0000-0000-000000000001"
+PERSONAL_WORKSPACE_ID = "bbbbbbbb-0000-0000-0000-000000000002"
+STRANGER_WORKSPACE_ID = "bbbbbbbb-0000-0000-0000-000000000003"
 
 
 class _State:
@@ -67,7 +69,7 @@ class _Node:
 
 @pytest.fixture()
 def node_fixture(monkeypatch):
-    """Real Supabase-shaped tables plus a patched principal, rolled back after.
+    """Real workspace-DB-shaped tables plus a patched principal, rolled back after.
 
     The principal is patched rather than minted because this suite is about
     what happens AFTER identity is established: whose key it is and who the
@@ -80,10 +82,11 @@ def node_fixture(monkeypatch):
         conn.execute(
             text(
                 """
-                CREATE TABLE public.accounts (
+                CREATE TABLE workspaces (
                     id uuid PRIMARY KEY,
                     slug text UNIQUE,
-                    is_personal_account boolean NOT NULL DEFAULT false
+                    is_personal boolean NOT NULL DEFAULT false,
+                    deleted_at timestamptz
                 )
                 """
             )
@@ -91,51 +94,59 @@ def node_fixture(monkeypatch):
         conn.execute(
             text(
                 """
-                CREATE TABLE public.accounts_memberships (
-                    account_id uuid NOT NULL REFERENCES public.accounts(id),
-                    user_id text NOT NULL
+                CREATE TABLE workspace_members (
+                    workspace_id uuid NOT NULL REFERENCES workspaces(id),
+                    member_id uuid NOT NULL,
+                    is_active boolean NOT NULL DEFAULT true,
+                    deleted_at timestamptz
                 )
                 """
             )
         )
 
-        for account_id, slug, is_personal in (
-            ("bbbbbbbb-0000-0000-0000-000000000001", KEY_SLUG, False),
-            (PERSONAL_ACCOUNT_ID, OTHER_NODE_SLUG, True),
-            ("bbbbbbbb-0000-0000-0000-000000000003", STRANGER_SLUG, False),
+        for workspace_id, slug, is_personal in (
+            (KEY_WORKSPACE_ID, KEY_SLUG, False),
+            (PERSONAL_WORKSPACE_ID, OTHER_NODE_SLUG, True),
+            (STRANGER_WORKSPACE_ID, STRANGER_SLUG, False),
         ):
             conn.execute(
                 text(
-                    "INSERT INTO public.accounts (id, slug, is_personal_account) "
+                    "INSERT INTO workspaces (id, slug, is_personal) "
                     "VALUES (:id, :slug, :personal)"
                 ),
-                {"id": account_id, "slug": slug, "personal": is_personal},
+                {"id": workspace_id, "slug": slug, "personal": is_personal},
             )
 
-        for account_id, user_id in (
-            ("bbbbbbbb-0000-0000-0000-000000000001", SUBJECT_USER),
-            (PERSONAL_ACCOUNT_ID, SUBJECT_USER),
-            ("bbbbbbbb-0000-0000-0000-000000000003", OTHER_USER),
+        for workspace_id, member_id in (
+            (KEY_WORKSPACE_ID, SUBJECT_USER),
+            (PERSONAL_WORKSPACE_ID, SUBJECT_USER),
+            (STRANGER_WORKSPACE_ID, OTHER_USER),
         ):
             conn.execute(
                 text(
-                    "INSERT INTO public.accounts_memberships (account_id, user_id) "
-                    "VALUES (:account_id, :user_id)"
+                    "INSERT INTO workspace_members (workspace_id, member_id) "
+                    "VALUES (:workspace_id, :member_id)"
                 ),
-                {"account_id": account_id, "user_id": user_id},
+                {"workspace_id": workspace_id, "member_id": member_id},
             )
 
-        for org_id, slug in (
-            (KEY_ORG, KEY_SLUG),
-            (OTHER_NODE_ORG, OTHER_NODE_SLUG),
-            (STRANGER_ORG, STRANGER_SLUG),
+        for org_id, slug, workspace_id in (
+            (KEY_ORG, KEY_SLUG, KEY_WORKSPACE_ID),
+            (OTHER_NODE_ORG, OTHER_NODE_SLUG, PERSONAL_WORKSPACE_ID),
+            (STRANGER_ORG, STRANGER_SLUG, STRANGER_WORKSPACE_ID),
         ):
             conn.execute(
                 text(
-                    "INSERT INTO organizations (org_id, name, account_slug) "
-                    "VALUES (:org_id, :name, :slug)"
+                    "INSERT INTO organizations "
+                    "(org_id, name, account_slug, workspace_id) "
+                    "VALUES (:org_id, :name, :slug, :workspace_id)"
                 ),
-                {"org_id": org_id, "name": org_id, "slug": slug},
+                {
+                    "org_id": org_id,
+                    "name": org_id,
+                    "slug": slug,
+                    "workspace_id": workspace_id,
+                },
             )
 
         monkeypatch.setattr(
@@ -158,15 +169,19 @@ def node_fixture(monkeypatch):
 
 @pytest.fixture()
 def revoke():
-    """Delete the membership row backing a node, mid-test."""
+    """Deactivate the membership row backing a node, mid-test.
 
-    def _revoke(db, user_id, account_id):
+    ``is_active = false`` rather than DELETE because that is what Plane does:
+    revocation is a deactivation, and the resolver must treat it as gone.
+    """
+
+    def _revoke(db, user_id, workspace_id):
         db.execute(
             text(
-                "DELETE FROM public.accounts_memberships "
-                "WHERE user_id = :user_id AND account_id = :account_id"
+                "UPDATE workspace_members SET is_active = false "
+                "WHERE member_id = :member_id AND workspace_id = :workspace_id"
             ),
-            {"user_id": user_id, "account_id": account_id},
+            {"member_id": user_id, "workspace_id": workspace_id},
         )
 
     return _revoke
@@ -192,20 +207,20 @@ def test_without_a_selection_the_keys_org_is_used(node_fixture):
 
 
 @needs_db
-def test_without_a_selection_supabase_is_never_consulted(node_fixture):
-    """The unselected path must not acquire a Supabase connection at all.
+def test_without_a_selection_the_workspace_db_is_never_consulted(node_fixture):
+    """The unselected path must not acquire a workspace DB connection at all.
 
-    A deployment with no SUPABASE_DATABASE_URL is the common case today, and it
-    must keep working untouched.
+    A deployment with no WORKSPACE_DATABASE_URL is the common case today, and
+    it must keep working untouched.
     """
 
     def _explode():  # pragma: no cover - only runs if the contract breaks
-        raise AssertionError("the unselected path opened a Supabase connection")
+        raise AssertionError("the unselected path opened a workspace DB connection")
 
-    import app.directory as directory_module
+    import app.workspace_db as workspace_db_module
 
     with pytest.MonkeyPatch.context() as mp:
-        mp.setattr(directory_module, "_engines", lambda: _explode())
+        mp.setattr(workspace_db_module, "workspace_engine", lambda: _explode())
         assert (
             identity_module.resolve_active_org(_Req({}), node_fixture.db)
             == node_fixture.key_org
@@ -216,7 +231,7 @@ def test_without_a_selection_supabase_is_never_consulted(node_fixture):
 def test_selecting_the_keys_own_org_is_a_no_op(node_fixture):
     _user_id, key_org, _other = node_fixture
     got = identity_module.resolve_active_org(
-        _Req({"X-Klio-Node": key_org}), node_fixture.db, supabase=node_fixture.db
+        _Req({"X-Klio-Node": key_org}), node_fixture.db, workspace_db=node_fixture.db
     )
     assert got == key_org
 
@@ -226,7 +241,7 @@ def test_a_reachable_node_may_be_selected(node_fixture):
     # A node that is NOT the key's org, so membership is genuinely consulted.
     _user_id, _key_org, other_org = node_fixture
     got = identity_module.resolve_active_org(
-        _Req({"X-Klio-Node": other_org}), node_fixture.db, supabase=node_fixture.db
+        _Req({"X-Klio-Node": other_org}), node_fixture.db, workspace_db=node_fixture.db
     )
     assert got == other_org
 
@@ -235,7 +250,7 @@ def test_a_reachable_node_may_be_selected(node_fixture):
 def test_the_legacy_vex_header_selects_too(node_fixture):
     _user_id, _key_org, other_org = node_fixture
     got = identity_module.resolve_active_org(
-        _Req({"X-Vex-Node": other_org}), node_fixture.db, supabase=node_fixture.db
+        _Req({"X-Vex-Node": other_org}), node_fixture.db, workspace_db=node_fixture.db
     )
     assert got == other_org
 
@@ -246,7 +261,7 @@ def test_an_unreachable_node_is_not_found(node_fixture):
         identity_module.resolve_active_org(
             _Req({"X-Klio-Node": STRANGER_ORG}),
             node_fixture.db,
-            supabase=node_fixture.db,
+            workspace_db=node_fixture.db,
         )
     # not_found, not forbidden: 403 confirms the org exists, which is an
     # existence oracle. The project tools already answer this way.
@@ -259,17 +274,17 @@ def test_revocation_takes_effect_on_the_very_next_call(node_fixture, revoke):
     req = _Req({"X-Klio-Node": other_org})
     assert (
         identity_module.resolve_active_org(
-            req, node_fixture.db, supabase=node_fixture.db
+            req, node_fixture.db, workspace_db=node_fixture.db
         )
         == other_org
     )
 
-    revoke(node_fixture.db, user_id, PERSONAL_ACCOUNT_ID)
+    revoke(node_fixture.db, user_id, PERSONAL_WORKSPACE_ID)
 
     # Same request object: nothing memoized on it may be trusted either.
     with pytest.raises(HTTPException) as exc:
         identity_module.resolve_active_org(
-            req, node_fixture.db, supabase=node_fixture.db
+            req, node_fixture.db, workspace_db=node_fixture.db
         )
     assert exc.value.status_code == 404
 
@@ -281,21 +296,21 @@ def test_an_unattributable_caller_cannot_select_a_node(node_fixture, unattributa
         identity_module.resolve_active_org(
             _Req({"X-Klio-Node": other_org}),
             node_fixture.db,
-            supabase=node_fixture.db,
+            workspace_db=node_fixture.db,
         )
     assert exc.value.status_code == 404
 
 
 @needs_db
-def test_an_unconfigured_directory_fails_closed(node_fixture, monkeypatch):
-    """No Supabase means the membership check cannot run, so nothing is reachable.
+def test_an_unconfigured_workspace_db_fails_closed(node_fixture, monkeypatch):
+    """No workspace DB means the membership check cannot run: nothing is reachable.
 
     Failing open here would let any caller select any node simply by pointing
-    the engine at a deployment with no directory configured.
+    the engine at a deployment with no workspace DB configured.
     """
-    import app.directory as directory_module
+    import app.workspace_db as workspace_db_module
 
-    monkeypatch.setattr(directory_module, "_engines", lambda: (None, None))
+    monkeypatch.setattr(workspace_db_module, "workspace_engine", lambda: None)
     with pytest.raises(HTTPException) as exc:
         identity_module.resolve_active_org(
             _Req({"X-Klio-Node": node_fixture.other_org}), node_fixture.db

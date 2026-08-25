@@ -5,19 +5,18 @@ this is the tenancy boundary, and it has to be asked on every call rather than
 once at switch time — a session outlives a membership revocation.
 
 The engine holds no local users or memberships table on purpose: identity lives
-in Supabase, and a local copy would be a cache with no invalidation.
+in the workspace DB (Plane), and a local copy would be a cache with no
+invalidation.
 
-**Two databases, joined in Python.** ``public.accounts`` and
-``public.accounts_memberships`` live in Supabase (``SUPABASE_DATABASE_URL``);
-``organizations`` lives in the engine's own database (``DATABASE_URL``). They
-are separate servers, so a single SQL statement naming both cannot run —
-however well it works against a test database that happens to hold both. This
-mirrors ``app.oauth.GrantResolver._lookup``, which asks Supabase for
-membership, asks the engine for the org, and joins the two answers itself.
+**Two databases, joined in Python.** ``workspaces`` and ``workspace_members``
+live in the workspace DB (``WORKSPACE_DATABASE_URL``); ``organizations`` lives
+in the engine's own database (``DATABASE_URL``). They are separate servers, so
+a single SQL statement naming both cannot run — however well it works against a
+test database that happens to hold both.
 
-Unlike every other engine query against ``accounts``, this one does NOT filter
-``is_personal_account = false``. A user's personal account is their personal
-node, and excluding it is exactly what made the engine org-rooted.
+The join key is ``organizations.workspace_id``, never the slug: slug is the
+*address* (username / org handle) and mutable — Plane's soft-delete rewrites
+it — while the workspace id is the identity.
 """
 
 from __future__ import annotations
@@ -29,23 +28,28 @@ from sqlalchemy import text
 
 logger = logging.getLogger(__name__)
 
-#: Supabase side: which accounts is this user a member of?
-_SLUGS_SQL = text(
+#: Workspace DB side: which living workspaces is this user an active member of?
+_WORKSPACES_SQL = text(
     """
-    SELECT a.slug AS slug,
-           a.is_personal_account AS is_personal
-    FROM public.accounts_memberships m
-    JOIN public.accounts a ON a.id = m.account_id
-    WHERE m.user_id = :user_id
+    SELECT w.id AS workspace_id,
+           w.slug AS slug,
+           w.is_personal AS is_personal
+    FROM workspace_members m
+    JOIN workspaces w ON w.id = m.workspace_id
+    WHERE m.member_id = :user_id
+      AND m.is_active = true
+      AND m.deleted_at IS NULL
+      AND w.deleted_at IS NULL
     """
 )
 
-#: Engine side: which of those slugs have an org row?
+#: Engine side: which of those workspaces have an org row? Joined by the
+#: immutable id -- slug is the address, not the identity.
 _ORGS_SQL = text(
     """
-    SELECT org_id, account_slug
+    SELECT org_id, workspace_id
     FROM organizations
-    WHERE account_slug = ANY(:slugs)
+    WHERE workspace_id = ANY(:workspace_ids)
     """
 )
 
@@ -57,18 +61,21 @@ def _clean(value: Optional[str]) -> Optional[str]:
     return cleaned or None
 
 
-def reachable_orgs(supabase: Any, tsdb: Any, *, user_id: Optional[str]) -> list[dict]:
+def reachable_orgs(
+    workspace_db: Any, tsdb: Any, *, user_id: Optional[str]
+) -> list[dict]:
     """Every org node this user may act in, personal node first.
 
     Args:
-        supabase: A connection to the Supabase database (accounts, memberships).
+        workspace_db: A connection to the workspace database (workspaces,
+            workspace_members).
         tsdb: A connection to the engine's own database (organizations).
-        user_id: The Supabase user UUID, or ``None``.
+        user_id: The user UUID (the same value in both systems), or ``None``.
 
     Returns:
-        ``[{"org_id", "account_slug", "is_personal"}]``, personal node first
-        then by slug. An account with no ``organizations`` row is omitted: the
-        engine cannot store memory for a node it has no id for.
+        ``[{"org_id", "workspace_id", "slug", "is_personal"}]``, personal node
+        first then by slug. A workspace with no ``organizations`` row is
+        omitted: the engine cannot store memory for a node it has no id for.
 
     An unattributable caller reaches nothing. Returning "everything" for a
     blank user id would turn a failure to identify someone into access to
@@ -78,29 +85,41 @@ def reachable_orgs(supabase: Any, tsdb: Any, *, user_id: Optional[str]) -> list[
     if cleaned is None:
         return []
 
-    rows = supabase.execute(_SLUGS_SQL, {"user_id": cleaned}).fetchall()
+    rows = workspace_db.execute(_WORKSPACES_SQL, {"user_id": cleaned}).fetchall()
     if not rows:
         return []
-    personal_by_slug = {r.slug: bool(r.is_personal) for r in rows}
+    # Keyed by the stringified id so uuid.UUID rows from one side and str rows
+    # from the other meet on equal terms.
+    info_by_id = {
+        str(r.workspace_id): {"slug": r.slug, "is_personal": bool(r.is_personal)}
+        for r in rows
+    }
 
-    org_rows = tsdb.execute(_ORGS_SQL, {"slugs": list(personal_by_slug)}).fetchall()
+    org_rows = tsdb.execute(
+        _ORGS_SQL, {"workspace_ids": [r.workspace_id for r in rows]}
+    ).fetchall()
 
-    resolved = [
-        {
-            "org_id": o.org_id,
-            "account_slug": o.account_slug,
-            "is_personal": personal_by_slug.get(o.account_slug, False),
-        }
-        for o in org_rows
-    ]
+    resolved = []
+    for o in org_rows:
+        info = info_by_id.get(str(o.workspace_id))
+        if info is None:  # pragma: no cover - ANY() already filtered
+            continue
+        resolved.append(
+            {
+                "org_id": o.org_id,
+                "workspace_id": str(o.workspace_id),
+                "slug": info["slug"],
+                "is_personal": info["is_personal"],
+            }
+        )
     # Personal node first, then by slug — a stable order so a caller listing
     # their nodes sees the same sequence every time.
-    resolved.sort(key=lambda o: (not o["is_personal"], o["account_slug"]))
+    resolved.sort(key=lambda o: (not o["is_personal"], o["slug"]))
     return resolved
 
 
 def may_reach(
-    supabase: Any, tsdb: Any, *, user_id: Optional[str], org_id: Optional[str]
+    workspace_db: Any, tsdb: Any, *, user_id: Optional[str], org_id: Optional[str]
 ) -> bool:
     """Whether ``user_id`` may act in ``org_id``.
 
@@ -113,7 +132,7 @@ def may_reach(
         return False
     return any(
         o["org_id"] == cleaned_org
-        for o in reachable_orgs(supabase, tsdb, user_id=cleaned_user)
+        for o in reachable_orgs(workspace_db, tsdb, user_id=cleaned_user)
     )
 
 

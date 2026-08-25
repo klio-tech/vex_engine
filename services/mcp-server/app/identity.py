@@ -297,14 +297,14 @@ def _oauth_principal(request: Request) -> Optional[Any]:
 
 
 @contextmanager
-def _supabase_connection(supplied: Optional[Any]) -> Iterator[Optional[Any]]:
-    """Yield a Supabase connection for the membership check.
+def _workspace_connection(supplied: Optional[Any]) -> Iterator[Optional[Any]]:
+    """Yield a workspace DB connection for the membership check.
 
     ``supplied`` is honoured as-is and NOT closed — it belongs to the caller.
-    Otherwise one is borrowed from :mod:`app.directory`'s pooled engine and
+    Otherwise one is borrowed from :mod:`app.workspace_db`'s pooled engine and
     returned to the pool on the way out.
 
-    Yields ``None`` when no directory is configured, or when the connection
+    Yields ``None`` when no workspace DB is configured, or when the connection
     could not be opened. Both are "the check cannot run", which every caller
     must read as "not reachable" rather than "assume yes".
     """
@@ -312,13 +312,13 @@ def _supabase_connection(supplied: Optional[Any]) -> Iterator[Optional[Any]]:
         yield supplied
         return
 
-    from app.directory import supabase_engine  # noqa: PLC0415
+    from app.workspace_db import workspace_engine  # noqa: PLC0415
 
     try:
-        engine = supabase_engine()
+        engine = workspace_engine()
     except Exception:
         logger.warning(
-            "node selection: the Supabase engine could not be built; "
+            "node selection: the workspace DB engine could not be built; "
             "treating every selected node as unreachable",
             exc_info=True,
         )
@@ -327,7 +327,7 @@ def _supabase_connection(supplied: Optional[Any]) -> Iterator[Optional[Any]]:
 
     if engine is None:
         logger.warning(
-            "node selection: SUPABASE_DATABASE_URL is not configured; "
+            "node selection: WORKSPACE_DATABASE_URL is not configured; "
             "no node can be selected (fail closed)"
         )
         yield None
@@ -338,7 +338,7 @@ def _supabase_connection(supplied: Optional[Any]) -> Iterator[Optional[Any]]:
             yield conn
     except Exception:
         logger.warning(
-            "node selection: the Supabase connection failed; treating the "
+            "node selection: the workspace DB connection failed; treating the "
             "selected node as unreachable",
             exc_info=True,
         )
@@ -346,7 +346,7 @@ def _supabase_connection(supplied: Optional[Any]) -> Iterator[Optional[Any]]:
 
 
 def resolve_active_org(
-    request: Request, db: Any, *, supabase: Optional[Any] = None
+    request: Request, db: Any, *, workspace_db: Optional[Any] = None
 ) -> str:
     """The org node this request acts in.
 
@@ -365,10 +365,10 @@ def resolve_active_org(
             (or the legacy ``X-Vex-Node``) via :mod:`app.headers`.
         db: A connection or Session against the engine's own database, where
             ``organizations`` lives — normally the tool body's ``SessionLocal()``.
-        supabase: A connection against the Supabase database, where
-            ``accounts`` and ``accounts_memberships`` live. Defaults to one
-            borrowed from :mod:`app.directory`. The two are separate servers in
-            production, which is why this cannot be one connection.
+        workspace_db: A connection against the workspace database, where
+            ``workspaces`` and ``workspace_members`` live. Defaults to one
+            borrowed from :mod:`app.workspace_db`. The two are separate servers
+            in production, which is why this cannot be one connection.
 
     Returns:
         The ``org_id`` to act in.
@@ -395,7 +395,7 @@ def resolve_active_org(
 
     user_id = resolve_request_user_id(request)
     if user_id:
-        with _supabase_connection(supabase) as conn:
+        with _workspace_connection(workspace_db) as conn:
             if conn is not None and may_reach(
                 conn, db, user_id=user_id, org_id=requested
             ):

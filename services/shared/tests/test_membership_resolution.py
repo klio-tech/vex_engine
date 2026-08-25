@@ -7,12 +7,12 @@ unconditionally -- so the fixture builds a second org, owned by a second user,
 that the subject must never see, and the negative assertions are the ones that
 carry this file.
 
-The two Supabase-side tables this reads (``public.accounts`` and
-``public.accounts_memberships``) do not exist in the engine's database, so the
-fixture creates them for real inside a transaction and rolls it back on
-teardown. Stubbing the session instead would match SQL by substring and return
-canned rows, which cannot catch a wrong WHERE or JOIN clause -- the single
-failure this module exists to prevent.
+The two workspace-DB tables this reads (``workspaces`` and
+``workspace_members``) do not exist in the engine's database, so the fixture
+creates them for real inside a transaction and rolls it back on teardown.
+Stubbing the session instead would match SQL by substring and return canned
+rows, which cannot catch a wrong WHERE or JOIN clause -- the single failure
+this module exists to prevent.
 """
 
 import pytest
@@ -35,6 +35,10 @@ PERSONAL_ORG = "org_subject_personal"
 TEAM_ORG = "org_team_alpha"
 OTHER_ORG = "org_someone_else"
 
+PERSONAL_WORKSPACE = "aaaaaaaa-0000-0000-0000-000000000001"
+TEAM_WORKSPACE = "aaaaaaaa-0000-0000-0000-000000000002"
+OTHER_WORKSPACE = "aaaaaaaa-0000-0000-0000-000000000003"
+
 
 class _Membership:
     """The fixture's return value.
@@ -56,7 +60,7 @@ class _Membership:
 
 @pytest.fixture()
 def membership_fixture():
-    """Real Supabase-shaped tables, in a transaction that is always rolled back.
+    """Real workspace-DB-shaped tables, in a transaction always rolled back.
 
     Postgres DDL is transactional, so the CREATE TABLEs and the rows both
     vanish on rollback and the test is repeatable against a database that is
@@ -69,10 +73,11 @@ def membership_fixture():
         conn.execute(
             text(
                 """
-                CREATE TABLE public.accounts (
+                CREATE TABLE workspaces (
                     id uuid PRIMARY KEY,
                     slug text UNIQUE,
-                    is_personal_account boolean NOT NULL DEFAULT false
+                    is_personal boolean NOT NULL DEFAULT false,
+                    deleted_at timestamptz
                 )
                 """
             )
@@ -80,54 +85,62 @@ def membership_fixture():
         conn.execute(
             text(
                 """
-                CREATE TABLE public.accounts_memberships (
-                    account_id uuid NOT NULL REFERENCES public.accounts(id),
-                    user_id text NOT NULL
+                CREATE TABLE workspace_members (
+                    workspace_id uuid NOT NULL REFERENCES workspaces(id),
+                    member_id uuid NOT NULL,
+                    is_active boolean NOT NULL DEFAULT true,
+                    deleted_at timestamptz
                 )
                 """
             )
         )
 
-        accounts = (
-            ("aaaaaaaa-0000-0000-0000-000000000001", PERSONAL_SLUG, True),
-            ("aaaaaaaa-0000-0000-0000-000000000002", TEAM_SLUG, False),
-            ("aaaaaaaa-0000-0000-0000-000000000003", OTHER_SLUG, False),
+        workspaces = (
+            (PERSONAL_WORKSPACE, PERSONAL_SLUG, True),
+            (TEAM_WORKSPACE, TEAM_SLUG, False),
+            (OTHER_WORKSPACE, OTHER_SLUG, False),
         )
-        for account_id, slug, is_personal in accounts:
+        for workspace_id, slug, is_personal in workspaces:
             conn.execute(
                 text(
-                    "INSERT INTO public.accounts (id, slug, is_personal_account) "
+                    "INSERT INTO workspaces (id, slug, is_personal) "
                     "VALUES (:id, :slug, :personal)"
                 ),
-                {"id": account_id, "slug": slug, "personal": is_personal},
+                {"id": workspace_id, "slug": slug, "personal": is_personal},
             )
 
-        # The subject belongs to their personal node and one team; the third
-        # account belongs to someone else entirely.
-        for account_id, user_id in (
-            ("aaaaaaaa-0000-0000-0000-000000000001", SUBJECT_USER),
-            ("aaaaaaaa-0000-0000-0000-000000000002", SUBJECT_USER),
-            ("aaaaaaaa-0000-0000-0000-000000000003", OTHER_USER),
+        # The subject belongs to their personal workspace and one team; the
+        # third workspace belongs to someone else entirely.
+        for workspace_id, member_id in (
+            (PERSONAL_WORKSPACE, SUBJECT_USER),
+            (TEAM_WORKSPACE, SUBJECT_USER),
+            (OTHER_WORKSPACE, OTHER_USER),
         ):
             conn.execute(
                 text(
-                    "INSERT INTO public.accounts_memberships (account_id, user_id) "
-                    "VALUES (:account_id, :user_id)"
+                    "INSERT INTO workspace_members (workspace_id, member_id) "
+                    "VALUES (:workspace_id, :member_id)"
                 ),
-                {"account_id": account_id, "user_id": user_id},
+                {"workspace_id": workspace_id, "member_id": member_id},
             )
 
-        for org_id, slug in (
-            (PERSONAL_ORG, PERSONAL_SLUG),
-            (TEAM_ORG, TEAM_SLUG),
-            (OTHER_ORG, OTHER_SLUG),
+        for org_id, slug, workspace_id in (
+            (PERSONAL_ORG, PERSONAL_SLUG, PERSONAL_WORKSPACE),
+            (TEAM_ORG, TEAM_SLUG, TEAM_WORKSPACE),
+            (OTHER_ORG, OTHER_SLUG, OTHER_WORKSPACE),
         ):
             conn.execute(
                 text(
-                    "INSERT INTO organizations (org_id, name, account_slug) "
-                    "VALUES (:org_id, :name, :slug)"
+                    "INSERT INTO organizations "
+                    "(org_id, name, account_slug, workspace_id) "
+                    "VALUES (:org_id, :name, :slug, :workspace_id)"
                 ),
-                {"org_id": org_id, "name": org_id, "slug": slug},
+                {
+                    "org_id": org_id,
+                    "name": org_id,
+                    "slug": slug,
+                    "workspace_id": workspace_id,
+                },
             )
 
         yield _Membership(conn, SUBJECT_USER, TEAM_ORG, TEAM_SLUG)
@@ -214,12 +227,13 @@ def test_reachable_orgs_lists_only_the_users_own(membership_fixture):
     got = [o["org_id"] for o in orgs]
     assert org_id in got
     assert OTHER_ORG not in got
-    # The personal node is included -- this is the one query against accounts
-    # that must not filter is_personal_account -- and it sorts first.
+    # The personal workspace is included and sorts first.
     assert got == [PERSONAL_ORG, TEAM_ORG]
     assert orgs[0]["is_personal"] is True
-    assert orgs[0]["account_slug"] == PERSONAL_SLUG
+    assert orgs[0]["slug"] == PERSONAL_SLUG
+    assert orgs[0]["workspace_id"] == PERSONAL_WORKSPACE
     assert orgs[1]["is_personal"] is False
+    assert orgs[1]["workspace_id"] == TEAM_WORKSPACE
 
 
 @requires_db("the membership resolution tests")
@@ -235,6 +249,67 @@ def test_may_reach_agrees_with_reachable_orgs(membership_fixture):
             user_id=user_id,
             org_id=org["org_id"],
         )
+
+
+# --- The kill switches -------------------------------------------------------
+#
+# Revocation is not a delete in Plane: memberships are deactivated
+# (``is_active = false``) or soft-deleted (``deleted_at`` set), and workspaces
+# are soft-deleted. Each of those must remove the workspace from
+# ``reachable_orgs`` on the very next call -- a filter dropped from the WHERE
+# clause turns "revoked" into "still inside", which is the exact failure this
+# module exists to prevent.
+
+
+@requires_db("the membership resolution tests")
+def test_a_deactivated_membership_is_gone_on_the_next_call(membership_fixture):
+    user_id, org_id, _slug = membership_fixture
+    db = membership_fixture.db
+    assert may_reach(db, db, user_id=user_id, org_id=org_id) is True
+
+    db.execute(
+        text(
+            "UPDATE workspace_members SET is_active = false "
+            "WHERE workspace_id = :ws AND member_id = :member"
+        ),
+        {"ws": TEAM_WORKSPACE, "member": user_id},
+    )
+
+    assert may_reach(db, db, user_id=user_id, org_id=org_id) is False
+    assert org_id not in {o["org_id"] for o in reachable_orgs(db, db, user_id=user_id)}
+
+
+@requires_db("the membership resolution tests")
+def test_a_soft_deleted_workspace_is_gone_on_the_next_call(membership_fixture):
+    user_id, org_id, _slug = membership_fixture
+    db = membership_fixture.db
+    assert may_reach(db, db, user_id=user_id, org_id=org_id) is True
+
+    db.execute(
+        text("UPDATE workspaces SET deleted_at = now() WHERE id = :ws"),
+        {"ws": TEAM_WORKSPACE},
+    )
+
+    assert may_reach(db, db, user_id=user_id, org_id=org_id) is False
+    assert org_id not in {o["org_id"] for o in reachable_orgs(db, db, user_id=user_id)}
+
+
+@requires_db("the membership resolution tests")
+def test_a_soft_deleted_membership_is_gone_on_the_next_call(membership_fixture):
+    user_id, org_id, _slug = membership_fixture
+    db = membership_fixture.db
+    assert may_reach(db, db, user_id=user_id, org_id=org_id) is True
+
+    db.execute(
+        text(
+            "UPDATE workspace_members SET deleted_at = now() "
+            "WHERE workspace_id = :ws AND member_id = :member"
+        ),
+        {"ws": TEAM_WORKSPACE, "member": user_id},
+    )
+
+    assert may_reach(db, db, user_id=user_id, org_id=org_id) is False
+    assert org_id not in {o["org_id"] for o in reachable_orgs(db, db, user_id=user_id)}
 
 
 class _RecordingConn:
@@ -261,29 +336,35 @@ class _Row:
 
 
 def test_the_two_databases_are_queried_separately():
-    """Supabase and the engine are different servers; one JOIN cannot span them.
+    """The workspace DB and the engine are different servers; one JOIN cannot span them.
 
-    public.accounts and public.accounts_memberships live behind
-    SUPABASE_DATABASE_URL; organizations lives behind DATABASE_URL. A single
-    statement naming both parses and runs happily against a test database that
-    holds both, and fails in production with 'relation does not exist'. This is
-    the only test that can catch that, because the local fixture legitimately
-    puts both in one database.
+    ``workspaces`` and ``workspace_members`` live behind
+    ``WORKSPACE_DATABASE_URL``; ``organizations`` lives behind ``DATABASE_URL``.
+    A single statement naming both parses and runs happily against a test
+    database that holds both, and fails in production with 'relation does not
+    exist'. This is the only test that can catch that, because the local
+    fixture legitimately puts both in one database.
     """
-    supabase = _RecordingConn([_Row(slug="acme", is_personal=False)])
-    tsdb = _RecordingConn([_Row(org_id="org_acme", account_slug="acme")])
+    workspace_db = _RecordingConn(
+        [_Row(workspace_id="ws-1", slug="acme", is_personal=False)]
+    )
+    tsdb = _RecordingConn([_Row(org_id="org_acme", workspace_id="ws-1")])
 
-    reachable_orgs(supabase, tsdb, user_id="user-1")
+    reachable_orgs(workspace_db, tsdb, user_id="user-1")
 
-    supabase_sql = " ".join(supabase.seen).lower()
+    workspace_sql = " ".join(workspace_db.seen).lower()
     tsdb_sql = " ".join(tsdb.seen).lower()
 
-    assert supabase.seen, "the Supabase side was never queried"
+    assert workspace_db.seen, "the workspace DB side was never queried"
     assert tsdb.seen, "the engine side was never queried"
-    assert "organizations" not in supabase_sql, (
-        "the Supabase connection was asked about organizations, which does not "
-        "exist there"
+    assert "organizations" not in workspace_sql, (
+        "the workspace DB connection was asked about organizations, which does "
+        "not exist there"
     )
-    assert "accounts" not in tsdb_sql, (
-        "the engine connection was asked about accounts, which does not exist there"
+    assert "workspaces" not in tsdb_sql, (
+        "the engine connection was asked about workspaces, which does not exist there"
+    )
+    assert "workspace_members" not in tsdb_sql, (
+        "the engine connection was asked about workspace_members, which does "
+        "not exist there"
     )
