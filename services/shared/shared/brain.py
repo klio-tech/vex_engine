@@ -495,6 +495,24 @@ def find_project_id(db_session: Any, *, org_id: str, identifier: str) -> Optiona
         ).fetchone()
         if row is not None:
             return str(row[0])
+        # A workspace (Plane) project UUID is a first-class identifier: a
+        # project linked via ``plane_project_id`` (migration 049, Task L1)
+        # answers for it, so ``X-Vex-Project: <plane uuid>`` and
+        # ``project=<plane uuid>`` resolve without the caller knowing the
+        # engine-side id. Tenant-scoped like every branch here, and unique
+        # where present (``uq_projects_plane_project_id``).
+        row = db_session.execute(
+            text(
+                """
+                SELECT id FROM projects
+                WHERE org_id = :org_id AND plane_project_id = :plane_id
+                LIMIT 1
+                """
+            ),
+            {"org_id": org_id, "plane_id": str(parsed)},
+        ).fetchone()
+        if row is not None:
+            return str(row[0])
         # Fall through: a UUID-shaped identifier that is not a known id may
         # still legitimately match a git_remote / display_name.
 

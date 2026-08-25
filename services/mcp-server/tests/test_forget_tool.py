@@ -109,9 +109,10 @@ def test_forget_is_registered():
         "project_list",
         "project_members",
         "project_grant",
+        "project_link",
     } <= set(EXPECTED_TOOL_NAMES)
     assert {"klio_retrieve", "compress"} <= set(EXPECTED_TOOL_NAMES)
     assert "explore" in EXPECTED_TOOL_NAMES
     assert "init" in EXPECTED_TOOL_NAMES
     assert {"claim", "release"} <= set(EXPECTED_TOOL_NAMES)
-    assert len(EXPECTED_TOOL_NAMES) == 23
+    assert len(EXPECTED_TOOL_NAMES) == 24

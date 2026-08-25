@@ -94,12 +94,44 @@ def test_find_project_id_uuid_identifier_hits_id_query():
     db_session.commit.assert_not_called()
 
 
-def test_find_project_id_uuid_miss_falls_back_to_name_query():
-    """A UUID that matches no id row falls back to the git_remote/name query."""
+def test_find_project_id_uuid_miss_tries_plane_link_then_name_query():
+    """A UUID that matches no id row tries the plane_project_id link, then
+    falls back to the git_remote/name query."""
     valid_uuid = str(uuid.uuid4())
     proj_id = uuid.uuid4()
     db_session = MagicMock()
-    # First call (id query) misses, second call (name query) hits.
+    # id query misses, plane-link query misses, name query hits.
+    db_session.execute.side_effect = [
+        _result_with_row(None),
+        _result_with_row(None),
+        _result_with_row((proj_id,)),
+    ]
+
+    result = find_project_id(db_session, org_id="org-1", identifier=valid_uuid)
+
+    assert result == str(proj_id)
+    assert db_session.execute.call_count == 3
+    plane_sql = str(db_session.execute.call_args_list[1].args[0])
+    assert "plane_project_id = :plane_id" in plane_sql
+    assert "org_id = :org_id" in plane_sql
+    plane_params = db_session.execute.call_args_list[1].args[1]
+    assert plane_params == {"org_id": "org-1", "plane_id": valid_uuid}
+    fallback_sql = str(db_session.execute.call_args_list[2].args[0])
+    assert "git_remote = :ident" in fallback_sql
+    # Names are matched case-insensitively; the exact keys are not.
+    assert "lower(display_name) = lower(:ident)" in fallback_sql
+    fallback_params = db_session.execute.call_args_list[2].args[1]
+    assert fallback_params == {"org_id": "org-1", "ident": valid_uuid}
+    db_session.commit.assert_not_called()
+
+
+def test_find_project_id_uuid_resolves_via_plane_link():
+    """A workspace (Plane) project uuid resolves to the LINKED engine project
+    without touching the ranked name query."""
+    valid_uuid = str(uuid.uuid4())
+    proj_id = uuid.uuid4()
+    db_session = MagicMock()
+    # id query misses, plane-link query hits.
     db_session.execute.side_effect = [
         _result_with_row(None),
         _result_with_row((proj_id,)),
@@ -109,12 +141,6 @@ def test_find_project_id_uuid_miss_falls_back_to_name_query():
 
     assert result == str(proj_id)
     assert db_session.execute.call_count == 2
-    fallback_sql = str(db_session.execute.call_args_list[1].args[0])
-    assert "git_remote = :ident" in fallback_sql
-    # Names are matched case-insensitively; the exact keys are not.
-    assert "lower(display_name) = lower(:ident)" in fallback_sql
-    fallback_params = db_session.execute.call_args_list[1].args[1]
-    assert fallback_params == {"org_id": "org-1", "ident": valid_uuid}
     db_session.commit.assert_not_called()
 
 
@@ -153,10 +179,11 @@ def test_find_project_id_returns_none_when_nothing_matches():
 
 
 def test_find_project_id_uuid_miss_then_name_miss_returns_none():
-    """A UUID matching neither id nor name yields None after both queries."""
+    """A UUID matching neither id, plane link, nor name yields None."""
     valid_uuid = str(uuid.uuid4())
     db_session = MagicMock()
     db_session.execute.side_effect = [
+        _result_with_row(None),
         _result_with_row(None),
         _result_with_row(None),
     ]
@@ -164,7 +191,7 @@ def test_find_project_id_uuid_miss_then_name_miss_returns_none():
     result = find_project_id(db_session, org_id="org-1", identifier=valid_uuid)
 
     assert result is None
-    assert db_session.execute.call_count == 2
+    assert db_session.execute.call_count == 3
     db_session.commit.assert_not_called()
 
 
