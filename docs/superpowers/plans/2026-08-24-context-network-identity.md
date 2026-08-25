@@ -622,7 +622,12 @@ def ensure_personal_org(db: Any, *, user_id: str, account_slug: str) -> str:
     if existing is not None:
         return existing.org_id
 
-    org_id = f"personal_{cleaned_user[:8]}"
+    # The whole user id, not a prefix: "personal_" + a 36-char UUID is 45
+    # characters and org_id is String(64), so there is no reason to truncate.
+    # An 8-hex-char prefix collides at birthday odds around 65k users, and the
+    # partial unique index would then reject the second user's personal node --
+    # a signup failure with no obvious cause.
+    org_id = f"personal_{cleaned_user}"
     row = db.execute(
         _ENSURE_PERSONAL_SQL,
         {
