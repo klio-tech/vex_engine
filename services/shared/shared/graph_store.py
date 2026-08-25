@@ -619,7 +619,12 @@ def entity_brief(
 
     # The visible evidence: memories tied to this entity by an edge, passing
     # the caller's ladder, in THIS org (the org check rides on the memory row
-    # — a tampered edge grants nothing).
+    # — a tampered edge grants nothing). ``branch_id IS NULL`` is the context-
+    # branch default fence (Track C): ``explore`` has no branch parameter, so
+    # the brief is a MAIN-only view — an edge into a branch row must not drag
+    # a half-formed draft into the evidence, the same rule ``neighbors``
+    # enforces on the recall expansion. The supersession query below carries
+    # the same fence for the same reason: it returns row CONTENT.
     evidence_rows = db.execute(
         text(
             f"""
@@ -638,6 +643,7 @@ def entity_brief(
               AND e.dst_id = ANY(CAST(:entity_ids AS uuid[]))
               AND m.status = 'active'
               AND m.recall_hidden = FALSE
+              AND m.branch_id IS NULL
               AND {ladder_sql}
             ORDER BY m.created_at DESC, m.id DESC
             LIMIT :limit
@@ -733,6 +739,7 @@ def entity_brief(
               AND e.src_id = ANY(CAST(:evidence_ids AS uuid[]))
               AND m.status != 'retracted'
               AND m.recall_hidden = FALSE
+              AND m.branch_id IS NULL
               AND {ladder_sql}
             ORDER BY e.created_at ASC
             """

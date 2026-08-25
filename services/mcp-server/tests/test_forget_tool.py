@@ -114,4 +114,4 @@ def test_forget_is_registered():
     assert "explore" in EXPECTED_TOOL_NAMES
     assert "init" in EXPECTED_TOOL_NAMES
     assert {"claim", "release"} <= set(EXPECTED_TOOL_NAMES)
-    assert len(EXPECTED_TOOL_NAMES) == 22
+    assert len(EXPECTED_TOOL_NAMES) == 23

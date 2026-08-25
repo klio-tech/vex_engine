@@ -36,6 +36,7 @@ _REQUIRED_SCHEMA_FIELD = {
     "artifact_put": "kind",
     "artifact_get": "artifact_id",
     "space": "action",
+    "branch": "action",
     "forget": "memory_id",
     "share": "memory_id",
     "project_create": "name",

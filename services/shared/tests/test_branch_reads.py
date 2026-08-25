@@ -63,6 +63,9 @@ def db():
                     text("DELETE FROM memory_edges WHERE org_id = :o"), {"o": org_id}
                 )
                 conn.execute(
+                    text("DELETE FROM entities WHERE org_id = :o"), {"o": org_id}
+                )
+                conn.execute(
                     text(
                         """
                         DELETE FROM project_members WHERE project_id IN (
@@ -497,3 +500,98 @@ async def test_personal_union_default_read_excludes_branch_rows_in_both_orgs(db)
     got = {str(r.id) for r in records}
     assert personal_main in got
     assert on_branch not in got
+
+
+# ---------------------------------------------------------------------------
+# The explore path: entity_brief keeps the same default fence (Task C3)
+# ---------------------------------------------------------------------------
+
+
+def test_entity_brief_never_returns_branch_rows(db):
+    """``explore`` has no branch parameter, so its brief is a MAIN-only view
+    by definition: an edge from an entity into a branch row must not drag the
+    branch draft into the evidence slice, its decisions, or its counts."""
+    org = _org(db)
+    project = _project(db, org_id=org, members=[ME])
+    branch = _branch(db, org_id=org, project_id=project)
+    on_main = _seed(
+        db, org_id=org, content="main evidence", project_id=project, user_id=ME
+    )
+    on_branch = _seed(
+        db,
+        org_id=org,
+        content="half-formed branch evidence",
+        project_id=project,
+        branch_id=branch,
+        user_id=ME,
+    )
+    entity = graph_store.add_entity(
+        db, org_id=org, name="auth service", kind="system"
+    ).id
+    for memory_id in (on_main, on_branch):
+        graph_store.add_edge(
+            db,
+            org_id=org,
+            src_id=memory_id,
+            dst_kind="entity",
+            dst_id=entity,
+            relation="about",
+        )
+    db.commit()
+
+    brief = graph_store.entity_brief(
+        db, org_id=org, viewer_user_id=ME, entity="auth service"
+    )
+    assert brief is not None
+    got = {str(m.id) for m in brief["memories"]}
+    assert on_main in got
+    assert on_branch not in got
+
+
+def test_entity_brief_supersession_section_never_surfaces_branch_rows(db):
+    """The brief's ``superseded`` section returns the RETIRED side's content;
+    a retired row still parked on a branch must not surface through it."""
+    org = _org(db)
+    project = _project(db, org_id=org, members=[ME])
+    branch = _branch(db, org_id=org, project_id=project)
+    evidence = _seed(
+        db, org_id=org, content="current belief", project_id=project, user_id=ME
+    )
+    retired_on_branch = _seed(
+        db,
+        org_id=org,
+        content="retired branch belief",
+        project_id=project,
+        branch_id=branch,
+        user_id=ME,
+    )
+    db.execute(
+        text("UPDATE session_memories SET status = 'superseded' WHERE id = :id"),
+        {"id": retired_on_branch},
+    )
+    entity = graph_store.add_entity(
+        db, org_id=org, name="auth service", kind="system"
+    ).id
+    graph_store.add_edge(
+        db,
+        org_id=org,
+        src_id=evidence,
+        dst_kind="entity",
+        dst_id=entity,
+        relation="about",
+    )
+    graph_store.add_edge(
+        db,
+        org_id=org,
+        src_id=evidence,
+        dst_kind="memory",
+        dst_id=retired_on_branch,
+        relation="supersedes",
+    )
+    db.commit()
+
+    brief = graph_store.entity_brief(
+        db, org_id=org, viewer_user_id=ME, entity="auth service"
+    )
+    assert brief is not None
+    assert brief["superseded"] == []

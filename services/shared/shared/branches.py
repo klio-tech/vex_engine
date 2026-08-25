@@ -266,3 +266,269 @@ def list_branches(db_session: Any, *, org_id: str, project_id: str) -> list[dict
         branch["last_activity"] = row.last_activity
         branches.append(branch)
     return branches
+
+
+# ---------------------------------------------------------------------------
+# Merge and discard (Task C3) — the two ways a branch's life ends
+# ---------------------------------------------------------------------------
+
+#: Lock the branch row for the duration of the state change. Any status is
+#: loaded — idempotence needs to SEE 'merged'/'discarded' to answer
+#: already_<status> instead of racing a second state change.
+_LOCK_BRANCH_SQL = text(
+    """
+    SELECT id, status, project_id
+    FROM context_branches
+    WHERE org_id = :org_id
+      AND id = :branch_id
+    FOR UPDATE
+    """
+)
+
+#: The similarity-vs-MAIN pass, entirely over STORED vectors (no embedding
+#: service): for each active branch row that has an embedding, the single
+#: nearest active MAIN row of the same project at or above the threshold.
+#: This is the plan's "query directly" option — ``find_similar_memory`` is
+#: shaped around one candidate text that still needs embedding, and merge has
+#: N rows whose vectors already exist.
+_MERGE_SIMILARITY_SQL = text(
+    """
+    SELECT bm.id AS branch_memory_id, nearest.id AS main_memory_id
+    FROM session_memories bm
+    JOIN LATERAL (
+        SELECT mm.id
+        FROM session_memories mm
+        WHERE mm.org_id = :org_id
+          AND mm.project_id = :project_id
+          AND mm.branch_id IS NULL
+          AND mm.status = 'active'
+          AND mm.embedding IS NOT NULL
+          AND 1 - (mm.embedding <=> bm.embedding) >= :threshold
+        ORDER BY mm.embedding <=> bm.embedding
+        LIMIT 1
+    ) nearest ON TRUE
+    WHERE bm.org_id = :org_id
+      AND bm.branch_id = :branch_id
+      AND bm.status = 'active'
+      AND bm.embedding IS NOT NULL
+    ORDER BY bm.created_at, bm.id
+    """
+)
+
+_PROMOTE_ROWS_SQL = text(
+    """
+    UPDATE session_memories
+    SET branch_id = NULL,
+        updated_at = NOW()
+    WHERE org_id = :org_id
+      AND branch_id = :branch_id
+    """
+)
+
+#: Mirrors :func:`shared.memory.retract_memory`'s metadata discipline —
+#: ``retracted_by`` / ``retracted_at`` / ``retracted_via`` merged into the
+#: existing metadata — with ``retracted_via='branch_discard'`` naming the path.
+_RETRACT_BRANCH_ROWS_SQL = text(
+    """
+    UPDATE session_memories
+    SET status = 'retracted',
+        metadata = COALESCE(metadata, '{}'::jsonb)
+                   || jsonb_build_object(
+                       'retracted_by', CAST(:discarded_by AS text),
+                       'retracted_at', NOW()::text,
+                       'retracted_via', 'branch_discard'
+                   ),
+        updated_at = NOW()
+    WHERE org_id = :org_id
+      AND branch_id = :branch_id
+      AND status = 'active'
+    """
+)
+
+_CLOSE_BRANCH_SQL = text(
+    """
+    UPDATE context_branches
+    SET status = :status,
+        closed_at = NOW()
+    WHERE org_id = :org_id
+      AND id = :branch_id
+    """
+)
+
+
+def _lock_branch(db_session: Any, *, org_id: str, branch_id: str) -> Optional[Any]:
+    """The branch row FOR UPDATE, or ``None`` for unknown/cross-org/bad id."""
+    cleaned_org = _clean(org_id)
+    cleaned_id = _clean(branch_id)
+    if cleaned_org is None or cleaned_id is None:
+        return None
+    try:
+        uuid.UUID(cleaned_id)
+    except ValueError:
+        return None
+    return db_session.execute(
+        _LOCK_BRANCH_SQL, {"org_id": cleaned_org, "branch_id": cleaned_id}
+    ).first()
+
+
+def merge_branch(
+    db_session: Any,
+    *,
+    org_id: str,
+    project_id: str,
+    branch_id: str,
+    merged_by: Optional[str],
+) -> dict:
+    """Promote a branch's memories to main; near-duplicates supersede.
+
+    The three steps, in order:
+
+    1. Where an active branch row's stored embedding is within
+       :data:`shared.memory.DEDUP_THRESHOLD` of an active MAIN row of the same
+       project, the main row is retired through the existing
+       :func:`shared.memory.supersede_memory` — the branch version is the
+       newer belief — and the judgment is recorded as a ``supersedes`` edge,
+       the same shape (and the same best-effort discipline) the curator's
+       reconcile pass writes: the status flip is the contract, the edge is
+       the explanation, and a graph problem never undoes a supersession.
+    2. Every row still on the branch gets ``branch_id = NULL`` — the rows ARE
+       main now, no copy, no re-write.
+    3. The branch row closes as ``merged``.
+
+    Contradiction detection is embedding similarity ONLY in v1 — no LLM judge
+    (that is the curator's job on main, later, and is explicitly out of the
+    Track C scope). ``merged_by`` is accepted for parity/audit at the call
+    surface; membership checks are the CALLER's job, per the module contract.
+
+    Idempotent: a branch that is not open answers
+    ``{"merged": False, "reason": "already_<status>"}``; an unknown or
+    cross-org id answers ``reason: "not_found"``. Neither raises — retrying a
+    merge must always be safe.
+
+    Returns:
+        ``{"merged": True, "promoted": n, "superseded": m}`` on success.
+    """
+    # Imported lazily, mirroring shared.graph_store's treatment of
+    # shared.memory: memory.py pulls in the embedding stack, which this
+    # registry module must not load just to be imported.
+    from shared import graph_store  # noqa: PLC0415
+    from shared.memory import DEDUP_THRESHOLD, supersede_memory  # noqa: PLC0415
+
+    row = _lock_branch(db_session, org_id=org_id, branch_id=branch_id)
+    if row is None:
+        db_session.rollback()
+        return {"merged": False, "reason": "not_found"}
+    if row.status != "open":
+        db_session.rollback()
+        return {"merged": False, "reason": f"already_{row.status}"}
+
+    cleaned_org = _clean(org_id)
+    target_project = str(row.project_id)
+
+    pairs = db_session.execute(
+        _MERGE_SIMILARITY_SQL,
+        {
+            "org_id": cleaned_org,
+            "project_id": target_project,
+            "branch_id": str(row.id),
+            "threshold": DEDUP_THRESHOLD,
+        },
+    ).fetchall()
+
+    superseded = 0
+    for pair in pairs:
+        # supersede_memory commits internally (and marks stale serves); the
+        # branch-row lock is therefore released after the first pair. That is
+        # accepted: the branch is still 'open' until step 3, and a concurrent
+        # merge re-running this pass supersedes idempotently (same old, same
+        # new) before one of the two closes the row.
+        supersede_memory(
+            db_session,
+            uuid.UUID(str(pair.main_memory_id)),
+            uuid.UUID(str(pair.branch_memory_id)),
+            org_id=cleaned_org,
+        )
+        superseded += 1
+        try:
+            graph_store.add_edge(
+                db_session,
+                org_id=cleaned_org,
+                src_id=str(pair.branch_memory_id),
+                dst_kind="memory",
+                dst_id=str(pair.main_memory_id),
+                relation="supersedes",
+                provenance="INFERRED",
+                created_by=_clean(merged_by),
+            )
+            db_session.commit()
+        except Exception:
+            try:
+                db_session.rollback()
+            except Exception:
+                logger.debug("merge_branch: rollback after edge failure also failed")
+            logger.warning(
+                "merge_branch: supersedes edge write failed for org %s "
+                "(new=%s old=%s); the status flip stands",
+                cleaned_org,
+                pair.branch_memory_id,
+                pair.main_memory_id,
+                exc_info=True,
+            )
+
+    promoted = db_session.execute(
+        _PROMOTE_ROWS_SQL, {"org_id": cleaned_org, "branch_id": str(row.id)}
+    ).rowcount
+    db_session.execute(
+        _CLOSE_BRANCH_SQL,
+        {"org_id": cleaned_org, "branch_id": str(row.id), "status": "merged"},
+    )
+    db_session.commit()
+    return {"merged": True, "promoted": int(promoted or 0), "superseded": superseded}
+
+
+def discard_branch(
+    db_session: Any,
+    *,
+    org_id: str,
+    branch_id: str,
+    discarded_by: Optional[str],
+) -> dict:
+    """Retract a branch's memories and close the branch as ``discarded``.
+
+    Every ACTIVE row on the branch becomes ``status='retracted'`` with the
+    same audit metadata :func:`shared.memory.retract_memory` writes
+    (``retracted_via='branch_discard'``), so the rows disappear from every
+    read path at once — recall, the graph, and capture recency all exclude
+    non-active rows already. Non-active rows (already retracted, or
+    superseded) are left exactly as they are.
+
+    Idempotent, mirroring :func:`merge_branch`: not open answers
+    ``already_<status>``, unknown/cross-org answers ``not_found``, and
+    neither raises.
+
+    Returns:
+        ``{"discarded": True, "retracted": n}`` on success.
+    """
+    row = _lock_branch(db_session, org_id=org_id, branch_id=branch_id)
+    if row is None:
+        db_session.rollback()
+        return {"discarded": False, "reason": "not_found"}
+    if row.status != "open":
+        db_session.rollback()
+        return {"discarded": False, "reason": f"already_{row.status}"}
+
+    cleaned_org = _clean(org_id)
+    retracted = db_session.execute(
+        _RETRACT_BRANCH_ROWS_SQL,
+        {
+            "org_id": cleaned_org,
+            "branch_id": str(row.id),
+            "discarded_by": _clean(discarded_by),
+        },
+    ).rowcount
+    db_session.execute(
+        _CLOSE_BRANCH_SQL,
+        {"org_id": cleaned_org, "branch_id": str(row.id), "status": "discarded"},
+    )
+    db_session.commit()
+    return {"discarded": True, "retracted": int(retracted or 0)}
