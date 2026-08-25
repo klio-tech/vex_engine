@@ -58,6 +58,7 @@ from app.config import DATABASE_URL
 logger = logging.getLogger("agentguard.mcp.auth")
 
 SUPABASE_DATABASE_URL = os.environ.get("SUPABASE_DATABASE_URL")
+WORKSPACE_DATABASE_URL = os.environ.get("WORKSPACE_DATABASE_URL")
 
 # Every read of ``X-Vex-Agent`` in this module goes through
 # ``shared.auth.normalize_agent_id``. The header (and, on the OAuth path,
@@ -185,6 +186,7 @@ def get_validator() -> KeyValidator:
             database_url=DATABASE_URL,
             required_scope="memory",
             supabase_database_url=SUPABASE_DATABASE_URL,
+            workspace_database_url=WORKSPACE_DATABASE_URL,
         )
     return _validator
 
