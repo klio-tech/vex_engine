@@ -140,7 +140,12 @@ def membership_fixture():
 @requires_db("the membership resolution tests")
 def test_a_member_reaches_their_org(membership_fixture):
     user_id, org_id, _slug = membership_fixture
-    assert may_reach(membership_fixture.db, user_id=user_id, org_id=org_id) is True
+    assert (
+        may_reach(
+            membership_fixture.db, membership_fixture.db, user_id=user_id, org_id=org_id
+        )
+        is True
+    )
 
 
 @requires_db("the membership resolution tests")
@@ -148,6 +153,7 @@ def test_a_non_member_does_not_reach_it(membership_fixture):
     _user_id, org_id, _slug = membership_fixture
     assert (
         may_reach(
+            membership_fixture.db,
             membership_fixture.db,
             user_id=STRANGER_USER,
             org_id=org_id,
@@ -157,7 +163,12 @@ def test_a_non_member_does_not_reach_it(membership_fixture):
     # ...and the org that really belongs to somebody else is just as closed,
     # even though it exists and has a membership row of its own.
     assert (
-        may_reach(membership_fixture.db, user_id=SUBJECT_USER, org_id=OTHER_ORG)
+        may_reach(
+            membership_fixture.db,
+            membership_fixture.db,
+            user_id=SUBJECT_USER,
+            org_id=OTHER_ORG,
+        )
         is False
     )
 
@@ -166,7 +177,12 @@ def test_a_non_member_does_not_reach_it(membership_fixture):
 def test_an_unknown_org_is_not_reachable(membership_fixture):
     user_id, _org_id, _slug = membership_fixture
     assert (
-        may_reach(membership_fixture.db, user_id=user_id, org_id="org_does_not_exist")
+        may_reach(
+            membership_fixture.db,
+            membership_fixture.db,
+            user_id=user_id,
+            org_id="org_does_not_exist",
+        )
         is False
     )
 
@@ -176,14 +192,25 @@ def test_a_blank_user_reaches_nothing(membership_fixture):
     # An unattributable caller must not fall through to "everything".
     _user_id, org_id, _slug = membership_fixture
     for blank in (None, "", "   "):
-        assert may_reach(membership_fixture.db, user_id=blank, org_id=org_id) is False
-        assert reachable_orgs(membership_fixture.db, user_id=blank) == []
+        assert (
+            may_reach(
+                membership_fixture.db,
+                membership_fixture.db,
+                user_id=blank,
+                org_id=org_id,
+            )
+            is False
+        )
+        assert (
+            reachable_orgs(membership_fixture.db, membership_fixture.db, user_id=blank)
+            == []
+        )
 
 
 @requires_db("the membership resolution tests")
 def test_reachable_orgs_lists_only_the_users_own(membership_fixture):
     user_id, org_id, _slug = membership_fixture
-    orgs = reachable_orgs(membership_fixture.db, user_id=user_id)
+    orgs = reachable_orgs(membership_fixture.db, membership_fixture.db, user_id=user_id)
     got = [o["org_id"] for o in orgs]
     assert org_id in got
     assert OTHER_ORG not in got
@@ -199,5 +226,64 @@ def test_reachable_orgs_lists_only_the_users_own(membership_fixture):
 def test_may_reach_agrees_with_reachable_orgs(membership_fixture):
     # The two must never disagree: one is the list, the other the predicate.
     user_id, _org_id, _slug = membership_fixture
-    for org in reachable_orgs(membership_fixture.db, user_id=user_id):
-        assert may_reach(membership_fixture.db, user_id=user_id, org_id=org["org_id"])
+    for org in reachable_orgs(
+        membership_fixture.db, membership_fixture.db, user_id=user_id
+    ):
+        assert may_reach(
+            membership_fixture.db,
+            membership_fixture.db,
+            user_id=user_id,
+            org_id=org["org_id"],
+        )
+
+
+class _RecordingConn:
+    """A connection that records the SQL it is handed and returns fixed rows."""
+
+    def __init__(self, rows):
+        self._rows = rows
+        self.seen: list[str] = []
+
+    def execute(self, sql, params=None):
+        self.seen.append(str(sql))
+        rows = self._rows
+
+        class _Result:
+            def fetchall(self_inner):
+                return rows
+
+        return _Result()
+
+
+class _Row:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def test_the_two_databases_are_queried_separately():
+    """Supabase and the engine are different servers; one JOIN cannot span them.
+
+    public.accounts and public.accounts_memberships live behind
+    SUPABASE_DATABASE_URL; organizations lives behind DATABASE_URL. A single
+    statement naming both parses and runs happily against a test database that
+    holds both, and fails in production with 'relation does not exist'. This is
+    the only test that can catch that, because the local fixture legitimately
+    puts both in one database.
+    """
+    supabase = _RecordingConn([_Row(slug="acme", is_personal=False)])
+    tsdb = _RecordingConn([_Row(org_id="org_acme", account_slug="acme")])
+
+    reachable_orgs(supabase, tsdb, user_id="user-1")
+
+    supabase_sql = " ".join(supabase.seen).lower()
+    tsdb_sql = " ".join(tsdb.seen).lower()
+
+    assert supabase.seen, "the Supabase side was never queried"
+    assert tsdb.seen, "the engine side was never queried"
+    assert "organizations" not in supabase_sql, (
+        "the Supabase connection was asked about organizations, which does not "
+        "exist there"
+    )
+    assert "accounts" not in tsdb_sql, (
+        "the engine connection was asked about accounts, which does not exist there"
+    )
