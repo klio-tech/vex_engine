@@ -1,0 +1,447 @@
+"""Workspace tools: one MCP that both acts and remembers.
+
+Until now an agent could recall and record Klio's memory but could not
+*do* anything in the workspace — no project, no work item, no status
+change. These tools close that gap on the SAME endpoint and the SAME
+credential, because the workspace's personal access token
+(``plane_api_…``) is already valid for both: the engine validates it
+against ``api_tokens`` (see :mod:`shared.auth`), and the workspace REST
+API validates the identical string as ``X-Api-Key``. There is no second
+server to run and no second key to issue.
+
+Design notes:
+
+* **Two tools, not thirty.** Every tool definition is context an agent
+  pays for on every request, so the actions are consolidated behind an
+  ``action`` parameter. (Plane's own MCP server learned this and
+  collapsed 177 per-operation tools into 30.)
+* **The caller's own token is forwarded** — never a service credential.
+  Actions therefore run as that person, with exactly the project
+  permissions they already have; the workspace stays the authority on
+  authorization and this module never second-guesses it.
+* **The workspace is resolved from the caller**, not passed in blind: a
+  token belongs to a workspace, and a caller who belongs to several may
+  name one with ``workspace``.
+"""
+
+import logging
+import os
+from typing import Any, Optional
+
+import httpx
+
+from app.headers import key_header
+from app.identity import resolve_request_user_id
+from app.workspace_db import workspace_engine
+from shared.membership import member_workspaces
+
+logger = logging.getLogger("agentguard.mcp.workspace_tools")
+
+#: Where the workspace app lives. Unset ⇒ the tools report themselves as
+#: unconfigured rather than guessing a host.
+WORKSPACE_API_URL_ENV = "WORKSPACE_API_URL"
+
+REQUEST_TIMEOUT_SECONDS = 20
+
+#: Work-item fields worth returning; the raw API rows are large and most of
+#: it is presentation state an agent has no use for.
+_ITEM_FIELDS = (
+    "id",
+    "name",
+    "sequence_id",
+    "priority",
+    "state",
+    "description_stripped",
+    "created_at",
+    "updated_at",
+    "target_date",
+)
+
+_PROJECT_FIELDS = ("id", "name", "identifier", "description", "created_at")
+
+
+def _base_url() -> Optional[str]:
+    url = os.environ.get(WORKSPACE_API_URL_ENV, "").strip().rstrip("/")
+    return url or None
+
+
+def _unconfigured() -> dict:
+    return {
+        "error": "not_configured",
+        "detail": (
+            "This deployment has no workspace API configured, so work items "
+            "are unavailable. Memory tools are unaffected."
+        ),
+    }
+
+
+def _slim(row: Any, fields: tuple[str, ...]) -> dict:
+    if not isinstance(row, dict):
+        return {"value": row}
+    out = {}
+    for field in fields:
+        if field not in row:
+            continue
+        value = row[field]
+        if value in (None, "", []):
+            continue
+        out[field] = value
+    return out
+
+
+def _rows(payload: Any) -> list:
+    """The workspace API paginates; a bare list comes back from some routes."""
+    if isinstance(payload, dict):
+        return payload.get("results", [])
+    return payload if isinstance(payload, list) else []
+
+
+def resolve_workspace_slug(
+    request: Any, requested: Optional[str]
+) -> tuple[Optional[str], Optional[dict]]:
+    """The workspace to act in: the one named, else the caller's only one.
+
+    Returns ``(slug, error)``. An unattributable caller gets an error: a
+    work item must be filed by a person, never anonymously.
+    """
+    user_id = resolve_request_user_id(request)
+    if not user_id:
+        return None, {
+            "error": "unauthorized",
+            "detail": "Work items need an attributable caller; use a personal access token.",
+        }
+
+    engine = workspace_engine()
+    if engine is None:
+        return None, _unconfigured()
+
+    with engine.connect() as connection:
+        workspaces = member_workspaces(connection, user_id=user_id)
+
+    if not workspaces:
+        return None, {
+            "error": "not_found",
+            "detail": "This token's user is not an active member of any workspace.",
+        }
+
+    if requested:
+        for workspace in workspaces:
+            if workspace["slug"] == requested:
+                return requested, None
+        return None, {
+            "error": "not_found",
+            "detail": f"No workspace '{requested}' that you are a member of.",
+        }
+
+    organizations = [w for w in workspaces if not w["is_personal"]]
+    candidates = organizations or workspaces
+    if len(candidates) == 1:
+        return candidates[0]["slug"], None
+    return None, {
+        "error": "ambiguous_workspace",
+        "detail": "You belong to several workspaces; pass `workspace`.",
+        "workspaces": [w["slug"] for w in candidates],
+    }
+
+
+async def _call(
+    request: Any,
+    method: str,
+    path: str,
+    *,
+    params: Optional[dict] = None,
+    json_body: Optional[dict] = None,
+) -> tuple[Optional[Any], Optional[dict]]:
+    """One authenticated call to the workspace API as the caller."""
+    base = _base_url()
+    if base is None:
+        return None, _unconfigured()
+    token = key_header(request)
+    if not token:
+        return None, {"error": "unauthorized", "detail": "No API key on the request."}
+
+    try:
+        async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
+            response = await client.request(
+                method,
+                f"{base}{path}",
+                params=params,
+                json=json_body,
+                headers={"X-Api-Key": token},
+            )
+    except httpx.HTTPError as exc:
+        logger.warning("workspace API unreachable: %s", exc)
+        return None, {
+            "error": "unreachable",
+            "detail": "The workspace API did not respond.",
+        }
+
+    if response.status_code in (401, 403):
+        return None, {
+            "error": "forbidden",
+            "detail": "This token may not do that in this workspace.",
+        }
+    if response.status_code == 404:
+        return None, {"error": "not_found", "detail": "No such project or work item."}
+    if response.status_code >= 400:
+        # The workspace's own validation message is the most useful thing
+        # an agent can get here, so pass it through rather than flatten it.
+        try:
+            detail = response.json()
+        except ValueError:
+            detail = response.text[:400]
+        return None, {
+            "error": "rejected",
+            "status": response.status_code,
+            "detail": detail,
+        }
+
+    if response.status_code == 204 or not response.content:
+        return {}, None
+    try:
+        return response.json(), None
+    except ValueError:
+        return None, {
+            "error": "bad_response",
+            "detail": "The workspace API returned non-JSON.",
+        }
+
+
+def register(mcp: Any) -> None:
+    """Add the workspace tools to the Klio MCP server."""
+    from typing import Annotated, Literal  # noqa: PLC0415 -- local to the schema
+
+    from mcp.server.fastmcp import Context  # noqa: PLC0415
+    from pydantic import Field  # noqa: PLC0415
+
+    @mcp.tool(
+        name="work_projects",
+        description=(
+            "The WORKSPACE projects you can see — the boards work items live "
+            "on, not the memory projects that `project_list` reports. "
+            "Args: action ('list' default | 'create' | 'members'); for create: "
+            "name and identifier (a short uppercase key, e.g. LAUNCH); "
+            "optional description, workspace. "
+            "Acts as you, with your own permissions."
+        ),
+    )
+    async def work_projects(
+        ctx: Context,
+        action: Annotated[
+            Literal["list", "create", "members"],
+            Field(description="What to do."),
+        ] = "list",
+        name: Annotated[
+            Optional[str], Field(description="Project name (create).")
+        ] = None,
+        identifier: Annotated[
+            Optional[str],
+            Field(description="Short uppercase key, e.g. LAUNCH (create)."),
+        ] = None,
+        description: Annotated[
+            Optional[str], Field(description="Project description.")
+        ] = None,
+        project_id: Annotated[
+            Optional[str], Field(description="Project id (members).")
+        ] = None,
+        workspace: Annotated[
+            Optional[str],
+            Field(description="Workspace slug, when you belong to several."),
+        ] = None,
+    ) -> dict:
+        request = ctx.request_context.request
+        if request is None:
+            return {"error": "unauthorized", "detail": "no request context"}
+
+        slug, error = resolve_workspace_slug(request, workspace)
+        if error:
+            return error
+
+        if action == "list":
+            payload, error = await _call(
+                request, "GET", f"/api/v1/workspaces/{slug}/projects/"
+            )
+            if error:
+                return error
+            return {
+                "workspace": slug,
+                "projects": [_slim(row, _PROJECT_FIELDS) for row in _rows(payload)],
+            }
+
+        if action == "members":
+            if not project_id:
+                return {
+                    "error": "missing_argument",
+                    "detail": "members needs project_id.",
+                }
+            payload, error = await _call(
+                request,
+                "GET",
+                f"/api/v1/workspaces/{slug}/projects/{project_id}/members/",
+            )
+            if error:
+                return error
+            return {
+                "workspace": slug,
+                "members": [
+                    _slim(row, ("id", "member", "role", "display_name"))
+                    for row in _rows(payload)
+                ],
+            }
+
+        if not name or not identifier:
+            return {
+                "error": "missing_argument",
+                "detail": "create needs both name and identifier.",
+            }
+        body = {"name": name, "identifier": identifier.upper()}
+        if description:
+            body["description"] = description
+        payload, error = await _call(
+            request, "POST", f"/api/v1/workspaces/{slug}/projects/", json_body=body
+        )
+        if error:
+            return error
+        return {"workspace": slug, "created": _slim(payload, _PROJECT_FIELDS)}
+
+    @mcp.tool(
+        name="work_items",
+        description=(
+            "Work items (issues) on a workspace project — create them, list "
+            "them, move them, comment on them. This is how you DO the work "
+            "you remember. "
+            "Args: action ('list' default | 'create' | 'update' | 'comment' | "
+            "'states'); project_id (required except for 'states' listing, "
+            "which also needs it); for create: name, optional description, "
+            "priority ('urgent'|'high'|'medium'|'low'|'none'), state_id; for "
+            "update: work_item_id plus any of name/description/priority/"
+            "state_id; for comment: work_item_id and comment. "
+            "Use 'states' first to learn a project's state ids before moving "
+            "an item. Acts as you, with your own permissions."
+        ),
+    )
+    async def work_items(
+        ctx: Context,
+        action: Annotated[
+            Literal["list", "create", "update", "comment", "states"],
+            Field(description="What to do."),
+        ] = "list",
+        project_id: Annotated[
+            Optional[str], Field(description="Workspace project id.")
+        ] = None,
+        work_item_id: Annotated[
+            Optional[str], Field(description="Work item id (update, comment).")
+        ] = None,
+        name: Annotated[
+            Optional[str], Field(description="Title (create/update).")
+        ] = None,
+        description: Annotated[
+            Optional[str], Field(description="Plain-text body (create/update).")
+        ] = None,
+        priority: Annotated[
+            Optional[Literal["urgent", "high", "medium", "low", "none"]],
+            Field(description="Priority."),
+        ] = None,
+        state_id: Annotated[
+            Optional[str], Field(description="State id to move to.")
+        ] = None,
+        comment: Annotated[Optional[str], Field(description="Comment body.")] = None,
+        limit: Annotated[
+            int, Field(description="Max rows for list (default 50).")
+        ] = 50,
+        workspace: Annotated[
+            Optional[str],
+            Field(description="Workspace slug, when you belong to several."),
+        ] = None,
+    ) -> dict:
+        request = ctx.request_context.request
+        if request is None:
+            return {"error": "unauthorized", "detail": "no request context"}
+
+        slug, error = resolve_workspace_slug(request, workspace)
+        if error:
+            return error
+        if not project_id:
+            return {
+                "error": "missing_argument",
+                "detail": "project_id is required; call work_projects(action='list') first.",
+            }
+
+        root = f"/api/v1/workspaces/{slug}/projects/{project_id}"
+
+        if action == "states":
+            payload, error = await _call(request, "GET", f"{root}/states/")
+            if error:
+                return error
+            return {
+                "states": [
+                    _slim(row, ("id", "name", "group")) for row in _rows(payload)
+                ]
+            }
+
+        if action == "list":
+            payload, error = await _call(
+                request,
+                "GET",
+                f"{root}/issues/",
+                params={"per_page": max(1, min(int(limit or 50), 100))},
+            )
+            if error:
+                return error
+            return {"work_items": [_slim(row, _ITEM_FIELDS) for row in _rows(payload)]}
+
+        if action == "create":
+            if not name:
+                return {"error": "missing_argument", "detail": "create needs a name."}
+            body: dict = {"name": name}
+            if description:
+                body["description_html"] = f"<p>{description}</p>"
+            if priority:
+                body["priority"] = priority
+            if state_id:
+                body["state"] = state_id
+            payload, error = await _call(
+                request, "POST", f"{root}/issues/", json_body=body
+            )
+            if error:
+                return error
+            return {"created": _slim(payload, _ITEM_FIELDS)}
+
+        if action == "update":
+            if not work_item_id:
+                return {
+                    "error": "missing_argument",
+                    "detail": "update needs work_item_id.",
+                }
+            body = {}
+            if name:
+                body["name"] = name
+            if description:
+                body["description_html"] = f"<p>{description}</p>"
+            if priority:
+                body["priority"] = priority
+            if state_id:
+                body["state"] = state_id
+            if not body:
+                return {"error": "missing_argument", "detail": "Nothing to update."}
+            payload, error = await _call(
+                request, "PATCH", f"{root}/issues/{work_item_id}/", json_body=body
+            )
+            if error:
+                return error
+            return {"updated": _slim(payload, _ITEM_FIELDS)}
+
+        if not work_item_id or not comment:
+            return {
+                "error": "missing_argument",
+                "detail": "comment needs work_item_id and comment.",
+            }
+        payload, error = await _call(
+            request,
+            "POST",
+            f"{root}/issues/{work_item_id}/comments/",
+            json_body={"comment_html": f"<p>{comment}</p>"},
+        )
+        if error:
+            return error
+        return {"commented": {"id": (payload or {}).get("id")}}
