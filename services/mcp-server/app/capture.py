@@ -891,7 +891,13 @@ async def capture_event(
         # answer; this can only widen it, and only when the project says so and
         # the member has not opted out. Unfiled captures never reach here with
         # a project, so they stay private.
-        if user_id:
+        # ... unless the scope is already an explicit org publication (a
+        # service token declared it — see _hook_write_scope). The comment
+        # above says this resolution "can only widen"; that stopped being
+        # true the day org became reachable upstream, and re-resolving here
+        # silently re-narrowed every chat capture back to private. An
+        # explicit publication is final.
+        if user_id and scope == "private":
             scope = await anyio.to_thread.run_sync(
                 lambda: project_scope.resolve_capture_scope(
                     db, org_id=org_id, project_id=project_id, user_id=user_id
@@ -1004,7 +1010,13 @@ async def capture_transcript(
         # Same rule as /capture/event: the project's default is applied only
         # after a project has resolved, and can only widen the safe answer
         # `_hook_write_scope` already produced.
-        if user_id:
+        # ... unless the scope is already an explicit org publication (a
+        # service token declared it — see _hook_write_scope). The comment
+        # above says this resolution "can only widen"; that stopped being
+        # true the day org became reachable upstream, and re-resolving here
+        # silently re-narrowed every chat capture back to private. An
+        # explicit publication is final.
+        if user_id and scope == "private":
             scope = await anyio.to_thread.run_sync(
                 lambda: project_scope.resolve_capture_scope(
                     db, org_id=org_id, project_id=project_id, user_id=user_id
