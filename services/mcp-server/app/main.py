@@ -17,6 +17,7 @@ from app.capture import router as capture_router
 from app.observability import log_remote_write_state
 from app.observability import router as observability_router
 from app.db import SessionLocal
+from app.internal_actions import router as internal_actions_router
 from app.internal_api import router as internal_api_router
 from app.mcp_app import build_mcp_server
 from app.proposals import router as proposals_router
@@ -177,6 +178,7 @@ def create_app() -> FastAPI:
     # gated by INTERNAL_API_SECRET (unset ⇒ every route 404s). Registered
     # before the catch-all MCP mount like every other REST surface.
     app.include_router(internal_api_router)
+    app.include_router(internal_actions_router)
 
     # Mount the MCP Streamable-HTTP ASGI app at the application root.
     # ``/healthz`` / ``/verify`` / ``/capture/*`` are registered above, so they
