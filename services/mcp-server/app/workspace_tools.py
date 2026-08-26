@@ -340,6 +340,17 @@ def register(mcp: Any) -> None:
         description: Annotated[
             Optional[str], Field(description="Plain-text body (create/update).")
         ] = None,
+        body_html: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    "Rich body as HTML, used instead of `description` when given. "
+                    "Supports <h2>, <p>, <ul><li>, <pre><code>, <strong>, <em>, <a>. "
+                    "Prefer this when the item needs real context: what is wrong, the "
+                    "evidence, where the code lives, and what done means."
+                )
+            ),
+        ] = None,
         priority: Annotated[
             Optional[Literal["urgent", "high", "medium", "low", "none"]],
             Field(description="Priority."),
@@ -396,7 +407,10 @@ def register(mcp: Any) -> None:
             if not name:
                 return {"error": "missing_argument", "detail": "create needs a name."}
             body: dict = {"name": name}
-            if description:
+            # Rich HTML wins when supplied; plain text stays a convenience.
+            if body_html:
+                body["description_html"] = body_html
+            elif description:
                 body["description_html"] = f"<p>{description}</p>"
             if priority:
                 body["priority"] = priority
@@ -418,7 +432,9 @@ def register(mcp: Any) -> None:
             body = {}
             if name:
                 body["name"] = name
-            if description:
+            if body_html:
+                body["description_html"] = body_html
+            elif description:
                 body["description_html"] = f"<p>{description}</p>"
             if priority:
                 body["priority"] = priority
