@@ -263,3 +263,67 @@ def test_unknown_workspace_reports_exists_false(client):
     )
     assert r.status_code == 200
     assert r.json() == {"org_id": None, "exists": False, "memory_count": 0}
+
+
+@requires_db("the internal API tests")
+def test_node_brain_counts_and_private_visibility(client, db_conn):
+    """The brain shows org rows to everyone, private rows only to their owner."""
+    db_conn.execute(
+        text(
+            "INSERT INTO organizations (org_id, name, account_slug, workspace_id) "
+            "VALUES (:org, 'brain test', :org, CAST(:ws AS uuid))"
+        ),
+        {"org": ORG, "ws": WORKSPACE_ID},
+    )
+    for content, scope, user in (
+        ("an org-wide decision", "org", "user-a"),
+        ("user A's private note", "private", "aaaaaaaa-0000-4000-8000-000000000001"),
+        ("user B's private note", "private", "bbbbbbbb-0000-4000-8000-000000000002"),
+    ):
+        db_conn.execute(
+            text(
+                """
+                INSERT INTO session_memories (
+                    id, session_id, org_id, agent_id, user_id, memory_type,
+                    content, scope, status, metadata, created_at, updated_at
+                ) VALUES (
+                    :id, 'brain-test', :org, 'agent-1', :user, 'fact',
+                    :content, :scope, 'active', '{}'::jsonb, NOW(), NOW()
+                )
+                """
+            ),
+            {
+                "id": str(uuid.uuid4()),
+                "org": ORG,
+                "user": user,
+                "content": content,
+                "scope": scope,
+            },
+        )
+
+    response = client.get(
+        f"/internal/node-brain?workspace={WORKSPACE_ID}"
+        "&user=aaaaaaaa-0000-4000-8000-000000000001",
+        headers={HEADER: SECRET},
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["exists"] is True
+    assert payload["counts"] == {"org": 1, "private": 2}
+    contents = {row["content"] for row in payload["recent"]}
+    assert "an org-wide decision" in contents
+    assert "user A's private note" in contents
+    assert "user B's private note" not in contents
+
+
+@requires_db("the internal API tests")
+def test_node_brain_unknown_workspace_is_empty(client):
+    response = client.get(
+        f"/internal/node-brain?workspace={UNKNOWN_WORKSPACE}", headers={HEADER: SECRET}
+    )
+    assert response.json() == {
+        "exists": False,
+        "org_id": None,
+        "counts": {},
+        "recent": [],
+    }

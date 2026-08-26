@@ -79,6 +79,47 @@ _ORG_MEMORY_COUNT_SQL = text(
 )
 
 
+#: Active rows by scope across the node.
+_ORG_SCOPE_COUNTS_SQL = text(
+    """
+    SELECT scope, COUNT(*) AS n
+    FROM session_memories
+    WHERE org_id = :org_id
+      AND status = 'active'
+    GROUP BY scope
+    """
+)
+
+#: The node's newest visible memories for the brain surface: org-wide rows,
+#: plus the asking user's own private rows — never anyone else's.
+_RECENT_MEMORIES_SQL = text(
+    """
+    SELECT id, LEFT(content, 280) AS content, scope, memory_type, created_at
+    FROM session_memories
+    WHERE org_id = :org_id
+      AND status = 'active'
+      AND (scope = 'org'
+           OR (scope = 'private' AND CAST(:user_id AS text) IS NOT NULL
+               AND CAST(user_id AS text) = CAST(:user_id AS text)))
+    ORDER BY created_at DESC
+    LIMIT :limit
+    """
+)
+
+#: One branch's newest rows, for the branch view's preview.
+_BRANCH_MEMORIES_SQL = text(
+    """
+    SELECT id, LEFT(content, 280) AS content, scope, memory_type, created_at
+    FROM session_memories
+    WHERE org_id = :org_id
+      AND branch_id = CAST(:branch_id AS uuid)
+      AND status = 'active'
+    ORDER BY created_at DESC
+    LIMIT 10
+    """
+)
+
+
 def _not_found() -> HTTPException:
     """The one refusal shape. 404, never 401/403 — no oracle."""
     return HTTPException(status_code=404, detail="Not Found")
@@ -163,3 +204,88 @@ def workspace_node_status(workspace: uuid.UUID, db: Any = Depends(get_db)) -> di
         "exists": True,
         "memory_count": int(count_row.n) if count_row is not None else 0,
     }
+
+
+@router.get("/node-brain")
+def node_brain(
+    workspace: uuid.UUID,
+    user: str | None = None,
+    limit: int = 20,
+    db: Any = Depends(get_db),
+) -> dict:
+    """The brain surface: scope counts and recent memories for one node.
+
+    ``user`` (a workspace user uuid) widens the recent list to include that
+    user's own private rows; org rows are always included. The Django proxy
+    authenticates the user — this parameter is attribution, not authz.
+    """
+    row = db.execute(_ORG_BY_WORKSPACE_SQL, {"workspace_id": str(workspace)}).fetchone()
+    if row is None:
+        return {"exists": False, "org_id": None, "counts": {}, "recent": []}
+
+    counts = {
+        count_row.scope: int(count_row.n)
+        for count_row in db.execute(
+            _ORG_SCOPE_COUNTS_SQL, {"org_id": row.org_id}
+        ).fetchall()
+    }
+    try:
+        user_id = str(uuid.UUID(user)) if user else None
+    except (ValueError, TypeError):
+        user_id = None
+    recent = [
+        {
+            "id": str(memory.id),
+            "content": memory.content,
+            "scope": memory.scope,
+            "memory_type": memory.memory_type,
+            "created_at": memory.created_at.isoformat() if memory.created_at else None,
+        }
+        for memory in db.execute(
+            _RECENT_MEMORIES_SQL,
+            {"org_id": row.org_id, "user_id": user_id, "limit": max(1, min(limit, 50))},
+        ).fetchall()
+    ]
+    return {"exists": True, "org_id": row.org_id, "counts": counts, "recent": recent}
+
+
+@router.get("/project-branches")
+def project_branches(workspace_project: uuid.UUID, db: Any = Depends(get_db)) -> dict:
+    """Every context branch of one linked project, with memory previews."""
+    row = db.execute(
+        _LINKED_PROJECT_SQL, {"plane_project_id": str(workspace_project)}
+    ).fetchone()
+    if row is None:
+        return {"linked": False, "branches": []}
+
+    branches = []
+    for branch in list_branches(db, org_id=row.org_id, project_id=str(row.id)):
+        memories = [
+            {
+                "id": str(memory.id),
+                "content": memory.content,
+                "scope": memory.scope,
+                "memory_type": memory.memory_type,
+                "created_at": memory.created_at.isoformat()
+                if memory.created_at
+                else None,
+            }
+            for memory in db.execute(
+                _BRANCH_MEMORIES_SQL,
+                {"org_id": row.org_id, "branch_id": branch["id"]},
+            ).fetchall()
+        ]
+        branches.append(
+            {
+                "id": branch["id"],
+                "name": branch["name"],
+                "status": branch["status"],
+                "unmerged_count": branch["unmerged_count"],
+                "last_activity": branch["last_activity"],
+                "created_at": branch["created_at"].isoformat()
+                if branch["created_at"]
+                else None,
+                "memories": memories,
+            }
+        )
+    return {"linked": True, "engine_project_id": str(row.id), "branches": branches}
