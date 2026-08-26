@@ -54,3 +54,20 @@ def test_attributable_declaring_agent_is_not_widened():
     # fall back to the private default for attributable callers.
     scope, user = _hook_write_scope(_Req(), _Key(), "agent")
     assert scope == "private" and user == _Key.user_id
+
+
+def test_project_resolution_never_renarrows_an_explicit_org_publication():
+    """The end-to-end shape of the live bug: the gate said org, then the
+    project-default resolution re-resolved the attributable capture and
+    silently returned it to private. Found in production with a spy on
+    _hook_write_scope: gate -> ('org', bot), response -> scope private.
+    The resolution may only run on the private default."""
+    import re
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1] / "app" / "capture.py"
+    text = src.read_text()
+    bare = len(re.findall(r"if user_id:\n\s+scope = await anyio", text))
+    guarded = len(re.findall(r'if user_id and scope == "private":', text))
+    assert bare == 0, "an unguarded resolve_capture_scope override survives"
+    assert guarded >= 2, "both capture routes must carry the guard"
