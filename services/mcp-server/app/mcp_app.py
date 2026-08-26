@@ -141,6 +141,7 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     # also file the work item it implies, on the same endpoint and key.
     "work_projects",
     "work_items",
+    "work_pages",
     "klio_retrieve",
     "compress",
     "explore",

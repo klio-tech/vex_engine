@@ -52,6 +52,7 @@ _REQUIRED_SCHEMA_FIELD = {
     # required — None asserts that, and still catches a silent new mandate.
     "work_projects": None,
     "work_items": None,
+    "work_pages": None,
     "klio_retrieve": "handle",
     "compress": "content",
     "explore": "entity",

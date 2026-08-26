@@ -59,6 +59,8 @@ _ITEM_FIELDS = (
 
 _PROJECT_FIELDS = ("id", "name", "identifier", "description", "created_at")
 
+_PAGE_FIELDS = ("id", "name", "access", "is_locked", "created_at", "updated_at")
+
 
 def _base_url() -> Optional[str]:
     url = os.environ.get(WORKSPACE_API_URL_ENV, "").strip().rstrip("/")
@@ -445,3 +447,100 @@ def register(mcp: Any) -> None:
         if error:
             return error
         return {"commented": {"id": (payload or {}).get("id")}}
+
+    @mcp.tool(
+        name="work_pages",
+        description=(
+            "Documentation pages on a workspace project — read the "
+            "architecture before you change it, and write down what you "
+            "learned after. "
+            "Args: action ('list' default | 'read' | 'create' | 'update'); "
+            "project_id (required); for create: title and body_html; for "
+            "read/update: page_id; for update: title and/or body_html. "
+            "`body_html` is HTML — use <h2>, <p>, <ul><li>, <pre><code> and "
+            "<strong>. Pages you write are visible to the whole project, so "
+            "write them for the next person, not as notes to yourself."
+        ),
+    )
+    async def work_pages(
+        ctx: Context,
+        action: Annotated[
+            Literal["list", "read", "create", "update"],
+            Field(description="What to do."),
+        ] = "list",
+        project_id: Annotated[
+            Optional[str], Field(description="Workspace project id.")
+        ] = None,
+        page_id: Annotated[
+            Optional[str], Field(description="Page id (read, update).")
+        ] = None,
+        title: Annotated[Optional[str], Field(description="Page title.")] = None,
+        body_html: Annotated[
+            Optional[str], Field(description="Page body as HTML.")
+        ] = None,
+        workspace: Annotated[
+            Optional[str],
+            Field(description="Workspace slug, when you belong to several."),
+        ] = None,
+    ) -> dict:
+        request = ctx.request_context.request
+        if request is None:
+            return {"error": "unauthorized", "detail": "no request context"}
+
+        slug, error = resolve_workspace_slug(request, workspace)
+        if error:
+            return error
+        if not project_id:
+            return {
+                "error": "missing_argument",
+                "detail": "project_id is required; call work_projects(action='list') first.",
+            }
+
+        root = f"/api/v1/workspaces/{slug}/projects/{project_id}/pages"
+
+        if action == "list":
+            payload, error = await _call(request, "GET", f"{root}/")
+            if error:
+                return error
+            return {"pages": [_slim(row, _PAGE_FIELDS) for row in _rows(payload)]}
+
+        if action == "read":
+            if not page_id:
+                return {"error": "missing_argument", "detail": "read needs page_id."}
+            payload, error = await _call(request, "GET", f"{root}/{page_id}/")
+            if error:
+                return error
+            page = _slim(payload, _PAGE_FIELDS)
+            # The body is the point of reading a page, so it is returned in
+            # full rather than trimmed like the list rows.
+            page["body_html"] = (payload or {}).get("description_html", "")
+            return {"page": page}
+
+        if action == "create":
+            if not title:
+                return {"error": "missing_argument", "detail": "create needs a title."}
+            payload, error = await _call(
+                request,
+                "POST",
+                f"{root}/",
+                json_body={"name": title, "description_html": body_html or "<p></p>"},
+            )
+            if error:
+                return error
+            return {"created": _slim(payload, _PAGE_FIELDS)}
+
+        if not page_id:
+            return {"error": "missing_argument", "detail": "update needs page_id."}
+        body: dict = {}
+        if title:
+            body["name"] = title
+        if body_html:
+            body["description_html"] = body_html
+        if not body:
+            return {"error": "missing_argument", "detail": "Nothing to update."}
+        payload, error = await _call(
+            request, "PATCH", f"{root}/{page_id}/", json_body=body
+        )
+        if error:
+            return error
+        return {"updated": _slim(payload, _PAGE_FIELDS)}
