@@ -343,15 +343,30 @@ def _hook_write_scope(
 
     The fallback honours ``declared_scope`` rather than forcing ``'org'`` so
     that a client already asking for the deprecated ``'agent'`` scope keeps
-    getting it. An attributable caller's declared scope is ignored on purpose:
-    ``private`` is strictly narrower than either alternative, so overriding it
-    can only ever reduce who sees the row.
+    getting it. An attributable caller's declared scope is ignored on purpose
+    -- with one exception, ``'org'``, which is an explicit publication (the
+    chat bridge declares it for plot messages; see the inline comment below).
+    Everything else collapses to ``private``: strictly narrower, so the
+    override can only ever reduce who sees the row.
 
     Returns:
         A ``(scope, user_id)`` pair.
     """
     user_id = resolve_user_id(request, key_info)
     if user_id:
+        # One exception to the discard rule, added for chat capture: an
+        # attributable caller declaring EXACTLY 'org' is making an explicit
+        # publication -- the plot bridge says it on purpose, because a plot
+        # message was said in the open room and forcing it private made the
+        # team's own conversation visible to nobody but the workspace bot.
+        # Only SERVICE tokens may publish this way -- a human's hook client
+        # declaring org still collapses to private, because nobody chose to
+        # publish when a Stop hook fired. The protected direction is unchanged:
+        # nothing is widened silently
+        # (hooks never declare a scope), 'private' stays private, and any
+        # other declared value still falls back to the private default.
+        if declared_scope == "org" and getattr(key_info, "is_service", False):
+            return "org", user_id
         return "private", user_id
     logger.warning(
         "capture: request could not be attributed to a user; writing scope=%s "

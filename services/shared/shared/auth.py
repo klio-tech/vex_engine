@@ -61,7 +61,7 @@ PAT_SCOPES = ("memory", "read")
 #: unlike engine keys, which are matched by SHA-256 hash.
 _PAT_TOKEN_SQL = text(
     """
-    SELECT id, user_id, workspace_id, is_active, expired_at, deleted_at
+    SELECT id, user_id, workspace_id, is_active, expired_at, deleted_at, is_service
     FROM api_tokens
     WHERE token = :token
     LIMIT 1
@@ -209,6 +209,11 @@ class KeyInfo:
     # This is the ONLY identity source on the key path. Never derive it from
     # X-Vex-Agent, which the client declares and can therefore forge.
     user_id: str | None = None
+    #: True only for workspace service/bot tokens (api_tokens.is_service).
+    #: Gates capabilities reserved for non-human publishers — e.g. the chat
+    #: bridge's explicit org-scope captures. Engine org keys are never
+    #: service tokens.
+    is_service: bool = False
 
 
 @dataclass
@@ -224,6 +229,7 @@ class _CachedKey:
     plan: str = "free"
     plan_overrides: dict | None = None
     user_id: str | None = None
+    is_service: bool = False
     # Whether ``user_id`` is still a member of the workspace, as of the last
     # ``organizations``/Supabase query (see ``KeyValidator._query_db``).
     # ``None`` means the check was not evaluated at all — ``user_id`` is
@@ -424,11 +430,27 @@ class KeyValidator:
         # cache hit re-checks ``entry.is_member`` on every call; a cache
         # miss re-queries it fresh via ``_query_db``).
         if entry.user_id is not None and entry.is_member is False:
+            # Log with full context: this refusal reads identically for a
+            # genuinely removed member and for a transient (stale cache
+            # entry, a validation that raced a deploy window). Omar's first
+            # connect hit the transient shape and the message below sent two
+            # people debugging workspace membership that was never broken --
+            # without this line there was nothing to pinpoint it afterwards.
+            logger.warning(
+                "membership guard refused key %s: owner %s is not an active "
+                "member of org %s (cached answer, ttl %ss)",
+                entry.key_id,
+                entry.user_id,
+                entry.org_id,
+                self._cache_ttl_s,
+            )
             raise AuthError(
                 403,
-                "The user who created this API key is no longer a member "
-                "of this workspace. Ask a workspace admin to issue a new "
-                "key, or re-add the original owner.",
+                "This key's owner is not currently an active member of the "
+                "workspace this key belongs to. If they were just added or "
+                "this seems wrong, retry in a minute (membership answers are "
+                "cached briefly) and restart your agent session; otherwise "
+                "ask a workspace admin to re-add them or issue a new key.",
             )
 
         # 5. Check scope
@@ -457,6 +479,7 @@ class KeyValidator:
             plan=entry.plan,
             plan_overrides=entry.plan_overrides,
             user_id=entry.user_id,
+            is_service=entry.is_service,
         )
 
     def flush_usage(self) -> None:
@@ -954,6 +977,7 @@ class KeyValidator:
             plan_overrides=plan_overrides_val,
             user_id=user_id,
             is_member=is_member,
+            is_service=bool(getattr(token_row, "is_service", False)),
         )
 
     def _touch_pat_last_used(self, token_id: str) -> None:
