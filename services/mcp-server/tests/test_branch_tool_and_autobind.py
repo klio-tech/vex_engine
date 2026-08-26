@@ -553,3 +553,99 @@ def test_event_branch_never_widens_a_private_capture():
     for call in write.await_args_list:
         assert call.kwargs["branch_id"] is None
         assert call.kwargs["scope"] == "private"
+
+
+# ---------------------------------------------------------------------------
+# Migration 051: a work-item branch files its captures under that work item
+# ---------------------------------------------------------------------------
+
+
+def _project_scope_capture():
+    """Patches identical to :func:`_capture_patches` but capture lands on the
+    project, which is the only scope a branch is ever bound under."""
+    session = MagicMock()
+    return {
+        "session": patch("app.capture.SessionLocal", MagicMock(return_value=session)),
+        "ensure_project": patch.object(
+            capture.brain, "ensure_project", MagicMock(return_value="proj-1")
+        ),
+        "scope": patch.object(
+            capture.project_scope,
+            "resolve_capture_scope",
+            MagicMock(return_value="project"),
+        ),
+        "summary": patch("app.capture.generate_summary", AsyncMock(return_value="a summary")),
+        "typed": patch("app.capture.extract_typed_memories", AsyncMock(return_value=[])),
+        "outbox": patch("app.capture.enqueue_trace_outbox", AsyncMock()),
+    }
+
+
+def _run_transcript(branch_row, *, git_branch="feat/x"):
+    write = AsyncMock(return_value={"stored": True})
+    ensure_branch = MagicMock(return_value=branch_row)
+    p = _project_scope_capture()
+    with (
+        p["session"],
+        patch.object(capture.brain, "write_scoped_memory", write),
+        p["ensure_project"],
+        p["scope"],
+        patch.object(capture.branches, "ensure_branch", ensure_branch),
+        p["summary"],
+        p["typed"],
+        p["outbox"],
+    ):
+        resp = _post_transcript(_client(user_id=USER), git_branch=git_branch)
+    return resp, write
+
+
+def test_a_capture_on_a_work_item_branch_inherits_the_work_item():
+    """The point of a feature branch: bind once, then just work.
+
+    Every memory the hooks capture while standing on a branch bound to a work
+    item is filed under that work item, without the hook — which knows only a
+    git branch name — ever naming it.
+    """
+    row = dict(BRANCH_ROW, work_item_id="cafe1234-1111-2222-3333-444444444444")
+    resp, write = _run_transcript(row)
+
+    assert resp.status_code == 200
+    assert write.await_args_list, "the transcript wrote nothing to assert on"
+    for call in write.await_args_list:
+        assert call.kwargs["branch_id"] == BRANCH_ROW["id"]
+        assert call.kwargs["work_item_id"] == "cafe1234-1111-2222-3333-444444444444"
+
+
+def test_a_capture_on_a_plain_branch_files_no_work_item():
+    """A branch with no work item must not invent one."""
+    row = dict(BRANCH_ROW)
+    row.pop("work_item_id", None)
+    resp, write = _run_transcript(row)
+
+    assert resp.status_code == 200
+    for call in write.await_args_list:
+        assert call.kwargs["branch_id"] == BRANCH_ROW["id"]
+        assert call.kwargs["work_item_id"] is None
+
+
+def test_a_capture_on_main_files_no_work_item():
+    """No branch means no inherited filing, even on a project that has one."""
+    write = AsyncMock(return_value={"stored": True})
+    ensure_branch = MagicMock()
+    p = _project_scope_capture()
+    with (
+        p["session"],
+        patch.object(capture.brain, "write_scoped_memory", write),
+        p["ensure_project"],
+        p["scope"],
+        patch.object(capture.branches, "ensure_branch", ensure_branch),
+        p["summary"],
+        p["typed"],
+        p["outbox"],
+    ):
+        resp = _post_transcript(_client(user_id=USER), git_branch="main")
+
+    assert resp.status_code == 200
+    ensure_branch.assert_not_called()
+    for call in write.await_args_list:
+        assert call.kwargs["branch_id"] is None
+        assert call.kwargs["work_item_id"] is None
