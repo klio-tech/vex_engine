@@ -467,11 +467,14 @@ def register(mcp: Any) -> None:
     @mcp.tool(
         name="work_pages",
         description=(
-            "Documentation pages on a workspace project — read the "
-            "architecture before you change it, and write down what you "
-            "learned after. "
+            "Documentation pages — read the architecture before you change "
+            "it, and write down what you learned after. "
+            "OMIT project_id for WORKSPACE pages: durable docs that outlive "
+            "any one project (architecture, conventions, runbooks) — that is "
+            "where the Klio architecture pages live. Pass project_id only for "
+            "notes that belong to one project and should disappear with it. "
             "Args: action ('list' default | 'read' | 'create' | 'update'); "
-            "project_id (required); for create: title and body_html; for "
+            "optional project_id; for create: title and body_html; for "
             "read/update: page_id; for update: title and/or body_html. "
             "`body_html` is HTML — use <h2>, <p>, <ul><li>, <pre><code> and "
             "<strong>. Pages you write are visible to the whole project, so "
@@ -506,13 +509,13 @@ def register(mcp: Any) -> None:
         slug, error = resolve_workspace_slug(request, workspace)
         if error:
             return error
-        if not project_id:
-            return {
-                "error": "missing_argument",
-                "detail": "project_id is required; call work_projects(action='list') first.",
-            }
-
-        root = f"/api/v1/workspaces/{slug}/projects/{project_id}/pages"
+        # No project_id means workspace level — the default home for
+        # documentation, not an error.
+        root = (
+            f"/api/v1/workspaces/{slug}/projects/{project_id}/pages"
+            if project_id
+            else f"/api/v1/workspaces/{slug}/pages"
+        )
 
         if action == "list":
             payload, error = await _call(request, "GET", f"{root}/")
