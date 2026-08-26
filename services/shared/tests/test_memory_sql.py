@@ -6,6 +6,8 @@ require no live Postgres instance and must run in every CI environment without
 skipping.
 """
 
+import uuid
+
 import pytest
 
 import shared.memory as memory_mod
@@ -285,3 +287,176 @@ def test_no_bind_param_immediately_followed_by_cast():
         if hits:
             offenders[os.path.basename(path)] = hits
     assert not offenders, f"bind-then-cast SQL found (use CAST()): {offenders}"
+
+
+# ---------------------------------------------------------------------------
+# Migration 051: work-item recall is three-tier
+# ---------------------------------------------------------------------------
+
+
+def _where(sql: str) -> str:
+    """Just the WHERE predicate.
+
+    The SELECT list names every column including ``work_item_id``, so a naive
+    ``"work_item_id" in sql`` is true of every statement and proves nothing
+    about filtering. These tests are about the predicate.
+    """
+    return sql.split("WHERE", 1)[1].split("ORDER BY", 1)[0]
+
+
+@pytest.mark.asyncio
+async def test_work_item_recall_is_three_tier(monkeypatch):
+    """work_item + project issues three tiers, narrowest first.
+
+    Tier 1 the work item's own rows, tier 2 the REST of the project, tier 3
+    unfiled org rows. Tier 2 must exclude tier 1 with ``IS DISTINCT FROM``
+    rather than ``work_item_id IS NULL``: the NULL form would silently drop
+    every sibling work item's rows out of the project tier, which is the
+    opposite of what a reader working the feature wants.
+    """
+    captured = await _run_recall_sql_capture(
+        monkeypatch, project_id="proj-1", work_item_id="item-9"
+    )
+    assert len(captured["vector"]) == 3, "expected exactly three vector tiers"
+
+    tier1_sql, tier1_params = captured["vector"][0]
+    assert "work_item_id = :work_item_id" in _where(tier1_sql)
+    assert "IS DISTINCT FROM" not in _where(tier1_sql)
+    assert tier1_params["work_item_id"] == "item-9"
+
+    tier2_sql, tier2_params = captured["vector"][1]
+    assert "project_id = :project_id" in _where(tier2_sql)
+    assert "work_item_id IS DISTINCT FROM :work_item_id" in _where(tier2_sql)
+    assert "work_item_id IS NULL" not in _where(tier2_sql)
+
+    tier3_sql, _ = captured["vector"][2]
+    assert "project_id IS NULL" in _where(tier3_sql)
+
+    # Every tier's ANN pool is sized for its OWN limit. With an empty stub no
+    # tier consumes slots, so this is the invariant that is observable here;
+    # the shrink itself is exercised in
+    # ``test_later_tiers_only_fill_the_slots_left``.
+    for _sql, tier_params in captured["vector"]:
+        assert tier_params["candidate_pool"] == ranking.candidate_pool(
+            tier_params["limit"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_project_recall_without_a_work_item_is_unchanged(monkeypatch):
+    """The pre-051 shape survives byte-for-byte when no work item is named.
+
+    This is the backward-compatibility guarantee: a project-scoped recall
+    still returns the project's work-item rows, because they are still that
+    project's context.
+    """
+    captured = await _run_recall_sql_capture(monkeypatch, project_id="proj-1")
+    assert len(captured["vector"]) == 2
+    for sql, _ in captured["vector"]:
+        assert "work_item_id" not in _where(sql)
+
+
+@pytest.mark.asyncio
+async def test_a_work_item_without_a_project_is_ignored(monkeypatch):
+    """A work item alone cannot skip the project tier.
+
+    Answering from a bare work_item_id would drop the project tier entirely,
+    so the argument is ignored rather than half-honoured.
+    """
+    captured = await _run_recall_sql_capture(monkeypatch, work_item_id="item-9")
+    assert len(captured["vector"]) == 1
+    assert "work_item_id" not in _where(captured["vector"][0][0])
+
+
+@pytest.mark.asyncio
+async def test_work_item_column_is_selected_on_both_arms(monkeypatch):
+    """Both arms must select it, or a row's filing depends on which arm found it."""
+    captured = await _run_recall_sql_capture(monkeypatch, project_id="proj-1")
+    assert "work_item_id" in captured["lexical"][-1][0]
+    # The vector arm selects it too; positional row_to_record reads index 22.
+    vector_sql = captured["vector"][0][0]
+    assert "revision, branch_id, work_item_id" in vector_sql
+
+
+def _fake_row(content: str, *, project_id=None, work_item_id=None, relevance=0.9):
+    """A row shaped like the recall SELECT list: 23 columns, then relevance.
+
+    Positional by necessity — ``row_to_record`` reads by index, and pinning the
+    layout here is what catches a column inserted in the middle of the SELECT.
+    """
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    return (
+        uuid.uuid4(),      # 0  id
+        "sess",            # 1  session_id
+        "org-1",           # 2  org_id
+        "agent-1",         # 3  agent_id
+        None,              # 4  execution_id
+        "note",            # 5  memory_type
+        content,           # 6  content
+        None,              # 7  embedding
+        None,              # 8  confidence
+        None,              # 9  sequence_number
+        "org",             # 10 scope
+        "active",          # 11 status
+        None,              # 12 superseded_by
+        {},                # 13 metadata
+        now,               # 14 created_at
+        now,               # 15 updated_at
+        None,              # 16 space_id
+        project_id,        # 17 project_id
+        None,              # 18 user_id
+        "EXTRACTED",       # 19 provenance
+        None,              # 20 revision
+        None,              # 21 branch_id
+        work_item_id,      # 22 work_item_id
+        relevance,         # 23 relevance (read as row[-1])
+    )
+
+
+@pytest.mark.asyncio
+async def test_later_tiers_only_fill_the_slots_left(monkeypatch):
+    """Tier 1 filling 6 of 10 slots leaves tier 2 asking for 4, not 10.
+
+    Without this the narrow tiers each issue a full-width ANN scan and the
+    caller silently gets more rows than ``limit``.
+    """
+    calls = []
+
+    async def _embed(_, **_kwargs):
+        return [0.1, 0.2]
+
+    monkeypatch.setattr(memory_mod, "embed_text", _embed)
+
+    class _DB:
+        def execute(self, sql, params=None):
+            sql_text = str(sql)
+            is_vector = "embedding <=> :embedding" in sql_text
+            if is_vector:
+                calls.append(dict(params))
+            first = is_vector and len(calls) == 1
+            rows = (
+                [_fake_row(f"row {i}", work_item_id="item-9") for i in range(6)]
+                if first
+                else []
+            )
+
+            class R:
+                def fetchall(self_inner):
+                    return rows
+
+                def scalar(self_inner):
+                    return False
+
+            return R()
+
+        def rollback(self):
+            pass
+
+    await memory_mod.retrieve_memories_scoped(
+        _DB(), "org-1", "q", project_id="proj-1", work_item_id="item-9", limit=10
+    )
+    assert calls[0]["limit"] == 10, "tier 1 gets the full budget"
+    assert calls[1]["limit"] == 4, "tier 2 gets only what tier 1 left"
+    assert calls[1]["candidate_pool"] == ranking.candidate_pool(4)

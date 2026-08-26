@@ -48,19 +48,20 @@ RESERVED_BRANCH_NAME = "main"
 #: existing open row, so a repeated ensure is idempotent.
 _ENSURE_BRANCH_SQL = text(
     """
-    INSERT INTO context_branches (org_id, project_id, name, created_by)
-    VALUES (:org_id, :project_id, :name, :created_by)
+    INSERT INTO context_branches
+        (org_id, project_id, name, created_by, work_item_id)
+    VALUES (:org_id, :project_id, :name, :created_by, :work_item_id)
     ON CONFLICT (org_id, project_id, name) WHERE status = 'open'
         DO UPDATE SET name = EXCLUDED.name
     RETURNING id, org_id, project_id, name, status, created_by,
-              created_at, closed_at
+              created_at, closed_at, work_item_id
     """
 )
 
 _GET_BRANCH_SQL = text(
     """
     SELECT id, org_id, project_id, name, status, created_by,
-           created_at, closed_at
+           created_at, closed_at, work_item_id
     FROM context_branches
     WHERE org_id = :org_id
       AND project_id = :project_id
@@ -73,7 +74,7 @@ _GET_BRANCH_SQL = text(
 _GET_BRANCH_BY_ID_SQL = text(
     """
     SELECT id, org_id, project_id, name, status, created_by,
-           created_at, closed_at
+           created_at, closed_at, work_item_id
     FROM context_branches
     WHERE org_id = :org_id
       AND id = :branch_id
@@ -89,7 +90,7 @@ _GET_BRANCH_BY_ID_SQL = text(
 _LIST_BRANCHES_SQL = text(
     """
     SELECT b.id, b.org_id, b.project_id, b.name, b.status, b.created_by,
-           b.created_at, b.closed_at,
+           b.created_at, b.closed_at, b.work_item_id,
            COUNT(m.id) FILTER (WHERE m.status = 'active') AS unmerged_count,
            MAX(m.created_at) FILTER (WHERE m.status = 'active') AS last_activity
     FROM context_branches b
@@ -98,8 +99,9 @@ _LIST_BRANCHES_SQL = text(
        AND m.org_id = b.org_id
     WHERE b.org_id = :org_id
       AND b.project_id = :project_id
+      AND (:work_item_id IS NULL OR b.work_item_id = CAST(:work_item_id AS uuid))
     GROUP BY b.id, b.org_id, b.project_id, b.name, b.status, b.created_by,
-             b.created_at, b.closed_at
+             b.created_at, b.closed_at, b.work_item_id
     ORDER BY b.created_at DESC, b.name
     """
 )
@@ -137,6 +139,11 @@ def _row_to_branch(row: Any) -> dict:
         "created_by": row.created_by,
         "created_at": row.created_at,
         "closed_at": row.closed_at,
+        "work_item_id": (
+            str(row.work_item_id)
+            if getattr(row, "work_item_id", None) is not None
+            else None
+        ),
     }
 
 
@@ -147,6 +154,7 @@ def ensure_branch(
     project_id: str,
     name: str,
     created_by: Optional[str],
+    work_item_id: Optional[str] = None,
 ) -> dict:
     """The open branch by this name, created if absent. Idempotent.
 
@@ -168,6 +176,12 @@ def ensure_branch(
         created_by: The resolved human who created the branch, or ``None``
             for an unattributable caller. Recorded on first creation only —
             an ensure that lands on an existing row never reassigns it.
+        work_item_id: Optional work item this branch is the feature branch
+            for (migration 051). Like ``created_by`` it is recorded on
+            CREATION only: the ``DO UPDATE`` deliberately does not touch it,
+            so an ensure that lands on an existing open branch never
+            re-points it at a different work item. The branch still belongs
+            to its PROJECT — merge promotes to project main, unchanged.
 
     Returns:
         The branch dict: ``{"id", "org_id", "project_id", "name", "status",
@@ -190,6 +204,7 @@ def ensure_branch(
             "project_id": cleaned_project,
             "name": cleaned_name,
             "created_by": _clean(created_by),
+            "work_item_id": _clean(work_item_id),
         },
     ).first()
     db_session.commit()
@@ -239,7 +254,13 @@ def get_branch_by_id(db_session: Any, *, org_id: str, branch_id: str) -> Optiona
     return _row_to_branch(row) if row is not None else None
 
 
-def list_branches(db_session: Any, *, org_id: str, project_id: str) -> list[dict]:
+def list_branches(
+    db_session: Any,
+    *,
+    org_id: str,
+    project_id: str,
+    work_item_id: Optional[str] = None,
+) -> list[dict]:
     """Every branch of this project (all statuses), newest first.
 
     Each dict carries the registry columns plus two computed fields:
@@ -250,6 +271,10 @@ def list_branches(db_session: Any, *, org_id: str, project_id: str) -> list[dict
     * ``last_activity`` — the newest active memory's ``created_at``, or
       ``None`` for a branch nothing has been written to. Together with
       ``unmerged_count`` this is the stale-branch surfacing from the spec.
+
+    ``work_item_id`` narrows the list to one work item's feature branches.
+    Omitted (the default) it is not a filter at all — every branch of the
+    project answers, which is the pre-051 behaviour.
     """
     cleaned_org = _clean(org_id)
     cleaned_project = _clean(project_id)
@@ -257,7 +282,11 @@ def list_branches(db_session: Any, *, org_id: str, project_id: str) -> list[dict
         return []
     rows = db_session.execute(
         _LIST_BRANCHES_SQL,
-        {"org_id": cleaned_org, "project_id": cleaned_project},
+        {
+            "org_id": cleaned_org,
+            "project_id": cleaned_project,
+            "work_item_id": _clean(work_item_id),
+        },
     ).fetchall()
     branches = []
     for row in rows:

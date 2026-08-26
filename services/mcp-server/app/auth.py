@@ -80,6 +80,14 @@ DEFAULT_AGENT_ID = "mcp-default"
 # scoping is a relevance feature, not a security boundary (org_id is).
 PROJECT_HEADER = "X-Vex-Project"
 
+# Optional per-request work-item scoping (migration 051), the finest filing
+# grain there is. Accepts a work item uuid or a ``PROJ-123`` reference. Like
+# the project header this is RELEVANCE, not a boundary, and fails open to
+# "not filed under a work item" — but unlike the project header it cannot be
+# resolved without the workspace database, so it is resolved by the tool
+# bodies (which already hold both connections) rather than here.
+WORK_ITEM_HEADER = "X-Vex-Work-Item"
+
 
 def resolve_project_from_request(
     request: Request, db: Any, *, org_id: str

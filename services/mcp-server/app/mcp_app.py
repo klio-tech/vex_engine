@@ -62,6 +62,7 @@ from shared import (
     project_link,
     project_scope,
     projects,
+    work_items,
 )
 from shared.compression.router import compress as route_compress
 from shared.compression.router import estimate_tokens
@@ -84,6 +85,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.auth import (
     PROJECT_HEADER,
+    WORK_ITEM_HEADER,
     resolve_project_from_request,
 )
 from app.config import (
@@ -179,6 +181,23 @@ SpaceParam = Annotated[
     Field(
         description=(
             "Optional space slug to scope this memory to; created if it doesn't exist."
+        )
+    ),
+]
+
+# Migration 051's filing grain, shared by the five write tools and `recall`
+# for the same drift-proofing reason as SpaceParam. A work item is FILING,
+# never a boundary: naming one narrows where the memory sits, never who may
+# read it. Unresolvable values fall back to project-level filing rather than
+# failing the call, because a memory that could not be filed precisely is
+# still worth keeping.
+WorkItemParam = Annotated[
+    Optional[str],
+    Field(
+        description=(
+            "Optional work item to file this under — a work item id or a "
+            "reference like 'KLIO-42'. Defaults to the X-Vex-Work-Item "
+            "header. The work item's project is used automatically."
         )
     ),
 ]
@@ -336,6 +355,44 @@ def _can_write_project_or_linked(
         return False
 
 
+def _resolve_work_item(
+    db: Any, request: Any, *, org_id: str, explicit: Optional[str] = None
+) -> Optional[dict]:
+    """The work item this call is filed under, or ``None``.
+
+    Two ways in, explicit first: a tool argument beats the
+    ``X-Vex-Work-Item`` header, because an agent that names a work item in
+    the call means that one, whatever its client is configured with.
+
+    Fails OPEN to ``None`` — a work item that cannot be resolved means the
+    memory is filed no finer than its project, exactly as every pre-051 row
+    is. Filing is relevance; the boundary is ``scope`` plus the project ACL
+    and is decided elsewhere. The one thing this must never do is file
+    against an unvalidated id: :func:`shared.work_items.resolve_work_item`
+    refuses any work item whose project is not linked into THIS org.
+    """
+    identifier = explicit
+    if identifier is None and request is not None:
+        identifier = request.headers.get(WORK_ITEM_HEADER)
+    if not identifier or not str(identifier).strip():
+        return None
+    try:
+        engine = workspace_engine()
+        if engine is None:
+            return None
+        with engine.connect() as ws:
+            return work_items.resolve_work_item(
+                db, ws, org_id=org_id, identifier=str(identifier)
+            )
+    except Exception:
+        logger.warning(
+            "work-item resolution failed for org %s; filing at project level",
+            org_id,
+            exc_info=True,
+        )
+        return None
+
+
 def _linked_project_reach(db: Any, *, org_id: str, user_id: str) -> Optional[list[str]]:
     """Engine project ids this caller reaches through the workspace link.
 
@@ -383,6 +440,7 @@ async def _perform_write(
     metadata: Optional[dict] = None,
     scope: str = "org",
     space: Optional[str] = None,
+    work_item: Optional[str] = None,
     memory_id: Optional[str] = None,
     base_revision: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -571,6 +629,20 @@ async def _perform_write(
             else None
         )
 
+        # Work-item filing (migration 051). Resolved AFTER the project
+        # header because a resolved work item supplies its own project — the
+        # engine project its plane project is linked to — and that is a
+        # better answer than the header's: the header describes the repo the
+        # client is standing in, while the work item names the project the
+        # work actually belongs to. A work item that does not resolve leaves
+        # both values exactly as they were.
+        work_item_row = await anyio.to_thread.run_sync(
+            lambda: _resolve_work_item(db, request, org_id=org_id, explicit=work_item)
+        )
+        work_item_id = work_item_row["id"] if work_item_row else None
+        if work_item_row is not None:
+            header_project_id = work_item_row["project_id"]
+
         effective_scope = await anyio.to_thread.run_sync(
             lambda: _explicit_write_scope(
                 db,
@@ -610,6 +682,7 @@ async def _perform_write(
                     scope=effective_scope,
                     space_id=space_id,
                     project_id=header_project_id,
+                    work_item_id=work_item_id,
                     metadata=metadata,
                 )
             )
@@ -661,6 +734,7 @@ async def _perform_write(
             session_id=session_id,
             space_id=space_id,
             project_id=header_project_id,
+            work_item_id=work_item_id,
             metadata=metadata,
             scope=effective_scope,
             user_id=user_id,
@@ -1909,6 +1983,7 @@ async def _perform_recall(
     space: Optional[str],
     project: Optional[str],
     branch: Optional[str] = None,
+    work_item: Optional[str] = None,
     limit: int = 10,
 ) -> dict[str, Any]:
     """Shared body for the Klio ``recall`` read tool.
@@ -2109,6 +2184,30 @@ async def _perform_recall(
         # is a row filter inside retrieve_memories_scoped, whose visibility
         # ladder still decides — in SQL — whether the caller may see any
         # project row at all (pushed-branch visibility rides that arm).
+        # Work-item narrowing (migration 051). Resolved BEFORE the branch
+        # block because a work item supplies a project, and the branch block
+        # needs one. A work item that does not resolve is a warning rather
+        # than a silent widening, for the same reason an unknown branch is:
+        # answering from the whole project while the caller believes they are
+        # reading one work item is worse than answering nothing.
+        work_item_id: Optional[str] = None
+        if work_item is not None and str(work_item).strip():
+            work_item_row = await anyio.to_thread.run_sync(
+                lambda: _resolve_work_item(
+                    db, request, org_id=org_id, explicit=work_item
+                )
+            )
+            if work_item_row is None:
+                return {
+                    "memories": [],
+                    "count": 0,
+                    "warning": f"unknown work item: {work_item}",
+                    "guidance": RECALL_WRITE_NUDGE,
+                }
+            work_item_id = work_item_row["id"]
+            if project_id is None:
+                project_id = work_item_row["project_id"]
+
         stripped_branch = branch.strip() if branch is not None else ""
         branch_row: Optional[dict[str, Any]] = None
         if stripped_branch and stripped_branch.lower() != "main":
@@ -2196,6 +2295,7 @@ async def _perform_recall(
             limit=min(max(limit, 1), 50),
             extra_org_id=extra_org_id,
             branch_id=branch_row["id"] if branch_row is not None else None,
+            work_item_id=work_item_id,
             extra_project_ids=extra_project_ids,
         )
         # Best-effort recall activity log; it swallows its own errors so a
@@ -3191,6 +3291,7 @@ def _serialize_branch(row: dict[str, Any]) -> dict[str, Any]:
             row["created_at"].isoformat() if row.get("created_at") else None
         ),
         "closed_at": row["closed_at"].isoformat() if row.get("closed_at") else None,
+        "work_item_id": row.get("work_item_id"),
     }
     if "unmerged_count" in row:
         serialized["unmerged_count"] = row["unmerged_count"]
@@ -3206,6 +3307,7 @@ async def _perform_branch(
     action: str,
     name: Optional[str],
     project: Optional[str],
+    work_item: Optional[str] = None,
 ) -> dict[str, Any]:
     """Shared body for the ``branch`` tool: a project's context branches.
 
@@ -3245,7 +3347,27 @@ async def _perform_branch(
     try:
         # Threading contract (shared/projects.py): every blocking helper below
         # runs via to_thread, matching capture.py's discipline.
-        if project is not None:
+        # A work item, when named, supplies the project — it knows which one
+        # it belongs to, and that beats both the argument and the header.
+        # Refused rather than ignored: a caller who names a work item and
+        # silently gets the whole project's branches has been misled.
+        work_item_row = None
+        if work_item is not None and str(work_item).strip():
+            work_item_row = await anyio.to_thread.run_sync(
+                lambda: _resolve_work_item(
+                    db, request, org_id=org_id, explicit=work_item
+                )
+            )
+            if work_item_row is None:
+                return {
+                    "error": "not_found",
+                    "detail": f"unknown work item: {work_item}",
+                }
+        work_item_id = work_item_row["id"] if work_item_row else None
+
+        if work_item_row is not None:
+            project_id = work_item_row["project_id"]
+        elif project is not None:
             project_id = await anyio.to_thread.run_sync(
                 lambda: brain.find_project_id(db, org_id=org_id, identifier=project)
             )
@@ -3289,9 +3411,13 @@ async def _perform_branch(
                 }
 
         if action == "list":
+            resolved_work_item_id = work_item_id
             rows = await anyio.to_thread.run_sync(
                 lambda: branches.list_branches(
-                    db, org_id=org_id, project_id=resolved_project_id
+                    db,
+                    org_id=org_id,
+                    project_id=resolved_project_id,
+                    work_item_id=resolved_work_item_id,
                 )
             )
             return {
@@ -3315,6 +3441,7 @@ async def _perform_branch(
                         project_id=resolved_project_id,
                         name=stripped_name,
                         created_by=user_id,
+                        work_item_id=work_item_id,
                     )
                 )
             except ValueError as exc:
@@ -3998,7 +4125,8 @@ def _register_tools(mcp: FastMCP) -> None:
         description=(
             "Retrieve relevant memories for the current org/team. "
             "Args: query (required); optional scope ('org' default | "
-            "'agent' | 'private'), space, project, branch, limit. Set the "
+            "'agent' | 'private'), space, project, branch, work_item, limit. "
+            "Set the "
             "X-Vex-Agent header to scope by agent. "
             "Search combines meaning and exact wording, so a rare literal — an "
             "identifier, an error string, a flag name — can be quoted verbatim "
@@ -4054,6 +4182,20 @@ def _register_tools(mcp: FastMCP) -> None:
                 )
             ),
         ] = None,
+        work_item: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    "Optional work item to focus the search on — a work item "
+                    "id or a reference like 'KLIO-42'. Its own memories come "
+                    "first, then the rest of its project, then unfiled team "
+                    "memories, so nothing is hidden: this RANKS, it does not "
+                    "exclude. Supplies the project automatically. An unknown "
+                    "work item returns empty with a warning rather than "
+                    "silently answering from the whole org."
+                )
+            ),
+        ] = None,
         limit: Annotated[
             int,
             Field(
@@ -4080,6 +4222,7 @@ def _register_tools(mcp: FastMCP) -> None:
             space=space,
             project=project,
             branch=branch,
+            work_item=work_item,
             limit=limit,
         )
 
@@ -4106,6 +4249,7 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        work_item: WorkItemParam = None,
         memory_id: MemoryIdParam = None,
         base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
@@ -4116,6 +4260,7 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata={"source": "mcp"},
             scope=scope,
             space=space,
+            work_item=work_item,
             memory_id=memory_id,
             base_revision=base_revision,
         )
@@ -4139,6 +4284,7 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        work_item: WorkItemParam = None,
         memory_id: MemoryIdParam = None,
         base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
@@ -4149,6 +4295,7 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata={"source": "mcp"},
             scope=scope,
             space=space,
+            work_item=work_item,
             memory_id=memory_id,
             base_revision=base_revision,
         )
@@ -4172,6 +4319,7 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        work_item: WorkItemParam = None,
     ) -> dict[str, Any]:
         return await _perform_write(
             ctx,
@@ -4180,6 +4328,7 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata={"source": "mcp"},
             scope=scope,
             space=space,
+            work_item=work_item,
         )
 
     @mcp.tool(
@@ -4203,6 +4352,7 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        work_item: WorkItemParam = None,
         memory_id: MemoryIdParam = None,
         base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
@@ -4216,6 +4366,7 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata=metadata,
             scope=scope,
             space=space,
+            work_item=work_item,
             memory_id=memory_id,
             base_revision=base_revision,
         )
@@ -4237,6 +4388,7 @@ def _register_tools(mcp: FastMCP) -> None:
             ),
         ] = "org",
         space: SpaceParam = None,
+        work_item: WorkItemParam = None,
         memory_id: MemoryIdParam = None,
         base_revision: BaseRevisionParam = None,
     ) -> dict[str, Any]:
@@ -4247,6 +4399,7 @@ def _register_tools(mcp: FastMCP) -> None:
             metadata={"source": "mcp"},
             scope=scope,
             space=space,
+            work_item=work_item,
             memory_id=memory_id,
             base_revision=base_revision,
         )
@@ -4399,8 +4552,9 @@ def _register_tools(mcp: FastMCP) -> None:
             "it (near-duplicates supersede the main version), discard "
             "retracts it. Args: action (create|list|info|merge|discard), "
             "name (the branch; not needed for 'list'), optional project "
-            "(defaults to the X-Vex-Project header). You must be a member of "
-            "the project; create/merge/discard need write access."
+            "(defaults to the X-Vex-Project header), optional work_item to "
+            "make it a feature branch for one work item. You must be a "
+            "member of the project; create/merge/discard need write access."
         ),
     )
     async def branch(
@@ -4427,8 +4581,23 @@ def _register_tools(mcp: FastMCP) -> None:
                 )
             ),
         ] = None,
+        work_item: Annotated[
+            Optional[str],
+            Field(
+                description=(
+                    "Optional work item this branch is for — an id or a "
+                    "reference like 'KLIO-42'. On 'create' it makes a feature "
+                    "branch for that work item; on 'list' it shows only that "
+                    "work item's branches. Supplies the project automatically. "
+                    "Merging is unchanged: a feature branch still promotes to "
+                    "the PROJECT's main."
+                )
+            ),
+        ] = None,
     ) -> dict[str, Any]:
-        return await _perform_branch(ctx, action=action, name=name, project=project)
+        return await _perform_branch(
+            ctx, action=action, name=name, project=project, work_item=work_item
+        )
 
     @mcp.tool(
         name="forget",

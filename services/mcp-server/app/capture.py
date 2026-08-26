@@ -521,15 +521,21 @@ def _ensure_project_id(
 _MAIN_GIT_BRANCHES = frozenset({"main", "master"})
 
 
-def _capture_branch_id(
+def _capture_branch(
     db: Any,
     *,
     org_id: str,
     project_id: Optional[str],
     user_id: Optional[str],
     git_branch: Optional[str],
-) -> Optional[str]:
-    """The context-branch id a hook capture should land on, or ``None``.
+) -> Optional[dict]:
+    """The context branch a hook capture should land on, or ``None``.
+
+    Returns the whole registry row rather than just its id, because a branch
+    bound to a work item (migration 051) files its captures under that work
+    item too — that is the whole point of a feature branch: you create it
+    once against the work item, and everything the hooks capture while you
+    are standing on it is filed there without anyone naming it again.
 
     The hook auto-bind (Track C): inside a git repo the hook sends the branch
     it is standing on, and the capture lands on the project's context branch
@@ -563,7 +569,7 @@ def _capture_branch_id(
             name=stripped,
             created_by=user_id,
         )
-        return row["id"]
+        return row
     except Exception:
         _rollback(db, "ensure_branch", org_id)
         logger.warning(
@@ -907,9 +913,10 @@ async def capture_event(
         # opted into project-visible capture. The branch must never widen a
         # private capture.
         branch_id = None
+        branch_work_item_id = None
         if scope == "project":
-            branch_id = await anyio.to_thread.run_sync(
-                lambda: _capture_branch_id(
+            branch_row = await anyio.to_thread.run_sync(
+                lambda: _capture_branch(
                     db,
                     org_id=org_id,
                     project_id=project_id,
@@ -917,6 +924,9 @@ async def capture_event(
                     git_branch=req.git_branch,
                 )
             )
+            if branch_row is not None:
+                branch_id = branch_row["id"]
+                branch_work_item_id = branch_row.get("work_item_id")
         over_cap = await anyio.to_thread.run_sync(
             lambda: _check_memory_quota_402(
                 db, org_id, key_info.plan, "memory", key_info.plan_overrides
@@ -936,6 +946,7 @@ async def capture_event(
             ),
             project_id=project_id,
             branch_id=branch_id,
+            work_item_id=branch_work_item_id,
             metadata=metadata,
             scope=scope,
             user_id=user_id,
@@ -1031,9 +1042,10 @@ async def capture_transcript(
         # stays private and unbranched; a branch is a draft OF THE PROJECT,
         # and only exists where captures are project-visible to begin with.
         branch_id = None
+        branch_work_item_id = None
         if scope == "project":
-            branch_id = await anyio.to_thread.run_sync(
-                lambda: _capture_branch_id(
+            branch_row = await anyio.to_thread.run_sync(
+                lambda: _capture_branch(
                     db,
                     org_id=org_id,
                     project_id=project_id,
@@ -1041,6 +1053,9 @@ async def capture_transcript(
                     git_branch=req.git_branch,
                 )
             )
+            if branch_row is not None:
+                branch_id = branch_row["id"]
+                branch_work_item_id = branch_row.get("work_item_id")
         session_id = _capture_session_id(
             org_id, agent_id, req.session_id, user_id=user_id
         )
@@ -1067,6 +1082,7 @@ async def capture_transcript(
                 session_id=session_id,
                 project_id=project_id,
                 branch_id=branch_id,
+                work_item_id=branch_work_item_id,
                 metadata=base_meta,
                 scope=scope,
                 user_id=user_id,
@@ -1099,6 +1115,7 @@ async def capture_transcript(
                 session_id=session_id,
                 project_id=project_id,
                 branch_id=branch_id,
+                work_item_id=branch_work_item_id,
                 metadata=base_meta,
                 scope=scope,
                 user_id=user_id,

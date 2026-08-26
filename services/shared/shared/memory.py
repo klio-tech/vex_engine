@@ -253,6 +253,11 @@ class MemoryRecord:
     expansion); ``None`` for records built by paths that never did, which is
     indistinguishable from main on purpose: those paths only ever read main
     rows."""
+    work_item_id: Optional[str] = None
+    """The work item this row is filed under (migration 051), or ``None`` for
+    a row filed no finer than its project. A FILING dimension, never a
+    boundary — a work item is visible to exactly whoever can see its project,
+    so nothing about access is decided by this value."""
 
 
 # ---------------------------------------------------------------------------
@@ -925,7 +930,8 @@ def _row_to_record(row: tuple) -> MemoryRecord:
     Optional trailing columns (additive, read only if present so existing
     16-column callers are unaffected):
         space_id (index 16), project_id (index 17), user_id (index 18),
-        provenance (index 19), revision (index 20), branch_id (index 21)
+        provenance (index 19), revision (index 20), branch_id (index 21),
+        work_item_id (index 22)
 
     ``user_id`` and ``provenance`` are read positionally like the two before
     them, and every caller that selects them appends them in this order. A
@@ -960,6 +966,9 @@ def _row_to_record(row: tuple) -> MemoryRecord:
         provenance=(row[19] if len(row) > 19 and row[19] is not None else "EXTRACTED"),
         revision=(str(row[20]) if len(row) > 20 and row[20] is not None else None),
         branch_id=(str(row[21]) if len(row) > 21 and row[21] is not None else None),
+        work_item_id=(
+            str(row[22]) if len(row) > 22 and row[22] is not None else None
+        ),
     )
 
 
@@ -1234,6 +1243,7 @@ async def find_similar_memory(
     agent_id: Optional[str] = None,
     user_id: Optional[str] = None,
     branch_id: Optional[str] = None,
+    work_item_id: Optional[str] = None,
 ) -> Optional[MemoryRecord]:
     """Find the closest existing memory and return it if above *threshold*.
 
@@ -1309,13 +1319,15 @@ async def find_similar_memory(
             "              AND scope = 'private'\n"
             "              AND user_id = :user_id\n"
             "              AND status = 'active'\n"
-            "              AND branch_id IS NOT DISTINCT FROM :branch_id"
+            "              AND branch_id IS NOT DISTINCT FROM :branch_id\n"
+            "              AND work_item_id IS NOT DISTINCT FROM :work_item_id"
         )
         params: dict[str, Any] = {
             "org_id": org_id,
             "user_id": user_id,
             "embedding": embedding_str,
             "branch_id": branch_id,
+            "work_item_id": work_item_id,
         }
     elif scope == "agent":
         # Agent-private dedup: compare only against this agent's own private
@@ -1325,13 +1337,15 @@ async def find_similar_memory(
             "              AND scope = 'agent'\n"
             "              AND agent_id = :agent_id\n"
             "              AND status = 'active'\n"
-            "              AND branch_id IS NOT DISTINCT FROM :branch_id"
+            "              AND branch_id IS NOT DISTINCT FROM :branch_id\n"
+            "              AND work_item_id IS NOT DISTINCT FROM :work_item_id"
         )
         params = {
             "org_id": org_id,
             "agent_id": agent_id,
             "embedding": embedding_str,
             "branch_id": branch_id,
+            "work_item_id": work_item_id,
         }
     else:
         # Default session-scoped dedup (historical behavior; unchanged).
@@ -1339,13 +1353,15 @@ async def find_similar_memory(
             "session_id = :session_id\n"
             "              AND org_id = :org_id\n"
             "              AND status = 'active'\n"
-            "              AND branch_id IS NOT DISTINCT FROM :branch_id"
+            "              AND branch_id IS NOT DISTINCT FROM :branch_id\n"
+            "              AND work_item_id IS NOT DISTINCT FROM :work_item_id"
         )
         params = {
             "session_id": session_id,
             "org_id": org_id,
             "embedding": embedding_str,
             "branch_id": branch_id,
+            "work_item_id": work_item_id,
         }
 
     def _nearest():
@@ -1787,6 +1803,7 @@ def _apply_supersession_for_cas(
     scope: str = "org",
     space_id: Optional[str] = None,
     project_id: Optional[str] = None,
+    work_item_id: Optional[str] = None,
     recall_hidden: bool = False,
     user_id: Optional[str] = None,
     provenance: str = "EXTRACTED",
@@ -1828,13 +1845,14 @@ def _apply_supersession_for_cas(
                 memory_type, content, embedding, confidence,
                 sequence_number, scope, status, metadata,
                 created_at, updated_at, recall_hidden,
-                user_id, provenance, space_id, project_id
+                user_id, provenance, space_id, project_id, work_item_id
             ) VALUES (
                 :id, :session_id, :org_id, :agent_id, NULL,
                 :memory_type, :content, :embedding, NULL,
                 NULL, :scope, 'active', :metadata,
                 :created_at, :updated_at, :recall_hidden,
-                :user_id, :provenance, :space_id, :project_id
+                :user_id, :provenance, :space_id, :project_id,
+                :work_item_id
             )
             RETURNING revision
             """
@@ -1856,6 +1874,7 @@ def _apply_supersession_for_cas(
             "provenance": provenance,
             "space_id": space_id,
             "project_id": project_id,
+            "work_item_id": work_item_id,
         },
     )
     returned = inserted.fetchone()
@@ -2414,6 +2433,7 @@ async def retrieve_memories_scoped(
     limit: int = 10,
     extra_org_id: Optional[str] = None,
     branch_id: Optional[str] = None,
+    work_item_id: Optional[str] = None,
     extra_project_ids: Optional[list[str]] = None,
 ) -> list[MemoryRecord]:
     """Brain recall across sessions, scoped to an org (and optionally an
@@ -2517,7 +2537,15 @@ async def retrieve_memories_scoped(
         space_id: When given, match rows whose ``space_id`` equals it OR is
             ``NULL`` (unfiled memories surface in every space filter — the safe
             default so nothing is hidden by an over-narrow filter).
-        project_id: Two-tier scoping. When given:
+        work_item_id: Narrowest filing grain (migration 051). Only meaningful
+            together with ``project_id``; alone it is ignored, because a work
+            item's rows are always inside its project and answering from a
+            work item with no project would skip the project tier entirely.
+            When both are given the scoping becomes three-tier — work item,
+            then the rest of the project, then unfiled — see ``project_id``.
+            It filters rows; it does NOT widen or narrow who may see them.
+        project_id: Two-tier scoping (three-tier with ``work_item_id``). When
+            given:
             * **Tier 1** — rows where ``project_id = :project_id`` fill the
               first ``limit`` slots.
             * **Tier 2** — unfiled rows (``project_id IS NULL``) fill any
@@ -2801,7 +2829,7 @@ async def retrieve_memories_scoped(
                    memory_type, content, embedding, confidence,
                    sequence_number, scope, status, superseded_by,
                    metadata, created_at, updated_at, space_id, project_id,
-                   user_id, provenance, revision, branch_id,
+                   user_id, provenance, revision, branch_id, work_item_id,
                    (1 - (embedding <=> :embedding)) AS relevance
             FROM session_memories
             WHERE {where}
@@ -2841,7 +2869,7 @@ async def retrieve_memories_scoped(
                memory_type, content, embedding, confidence,
                sequence_number, scope, status, superseded_by,
                metadata, created_at, updated_at, space_id, project_id,
-               user_id, provenance, revision, branch_id,
+               user_id, provenance, revision, branch_id, work_item_id,
                ts_rank({document}, {query}) AS lexical_rank
         FROM session_memories
         WHERE {where}
@@ -2964,25 +2992,66 @@ async def retrieve_memories_scoped(
                 )
         return records
 
-    if project_id is not None:
+    def _fill(tiers: list[tuple[str, dict[str, Any]]]) -> list:
+        """Run tiers in order, each filling only the slots its seniors left.
+
+        The first tier gets the full ``limit``; every later one is re-bound to
+        the slots actually remaining, along with a candidate pool proportional
+        to them, so a narrow tier never pays for an ANN scan sized for a
+        budget it cannot use. A tier that returns nothing costs nothing.
+        """
+        collected: list = []
+        for index, (clause, extra) in enumerate(tiers):
+            remaining = limit - len(collected)
+            if remaining <= 0:
+                break
+            bound = dict(extra)
+            if index > 0:
+                bound["limit"] = remaining
+                bound["candidate_pool"] = ranking.candidate_pool(remaining)
+            collected.extend(_fetch(clause, bound))
+        return collected
+
+    if work_item_id is not None and project_id is not None:
+        # Three-tier (migration 051). The work item is the finest filing
+        # grain, so its own rows come first; the rest of the project follows,
+        # because a sibling work item's context is still this project's
+        # context and a reader working the feature wants it; unfiled org rows
+        # fill whatever is left.
+        #
+        # Tier 2 excludes tier 1's rows with IS DISTINCT FROM rather than
+        # ``work_item_id IS NULL``: a plain NULL test would drop every SIBLING
+        # work item's rows out of the project tier entirely, which is the
+        # opposite of the intent.
+        records = _fill(
+            [
+                (
+                    "work_item_id = :work_item_id",
+                    {"work_item_id": work_item_id, "project_id": project_id},
+                ),
+                (
+                    "project_id = :project_id "
+                    "AND work_item_id IS DISTINCT FROM :work_item_id",
+                    {"work_item_id": work_item_id, "project_id": project_id},
+                ),
+                ("project_id IS NULL", {}),
+            ]
+        )
+    elif project_id is not None:
         # Two-tier: same-project rows fill first; remaining slots come from
         # unfiled (org-level) rows. Rows filed under OTHER projects never
         # surface. Fusion happens INSIDE _fetch, so both tiers see both arms
         # and the tier semantics are structurally unchanged.
-        tier1 = _fetch("project_id = :project_id", {"project_id": project_id})
-        remaining = limit - len(tier1)
-        tier2 = []
-        if remaining > 0:
-            # Override both limit and candidate_pool for the tier-2 fill so
-            # the inner ANN pool is proportional to the actual remaining slots.
-            tier2 = _fetch(
-                "project_id IS NULL",
-                {
-                    "limit": remaining,
-                    "candidate_pool": ranking.candidate_pool(remaining),
-                },
-            )
-        records = list(tier1) + list(tier2)
+        #
+        # Unchanged by 051 on purpose: with no work item named, the project
+        # tier still returns the project's work-item rows too, so a caller
+        # that has never heard of work items sees byte-identical behaviour.
+        records = _fill(
+            [
+                ("project_id = :project_id", {"project_id": project_id}),
+                ("project_id IS NULL", {}),
+            ]
+        )
     else:
         records = _fetch("TRUE", {})
 

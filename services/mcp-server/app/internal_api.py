@@ -289,3 +289,142 @@ def project_branches(workspace_project: uuid.UUID, db: Any = Depends(get_db)) ->
             }
         )
     return {"linked": True, "engine_project_id": str(row.id), "branches": branches}
+
+
+# ---------------------------------------------------------------------------
+# Work-item memory (migration 051)
+# ---------------------------------------------------------------------------
+
+#: Active rows filed under one work item, by scope. The org predicate is what
+#: makes a borrowed work item id useless: it can only ever count rows this
+#: org already owns.
+_WORK_ITEM_COUNTS_SQL = text(
+    """
+    SELECT scope, COUNT(*) AS n
+    FROM session_memories
+    WHERE org_id = :org_id
+      AND work_item_id = CAST(:work_item_id AS uuid)
+      AND status = 'active'
+      AND scope IN ('org', 'project', 'private')
+    GROUP BY scope
+    """
+)
+
+#: The work item's own memories, newest first. ``user_id`` widens the read to
+#: include the caller's OWN private rows and nobody else's — the same shape
+#: ``/node-brain`` uses, and for the same reason.
+_WORK_ITEM_MEMORIES_SQL = text(
+    """
+    SELECT id, content, scope, memory_type, branch_id, created_at
+    FROM session_memories
+    WHERE org_id = :org_id
+      AND work_item_id = CAST(:work_item_id AS uuid)
+      AND status = 'active'
+      AND superseded_by IS NULL
+      AND recall_hidden = FALSE
+      AND (
+            scope IN ('org', 'project')
+            OR (scope = 'private' AND user_id = CAST(:user_id AS uuid))
+          )
+    ORDER BY created_at DESC
+    LIMIT :limit
+    """
+)
+
+
+def _serialize_memories(rows) -> list[dict]:
+    return [
+        {
+            "id": str(row.id),
+            "content": row.content,
+            "scope": row.scope,
+            "memory_type": row.memory_type,
+            "branch_id": (
+                str(row.branch_id)
+                if getattr(row, "branch_id", None) is not None
+                else None
+            ),
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+        }
+        for row in rows
+    ]
+
+
+@router.get("/work-item-brain")
+def work_item_brain(
+    workspace_project: uuid.UUID,
+    work_item: uuid.UUID,
+    user: str | None = None,
+    limit: int = 20,
+    db: Any = Depends(get_db),
+) -> dict:
+    """Scope counts, memories and branches for one work item.
+
+    ``workspace_project`` is required even though ``work_item`` alone would
+    find rows: it is what ties the answer to a project the CALLER has already
+    been authorized against by the Django proxy. Without it this endpoint
+    would answer for any work item id in any of the engine's orgs.
+    """
+    row = db.execute(
+        _LINKED_PROJECT_SQL, {"plane_project_id": str(workspace_project)}
+    ).fetchone()
+    if row is None:
+        return {"linked": False, "counts": {}, "memories": [], "branches": []}
+
+    try:
+        user_id = str(uuid.UUID(user)) if user else None
+    except (ValueError, TypeError):
+        user_id = None
+
+    counts = {
+        count_row.scope: int(count_row.n)
+        for count_row in db.execute(
+            _WORK_ITEM_COUNTS_SQL,
+            {"org_id": row.org_id, "work_item_id": str(work_item)},
+        ).fetchall()
+    }
+    memories = _serialize_memories(
+        db.execute(
+            _WORK_ITEM_MEMORIES_SQL,
+            {
+                "org_id": row.org_id,
+                "work_item_id": str(work_item),
+                "user_id": user_id,
+                "limit": max(1, min(limit, 50)),
+            },
+        ).fetchall()
+    )
+
+    branches = []
+    for branch in list_branches(
+        db,
+        org_id=row.org_id,
+        project_id=str(row.id),
+        work_item_id=str(work_item),
+    ):
+        branches.append(
+            {
+                "id": branch["id"],
+                "name": branch["name"],
+                "status": branch["status"],
+                "unmerged_count": branch["unmerged_count"],
+                "last_activity": branch["last_activity"],
+                "created_at": branch["created_at"].isoformat()
+                if branch["created_at"]
+                else None,
+                "memories": _serialize_memories(
+                    db.execute(
+                        _BRANCH_MEMORIES_SQL,
+                        {"org_id": row.org_id, "branch_id": branch["id"]},
+                    ).fetchall()
+                ),
+            }
+        )
+
+    return {
+        "linked": True,
+        "engine_project_id": str(row.id),
+        "counts": counts,
+        "memories": memories,
+        "branches": branches,
+    }

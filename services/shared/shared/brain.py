@@ -661,6 +661,7 @@ async def write_scoped_memory(
     space_id: Optional[str] = None,
     project_id: Optional[str] = None,
     branch_id: Optional[str] = None,
+    work_item_id: Optional[str] = None,
     metadata: Optional[dict] = None,
     dedup: bool = True,
     scope: str = "org",
@@ -742,6 +743,14 @@ async def write_scoped_memory(
             exists, matching how ``project_id`` is treated). Dedup becomes
             branch-aware: the write compares only against rows on the SAME
             branch — see :func:`shared.memory.find_similar_memory`.
+        work_item_id: Optional work item (the WORKSPACE ``issues.id``) the row
+            is filed under — the finest filing grain there is. ``None`` (the
+            default) is every pre-051 row. Requires a ``project_id`` (a work
+            item always belongs to a project) but NOT a particular scope:
+            filing is relevance, and the boundary stays ``scope`` plus the
+            project ACL. Resolve it via :func:`shared.work_items.resolve_work_item`,
+            which is what refuses a work item outside this org. Dedup is
+            work-item-aware for the same reason it is branch-aware.
         metadata: Optional metadata dict persisted on the row.
         dedup: When ``True`` (default), suppress the write if a sufficiently
             similar active memory already exists in the dedup window (see Scope).
@@ -804,6 +813,13 @@ async def write_scoped_memory(
         # scope='project' + project_id + branch_id). Anything else would be a
         # branch memory no branch-aware reader can ever reach.
         raise ValueError("branch_id requires scope='project'")
+    if work_item_id and not project_id:
+        # A work item always belongs to a project, so a work-item row with no
+        # project is structurally impossible. Unlike branch_id this does NOT
+        # constrain the scope: filing is not a boundary here, so an org-scoped
+        # row may perfectly well be filed under a work item -- that is the
+        # common case, since an explicit write defaults to org.
+        raise ValueError("work_item_id requires a project_id")
     if provenance not in ("EXTRACTED", "INFERRED", "AMBIGUOUS"):
         raise ValueError(f"unsupported provenance: {provenance!r}")
 
@@ -851,6 +867,11 @@ async def write_scoped_memory(
             # Branch-aware window: a branch write dedups only against its own
             # branch, and a main write (branch_id=None) only against main.
             branch_id=branch_id,
+            # Work-item-aware for the same reason: a note filed under a work
+            # item is a narrower belief than the same sentence filed at
+            # project level, and collapsing the two would silently drop the
+            # narrower filing.
+            work_item_id=work_item_id,
         )
         if existing is not None:
             return {
@@ -894,6 +915,7 @@ async def write_scoped_memory(
                 space_id = :space_id,
                 project_id = :project_id,
                 branch_id = :branch_id,
+                work_item_id = :work_item_id,
                 updated_at = NOW()
             WHERE id = :id
             """
@@ -903,6 +925,7 @@ async def write_scoped_memory(
             "space_id": space_id,
             "project_id": project_id,
             "branch_id": branch_id,
+            "work_item_id": work_item_id,
             "id": str(record.id),
         },
     )
@@ -916,6 +939,7 @@ async def write_scoped_memory(
         "scope": scope,
         "space_id": space_id,
         "project_id": project_id,
+        "work_item_id": work_item_id,
         "user_id": user_id,
         "provenance": provenance,
         "redacted": was_redacted,
