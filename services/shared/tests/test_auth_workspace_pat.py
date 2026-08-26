@@ -137,7 +137,8 @@ def pat_fixture():
                     is_active boolean NOT NULL DEFAULT true,
                     expired_at timestamptz,
                     last_used timestamptz,
-                    deleted_at timestamptz
+                    deleted_at timestamptz,
+                    is_service boolean NOT NULL DEFAULT false
                 )
                 """
             )
