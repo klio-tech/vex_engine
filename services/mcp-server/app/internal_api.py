@@ -324,7 +324,8 @@ _WORK_ITEM_MEMORIES_SQL = text(
       AND recall_hidden = FALSE
       AND (
             scope IN ('org', 'project')
-            OR (scope = 'private' AND user_id = CAST(:user_id AS uuid))
+            OR (scope = 'private' AND CAST(:user_id AS text) IS NOT NULL
+                AND CAST(user_id AS text) = CAST(:user_id AS text))
           )
     ORDER BY created_at DESC
     LIMIT :limit
