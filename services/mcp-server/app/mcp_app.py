@@ -92,6 +92,7 @@ from app.config import (
     MCP_DNS_REBINDING_PROTECTION,
 )
 from app.db import SessionLocal
+from app import workspace_tools
 from app.workspace_db import workspace_engine
 from app.directory import resolve_org_member_by_email
 from app.compression_cache import (
@@ -136,6 +137,10 @@ EXPECTED_TOOL_NAMES: tuple[str, ...] = (
     "project_grant",
     "project_scope",
     "project_link",
+    # The workspace half: an agent that can recall the decision can now
+    # also file the work item it implies, on the same endpoint and key.
+    "work_projects",
+    "work_items",
     "klio_retrieve",
     "compress",
     "explore",
@@ -3954,6 +3959,15 @@ def build_mcp_server() -> FastMCP:
         transport_security=_build_transport_security(),
     )
     _register_tools(mcp)
+    # The workspace half: one MCP that both acts and remembers. Registered
+    # last so a failure here can never take the memory tools down with it.
+    try:
+        workspace_tools.register(mcp)
+    except Exception:
+        logger.error(
+            "workspace tools failed to register; memory tools are unaffected",
+            exc_info=True,
+        )
     return mcp
 
 

@@ -48,6 +48,10 @@ _REQUIRED_SCHEMA_FIELD = {
     "project_grant": "project",
     "project_scope": "project",
     "project_link": "project",
+    # Both workspace tools default `action`, so nothing is strictly
+    # required — None asserts that, and still catches a silent new mandate.
+    "work_projects": None,
+    "work_items": None,
     "klio_retrieve": "handle",
     "compress": "content",
     "explore": "entity",
