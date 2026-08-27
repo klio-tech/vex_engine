@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **`call_llm` forced `temperature=0.0`, which made every GPT-5-family model
+  silently unusable.** Those models raise `UnsupportedParamsError` on
+  `temperature=0.0` (only 1 is accepted), and `call_llm`'s `except` turns any
+  exception into `None` — reported upstream as "no summary" and "nothing
+  durable in this turn". Pointing `VERIFICATION_MODEL` at one of them therefore
+  disabled memory capture completely, instantly, and with nothing anywhere
+  saying so. `drop_params=True` now lets litellm omit a parameter the target
+  model does not support instead of raising; temperature is the only optional
+  parameter sent, so nothing else can be dropped by it. Models that honour
+  `temperature=0.0` still get it.
+
+### Fixed
+
 - **Transcript distillation ran inside the request, and a 10s timeout was
   silently discarding about a third of every captured session.**
   `POST /capture/transcript` called `generate_summary` and then

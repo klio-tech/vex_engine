@@ -253,6 +253,35 @@ async def test_call_llm_returns_parsed_json():
 
 
 @pytest.mark.asyncio
+async def test_call_llm_lets_litellm_drop_a_param_the_model_rejects():
+    """A model that refuses ``temperature=0.0`` must still work.
+
+    Every GPT-5-family model raises ``UnsupportedParamsError`` on
+    ``temperature=0.0`` (only 1 is allowed). ``call_llm`` swallows exceptions
+    and returns ``None``, so before this flag the effect of pointing
+    ``VERIFICATION_MODEL`` at one of them was that summarisation and extraction
+    returned nothing, instantly, for every single call — with no error anywhere
+    that said so. Memory capture simply stopped.
+
+    ``drop_params`` makes litellm omit a parameter the target model does not
+    support instead of raising. Temperature is the only optional parameter
+    ``call_llm`` sends, so this cannot silently discard anything else.
+    """
+    mock_response = MagicMock()
+    mock_response.choices = [MagicMock(message=MagicMock(content='{"ok": true}'))]
+
+    with patch(
+        "shared.memory.acompletion", new_callable=AsyncMock, return_value=mock_response
+    ) as ac:
+        result = await call_llm("extract this")
+
+    assert result == {"ok": True}
+    assert ac.await_args.kwargs["drop_params"] is True
+    # Still REQUESTED, so models that honour it stay deterministic.
+    assert ac.await_args.kwargs["temperature"] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_call_llm_returns_none_on_error():
     """call_llm should return None when the LLM call fails."""
     with patch(

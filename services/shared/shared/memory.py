@@ -767,7 +767,19 @@ async def call_llm(
         "model": model,
         "messages": messages,
         "timeout": timeout_s,
+        # Requested, not required. Deterministic output is what we want from a
+        # summariser and an extractor, and every model that honours it gets it.
         "temperature": 0.0,
+        # ...but a model that REFUSES it must not take memory capture down with
+        # it. Every GPT-5-family model raises UnsupportedParamsError on
+        # temperature=0.0 (only 1 is allowed), and the ``except`` below turns
+        # that into ``None`` — which generate_summary reports as "no summary"
+        # and extract_typed_memories as "nothing durable here". Pointing
+        # VERIFICATION_MODEL at such a model therefore disabled capture
+        # entirely, instantly, and silently. ``drop_params`` makes litellm omit
+        # an unsupported parameter instead of raising; temperature is the only
+        # optional parameter sent here, so nothing else can be dropped by it.
+        "drop_params": True,
     }
 
     if api_base:
