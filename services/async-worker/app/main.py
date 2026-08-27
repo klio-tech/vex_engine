@@ -565,6 +565,83 @@ def _warn_if_s3_env_missing() -> None:
         )
 
 
+async def _consume_agent_turns(redis_client: aioredis.Redis) -> None:
+    """Run agent turns as they are queued.
+
+    Turns run in a worker THREAD: a turn is minutes of blocking HTTP (a
+    model call, then tool calls) and running it on this loop would stall
+    every other consumer in the process for its duration.
+
+    A turn that fails is acked anyway. Redelivering it would re-run a model
+    call that already cost money and may already have posted, and the
+    failure is visible in the thread the agent was replying to — which is a
+    better place for a person to see it than a redelivery loop.
+    """
+    from shared.agent_turns import AGENT_TURNS, AGENT_TURNS_GROUP  # noqa: PLC0415
+
+    from app.agent_turn import execute_turn, load_turn  # noqa: PLC0415
+    from app.agent_tools import build_tools  # noqa: PLC0415
+
+    workspace_url = os.environ.get("WORKSPACE_DATABASE_URL")
+    if not workspace_url:
+        logger.warning(
+            "agent turns disabled: WORKSPACE_DATABASE_URL is not configured"
+        )
+        return
+
+    workspace_engine = create_engine(workspace_url, pool_pre_ping=True, pool_size=2)
+    engine_db = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True, pool_size=2)
+
+    await _ensure_consumer_group(redis_client, AGENT_TURNS, AGENT_TURNS_GROUP)
+    logger.info("agent turn consumer ready")
+
+    def _run_one(payload: dict) -> str:
+        with workspace_engine.connect() as workspace_conn, engine_db.connect() as engine_conn:
+            loaded = load_turn(
+                workspace_conn,
+                engine_conn,
+                agent_id=payload["agent_id"],
+                message_id=payload["message_id"],
+            )
+        if loaded is None:
+            # Disabled, deleted, removed, or the agent's own words. A turn
+            # that should not happen is not an error.
+            return "skipped"
+        return execute_turn(loaded, build_tools=build_tools)
+
+    while True:
+        try:
+            messages = await redis_client.xreadgroup(
+                groupname=AGENT_TURNS_GROUP,
+                consumername=CONSUMER_NAME,
+                streams={AGENT_TURNS: ">"},
+                count=1,
+                block=5000,
+            )
+            if not messages:
+                continue
+            for _stream, entries in messages:
+                for msg_id, data in entries:
+                    try:
+                        payload = json.loads(data["payload"])
+                        outcome = await asyncio.to_thread(_run_one, payload)
+                        logger.info(
+                            "agent turn %s: agent=%s %s",
+                            msg_id,
+                            payload.get("agent_id"),
+                            outcome,
+                        )
+                    except Exception:
+                        logger.exception("agent turn %s failed", msg_id)
+                    finally:
+                        await redis_client.xack(AGENT_TURNS, AGENT_TURNS_GROUP, msg_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("agent turn consumer error; continuing")
+            await asyncio.sleep(1)
+
+
 async def run() -> None:
     """Start all consumer loops concurrently."""
     logging.basicConfig(
@@ -580,6 +657,7 @@ async def run() -> None:
     await asyncio.gather(
         _consume_executions(redis_client),
         _consume_sessions_stored(redis_client, s3_client),
+        _consume_agent_turns(redis_client),
     )
 
 

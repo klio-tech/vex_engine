@@ -307,3 +307,54 @@ def proposal_decide(
             return {"decided": False, "reason": "apply_failed"}
 
     return {"decided": True, "status": status}
+
+
+# ---------------------------------------------------------------------------
+# Agent turns
+# ---------------------------------------------------------------------------
+
+
+@router.post("/agent-turn")
+async def agent_turn(
+    payload: dict[str, Any] = Body(...),
+    _: None = Depends(require_internal_secret),
+) -> dict:
+    """Queue one agent turn.
+
+    The workspace decides WHETHER an agent was summoned — it owns mentions
+    and knows which member is an agent. This endpoint decides nothing; it
+    validates the shape and puts the turn on the stream the worker reads.
+    Keeping the judgement on one side and the execution on the other is
+    what stops the two services growing a second, disagreeing copy of the
+    rule about who gets woken.
+
+    Answers 200 with ``queued: false`` rather than an error when the
+    payload is unusable: the caller is a fire-and-forget task that must not
+    retry, and a 4xx would only produce noise in its logs.
+    """
+    from shared.agent_turns import build_turn, publish_turn  # noqa: PLC0415
+
+    required = ("workspace_slug", "channel_id", "message_id", "agent_id")
+    missing = [key for key in required if not str(payload.get(key) or "").strip()]
+    if missing:
+        logger.warning("agent turn rejected; missing %s", ", ".join(missing))
+        return {"queued": False, "reason": "incomplete"}
+
+    turn = build_turn(
+        workspace_slug=str(payload["workspace_slug"]).strip(),
+        channel_id=str(payload["channel_id"]).strip(),
+        message_id=str(payload["message_id"]).strip(),
+        agent_id=str(payload["agent_id"]).strip(),
+    )
+    try:
+        await publish_turn(turn)
+    except Exception:
+        # Loud in the log, quiet to the caller: the message it came from is
+        # already sent and must not be affected by our queue being down.
+        logger.exception("could not queue agent turn for %s", turn["agent_id"])
+        return {"queued": False, "reason": "queue_unavailable"}
+
+    logger.info(
+        "queued agent turn: agent=%s channel=%s", turn["agent_id"], turn["channel_id"]
+    )
+    return {"queued": True}
