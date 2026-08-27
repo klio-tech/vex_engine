@@ -94,6 +94,4 @@ def resolve_audience_scope(
     # not what those people have individually kept private: being in a
     # closed room together does not pool the members' private memories.
     del is_private  # named for the caller's clarity; deliberately unused
-    return AudienceScope(
-        project_id=project_id, work_item_id=work_item_id, user_id=None
-    )
+    return AudienceScope(project_id=project_id, work_item_id=work_item_id, user_id=None)

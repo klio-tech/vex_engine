@@ -57,7 +57,9 @@ def _new(db, **over):
 def test_create_job_persists_the_transcript_and_starts_pending(db):
     job_id = _new(db)
     row = db.execute(
-        text("SELECT status, attempts, transcript, scope FROM capture_jobs WHERE id = :i"),
+        text(
+            "SELECT status, attempts, transcript, scope FROM capture_jobs WHERE id = :i"
+        ),
         {"i": job_id},
     ).one()
     assert row.status == "pending"

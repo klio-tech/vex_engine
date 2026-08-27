@@ -26,7 +26,6 @@ from datetime import datetime, timezone
 import app.capture as capture
 from app.main import create_app
 from fastapi.testclient import TestClient
-from shared.taxonomy import ExtractedMemory
 
 
 def _memrow(id="m1", memory_type="observation", content="hi", created_at=None):
@@ -211,7 +210,9 @@ def test_transcript_survives_a_publish_failure_because_the_row_is_durable(client
         patch.object(capture.brain, "write_scoped_memory", AsyncMock()),
         patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
         patch("app.capture.create_job", create),
-        patch("app.capture.publish_job", AsyncMock(side_effect=RuntimeError("no redis"))),
+        patch(
+            "app.capture.publish_job", AsyncMock(side_effect=RuntimeError("no redis"))
+        ),
     ):
         resp = client.post(
             "/capture/transcript", json={"messages": [{"content": "hi"}]}
@@ -237,7 +238,10 @@ def test_transcript_empty_messages_short_circuits(client):
     with (
         patch("app.capture.SessionLocal", sl),
         patch.object(capture.brain, "write_scoped_memory", write),
-        patch("app.capture.create_job", MagicMock(return_value="77777777-7777-7777-7777-777777777777")) as gs,
+        patch(
+            "app.capture.create_job",
+            MagicMock(return_value="77777777-7777-7777-7777-777777777777"),
+        ) as gs,
         patch("app.capture.publish_job", AsyncMock()) as ef,
     ):
         resp = client.post(

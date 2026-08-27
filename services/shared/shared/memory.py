@@ -1005,9 +1005,7 @@ def _row_to_record(row: tuple) -> MemoryRecord:
         provenance=(row[19] if len(row) > 19 and row[19] is not None else "EXTRACTED"),
         revision=(str(row[20]) if len(row) > 20 and row[20] is not None else None),
         branch_id=(str(row[21]) if len(row) > 21 and row[21] is not None else None),
-        work_item_id=(
-            str(row[22]) if len(row) > 22 and row[22] is not None else None
-        ),
+        work_item_id=(str(row[22]) if len(row) > 22 and row[22] is not None else None),
     )
 
 

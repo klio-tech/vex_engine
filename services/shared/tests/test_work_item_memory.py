@@ -238,9 +238,7 @@ class TestResolution:
         _project(db, org_id=org_id, plane_project_id=plane_project_id)
         ws = _StubWorkspace(_issue_row(plane_project_id, seq=7, ident="LAUNCH"))
 
-        got = work_items.resolve_work_item(
-            db, ws, org_id=org_id, identifier="LAUNCH-7"
-        )
+        got = work_items.resolve_work_item(db, ws, org_id=org_id, identifier="LAUNCH-7")
         assert got is not None and got["reference"] == "LAUNCH-7"
 
     def test_an_unlinked_project_is_refused(self, db):

@@ -388,30 +388,30 @@ def _fake_row(content: str, *, project_id=None, work_item_id=None, relevance=0.9
 
     now = datetime.now(timezone.utc)
     return (
-        uuid.uuid4(),      # 0  id
-        "sess",            # 1  session_id
-        "org-1",           # 2  org_id
-        "agent-1",         # 3  agent_id
-        None,              # 4  execution_id
-        "note",            # 5  memory_type
-        content,           # 6  content
-        None,              # 7  embedding
-        None,              # 8  confidence
-        None,              # 9  sequence_number
-        "org",             # 10 scope
-        "active",          # 11 status
-        None,              # 12 superseded_by
-        {},                # 13 metadata
-        now,               # 14 created_at
-        now,               # 15 updated_at
-        None,              # 16 space_id
-        project_id,        # 17 project_id
-        None,              # 18 user_id
-        "EXTRACTED",       # 19 provenance
-        None,              # 20 revision
-        None,              # 21 branch_id
-        work_item_id,      # 22 work_item_id
-        relevance,         # 23 relevance (read as row[-1])
+        uuid.uuid4(),  # 0  id
+        "sess",  # 1  session_id
+        "org-1",  # 2  org_id
+        "agent-1",  # 3  agent_id
+        None,  # 4  execution_id
+        "note",  # 5  memory_type
+        content,  # 6  content
+        None,  # 7  embedding
+        None,  # 8  confidence
+        None,  # 9  sequence_number
+        "org",  # 10 scope
+        "active",  # 11 status
+        None,  # 12 superseded_by
+        {},  # 13 metadata
+        now,  # 14 created_at
+        now,  # 15 updated_at
+        None,  # 16 space_id
+        project_id,  # 17 project_id
+        None,  # 18 user_id
+        "EXTRACTED",  # 19 provenance
+        None,  # 20 revision
+        None,  # 21 branch_id
+        work_item_id,  # 22 work_item_id
+        relevance,  # 23 relevance (read as row[-1])
     )
 
 

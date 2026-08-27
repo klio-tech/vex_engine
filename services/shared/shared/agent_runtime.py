@@ -83,7 +83,9 @@ def _report(context: TurnContext, line: str) -> None:
         logger.warning("agent progress report failed", exc_info=True)
 
 
-def run_turn(context: TurnContext, *, now: Callable[[], float] = time.monotonic) -> TurnResult:
+def run_turn(
+    context: TurnContext, *, now: Callable[[], float] = time.monotonic
+) -> TurnResult:
     """Run one turn to an answer, a bound, or a failure.
 
     Args:
@@ -145,7 +147,10 @@ def run_turn(context: TurnContext, *, now: Callable[[], float] = time.monotonic)
                 result = f"error: {exc}"
                 logger.info("agent tool %s failed: %s", tool, exc)
             messages.append(
-                {"role": "assistant", "content": json.dumps({"tool": tool, "arguments": arguments})}
+                {
+                    "role": "assistant",
+                    "content": json.dumps({"tool": tool, "arguments": arguments}),
+                }
             )
             messages.append({"role": "user", "content": f"result of {tool}: {result}"})
             continue

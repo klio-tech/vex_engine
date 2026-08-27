@@ -584,19 +584,22 @@ async def _consume_agent_turns(redis_client: aioredis.Redis) -> None:
 
     workspace_url = os.environ.get("WORKSPACE_DATABASE_URL")
     if not workspace_url:
-        logger.warning(
-            "agent turns disabled: WORKSPACE_DATABASE_URL is not configured"
-        )
+        logger.warning("agent turns disabled: WORKSPACE_DATABASE_URL is not configured")
         return
 
     workspace_engine = create_engine(workspace_url, pool_pre_ping=True, pool_size=2)
-    engine_db = create_engine(os.environ["DATABASE_URL"], pool_pre_ping=True, pool_size=2)
+    engine_db = create_engine(
+        os.environ["DATABASE_URL"], pool_pre_ping=True, pool_size=2
+    )
 
     await _ensure_consumer_group(redis_client, AGENT_TURNS, AGENT_TURNS_GROUP)
     logger.info("agent turn consumer ready")
 
     def _run_one(payload: dict) -> str:
-        with workspace_engine.connect() as workspace_conn, engine_db.connect() as engine_conn:
+        with (
+            workspace_engine.connect() as workspace_conn,
+            engine_db.connect() as engine_conn,
+        ):
             loaded = load_turn(
                 workspace_conn,
                 engine_conn,
@@ -738,9 +741,10 @@ def _sweep_orphaned_capture_jobs() -> list[str]:
 
     db = SessionLocal()
     try:
-        rows = db.execute(
-            text(
-                """
+        rows = (
+            db.execute(
+                text(
+                    """
                 SELECT id FROM capture_jobs
                  WHERE attempts < :max_attempts
                    AND (
@@ -750,9 +754,12 @@ def _sweep_orphaned_capture_jobs() -> list[str]:
                  ORDER BY created_at
                  LIMIT 100
                 """
-            ),
-            {"max_attempts": MAX_ATTEMPTS},
-        ).scalars().all()
+                ),
+                {"max_attempts": MAX_ATTEMPTS},
+            )
+            .scalars()
+            .all()
+        )
         if not rows:
             return []
         # A 'running' row whose worker died must become claimable again.

@@ -310,7 +310,9 @@ def _capture_patches(write, ensure_branch, *, scope="private", create_mock=None)
     now, not on ``write_scoped_memory``.
     """
     session = MagicMock()
-    create_mock = create_mock if create_mock is not None else MagicMock(return_value=JOB_ID)
+    create_mock = (
+        create_mock if create_mock is not None else MagicMock(return_value=JOB_ID)
+    )
     return (
         patch("app.capture.SessionLocal", MagicMock(return_value=session)),
         patch.object(capture.brain, "write_scoped_memory", write),
@@ -436,7 +438,10 @@ def test_transcript_without_a_project_never_auto_creates_a_branch():
         patch.object(capture.brain, "write_scoped_memory", write),
         patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
         patch.object(capture.branches, "ensure_branch", ensure_branch),
-        patch("app.capture.create_job", MagicMock(return_value="77777777-7777-7777-7777-777777777777")),
+        patch(
+            "app.capture.create_job",
+            MagicMock(return_value="77777777-7777-7777-7777-777777777777"),
+        ),
         patch("app.capture.publish_job", AsyncMock()),
         patch("app.capture.enqueue_trace_outbox", AsyncMock()),
     ):

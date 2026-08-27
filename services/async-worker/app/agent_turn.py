@@ -104,7 +104,9 @@ _ORG_BY_WORKSPACE_SQL = text(
 )
 
 
-def _post_message(slug: str, channel_id: str, token: str, content: str, parent: str) -> Optional[str]:
+def _post_message(
+    slug: str, channel_id: str, token: str, content: str, parent: str
+) -> Optional[str]:
     """Post as the agent through the external API, returning the message id.
 
     The external API because it takes an API key; the app's chat endpoints
@@ -118,12 +120,18 @@ def _post_message(slug: str, channel_id: str, token: str, content: str, parent: 
         timeout=HTTP_TIMEOUT,
     )
     if response.status_code != 201:
-        logger.warning("agent could not post: HTTP %s %s", response.status_code, response.text[:200])
+        logger.warning(
+            "agent could not post: HTTP %s %s",
+            response.status_code,
+            response.text[:200],
+        )
         return None
     return (response.json() or {}).get("id")
 
 
-def _edit_message(slug: str, channel_id: str, token: str, message_id: str, content: str) -> None:
+def _edit_message(
+    slug: str, channel_id: str, token: str, message_id: str, content: str
+) -> None:
     try:
         requests.patch(
             f"{WORKSPACE_API_URL}/api/v1/workspaces/{slug}/channels/{channel_id}/messages/{message_id}/",
@@ -143,7 +151,9 @@ def _call_litellm(model: str):
     request or text — so the loop never learns an API's response format.
     """
 
-    def call(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+    def call(
+        messages: list[dict[str, Any]], tools: list[dict[str, Any]]
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {"model": model, "messages": messages}
         if tools:
             body["tools"] = tools
@@ -170,7 +180,9 @@ def _call_litellm(model: str):
     return call
 
 
-def load_turn(workspace_conn, engine_conn, *, agent_id: str, message_id: str) -> Optional[dict]:
+def load_turn(
+    workspace_conn, engine_conn, *, agent_id: str, message_id: str
+) -> Optional[dict]:
     """Everything one turn needs, or ``None`` if it should not run.
 
     Returns ``None`` — rather than raising — for every ordinary reason a
@@ -185,7 +197,9 @@ def load_turn(workspace_conn, engine_conn, *, agent_id: str, message_id: str) ->
         logger.warning("agent %s has no active token; cannot act", agent_id)
         return None
 
-    message = workspace_conn.execute(_MESSAGE_SQL, {"message_id": message_id}).fetchone()
+    message = workspace_conn.execute(
+        _MESSAGE_SQL, {"message_id": message_id}
+    ).fetchone()
     if message is None:
         return None
     if str(message.actor_id) == str(agent.bot_user_id):
@@ -274,7 +288,9 @@ def execute_turn(loaded: dict, *, build_tools) -> str:
     # Posted BEFORE the model is called, so the room can see it was heard.
     # Silence and thinking look identical, and that ambiguity is what makes
     # people stop trusting an agent.
-    placeholder = _post_message(slug, channel_id, token, "…thinking", loaded["thread_root"])
+    placeholder = _post_message(
+        slug, channel_id, token, "…thinking", loaded["thread_root"]
+    )
     if placeholder is None:
         return "could not post"
 

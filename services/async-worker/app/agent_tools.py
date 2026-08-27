@@ -165,9 +165,7 @@ def build_tools(scope, org_id, token, slug):
             return f"could not list work items (HTTP {response.status_code})"
         rows = (response.json() or {}).get("results") or []
         return _truncate(
-            json.dumps(
-                [{"id": r.get("id"), "name": r.get("name")} for r in rows[:25]]
-            )
+            json.dumps([{"id": r.get("id"), "name": r.get("name")} for r in rows[:25]])
         )
 
     handlers = {

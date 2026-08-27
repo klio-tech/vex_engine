@@ -202,7 +202,9 @@ def _transcript_patches(write_mock, create_mock=None):
     ``create_mock`` is passed in rather than made here so the caller still
     holds it once the patch context has exited.
     """
-    create_mock = create_mock if create_mock is not None else MagicMock(return_value=_JOB_ID)
+    create_mock = (
+        create_mock if create_mock is not None else MagicMock(return_value=_JOB_ID)
+    )
     return (
         patch.object(capture_module, "_ensure_project_id", return_value=None),
         patch.object(capture_module, "_check_memory_quota_402", return_value=False),

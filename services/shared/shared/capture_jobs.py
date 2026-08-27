@@ -134,9 +134,10 @@ def claim_job(db_session: Any, job_id: str) -> Optional[dict]:
     Returns the full job row as a dict on success.
     """
     try:
-        row = db_session.execute(
-            text(
-                """
+        row = (
+            db_session.execute(
+                text(
+                    """
                 UPDATE capture_jobs
                    SET status = 'running',
                        attempts = attempts + 1,
@@ -149,9 +150,12 @@ def claim_job(db_session: Any, job_id: str) -> Optional[dict]:
                        project_id, branch_id, work_item_id, transcript,
                        metadata, over_cap, attempts
                 """
-            ),
-            {"job_id": job_id, "max_attempts": MAX_ATTEMPTS},
-        ).mappings().one_or_none()
+                ),
+                {"job_id": job_id, "max_attempts": MAX_ATTEMPTS},
+            )
+            .mappings()
+            .one_or_none()
+        )
     except Exception:
         # A malformed id is a stream entry that outlived its row, not an
         # outage. Roll back so the caller's connection stays usable.

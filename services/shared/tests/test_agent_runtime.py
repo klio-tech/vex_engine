@@ -5,8 +5,6 @@ in a team channel: an agent that loops forever, one that dies on a tool
 error, one that goes silent, one that answers.
 """
 
-import pytest
-
 from shared.agent_runtime import DEFAULT_MAX_STEPS, TurnContext, run_turn
 
 
@@ -42,7 +40,12 @@ class TestAnswering:
         assert result.steps == 1
 
     def test_a_tool_call_then_an_answer(self):
-        ctx = context([{"tool": "recall", "arguments": {"query": "retries"}}, {"text": "found it"}])
+        ctx = context(
+            [
+                {"tool": "recall", "arguments": {"query": "retries"}},
+                {"text": "found it"},
+            ]
+        )
         result = run_turn(ctx)
         assert result.answered is True
         assert result.tool_calls == ["recall"]
@@ -53,7 +56,11 @@ class TestAnswering:
 
         def call_model(messages, _tools):
             seen["last"] = messages[-1]["content"]
-            return {"text": "done"} if len(messages) > 2 else {"tool": "recall", "arguments": {}}
+            return (
+                {"text": "done"}
+                if len(messages) > 2
+                else {"tool": "recall", "arguments": {}}
+            )
 
         ctx = context([], call_model=call_model)
         run_turn(ctx)
@@ -89,7 +96,10 @@ class TestFailures:
             raise RuntimeError("work item not found")
 
         ctx = context(
-            [{"tool": "work_items", "arguments": {}}, {"text": "that ticket does not exist"}],
+            [
+                {"tool": "work_items", "arguments": {}},
+                {"text": "that ticket does not exist"},
+            ],
             run_tool=run_tool,
         )
         result = run_turn(ctx)

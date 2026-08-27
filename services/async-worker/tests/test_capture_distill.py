@@ -14,7 +14,6 @@ would be invisible: the memory would simply appear in somebody else's recall.
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
 
 from app import capture_distill
 from shared.taxonomy import ExtractedMemory
@@ -83,7 +82,9 @@ async def _run(job, **kw):
 async def test_writes_the_summary_and_each_typed_memory():
     memories = [
         ExtractedMemory(content="Redis was dropped.", memory_type="decision"),
-        ExtractedMemory(content="Team prefers Postgres streams.", memory_type="preference"),
+        ExtractedMemory(
+            content="Team prefers Postgres streams.", memory_type="preference"
+        ),
     ]
     outcome, write = await _run(_job(), memories=memories)
     assert outcome == "done"
@@ -154,7 +155,9 @@ async def test_an_exception_marks_the_job_failed_rather_than_crashing():
             "generate_summary",
             AsyncMock(side_effect=RuntimeError("gateway on fire")),
         ),
-        patch.object(capture_distill, "extract_typed_memories", AsyncMock(return_value=[])),
+        patch.object(
+            capture_distill, "extract_typed_memories", AsyncMock(return_value=[])
+        ),
         patch.object(capture_distill, "write_scoped_memory", AsyncMock()),
         patch.object(capture_distill, "record_usage", MagicMock()),
         patch.object(capture_distill, "finish_job", MagicMock()),
@@ -166,7 +169,9 @@ async def test_an_exception_marks_the_job_failed_rather_than_crashing():
 
 async def test_usage_is_recorded_once_per_stored_memory_only():
     """A deduped write is not a new memory and must not be billed as one."""
-    write = AsyncMock(side_effect=[{"stored": True}, {"stored": False}, {"stored": True}])
+    write = AsyncMock(
+        side_effect=[{"stored": True}, {"stored": False}, {"stored": True}]
+    )
     ps = _patches(
         job=_job(),
         write=write,
@@ -195,4 +200,7 @@ async def test_an_empty_extracted_item_is_skipped():
         ],
     )
     assert outcome == "done"
-    assert [c.kwargs["content"] for c in write.await_args_list] == ["a summary", "Real."]
+    assert [c.kwargs["content"] for c in write.await_args_list] == [
+        "a summary",
+        "Real.",
+    ]
