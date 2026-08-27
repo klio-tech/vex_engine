@@ -41,7 +41,7 @@ import time
 
 import anyio
 import redis.asyncio as aioredis
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from shared.evidence_stream import SESSIONS_STORED
 from shared.models import IngestEvent
 from shared.redis_config import REDIS_CLIENT_OPTIONS
@@ -642,6 +642,136 @@ async def _consume_agent_turns(redis_client: aioredis.Redis) -> None:
             await asyncio.sleep(1)
 
 
+async def _consume_capture_jobs(redis_client: aioredis.Redis) -> None:
+    """Distil captured transcripts as they are queued.
+
+    This work used to run inside ``POST /capture/transcript`` under a 10s
+    timeout, because the Stop hook that posted the transcript was waiting on
+    the response. Here nothing is waiting, so the timeout is sized for the
+    work -- see ``CAPTURE_DISTIL_TIMEOUT_S``.
+
+    A job is acked on EVERY outcome, including failure. The durable record is
+    the ``capture_jobs`` row (``status``, ``attempts``, ``error``), not the
+    stream: redelivering here would just re-spend two LLM calls on a job whose
+    own row already says it failed, and ``claim_job`` would refuse it anyway
+    once it is out of attempts.
+
+    A pending job whose publish never landed (dead Redis at request time) is
+    picked up by the sweep below rather than lost.
+    """
+    from shared.capture_jobs import (  # noqa: PLC0415
+        CAPTURE_JOBS,
+        CAPTURE_JOBS_GROUP,
+        publish_job,
+    )
+
+    from app.capture_distill import distill_job  # noqa: PLC0415
+
+    await _ensure_consumer_group(redis_client, CAPTURE_JOBS, CAPTURE_JOBS_GROUP)
+    logger.info(
+        "capture distiller ready (timeout=%ss)", config.CAPTURE_DISTIL_TIMEOUT_S
+    )
+
+    # The distiller's own timeout, not the hook's. Set on this process only,
+    # so the request path's shorter ceiling elsewhere is untouched.
+    os.environ["VERIFICATION_TIMEOUT_S"] = str(config.CAPTURE_DISTIL_TIMEOUT_S)
+
+    last_sweep = 0.0
+    while True:
+        try:
+            messages = await redis_client.xreadgroup(
+                groupname=CAPTURE_JOBS_GROUP,
+                consumername=CONSUMER_NAME,
+                streams={CAPTURE_JOBS: ">"},
+                count=1,
+                block=5000,
+            )
+            now = time.monotonic()
+            if now - last_sweep > config.CAPTURE_SWEEP_SECONDS:
+                last_sweep = now
+                # The DB half runs in a thread; the publish is async and
+                # belongs on this loop, so the sweep RETURNS ids rather than
+                # publishing them from a thread it does not own.
+                for orphan in await asyncio.to_thread(_sweep_orphaned_capture_jobs):
+                    try:
+                        await publish_job(orphan)
+                    except Exception:
+                        logger.warning(
+                            "re-publish of capture job %s failed", orphan, exc_info=True
+                        )
+
+            if not messages:
+                continue
+            for _stream, entries in messages:
+                for msg_id, data in entries:
+                    try:
+                        job_id = json.loads(data["payload"])["job_id"]
+                        db = SessionLocal()
+                        try:
+                            outcome = await distill_job(db, job_id)
+                        finally:
+                            db.close()
+                        logger.info("capture job %s: %s", job_id, outcome)
+                    except Exception:
+                        logger.exception("capture job %s failed", msg_id)
+                    finally:
+                        await redis_client.xack(
+                            CAPTURE_JOBS, CAPTURE_JOBS_GROUP, msg_id
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("capture distiller error; continuing")
+            await asyncio.sleep(1)
+
+
+def _sweep_orphaned_capture_jobs() -> list[str]:
+    """Re-publish jobs the stream never got, or that died mid-flight.
+
+    Two ways a durable job can end up with nobody coming for it: the request
+    persisted the row but the XADD failed, or a worker claimed it and was
+    killed before finishing. Neither is visible to the stream, so without this
+    the transcript is silently lost -- which is precisely the failure mode this
+    whole change exists to remove.
+    """
+    from shared.capture_jobs import MAX_ATTEMPTS  # noqa: PLC0415
+
+    db = SessionLocal()
+    try:
+        rows = db.execute(
+            text(
+                """
+                SELECT id FROM capture_jobs
+                 WHERE attempts < :max_attempts
+                   AND (
+                        (status = 'pending' AND created_at < NOW() - INTERVAL '5 minutes')
+                     OR (status = 'running' AND started_at < NOW() - INTERVAL '30 minutes')
+                   )
+                 ORDER BY created_at
+                 LIMIT 100
+                """
+            ),
+            {"max_attempts": MAX_ATTEMPTS},
+        ).scalars().all()
+        if not rows:
+            return []
+        # A 'running' row whose worker died must become claimable again.
+        db.execute(
+            text(
+                "UPDATE capture_jobs SET status = 'pending' "
+                " WHERE status = 'running' AND started_at < NOW() - INTERVAL '30 minutes'"
+            )
+        )
+        db.commit()
+        logger.info("capture sweep re-publishing %d orphaned job(s)", len(rows))
+        return [str(job_id) for job_id in rows]
+    except Exception:
+        logger.warning("capture job sweep failed; will retry", exc_info=True)
+        return []
+    finally:
+        db.close()
+
+
 async def run() -> None:
     """Start all consumer loops concurrently."""
     logging.basicConfig(
@@ -658,6 +788,7 @@ async def run() -> None:
         _consume_executions(redis_client),
         _consume_sessions_stored(redis_client, s3_client),
         _consume_agent_turns(redis_client),
+        _consume_capture_jobs(redis_client),
     )
 
 

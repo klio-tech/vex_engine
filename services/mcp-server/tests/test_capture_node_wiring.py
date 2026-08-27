@@ -193,18 +193,22 @@ def wired_client(monkeypatch):
         engine.dispose()
 
 
-def _transcript_patches(write_mock):
-    """Neuter everything a transcript capture does EXCEPT the org binding."""
+_JOB_ID = "77777777-7777-7777-7777-777777777777"
+
+
+def _transcript_patches(write_mock, create_mock=None):
+    """Neuter everything a transcript capture does EXCEPT the org binding.
+
+    ``create_mock`` is passed in rather than made here so the caller still
+    holds it once the patch context has exited.
+    """
+    create_mock = create_mock if create_mock is not None else MagicMock(return_value=_JOB_ID)
     return (
         patch.object(capture_module, "_ensure_project_id", return_value=None),
         patch.object(capture_module, "_check_memory_quota_402", return_value=False),
         patch.object(capture_module, "record_usage"),
-        patch.object(
-            capture_module, "generate_summary", new=AsyncMock(return_value="a summary")
-        ),
-        patch.object(
-            capture_module, "extract_typed_memories", new=AsyncMock(return_value=[])
-        ),
+        patch.object(capture_module, "create_job", new=create_mock),
+        patch.object(capture_module, "publish_job", new=AsyncMock()),
         patch.object(capture_module, "build_captured_payload", return_value=None),
         patch.object(capture_module.brain, "write_scoped_memory", new=write_mock),
     )
@@ -218,8 +222,15 @@ needs_db = requires_db("the capture/proposals node-wiring tests")
 
 @needs_db
 def test_hook_transcript_captures_into_the_selected_node(wired_client):
+    """The org binding is resolved in the REQUEST and carried on the job.
+
+    Distillation runs in another process now, so this is the last point at
+    which the selected node is known -- if the wrong org reaches the job row,
+    every memory the worker writes from it lands in the wrong tenant.
+    """
     write_mock = AsyncMock(return_value={"stored": True, "id": "m1"})
-    p = _transcript_patches(write_mock)
+    create_mock = MagicMock(return_value=_JOB_ID)
+    p = _transcript_patches(write_mock, create_mock)
     with p[0], p[1], p[2], p[3], p[4], p[5], p[6]:
         resp = wired_client.post(
             "/capture/transcript",
@@ -227,20 +238,21 @@ def test_hook_transcript_captures_into_the_selected_node(wired_client):
             headers={"X-Klio-Node": OTHER_NODE_ORG},
         )
     assert resp.status_code == 200
-    assert resp.json()["stored"] == 1
-    write_mock.assert_awaited_once()
-    assert write_mock.await_args.kwargs["org_id"] == OTHER_NODE_ORG
+    create_mock.assert_called_once()
+    assert create_mock.call_args.kwargs["org_id"] == OTHER_NODE_ORG
+    write_mock.assert_not_awaited()
 
 
 @needs_db
 def test_hook_transcript_without_a_header_stays_in_the_keys_org(wired_client):
     write_mock = AsyncMock(return_value={"stored": True, "id": "m1"})
-    p = _transcript_patches(write_mock)
+    create_mock = MagicMock(return_value=_JOB_ID)
+    p = _transcript_patches(write_mock, create_mock)
     with p[0], p[1], p[2], p[3], p[4], p[5], p[6]:
         resp = wired_client.post("/capture/transcript", json=_TRANSCRIPT_BODY)
     assert resp.status_code == 200
-    write_mock.assert_awaited_once()
-    assert write_mock.await_args.kwargs["org_id"] == KEY_ORG
+    create_mock.assert_called_once()
+    assert create_mock.call_args.kwargs["org_id"] == KEY_ORG
 
 
 @needs_db

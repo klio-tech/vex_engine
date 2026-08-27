@@ -158,43 +158,70 @@ def test_event_write_exception_returns_clean_error(client):
 # ---------------------------------------------------------------------------
 
 
-def test_transcript_extracts_typed_memories_and_summary(client):
-    """Transcript distils to one summary + N typed items, each stored as its
-    own kind. The kinds are what the Context workspace groups by, so a
-    ``decision`` must reach the write path AS a decision rather than being
-    flattened to ``fact`` the way the old facts-only extraction did."""
+JOB_ID = "77777777-7777-7777-7777-777777777777"
+
+
+def test_transcript_queues_a_job_and_calls_no_model_inline(client):
+    """The request path resolves and enqueues; it does not distil.
+
+    Distillation was two LLM calls inside this handler, with the Stop hook
+    waiting on them. It now happens in ``async-worker``, so the endpoint must
+    write NOTHING to memory itself -- a write here would mean the model work
+    is still on the caller's clock.
+    """
     write = AsyncMock(return_value={"stored": True})
+    create = MagicMock(return_value=JOB_ID)
+    publish = AsyncMock()
     db_patch, session = _patch_db()
     with (
         db_patch,
         patch.object(capture.brain, "write_scoped_memory", write),
         patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
-        patch("app.capture.generate_summary", AsyncMock(return_value="a summary")),
-        patch(
-            "app.capture.extract_typed_memories",
-            AsyncMock(
-                return_value=[
-                    ExtractedMemory("decision", "deploys run from GitHub source"),
-                    ExtractedMemory("fact", "the pooled endpoint refuses params"),
-                ]
-            ),
-        ),
+        patch("app.capture.create_job", create),
+        patch("app.capture.publish_job", publish),
     ):
         resp = client.post(
             "/capture/transcript",
             json={"messages": [{"role": "user", "content": "hello"}]},
         )
 
-    body = resp.json()
-    assert body == {
-        "stored": 3,
-        "facts": 2,
-        "by_kind": {"decision": 1, "fact": 1},
-        "summary": True,
+    assert resp.json() == {
+        "stored": 0,
+        "facts": 0,
+        "by_kind": {},
+        "summary": False,
+        "queued": True,
+        "job_id": JOB_ID,
     }
-    types = [c.kwargs["memory_type"] for c in write.await_args_list]
-    assert types == ["summary", "decision", "fact"]
+    write.assert_not_awaited()
+    create.assert_called_once()
+    publish.assert_awaited_once_with(JOB_ID)
+    assert create.call_args.kwargs["transcript"] == "user: hello"
+    assert create.call_args.kwargs["org_id"] == "test-org"
     session.close.assert_called_once()
+
+
+def test_transcript_survives_a_publish_failure_because_the_row_is_durable(client):
+    """A dead Redis delays the job to the next sweep; it must not fail the
+    capture, and the response must say so rather than claiming success."""
+    create = MagicMock(return_value=JOB_ID)
+    db_patch, _ = _patch_db()
+    with (
+        db_patch,
+        patch.object(capture.brain, "write_scoped_memory", AsyncMock()),
+        patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
+        patch("app.capture.create_job", create),
+        patch("app.capture.publish_job", AsyncMock(side_effect=RuntimeError("no redis"))),
+    ):
+        resp = client.post(
+            "/capture/transcript", json={"messages": [{"content": "hi"}]}
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["queued"] is False
+    assert body["job_id"] == JOB_ID
+    create.assert_called_once()
 
 
 def test_transcript_empty_messages_short_circuits(client):
@@ -210,8 +237,8 @@ def test_transcript_empty_messages_short_circuits(client):
     with (
         patch("app.capture.SessionLocal", sl),
         patch.object(capture.brain, "write_scoped_memory", write),
-        patch("app.capture.generate_summary", AsyncMock()) as gs,
-        patch("app.capture.extract_typed_memories", AsyncMock()) as ef,
+        patch("app.capture.create_job", MagicMock(return_value="77777777-7777-7777-7777-777777777777")) as gs,
+        patch("app.capture.publish_job", AsyncMock()) as ef,
     ):
         resp = client.post(
             "/capture/transcript", json={"messages": [{"content": "  "}]}
@@ -223,35 +250,6 @@ def test_transcript_empty_messages_short_circuits(client):
     ef.assert_not_called()
     sl.return_value.execute.assert_not_called()
     sl.return_value.close.assert_called_once()
-
-
-def test_transcript_summary_failure_still_stores_memories(client):
-    """A summary-extraction failure does not block item storage (independent)."""
-    write = AsyncMock(return_value={"stored": True})
-    db_patch, _ = _patch_db()
-    with (
-        db_patch,
-        patch.object(capture.brain, "write_scoped_memory", write),
-        patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
-        patch("app.capture.generate_summary", AsyncMock(side_effect=RuntimeError())),
-        patch(
-            "app.capture.extract_typed_memories",
-            AsyncMock(return_value=[ExtractedMemory("plan", "next: wire the UI")]),
-        ),
-    ):
-        resp = client.post(
-            "/capture/transcript",
-            json={"messages": [{"content": "hi"}]},
-        )
-
-    body = resp.json()
-    assert body == {
-        "stored": 1,
-        "facts": 1,
-        "by_kind": {"plan": 1},
-        "summary": False,
-    }
-    assert write.await_args.kwargs["memory_type"] == "plan"
 
 
 # ---------------------------------------------------------------------------

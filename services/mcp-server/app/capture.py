@@ -87,9 +87,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from shared import brain, branches, claims
 from shared.auth import KeyInfo
+from shared.capture_jobs import create_job, publish_job
 from shared.memory import (
-    extract_typed_memories,
-    generate_summary,
     retract_memory,
     retrieve_memories_scoped,
 )
@@ -1060,73 +1059,57 @@ async def capture_transcript(
             org_id, agent_id, req.session_id, user_id=user_id
         )
         base_meta = {"source": "hook-transcript"}
-        stored = 0
         over_cap = await anyio.to_thread.run_sync(
             lambda: _check_memory_quota_402(
                 db, org_id, key_info.plan, "memory", key_info.plan_overrides
             )
         )
 
-        try:
-            summary = await generate_summary(combined)
-        except Exception:
-            logger.warning("capture: generate_summary raised for org %s", org_id)
-            summary = None
-        if summary:
-            result = await brain.write_scoped_memory(
+        # Distillation is QUEUED, not run here. It used to be two LLM calls
+        # inside this handler, which is why VERIFICATION_TIMEOUT_S was 10s:
+        # the Stop hook that posted this transcript is waiting on the
+        # response. Measured against 40 real captured transcripts, that
+        # ceiling was dropping roughly a third of all sessions -- and dropping
+        # them silently, because a timed-out extraction is indistinguishable
+        # from a turn that held nothing worth keeping.
+        #
+        # Everything that must fail LOUDLY and at the caller has already
+        # happened above: key validation, principal resolution, node
+        # reachability, scope, project, branch and quota. What remains is
+        # model work, and it belongs on the worker with a timeout sized for
+        # it. See ``async-worker/app/capture_distill.py``.
+        job_id = await anyio.to_thread.run_sync(
+            lambda: create_job(
                 db,
                 org_id=org_id,
                 agent_id=agent_id,
-                content=summary,
-                memory_type="summary",
                 session_id=session_id,
+                transcript=combined,
+                scope=scope,
+                user_id=user_id,
                 project_id=project_id,
                 branch_id=branch_id,
                 work_item_id=branch_work_item_id,
                 metadata=base_meta,
-                scope=scope,
-                user_id=user_id,
+                over_cap=over_cap,
             )
-            if result.get("stored"):
-                stored += 1
-                await anyio.to_thread.run_sync(
-                    lambda: record_usage(db, org_id, "memory", over_cap=over_cap)
-                )
+        )
 
-        # Typed distillation. Each item carries its own ``memory_type`` from
-        # the taxonomy the Context workspace groups by, instead of every item
-        # landing as ``fact`` because that was the only thing the old
-        # facts-only prompt could return. Items that fail the durability rule
-        # never reach this loop — see :mod:`shared.taxonomy`.
+        # The row is already durable, so a publish failure delays this job to
+        # whenever the worker next sweeps -- it does not lose it, and it must
+        # not fail a capture that has otherwise succeeded.
+        queued = True
         try:
-            memories = await extract_typed_memories(combined)
+            await publish_job(job_id)
         except Exception:
-            logger.warning("capture: extract_typed_memories raised for org %s", org_id)
-            memories = []
-        for item in memories:
-            if not item.content:
-                continue
-            result = await brain.write_scoped_memory(
-                db,
-                org_id=org_id,
-                agent_id=agent_id,
-                content=item.content,
-                memory_type=item.memory_type,
-                session_id=session_id,
-                project_id=project_id,
-                branch_id=branch_id,
-                work_item_id=branch_work_item_id,
-                metadata=base_meta,
-                scope=scope,
-                user_id=user_id,
+            queued = False
+            logger.warning(
+                "capture job %s persisted but not published; awaiting sweep",
+                job_id,
+                exc_info=True,
             )
-            if result.get("stored"):
-                stored += 1
-                await anyio.to_thread.run_sync(
-                    lambda: record_usage(db, org_id, "memory", over_cap=over_cap)
-                )
 
-        record_capture("accepted" if stored else "rejected")
+        record_capture("accepted")
 
         # Evidence loop: publish the redacted session for retention. Best
         # effort — a publish failure (bad Redis, redaction failure inside
@@ -1155,18 +1138,20 @@ async def capture_transcript(
         except Exception:
             logger.warning("evidence publish failed; capture unaffected", exc_info=True)
 
-        # ``facts`` stays in the response for wire compatibility with hook
-        # clients already in the field: it is the count of distilled items,
-        # which is exactly what it always was. ``by_kind`` is the additive
-        # breakdown across the taxonomy.
-        by_kind: dict[str, int] = {}
-        for item in memories:
-            by_kind[item.memory_type] = by_kind.get(item.memory_type, 0) + 1
+        # Every key a field hook client already reads stays present and stays
+        # the same TYPE, so nothing in the wild raises. What changed is that
+        # the counts are no longer knowable at response time: distillation has
+        # not run yet. They report zero and ``job_id`` says where the real
+        # answer will appear -- which is strictly more than the old response
+        # could offer, since a timed-out extraction also returned zero and
+        # gave no way to tell the two apart.
         return {
-            "stored": stored,
-            "facts": len(memories),
-            "by_kind": by_kind,
-            "summary": bool(summary),
+            "stored": 0,
+            "facts": 0,
+            "by_kind": {},
+            "summary": False,
+            "queued": queued,
+            "job_id": job_id,
         }
     except HTTPException:
         raise

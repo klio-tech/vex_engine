@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Transcript distillation ran inside the request, and a 10s timeout was
+  silently discarding about a third of every captured session.**
+  `POST /capture/transcript` called `generate_summary` and then
+  `extract_typed_memories` in the handler, so the Stop hook that posted the
+  transcript blocked on both. `VERIFICATION_TIMEOUT_S` defaults to 10s and
+  exists to bound exactly that stall — but on timeout `generate_summary`
+  returns `None` and `extract_typed_memories` returns `[]`, which is precisely
+  what they return for a turn that genuinely held nothing durable. A dropped
+  session and an uneventful one were indistinguishable, so nothing ever
+  surfaced the loss.
+
+  Measured over 40 real captured transcripts (median 7.3k chars) against the
+  incumbent model, running alone: at a 10s ceiling only 67% of turns produced
+  both a summary and its distilled memories; at 30s it was 100%. Under
+  concurrent load the 10s figure fell to 58%.
+
+  Distillation now runs in `async-worker`. The request path still resolves —
+  synchronously, and still failing loudly at the caller — identity, active
+  node, scope, project, branch and quota; it then writes the already-redacted
+  transcript to the new `capture_jobs` table (migration 052) and returns.
+  `CAPTURE_DISTIL_TIMEOUT_S` (default 60s) sizes the model budget for the work
+  instead of for a hook's patience.
+
+  The table, not just a queue payload, because the stream contract for
+  `agents.turns` is ids-only and a transcript had no other durable home. It
+  also buys what the inline path could not offer: a failed distillation is a
+  `status='failed'` row with a reason on it, `attempts` is bounded so a poison
+  transcript stops costing two LLM calls a redelivery, and a sweep re-publishes
+  jobs whose `XADD` never landed or whose worker died mid-flight.
+
+  `/capture/transcript` keeps every response key it had, with the same types,
+  so hook clients in the field do not break. The counts now report zero — the
+  work has not run yet — and a new `job_id` says where the real answer will
+  appear. `queued` reports whether the stream publish succeeded; the row is
+  durable either way.
+
 ### Security
 
 - **The dashboard `/ws` feed was unauthenticated and untenanted, and it is

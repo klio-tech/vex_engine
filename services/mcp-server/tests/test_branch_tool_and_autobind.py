@@ -294,8 +294,23 @@ def _client(user_id=None):
     return TestClient(app)
 
 
-def _capture_patches(write, ensure_branch):
+JOB_ID = "77777777-7777-7777-7777-777777777777"
+
+
+def _capture_patches(write, ensure_branch, *, scope="private", create_mock=None):
+    """Seams for both capture routes.
+
+    ``scope`` is a parameter rather than a patch the caller swaps by index:
+    /capture/transcript no longer distils inline, so the tuple's shape changed,
+    and an index-based override silently unpatched ``create_job`` instead of
+    the scope resolver -- which made the assertions that followed vacuous.
+
+    ``create_mock`` is passed in so the caller still holds it after the patch
+    context exits; the transcript route's filing decisions land on THAT call
+    now, not on ``write_scoped_memory``.
+    """
     session = MagicMock()
+    create_mock = create_mock if create_mock is not None else MagicMock(return_value=JOB_ID)
     return (
         patch("app.capture.SessionLocal", MagicMock(return_value=session)),
         patch.object(capture.brain, "write_scoped_memory", write),
@@ -303,13 +318,19 @@ def _capture_patches(write, ensure_branch):
         patch.object(
             capture.project_scope,
             "resolve_capture_scope",
-            MagicMock(return_value="private"),
+            MagicMock(return_value=scope),
         ),
         patch.object(capture.branches, "ensure_branch", ensure_branch),
-        patch("app.capture.generate_summary", AsyncMock(return_value="a summary")),
-        patch("app.capture.extract_typed_memories", AsyncMock(return_value=[])),
+        patch("app.capture.create_job", create_mock),
+        patch("app.capture.publish_job", AsyncMock()),
         patch("app.capture.enqueue_trace_outbox", AsyncMock()),
     )
+
+
+def _job_kwargs(create_mock):
+    """The one create_job call a transcript capture makes."""
+    assert create_mock.call_args is not None, "the transcript queued no job"
+    return create_mock.call_args.kwargs
 
 
 def _post_transcript(client, **extra):
@@ -325,7 +346,8 @@ def test_transcript_branch_never_widens_a_private_capture():
     write = AsyncMock(return_value={"stored": True})
     ensure_branch = MagicMock(return_value=dict(BRANCH_ROW))
 
-    patches = _capture_patches(write, ensure_branch)
+    create_mock = MagicMock(return_value=JOB_ID)
+    patches = _capture_patches(write, ensure_branch, create_mock=create_mock)
     with (
         patches[0],
         patches[1],
@@ -344,9 +366,9 @@ def test_transcript_branch_never_widens_a_private_capture():
     # is on a feature branch nearly all the time, and forcing 'project'
     # here silently publishes private hook captures to the whole team.
     ensure_branch.assert_not_called()
-    for call in write.await_args_list:
-        assert call.kwargs["branch_id"] is None
-        assert call.kwargs["scope"] == "private"
+    kw = _job_kwargs(create_mock)
+    assert kw["branch_id"] is None
+    assert kw["scope"] == "private"
 
 
 @pytest.mark.parametrize("default_branch", ["main", "Main", "master", "MASTER"])
@@ -356,7 +378,8 @@ def test_transcript_default_branch_means_main(default_branch):
     write = AsyncMock(return_value={"stored": True})
     ensure_branch = MagicMock()
 
-    patches = _capture_patches(write, ensure_branch)
+    create_mock = MagicMock(return_value=JOB_ID)
+    patches = _capture_patches(write, ensure_branch, create_mock=create_mock)
     with (
         patches[0],
         patches[1],
@@ -381,7 +404,8 @@ def test_transcript_unattributable_caller_never_auto_creates_a_branch(client):
     write = AsyncMock(return_value={"stored": True})
     ensure_branch = MagicMock()
 
-    patches = _capture_patches(write, ensure_branch)
+    create_mock = MagicMock(return_value=JOB_ID)
+    patches = _capture_patches(write, ensure_branch, create_mock=create_mock)
     with (
         patches[0],
         patches[1],
@@ -412,8 +436,8 @@ def test_transcript_without_a_project_never_auto_creates_a_branch():
         patch.object(capture.brain, "write_scoped_memory", write),
         patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
         patch.object(capture.branches, "ensure_branch", ensure_branch),
-        patch("app.capture.generate_summary", AsyncMock(return_value="a summary")),
-        patch("app.capture.extract_typed_memories", AsyncMock(return_value=[])),
+        patch("app.capture.create_job", MagicMock(return_value="77777777-7777-7777-7777-777777777777")),
+        patch("app.capture.publish_job", AsyncMock()),
         patch("app.capture.enqueue_trace_outbox", AsyncMock()),
     ):
         resp = _client(user_id=USER).post(
@@ -434,11 +458,9 @@ def test_event_git_branch_binds_the_write():
     write = AsyncMock(return_value={"stored": True})
     ensure_branch = MagicMock(return_value=dict(BRANCH_ROW))
 
-    patches = list(_capture_patches(write, ensure_branch))
-    patches[5] = patch.object(
-        capture.project_scope,
-        "resolve_capture_scope",
-        MagicMock(return_value="project"),
+    create_mock = MagicMock(return_value=JOB_ID)
+    patches = _capture_patches(
+        write, ensure_branch, scope="project", create_mock=create_mock
     )
     with (
         patches[0],
@@ -494,11 +516,9 @@ def test_transcript_binds_the_branch_when_the_project_opted_into_project_scope()
     write = AsyncMock(return_value={"stored": True})
     ensure_branch = MagicMock(return_value=BRANCH_ROW)
 
-    patches = list(_capture_patches(write, ensure_branch))
-    patches[5] = patch.object(
-        capture.project_scope,
-        "resolve_capture_scope",
-        MagicMock(return_value="project"),
+    create_mock = MagicMock(return_value=JOB_ID)
+    patches = _capture_patches(
+        write, ensure_branch, scope="project", create_mock=create_mock
     )
     with (
         patches[0],
@@ -515,9 +535,9 @@ def test_transcript_binds_the_branch_when_the_project_opted_into_project_scope()
     assert resp.status_code == 200
     ensure_branch.assert_called_once()
     assert ensure_branch.call_args.kwargs["name"] == "feat/x"
-    for call in write.await_args_list:
-        assert call.kwargs["branch_id"] == BRANCH_ROW["id"]
-        assert call.kwargs["scope"] == "project"
+    kw = _job_kwargs(create_mock)
+    assert kw["branch_id"] == BRANCH_ROW["id"]
+    assert kw["scope"] == "project"
 
 
 def test_event_branch_never_widens_a_private_capture():
@@ -527,7 +547,8 @@ def test_event_branch_never_widens_a_private_capture():
     write = AsyncMock(return_value={"stored": True})
     ensure_branch = MagicMock(return_value=BRANCH_ROW)
 
-    patches = _capture_patches(write, ensure_branch)
+    create_mock = MagicMock(return_value=JOB_ID)
+    patches = _capture_patches(write, ensure_branch, create_mock=create_mock)
     with (
         patches[0],
         patches[1],
@@ -560,7 +581,7 @@ def test_event_branch_never_widens_a_private_capture():
 # ---------------------------------------------------------------------------
 
 
-def _project_scope_capture():
+def _project_scope_capture(create_mock):
     """Patches identical to :func:`_capture_patches` but capture lands on the
     project, which is the only scope a branch is ever bound under."""
     session = MagicMock()
@@ -574,28 +595,31 @@ def _project_scope_capture():
             "resolve_capture_scope",
             MagicMock(return_value="project"),
         ),
-        "summary": patch("app.capture.generate_summary", AsyncMock(return_value="a summary")),
-        "typed": patch("app.capture.extract_typed_memories", AsyncMock(return_value=[])),
+        "create": patch("app.capture.create_job", create_mock),
+        "publish": patch("app.capture.publish_job", AsyncMock()),
         "outbox": patch("app.capture.enqueue_trace_outbox", AsyncMock()),
     }
 
 
 def _run_transcript(branch_row, *, git_branch="feat/x"):
+    """Returns the response and the create_job mock: the transcript route's
+    filing decisions now land on the QUEUED JOB, not on a memory write."""
     write = AsyncMock(return_value={"stored": True})
     ensure_branch = MagicMock(return_value=branch_row)
-    p = _project_scope_capture()
+    create_mock = MagicMock(return_value=JOB_ID)
+    p = _project_scope_capture(create_mock)
     with (
         p["session"],
         patch.object(capture.brain, "write_scoped_memory", write),
         p["ensure_project"],
         p["scope"],
         patch.object(capture.branches, "ensure_branch", ensure_branch),
-        p["summary"],
-        p["typed"],
+        p["create"],
+        p["publish"],
         p["outbox"],
     ):
         resp = _post_transcript(_client(user_id=USER), git_branch=git_branch)
-    return resp, write
+    return resp, create_mock
 
 
 def test_a_capture_on_a_work_item_branch_inherits_the_work_item():
@@ -606,46 +630,46 @@ def test_a_capture_on_a_work_item_branch_inherits_the_work_item():
     git branch name — ever naming it.
     """
     row = dict(BRANCH_ROW, work_item_id="cafe1234-1111-2222-3333-444444444444")
-    resp, write = _run_transcript(row)
+    resp, create_mock = _run_transcript(row)
 
     assert resp.status_code == 200
-    assert write.await_args_list, "the transcript wrote nothing to assert on"
-    for call in write.await_args_list:
-        assert call.kwargs["branch_id"] == BRANCH_ROW["id"]
-        assert call.kwargs["work_item_id"] == "cafe1234-1111-2222-3333-444444444444"
+    kw = _job_kwargs(create_mock)
+    assert kw["branch_id"] == BRANCH_ROW["id"]
+    assert kw["work_item_id"] == "cafe1234-1111-2222-3333-444444444444"
 
 
 def test_a_capture_on_a_plain_branch_files_no_work_item():
     """A branch with no work item must not invent one."""
     row = dict(BRANCH_ROW)
     row.pop("work_item_id", None)
-    resp, write = _run_transcript(row)
+    resp, create_mock = _run_transcript(row)
 
     assert resp.status_code == 200
-    for call in write.await_args_list:
-        assert call.kwargs["branch_id"] == BRANCH_ROW["id"]
-        assert call.kwargs["work_item_id"] is None
+    kw = _job_kwargs(create_mock)
+    assert kw["branch_id"] == BRANCH_ROW["id"]
+    assert kw["work_item_id"] is None
 
 
 def test_a_capture_on_main_files_no_work_item():
     """No branch means no inherited filing, even on a project that has one."""
     write = AsyncMock(return_value={"stored": True})
     ensure_branch = MagicMock()
-    p = _project_scope_capture()
+    create_mock = MagicMock(return_value=JOB_ID)
+    p = _project_scope_capture(create_mock)
     with (
         p["session"],
         patch.object(capture.brain, "write_scoped_memory", write),
         p["ensure_project"],
         p["scope"],
         patch.object(capture.branches, "ensure_branch", ensure_branch),
-        p["summary"],
-        p["typed"],
+        p["create"],
+        p["publish"],
         p["outbox"],
     ):
         resp = _post_transcript(_client(user_id=USER), git_branch="main")
 
     assert resp.status_code == 200
     ensure_branch.assert_not_called()
-    for call in write.await_args_list:
-        assert call.kwargs["branch_id"] is None
-        assert call.kwargs["work_item_id"] is None
+    kw = _job_kwargs(create_mock)
+    assert kw["branch_id"] is None
+    assert kw["work_item_id"] is None

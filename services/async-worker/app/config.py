@@ -115,3 +115,37 @@ DREAM_MAX_ORGS_PER_TICK = parse_int(
     name="DREAM_MAX_ORGS_PER_TICK",
     minimum=1,
 )
+
+
+#: How long ONE distillation LLM call may take, in seconds.
+#:
+#: This is the number the whole capture-job change exists to raise. While
+#: distillation ran inside ``POST /capture/transcript`` the ceiling was
+#: ``VERIFICATION_TIMEOUT_S``'s 10s default, because the Stop hook that posted
+#: the transcript was blocked on the response. Measured over 40 real captured
+#: transcripts, 10s produced BOTH a summary and its memories for only ~67% of
+#: turns; at 30s it was 100%. The remaining third failed silently, because a
+#: timed-out extraction returns ``[]`` — indistinguishable from a turn that
+#: genuinely held nothing durable.
+#:
+#: Nothing waits on this loop, so the budget is set by the work rather than by
+#: a hook's patience. It is applied to ``VERIFICATION_TIMEOUT_S`` inside the
+#: distiller's own process only; the request path is untouched.
+CAPTURE_DISTIL_TIMEOUT_S = parse_int(
+    os.environ.get("CAPTURE_DISTIL_TIMEOUT_S"),
+    default=60,
+    name="CAPTURE_DISTIL_TIMEOUT_S",
+    minimum=5,
+    maximum=600,
+)
+
+#: How often the distiller looks for jobs the stream never delivered — a row
+#: persisted while Redis was down, or claimed by a worker that then died.
+#: Cheap (one partial-index query), and it is the backstop that makes a
+#: persisted job genuinely durable rather than merely persisted.
+CAPTURE_SWEEP_SECONDS = parse_int(
+    os.environ.get("CAPTURE_SWEEP_SECONDS"),
+    default=300,
+    name="CAPTURE_SWEEP_SECONDS",
+    minimum=30,
+)

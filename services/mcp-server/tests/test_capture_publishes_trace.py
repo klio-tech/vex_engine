@@ -37,8 +37,8 @@ def _distillation_mocks():
     """Patch the distillation seams so no real DB/LLM call happens."""
     return (
         patch.object(capture.brain, "ensure_project", MagicMock(return_value=None)),
-        patch("app.capture.generate_summary", AsyncMock(return_value=None)),
-        patch("app.capture.extract_typed_memories", AsyncMock(return_value=[])),
+        patch("app.capture.create_job", MagicMock(return_value="77777777-7777-7777-7777-777777777777")),
+        patch("app.capture.publish_job", AsyncMock()),
     )
 
 
