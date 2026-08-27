@@ -42,9 +42,16 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
+      # The worker runs agent turns, which read the workspace database and
+      # post back through the workspace API — so it needs the workspace
+      # stack's network for the same reason `mcp` does. Without it a turn
+      # dies on "could not translate host name klio-db", which looks like a
+      # code fault and is not one.
+      WORKSPACE_DATABASE_URL: ${WORKSPACE_DATABASE_URL:?set WORKSPACE_DATABASE_URL}
       REDIS_URL: redis://engine-redis:6379/0
     networks:
       - engine
+      - klio_default
 
   engine-redis:
     image: redis:7-alpine
