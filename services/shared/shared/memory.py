@@ -305,6 +305,34 @@ def _embed_model() -> str:
     return os.environ.get("MEMORY_EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
 
 
+def _embed_endpoint() -> tuple[Optional[str], Optional[str]]:
+    """``(api_base, api_key)`` for EMBEDDINGS specifically.
+
+    Separate from the chat endpoint because the two are not interchangeable
+    and the consequences of confusing them are not symmetric. Chat models
+    can be swapped between gateways freely; an embedding model cannot,
+    because every vector already in ``session_memories`` was produced by
+    one specific model. Point embeddings at a gateway that does not serve
+    that exact model and recall does not fail loudly — it returns
+    confidently wrong neighbours, or nothing, against vectors that are no
+    longer comparable.
+
+    Falls back to the shared ``LITELLM_*`` pair when unset, so an
+    installation that has not split them behaves exactly as before.
+    """
+    api_base = (
+        os.environ.get("MEMORY_EMBEDDING_API_URL")
+        or os.environ.get("LITELLM_API_URL")
+        or os.environ.get("OPENAI_API_BASE")
+    )
+    api_key = (
+        os.environ.get("MEMORY_EMBEDDING_API_KEY")
+        or os.environ.get("LITELLM_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+    )
+    return api_base, api_key
+
+
 def _embed_timeout_s() -> float:
     """Per-attempt embedding timeout, read at call time.
 
@@ -434,8 +462,7 @@ async def _aembedding_call(text_input: str, prefix: str = "") -> list[float]:
         The embedding vector as a list of floats.
     """
     model = _embed_model()
-    api_base = os.environ.get("LITELLM_API_URL") or os.environ.get("OPENAI_API_BASE")
-    api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    api_base, api_key = _embed_endpoint()
 
     kwargs: dict[str, Any] = {"model": model, "input": [prefix + text_input]}
     if api_base:
@@ -1544,8 +1571,7 @@ def _embed_text_sync(
     candidate = embedding_prompt.prefix_for(role) + candidate
 
     model = _embed_model()
-    api_base = os.environ.get("LITELLM_API_URL") or os.environ.get("OPENAI_API_BASE")
-    api_key = os.environ.get("LITELLM_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    api_base, api_key = _embed_endpoint()
 
     kwargs: dict[str, Any] = {"model": model, "input": [candidate]}
     if api_base:
