@@ -7,10 +7,14 @@ generic tool that takes a scope argument — puts the security decision in
 the model's hands, and the model is the one component here that is
 explicitly not trusted.
 
-Reads go straight to the memory layer in this process. Writes go through
-the workspace's external API with the AGENT's own credential, so anything
-an agent changes is attributable to it and constrained by its membership.
-Two independent limits: a bug in one does not open the door.
+Reads go straight to the memory layer in this process. Writes — both the
+memory write and the workspace writes — go through the SAME scope
+boundary: `remember` is pinned to `scope="org"` for exactly the reason
+`_recall` is pinned to `scope="org"` below, and workspace actions go
+through the workspace's external API with the AGENT's own credential, so
+anything an agent changes there is attributable to it and constrained by
+its membership. Independent limits: a bug in one does not open the door
+on another.
 """
 
 from __future__ import annotations
@@ -83,6 +87,31 @@ TOOL_SCHEMAS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": (
+                "Record a durable fact or decision this team would want "
+                "recalled later — something that will still be true and "
+                "still useful next week, not this message's chatter, not "
+                "your own reasoning, and not a recap of something you just "
+                "read with `recall` or `list_work_items`. Use it when the "
+                "conversation states a fact, makes a decision, or settles "
+                "something worth remembering — not on every turn."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The fact or decision to store, in your own words.",
+                    }
+                },
+                "required": ["content"],
+            },
+        },
+    },
 ]
 
 
@@ -92,17 +121,20 @@ def _truncate(value: str) -> str:
     return value[:MAX_RESULT_CHARS] + f"\n…(truncated at {MAX_RESULT_CHARS} characters)"
 
 
-def build_tools(scope, org_id, token, slug):
+def build_tools(scope, org_id, token, slug, agent_id=None):
     """``(schemas, run_tool)`` for one turn.
 
     Args:
         scope: The audience scope. Closed over, never a tool argument.
-        org_id: Tenant whose memories may be read. ``None`` disables recall
-            rather than widening it.
+        org_id: Tenant whose memories may be read and written. ``None``
+            disables recall and remember rather than widening either.
         token: The agent's credential for workspace writes.
         slug: The workspace being acted in.
+        agent_id: The agent principal, for attributing memories it writes.
+            ``None`` disables `remember` rather than writing an unowned row.
     """
     from app.db import SessionLocal  # noqa: PLC0415
+    from shared.brain import write_scoped_memory  # noqa: PLC0415
     from shared.memory import retrieve_memories_scoped  # noqa: PLC0415
 
     def _recall(arguments: dict[str, Any]) -> str:
@@ -145,6 +177,61 @@ def build_tools(scope, org_id, token, slug):
             project_id=scope.project_id,
             work_item_id=scope.work_item_id,
             limit=8,
+        )
+
+    def _remember(arguments: dict[str, Any]) -> str:
+        content = str(arguments.get("content") or "").strip()
+        if not content:
+            return "remember needs content"
+        if not org_id or not agent_id:
+            # Same failure shape as `_recall` with no org: say so plainly
+            # rather than writing an unattributed or unscoped row.
+            return "no memory is connected to this conversation"
+
+        db = SessionLocal()
+        try:
+            # Same off-loop reasoning as `_recall`: write_scoped_memory is
+            # async, the turn runs in a worker thread, so it gets its own
+            # loop.
+            result = anyio.run(_write, db, write_scoped_memory, content)
+        except Exception as exc:
+            logger.warning("agent remember failed: %s", exc, exc_info=True)
+            return f"could not store that: {exc}"
+        finally:
+            db.close()
+
+        if not result.get("stored"):
+            if result.get("deduplicated"):
+                return "the team already knows this — nothing new was stored"
+            return f"could not store that: {result.get('error', 'unknown error')}"
+        return "stored"
+
+    async def _write(db, write, content):
+        # Pinned to scope="org" for the SAME reason `_retrieve` above is
+        # pinned to scope="org": this is the exact scope `_recall` reads,
+        # narrowed by the exact same `project_id` / `work_item_id`. Nothing
+        # here can widen to another org (org_id is closed over, never a tool
+        # argument) or land in a user's private tier (scope is never
+        # "private" — user_id below is authorship on a shared row, not a
+        # visibility predicate; see `write_scoped_memory`'s docstring).
+        #
+        # `agent_id` makes the row attributable to the agent that asserted
+        # it. `metadata.source` is what lets a human reading the brain tell
+        # this apart from a hook-captured, curator-extracted row: those
+        # carry `source: "capture"` / go through the curator, this one is
+        # the agent's own stated claim, made in the room, right now.
+        return await write(
+            db,
+            org_id=org_id,
+            agent_id=agent_id,
+            content=content,
+            memory_type="memory",
+            session_id=f"agent-turn:{org_id}:{agent_id}",
+            project_id=scope.project_id,
+            work_item_id=scope.work_item_id if scope.project_id else None,
+            metadata={"source": "agent_chat"},
+            scope="org",
+            user_id=scope.user_id,
         )
 
     def _list_projects(_arguments: dict[str, Any]) -> str:
@@ -237,6 +324,7 @@ def build_tools(scope, org_id, token, slug):
         "recall": _recall,
         "list_projects": _list_projects,
         "list_work_items": _list_work_items,
+        "remember": _remember,
     }
 
     def run_tool(name: str, arguments: dict[str, Any]) -> str:
