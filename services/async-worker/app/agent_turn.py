@@ -272,9 +272,10 @@ def execute_turn(loaded: dict, *, build_tools) -> str:
 
     Args:
         loaded: The output of :func:`load_turn`.
-        build_tools: ``(scope, org_id, token) -> (schemas, run_tool)``.
-            Injected so the tool surface can grow — including, later, tools
-            from a connected MCP server — without this function changing.
+        build_tools: ``(scope, org_id, token, slug, agent_id) -> (schemas,
+            run_tool)``. Injected so the tool surface can grow — including,
+            later, tools from a connected MCP server — without this
+            function changing.
 
     Returns:
         A short outcome string for the log.
@@ -294,7 +295,9 @@ def execute_turn(loaded: dict, *, build_tools) -> str:
     if placeholder is None:
         return "could not post"
 
-    schemas, run_tool = build_tools(loaded["scope"], loaded["org_id"], token, slug)
+    schemas, run_tool = build_tools(
+        loaded["scope"], loaded["org_id"], token, slug, str(agent.id)
+    )
 
     def on_progress(line: str) -> None:
         _edit_message(slug, channel_id, token, placeholder, f"…{line}")
