@@ -52,7 +52,7 @@ _MESSAGE_SQL = text(
     """
     SELECT m.id, m.content, m.actor_id, m.parent_id,
            c.id AS channel_id, c.kind, c.is_private, c.project_id,
-           c.workspace_id, w.slug AS workspace_slug
+           c.workspace_id, w.slug AS workspace_slug, w.name AS workspace_name
     FROM channel_messages m
     JOIN channels c ON c.id = m.channel_id
     JOIN workspaces w ON w.id = c.workspace_id
@@ -85,7 +85,7 @@ _HISTORY_SQL = text(
 
 _LINKED_PROJECT_SQL = text(
     """
-    SELECT id, org_id FROM projects
+    SELECT id, org_id, display_name FROM projects
     WHERE plane_project_id = CAST(:plane_project_id AS uuid)
     LIMIT 1
     """
@@ -130,12 +130,30 @@ def _post_message(
 
 
 def _edit_message(
-    slug: str, channel_id: str, token: str, message_id: str, content: str
+    slug: str,
+    channel_id: str,
+    token: str,
+    message_id: str,
+    content: str,
+    *,
+    provenance: Optional[dict] = None,
 ) -> None:
+    """PATCH the placeholder into its next state.
+
+    Called once per progress line (``provenance`` omitted — nothing has
+    been decided yet) and once, finally, with the answer. ``provenance``
+    is only ever passed by the caller on that last call: this function
+    does not decide what counts as "final", it only forwards what it was
+    given, so the honesty rule (never on a progress edit) lives in exactly
+    one place — :func:`execute_turn`.
+    """
+    body: dict[str, Any] = {"content": content}
+    if provenance is not None:
+        body["provenance"] = provenance
     try:
         requests.patch(
             f"{WORKSPACE_API_URL}/api/v1/workspaces/{slug}/channels/{channel_id}/messages/{message_id}/",
-            json={"content": content},
+            json=body,
             headers={"X-Api-Key": token},
             timeout=HTTP_TIMEOUT,
         )
@@ -222,15 +240,24 @@ def load_turn(
 
     # A linked project narrows further, when there is one.
     project_id = None
+    project_display_name = None
     if message.project_id:
         linked = engine_conn.execute(
             _LINKED_PROJECT_SQL, {"plane_project_id": str(message.project_id)}
         ).fetchone()
         if linked is not None:
             project_id = str(linked.id)
+            project_display_name = linked.display_name
             # A linked project's org wins: it is the org that actually owns
             # the memories being read.
             org_id = linked.org_id
+
+    # The real scope a recall this turn is narrowed to, for citing it
+    # honestly later (`execute_turn`) — never a guess, never a constant.
+    # The linked project's own name when there is one; otherwise the
+    # workspace itself, which is the floor every recall this turn reads at
+    # regardless of project linkage.
+    scope_label = project_display_name or message.workspace_name
 
     scope = resolve_audience_scope(
         channel_kind=message.kind,
@@ -259,6 +286,7 @@ def load_turn(
         "message": message,
         "scope": scope,
         "org_id": org_id,
+        "scope_label": scope_label,
         "history": history[:-1] if history else [],
         # A reply goes in a thread off the message that summoned the agent;
         # if that message is itself a reply, threads are one level, so the
@@ -323,5 +351,36 @@ def execute_turn(loaded: dict, *, build_tools) -> str:
     else:
         final = "I couldn't finish that one. Nothing was changed."
 
-    _edit_message(slug, channel_id, token, placeholder, final)
+    _edit_message(
+        slug,
+        channel_id,
+        token,
+        placeholder,
+        final,
+        provenance=_provenance(run_tool, loaded.get("scope_label")),
+    )
     return f"{result.reason or 'answered'} in {result.steps} step(s)"
+
+
+def _provenance(run_tool, scope_label: Optional[str]) -> Optional[dict]:
+    """What this turn's ``recall`` calls actually returned, or ``None``
+    when there is nothing honest to cite.
+
+    ``run_tool`` carries ``recalled_memory_counts`` — one entry per
+    ``recall`` call that found something (``agent_tools.build_tools``
+    never logs a call that matched nothing: a recall of zero memories is
+    not a citation). Multiple ``recall`` calls in one turn all read at the
+    SAME audience scope (`load_turn` resolves it once, before the turn
+    starts), so summing their counts into one total is the natural
+    reading of "recalled N memories" — there is exactly one scope for a
+    turn to have narrowed to, never several to disambiguate between.
+
+    ``scope_label`` must be a real, resolved scope (see `load_turn`) — if
+    it is missing, the count is dropped along with it rather than paired
+    with a fabricated or constant name.
+    """
+    counts = getattr(run_tool, "recalled_memory_counts", None) or []
+    total = sum(counts)
+    if total < 1 or not scope_label:
+        return None
+    return {"memory_count": total, "source_name": scope_label}

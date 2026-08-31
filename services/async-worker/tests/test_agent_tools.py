@@ -68,6 +68,56 @@ def test_recall_reads_at_org_scope_matching_the_audience():
     assert kwargs["work_item_id"] == "wi-1"
 
 
+def test_recall_records_a_count_when_it_finds_something():
+    """`run_tool.recalled_memory_counts` is what `agent_turn.execute_turn`
+    reads to build the provenance line -- a hit must be logged."""
+    with (
+        patch("app.db.SessionLocal", return_value=MagicMock()),
+        patch(
+            "shared.memory.retrieve_memories_scoped",
+            new_callable=AsyncMock,
+            return_value=[_record("a"), _record("b"), _record("c")],
+        ),
+    ):
+        _, run_tool = build_tools(_scope(), ORG_ID, TOKEN, SLUG, AGENT_ID)
+        run_tool("recall", {"query": "anything"})
+
+    assert run_tool.recalled_memory_counts == [3]
+
+
+def test_recall_records_nothing_when_it_finds_nothing():
+    """Zero memories is not a citation -- see `_extract_agent_provenance`
+    on the workspace app side. Nothing should even be logged for it."""
+    with (
+        patch("app.db.SessionLocal", return_value=MagicMock()),
+        patch(
+            "shared.memory.retrieve_memories_scoped",
+            new_callable=AsyncMock,
+            return_value=[],
+        ),
+    ):
+        _, run_tool = build_tools(_scope(), ORG_ID, TOKEN, SLUG, AGENT_ID)
+        run_tool("recall", {"query": "anything"})
+
+    assert run_tool.recalled_memory_counts == []
+
+
+def test_recall_counts_accumulate_across_calls_in_one_turn():
+    with (
+        patch("app.db.SessionLocal", return_value=MagicMock()),
+        patch(
+            "shared.memory.retrieve_memories_scoped",
+            new_callable=AsyncMock,
+            side_effect=[[_record("a")], [_record("b"), _record("c")]],
+        ),
+    ):
+        _, run_tool = build_tools(_scope(), ORG_ID, TOKEN, SLUG, AGENT_ID)
+        run_tool("recall", {"query": "first"})
+        run_tool("recall", {"query": "second"})
+
+    assert run_tool.recalled_memory_counts == [1, 2]
+
+
 def test_recall_failure_is_returned_not_raised():
     with (
         patch("app.db.SessionLocal", return_value=MagicMock()),

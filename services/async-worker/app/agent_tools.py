@@ -137,6 +137,16 @@ def build_tools(scope, org_id, token, slug, agent_id=None):
     from shared.brain import write_scoped_memory  # noqa: PLC0415
     from shared.memory import retrieve_memories_scoped  # noqa: PLC0415
 
+    #: One entry per `recall` call THIS TURN that actually matched
+    #: something — never for a call that found nothing, per the same
+    #: honesty rule the tool's own text reply follows below. Read by
+    #: `agent_turn.execute_turn` (via the `recalled_memory_counts`
+    #: attribute on the returned `run_tool`) to report what was really
+    #: recalled — a count `_recall` itself has no business deciding how
+    #: to present, since it does not know whether this is the only
+    #: `recall` call in the turn.
+    recalled_memory_counts: list[int] = []
+
     def _recall(arguments: dict[str, Any]) -> str:
         query = str(arguments.get("query") or "").strip()
         if not query:
@@ -161,6 +171,7 @@ def build_tools(scope, org_id, token, slug, agent_id=None):
                 "nothing in this conversation's memory matches that. Say so "
                 "plainly rather than guessing."
             )
+        recalled_memory_counts.append(len(records))
         lines = [f"- {record.content}" for record in records]
         return _truncate("\n".join(lines))
 
@@ -333,5 +344,11 @@ def build_tools(scope, org_id, token, slug, agent_id=None):
             # Named rather than raised: the model can pick another tool.
             return f"no such tool: {name}"
         return handler(arguments or {})
+
+    # Exposed as an attribute rather than widening the `(schemas, run_tool)`
+    # return shape: every caller of `build_tools` — including every
+    # existing test — unpacks exactly two values, and `run_tool` is a
+    # closure, so it can carry this without disturbing any of them.
+    run_tool.recalled_memory_counts = recalled_memory_counts
 
     return TOOL_SCHEMAS, run_tool
