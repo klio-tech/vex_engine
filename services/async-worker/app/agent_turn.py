@@ -19,6 +19,7 @@ from sqlalchemy import text
 
 from shared.agent_runtime import TurnContext, run_turn
 from shared.audience_scope import resolve_audience_scope
+from shared.token_crypto import InvalidToken, decrypt_bot_token
 
 logger = logging.getLogger("agentguard.async-worker.agent")
 
@@ -34,11 +35,35 @@ HTTP_TIMEOUT = 30
 HISTORY_LIMIT = 12
 
 
+def _agent_raw_token(agent_id: str, encrypted: str | None) -> str | None:
+    """The agent's own workspace credential, or ``None`` if the turn cannot act.
+
+    The workspace keeps bot tokens Fernet-encrypted (``token_encrypted``)
+    rather than in the clear; this is the only place the engine turns one
+    back into the ``X-Api-Key`` it presents. Every failure — no token, a
+    token minted before the cipher existed, a secret that does not match
+    the workspace's — is logged and returns ``None`` so the turn is skipped
+    rather than sent with a guessed credential.
+    """
+    if not encrypted:
+        logger.warning("agent %s has no active token; cannot act", agent_id)
+        return None
+    try:
+        return decrypt_bot_token(encrypted)
+    except (InvalidToken, ValueError):
+        logger.error(
+            "agent %s: cannot decrypt its token -- BOT_TOKEN_CIPHER_KEY must be the "
+            "same value here and in the workspace's environment",
+            agent_id,
+        )
+        return None
+
+
 _AGENT_SQL = text(
     """
     SELECT a.id, a.name, a.instructions, a.model, a.is_enabled,
            a.user_id AS bot_user_id,
-           t.token AS agent_token
+           t.token_encrypted AS agent_token_encrypted
     FROM agents a
     LEFT JOIN api_tokens t
            ON t.user_id = a.user_id AND t.is_active = true
@@ -211,8 +236,8 @@ def load_turn(
     agent = workspace_conn.execute(_AGENT_SQL, {"agent_id": agent_id}).fetchone()
     if agent is None or not agent.is_enabled:
         return None
-    if not agent.agent_token:
-        logger.warning("agent %s has no active token; cannot act", agent_id)
+    agent_token = _agent_raw_token(agent_id, agent.agent_token_encrypted)
+    if not agent_token:
         return None
 
     message = workspace_conn.execute(
@@ -283,6 +308,9 @@ def load_turn(
 
     return {
         "agent": agent,
+        # Decrypted once here, never stored on the row: the raw credential
+        # lives in this dict for the turn's lifetime and nowhere else.
+        "agent_token": agent_token,
         "message": message,
         "scope": scope,
         "org_id": org_id,
@@ -312,7 +340,7 @@ def execute_turn(loaded: dict, *, build_tools) -> str:
     message = loaded["message"]
     slug = message.workspace_slug
     channel_id = str(message.channel_id)
-    token = agent.agent_token
+    token = loaded["agent_token"]
 
     # Posted BEFORE the model is called, so the room can see it was heard.
     # Silence and thinking look identical, and that ambiguity is what makes

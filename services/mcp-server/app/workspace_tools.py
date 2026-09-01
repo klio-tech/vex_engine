@@ -4,10 +4,11 @@ Until now an agent could recall and record Klio's memory but could not
 *do* anything in the workspace — no project, no work item, no status
 change. These tools close that gap on the SAME endpoint and the SAME
 credential, because the workspace's personal access token
-(``plane_api_…``) is already valid for both: the engine validates it
-against ``api_tokens`` (see :mod:`shared.auth`), and the workspace REST
-API validates the identical string as ``X-Api-Key``. There is no second
-server to run and no second key to issue.
+(``klio_pat_…``; legacy ``plane_api_…`` still honoured) is already valid
+for both: the engine validates it against ``api_tokens.token_hash`` (see
+:mod:`shared.auth` — the raw value is hashed on lookup, never stored), and
+the workspace REST API validates the identical string as ``X-Api-Key``.
+There is no second server to run and no second key to issue.
 
 Design notes:
 

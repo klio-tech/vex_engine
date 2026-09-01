@@ -1,6 +1,7 @@
 """Workspace personal access tokens are engine credentials.
 
-A PAT (Plane's ``api_tokens`` row, plaintext ``plane_api_<32hex>``) is a USER
+A PAT (the workspace's ``api_tokens`` row — stored as a SHA-256 ``token_hash``
+since 2026-09-02; raw form ``klio_pat_<32hex>``, legacy ``plane_api_``) is a USER
 credential: ``KeyInfo.user_id`` is the token's workspace user and the org is
 the token's workspace org (or the user's personal workspace for a
 workspace-less token). The engine-keys lookup stays FIRST; the PAT arm runs
@@ -29,6 +30,7 @@ from sqlalchemy import create_engine, text
 
 from shared.auth import AuthError, KeyValidator
 from shared.testing import database_url, requires_db
+from shared.token_crypto import hash_token
 
 DB_URL = database_url()
 
@@ -42,8 +44,10 @@ TEAM_SLUG = "pat-team-alpha"
 PERSONAL_SLUG = "pat-personal-owner"
 
 
-def _pat() -> str:
-    return f"plane_api_{uuid.uuid4().hex}"
+def _pat(prefix: str = "klio_pat_") -> str:
+    """A raw PAT as a user presents it. ``prefix`` defaults to the current
+    one; pass the legacy ``plane_api_`` to prove the prefix is never parsed."""
+    return f"{prefix}{uuid.uuid4().hex}"
 
 
 class _RecordingConn:
@@ -131,7 +135,8 @@ def pat_fixture():
                 """
                 CREATE TABLE api_tokens (
                     id uuid PRIMARY KEY,
-                    token varchar UNIQUE NOT NULL,
+                    token_hash varchar UNIQUE NOT NULL,
+                    token_encrypted text,
                     user_id uuid NOT NULL,
                     workspace_id uuid,
                     is_active boolean NOT NULL DEFAULT true,
@@ -178,17 +183,20 @@ def _insert_token(
     expired_at: str | None = None,
     deleted_at: str | None = None,
 ) -> str:
+    # Callers hand in the RAW token, exactly as a user would present it; the
+    # row stores only its hash, exactly as the workspace does since
+    # 2026-09-02. The validator must hash on lookup or nothing here matches.
     token_id = str(uuid.uuid4())
     conn.execute(
         text(
             "INSERT INTO api_tokens "
-            "(id, token, user_id, workspace_id, is_active, expired_at, deleted_at) "
-            "VALUES (:id, :token, :uid, :ws, :active, "
+            "(id, token_hash, user_id, workspace_id, is_active, expired_at, deleted_at) "
+            "VALUES (:id, :token_hash, :uid, :ws, :active, "
             "CAST(:expired AS timestamptz), CAST(:deleted AS timestamptz))"
         ),
         {
             "id": token_id,
-            "token": token,
+            "token_hash": hash_token(token),
             "uid": user_id,
             "ws": workspace_id,
             "active": is_active,
@@ -241,6 +249,28 @@ def test_active_workspace_token_authenticates_and_ensures_the_org(pat_fixture):
     assert row is not None
     assert row.org_id == info.org_id
     assert row.account_slug == TEAM_SLUG
+
+
+@requires_db("the workspace PAT tests")
+def test_legacy_plane_api_prefix_still_authenticates(pat_fixture):
+    """A token minted before the rename was backfilled as a hash like any
+    other; the prefix is a label, never parsed, so it keeps working."""
+    raw = _pat(prefix="plane_api_")
+    _insert_token(pat_fixture.conn, token=raw, workspace_id=TEAM_WS)
+
+    assert _validator(pat_fixture).validate(raw).org_id == f"ws_{TEAM_WS}"
+
+
+@requires_db("the workspace PAT tests")
+def test_presenting_the_stored_hash_is_not_a_credential(pat_fixture):
+    """A leaked ``api_tokens`` table must not log anyone in: the validator
+    hashes what it is given, so handing it the hash hashes it again."""
+    raw = _pat()
+    _insert_token(pat_fixture.conn, token=raw, workspace_id=TEAM_WS)
+
+    with pytest.raises(AuthError) as exc:
+        _validator(pat_fixture).validate(hash_token(raw))
+    assert exc.value.status_code == 401
 
 
 @requires_db("the workspace PAT tests")

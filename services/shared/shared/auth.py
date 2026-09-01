@@ -38,6 +38,7 @@ from sqlalchemy.engine import Engine
 
 from shared.engine_bounds import engine_bounds
 from shared.plan_limits import PlanConfig, get_plan_config
+from shared.token_crypto import hash_token
 
 logger = logging.getLogger("agentguard.auth")
 
@@ -56,14 +57,17 @@ RELIABILITY_SCOPES = frozenset({"ingest", "verify", "read"})
 #: territory.
 PAT_SCOPES = ("memory", "read")
 
-#: Workspace DB: the PAT row itself. Plane stores the token PLAINTEXT and
-#: UNIQUE (format ``plane_api_<32hex>``), so the lookup is by the raw value —
-#: unlike engine keys, which are matched by SHA-256 hash.
+#: Workspace DB: the PAT row itself. Since 2026-09-02 the workspace stores
+#: only the SHA-256 of a token (``token_hash``; raw prefixes ``klio_pat_`` /
+#: ``klio_bot_``, legacy ``plane_api_`` backfilled), so the lookup hashes the
+#: presented value exactly like engine keys are matched. The hash is a
+#: cross-repo contract pinned by ``tests/test_token_crypto.py`` — see
+#: :mod:`shared.token_crypto`.
 _PAT_TOKEN_SQL = text(
     """
     SELECT id, user_id, workspace_id, is_active, expired_at, deleted_at, is_service
     FROM api_tokens
-    WHERE token = :token
+    WHERE token_hash = :token_hash
     LIMIT 1
     """
 )
@@ -877,7 +881,9 @@ class KeyValidator:
 
         try:
             with self._workspace_engine.connect() as conn:
-                token_row = conn.execute(_PAT_TOKEN_SQL, {"token": raw_key}).fetchone()
+                token_row = conn.execute(
+                    _PAT_TOKEN_SQL, {"token_hash": hash_token(raw_key)}
+                ).fetchone()
                 if token_row is None:
                     return None
                 if not self._pat_token_alive(token_row):

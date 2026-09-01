@@ -14,6 +14,9 @@ dependencies = [
     "litellm>=1.0.0",
     "boto3>=1.29.0",
     "redis>=5.0.0",
+    # Bot-token cipher (shared/token_crypto.py): decrypts an agent's
+    # workspace credential so the engine can act on the agent's behalf.
+    "cryptography>=42.0.0",
 ]
 
 [project.optional-dependencies]

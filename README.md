@@ -38,6 +38,17 @@ Set `KLIO_REQUIRE_DB=1` so database-gated tests fail loudly instead of skipping.
 `sync-gateway` and `async-worker` also import `verification-engine`, so install it
 (`pip install -e services/verification-engine`) or their tests will not collect.
 
+### Workspace tokens and `BOT_TOKEN_CIPHER_KEY`
+
+The workspace (Klio's Django backend) stores API tokens as SHA-256 hashes; the
+engine hashes a presented `X-Vex-Key` before looking it up in `api_tokens`
+(`shared/token_crypto.py` — the hash and KDF are a cross-repo contract pinned by
+`services/shared/tests/test_token_crypto.py` and the workspace's own test). Bot
+tokens additionally carry a Fernet-encrypted copy so `async-worker` can act as
+an agent; decrypting it needs **`BOT_TOKEN_CIPHER_KEY` set to the same value as
+the workspace's**. With it unset or different, every agent turn logs
+"cannot decrypt its token" and is skipped — loudly, never with a guessed key.
+
 ## Operational endpoints
 
 The mcp-server exposes three endpoints that answer three different questions. Wiring

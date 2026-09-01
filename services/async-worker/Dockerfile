@@ -9,7 +9,10 @@ ENV PYTHONPATH="/app/lib/shared:/app/lib/verification-engine"
 ENV PYTHONUNBUFFERED=1
 
 # Install shared + verification-engine dependencies.
-RUN pip install --no-cache-dir pydantic>=2.0.0 sqlalchemy>=2.0.0 psycopg2-binary>=2.9.0 litellm>=1.0.0 jsonschema>=4.0.0
+# cryptography: shared/token_crypto decrypts an agent's workspace token
+# (Fernet) so a turn can act as the agent. This is the ONLY service that
+# decrypts; the others hash only and import it lazily.
+RUN pip install --no-cache-dir pydantic>=2.0.0 sqlalchemy>=2.0.0 psycopg2-binary>=2.9.0 litellm>=1.0.0 jsonschema>=4.0.0 cryptography>=42.0.0
 
 # Install the async worker service.
 COPY services/async-worker/pyproject.toml /app/

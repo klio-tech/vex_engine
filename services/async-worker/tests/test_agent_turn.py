@@ -21,10 +21,28 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from app.agent_turn import execute_turn, load_turn
+from cryptography.fernet import Fernet
 from shared.agent_runtime import TurnResult
+from shared.token_crypto import derive_key
 
 
 # --- load_turn: scope_label --------------------------------------------
+
+
+#: The workspace stores a bot's token Fernet-encrypted; the row a turn loads
+#: carries that ciphertext, and load_turn decrypts it with the shared secret.
+#: Real crypto here on purpose -- a stub would hide a KDF drift between the
+#: two repos, which is the exact failure this contract exists to catch.
+_TEST_SECRET = "klio-test-secret"
+_RAW_BOT_TOKEN = "klio_bot_test"
+_ENCRYPTED_BOT_TOKEN = (
+    Fernet(derive_key(_TEST_SECRET)).encrypt(_RAW_BOT_TOKEN.encode()).decode()
+)
+
+
+@pytest.fixture(autouse=True)
+def _shared_secret(monkeypatch):
+    monkeypatch.setenv("BOT_TOKEN_CIPHER_KEY", _TEST_SECRET)
 
 
 def _agent_row(**overrides):
@@ -35,7 +53,7 @@ def _agent_row(**overrides):
         model="",
         is_enabled=True,
         bot_user_id="bot-user-1",
-        agent_token="plane_api_test",
+        agent_token_encrypted=_ENCRYPTED_BOT_TOKEN,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -135,6 +153,9 @@ def test_scope_label_falls_back_to_workspace_name_when_project_id_does_not_resol
 def _loaded(**overrides):
     defaults = dict(
         agent=_agent_row(),
+        # What load_turn produces from the row's ciphertext: the raw
+        # credential execute_turn presents as X-Api-Key.
+        agent_token=_RAW_BOT_TOKEN,
         message=_message_row(),
         scope=SimpleNamespace(project_id=None, work_item_id=None, user_id=None),
         org_id="org-1",
