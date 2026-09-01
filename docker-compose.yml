@@ -142,6 +142,10 @@ services:
       MEMORY_ENABLED: ${MEMORY_ENABLED:-true}
       MEMORY_EMBEDDING_MODEL: ${MEMORY_EMBEDDING_MODEL:-intfloat/multilingual-e5-large-instruct}
       CONSUMER_NAME: async-worker-1
+      # Decrypts an agent's workspace token (shared/token_crypto). Must equal
+      # the workspace's BOT_TOKEN_CIPHER_KEY; unset = agent turns are skipped
+      # with a clear log line rather than sent with a guessed credential.
+      BOT_TOKEN_CIPHER_KEY: ${BOT_TOKEN_CIPHER_KEY:-}
     depends_on:
       migrations:
         condition: service_completed_successfully
