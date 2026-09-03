@@ -12,6 +12,8 @@ from unittest.mock import MagicMock
 import app.workspace_tools as workspace_tools
 import pytest
 
+from app import workspace_tools
+
 
 class _Request:
     def __init__(self, key="plane_api_deadbeef"):
@@ -180,3 +182,33 @@ def test_rows_handles_both_paginated_and_bare_payloads():
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+class TestCredentialKind:
+    """An engine key is a valid Klio credential that the WORKSPACE cannot
+    authenticate. Plane answers an unrecognised key with 403 (DRF sends no
+    challenge), so the status code alone reads exactly like a permission
+    denial -- which is how a whole debugging session went looking for a
+    permissions bug that did not exist (2026-09-03)."""
+
+    @pytest.mark.parametrize("key", ["klio_pat_abc", "klio_bot_abc", "plane_api_abc"])
+    def test_workspace_keys_are_accepted(self, key):
+        assert workspace_tools._is_workspace_key(key) is True
+
+    @pytest.mark.parametrize("key", ["ag_live_abc", "sk-abc", "", "klio_key_abc"])
+    def test_other_keys_are_rejected(self, key):
+        assert workspace_tools._is_workspace_key(key) is False
+
+    def test_engine_key_is_named_in_the_error(self):
+        err = workspace_tools._not_a_workspace_key("ag_live_abc")
+
+        assert err["error"] == "unauthorized"
+        assert "engine key" in err["detail"]
+        # The error must name the fix; the caller cannot see their own MCP
+        # config from inside a tool result.
+        assert "klio_pat_" in err["detail"]
+
+    def test_unauthorized_is_not_reported_as_forbidden(self):
+        """`forbidden` means "recognised you, refused you". Reporting an
+        unusable credential that way sends people to the permissions UI."""
+        assert workspace_tools._not_a_workspace_key("ag_live_abc")["error"] != "forbidden"
