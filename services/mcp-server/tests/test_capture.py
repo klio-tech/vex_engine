@@ -580,3 +580,50 @@ def test_capture_forget_returns_200_on_success(client):
     body = resp.json()
     assert body["forgotten"] is True
     assert body["id"] == mem_id
+
+
+# ---------------------------------------------------------------------------
+# `agent_only` on the recall contract.
+#
+# `scope="agent"` unions the org tier, so it can only widen a read. A client
+# that partitions its end users by X-Vex-Agent (one API key, one agent id per
+# end user) got the whole shared brain back whatever agent it declared.
+# ---------------------------------------------------------------------------
+
+
+def test_recall_request_accepts_agent_only():
+    from app.capture import RecallRequest
+
+    assert RecallRequest(query="q", scope="agent_only").scope == "agent_only"
+
+
+def test_recall_request_still_defaults_to_org():
+    """The default is unchanged: existing callers keep the ladder."""
+    from app.capture import RecallRequest
+
+    assert RecallRequest(query="q").scope == "org"
+
+
+def test_recall_request_rejects_an_unknown_scope():
+    """A typo must be a 422, never a quiet fall back to a wider read."""
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    from app.capture import RecallRequest
+
+    with _pytest.raises(ValidationError):
+        RecallRequest(query="q", scope="agent-only")
+
+
+def test_agent_only_is_a_read_mode_not_a_writable_scope():
+    """It must never reach a row: `session_memories.scope` has no such value,
+    so a write declaring it would be rejected by ck_session_memories_scope."""
+    from app.capture import CaptureEventRequest
+    from shared import scopes
+
+    assert "agent_only" in scopes.RECALL_MODES
+    assert "agent_only" not in scopes.WRITABLE_SCOPES
+    assert "agent_only" not in scopes.MEMORY_SCOPES
+    # The write contract is the other half of the fix: pair agent_only reads
+    # with scope="agent" writes, or there are no agent rows to find.
+    assert CaptureEventRequest(content="x", scope="agent").scope == "agent"

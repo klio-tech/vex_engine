@@ -289,12 +289,17 @@ class RecallRequest(BaseModel):
         description="Search text; empty falls back to most-recent memories.",
     )
     limit: int = Field(default=12, ge=1, description="Max memories to return.")
-    scope: Literal["org", "agent", "private"] = Field(
+    scope: Literal["org", "agent", "private", "agent_only"] = Field(
         default="org",
         description=(
             "'org' (default) returns the visibility ladder — the shared brain "
             "plus the caller's own private and project memories. 'private' "
-            "narrows to the caller's own memories alone. 'agent' is deprecated."
+            "narrows to the caller's own memories alone. 'agent_only' returns "
+            "ONLY memories written by the calling X-Vex-Agent and nothing "
+            "shared — the read for a client that partitions its end users by "
+            "agent; pair it with scope='agent' on the write, or there will be "
+            "no agent rows to find. 'agent' is deprecated: it unions the org "
+            "tier and so can only widen a read, never isolate one."
         ),
     )
     space: Optional[str] = Field(default=None, description="Optional space slug.")
