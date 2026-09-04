@@ -371,6 +371,25 @@ def _hook_write_scope(
         # other declared value still falls back to the private default.
         if declared_scope == "org" and getattr(key_info, "is_service", False):
             return "org", user_id
+        # The second exception: an explicit 'agent' declaration. Without it
+        # `agent_only` recall can never match -- no row is written with
+        # scope='agent', so `scope = 'agent' AND agent_id = :agent_id`
+        # matches nothing forever and the isolation it promises is silently
+        # inert. An integration key IS attributable (shared.auth sets
+        # KeyInfo.user_id from the key's created_by), so every such capture
+        # was landing as private and the partition the client believed it had
+        # did not exist.
+        #
+        # Unlike 'org' this needs no service token, because it is not a
+        # publication: a default read's ladder is (org | private-mine |
+        # project-mine) with NO agent arm, so an agent row never reaches the
+        # team brain. Attribution is kept -- the agent arm carries no user
+        # predicate, so it does not change who can read the row.
+        #
+        # Hooks are unaffected either way: they never declare a scope, so the
+        # private default that protects them is untouched.
+        if declared_scope == "agent":
+            return "agent", user_id
         return "private", user_id
     logger.warning(
         "capture: request could not be attributed to a user; writing scope=%s "

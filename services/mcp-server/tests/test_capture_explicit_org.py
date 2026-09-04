@@ -49,10 +49,22 @@ def test_attributable_declaring_private_stays_private():
     assert scope == "private" and user == _Key.user_id
 
 
-def test_attributable_declaring_agent_is_not_widened():
-    # only the exact 'org' publication is honoured; deprecated/odd scopes
-    # fall back to the private default for attributable callers.
+def test_attributable_declaring_agent_is_honoured():
+    # This asserted `private` while 'agent' was a deprecated read-only idea,
+    # so collapsing it lost nothing. `agent_only` recall changed the premise:
+    # it filters `scope = 'agent' AND agent_id = :agent_id`, so collapsing the
+    # write makes that predicate match nothing forever and the isolation it
+    # promises silently inert. 'agent' is now an explicit destination, not an
+    # odd scope. See test_capture_agent_scope.py for the full rule and for why
+    # it is not a widening (a default read's ladder has no agent arm).
     scope, user = _hook_write_scope(_Req(), _Key(), "agent")
+    assert scope == "agent" and user == _Key.user_id
+
+
+def test_an_unrecognised_scope_still_falls_back_to_private():
+    # The discard rule itself is unchanged: only the two named exceptions
+    # ('org' for a service token, 'agent') survive attribution.
+    scope, user = _hook_write_scope(_Req(), _Key(), "project")
     assert scope == "private" and user == _Key.user_id
 
 
