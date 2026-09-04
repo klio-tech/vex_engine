@@ -2519,6 +2519,14 @@ async def retrieve_memories_scoped(
           READ so existing rows do not vanish. When a ``user_id`` is supplied
           the caller's own private and project tiers are unioned in as well,
           so an agent-scoped read is never *narrower* than the default one.
+        * ``"agent_only"`` (requires ``agent_id``) →
+          ``scope = 'agent' AND agent_id = :agent_id``. The narrow read
+          ``agent`` never was: no org arm, and no private/project arms even
+          when a ``user_id`` is available. This is the only scope that
+          isolates a caller which partitions its end users by the
+          client-declared ``X-Vex-Agent``. NOTE that ``agent_id`` is declared
+          by the client, so this partitions trusted callers' own users; it is
+          not a boundary between parties that do not trust each other.
         * ``"session"`` → not supported here; raises ``ValueError``. Use
           :func:`retrieve_memories` for session-scoped reads instead of
           silently reading org-wide.
@@ -2659,15 +2667,18 @@ async def retrieve_memories_scoped(
             "scope='session' is not supported by retrieve_memories_scoped; "
             "use retrieve_memories for session-scoped reads"
         )
-    if scope not in scopes.RECALL_SCOPES:
+    if scope not in scopes.RECALL_MODES:
         raise ValueError(f"unknown scope: {scope!r}")
     if scope == "private" and not user_id:
         # Fail rather than fall back to org: a caller asking for "mine"
         # and silently receiving the team's brain is the wrong kind of
         # surprise, and there is no correct owner to guess.
         raise ValueError("user_id is required when scope='private'")
-    if scope == "agent" and agent_id is None:
-        raise ValueError("agent_id is required when scope='agent'")
+    if scope in ("agent", "agent_only") and agent_id is None:
+        # Failing closed matters most on 'agent_only': dropping the agent
+        # from a read that asked for isolation would hand the caller the
+        # whole org, which is the exact failure this scope exists to end.
+        raise ValueError(f"agent_id is required when scope={scope!r}")
 
     # Availability: return the pooled connection BEFORE awaiting the
     # embedding. See :func:`release_connection` for the measurements.
@@ -2712,6 +2723,10 @@ async def retrieve_memories_scoped(
     # ``test_recall_personal_union.py`` seed.
     if scope == "private":
         params["user_id"] = user_id
+    elif scope == "agent_only":
+        # Narrow read: the agent is the ONLY predicate, so user_id is not
+        # bound even when the caller has one — see the ladder below.
+        params["agent_id"] = agent_id
     else:
         if scope == "agent":  # validated above; agent_id is not None
             params["agent_id"] = agent_id
@@ -2728,6 +2743,18 @@ async def retrieve_memories_scoped(
         if scope == "private":
             # Narrowed read: mine, and only mine. No org arm, no project arm.
             ladder = "scope = 'private' AND user_id = :user_id"
+        elif scope == "agent_only":
+            # Narrowed read: this agent's rows, and only this agent's. No org
+            # arm — that omission IS the feature. `scope='agent'` below always
+            # unions `scope = 'org'`, so it can only widen; a caller that
+            # partitions its end users by X-Vex-Agent got every org row back
+            # whatever agent it declared.
+            #
+            # The caller's private and project tiers are deliberately NOT
+            # unioned in either, even when a user_id is available: an
+            # attributable caller asking for isolation must not quietly get
+            # a wider read than an unattributable one.
+            ladder = "scope = 'agent' AND agent_id = :agent_id"
         else:
             arms = ["scope = 'org'"]
             if scope == "agent":

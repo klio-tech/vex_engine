@@ -16,6 +16,7 @@ from shared.scopes import (
     GRAPH_SCOPES,
     MEMORY_SCOPES,
     PROMOTABLE_SCOPES,
+    RECALL_MODES,
     RECALL_SCOPES,
     WRITABLE_SCOPES,
 )
@@ -83,3 +84,22 @@ def test_private_is_not_promotable():
     # promote_memory moves a row OUT of private; private is the source, never a
     # destination.
     assert "private" not in PROMOTABLE_SCOPES
+
+
+def test_recall_modes_extends_recall_scopes_without_widening_the_column():
+    """`agent_only` is a READ MODE, not a row value.
+
+    The set above must keep satisfying "these are values the column accepts";
+    a read mode that leaked into it would be accepted on write and invisible
+    on read, which is the whole failure this module prevents. So the modes
+    live in their own set, and every mode that is NOT a column value must be
+    absent from every column-valued set.
+    """
+    assert RECALL_SCOPES <= RECALL_MODES
+    read_only_modes = RECALL_MODES - RECALL_SCOPES
+    assert read_only_modes == {"agent_only"}
+    for mode in read_only_modes:
+        assert mode not in MEMORY_SCOPES, f"{mode} must not be a column value"
+        assert mode not in WRITABLE_SCOPES, f"{mode} must not be writable"
+        assert mode not in PROMOTABLE_SCOPES
+        assert mode not in GRAPH_SCOPES
