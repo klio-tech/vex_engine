@@ -12,8 +12,6 @@ from unittest.mock import MagicMock
 import app.workspace_tools as workspace_tools
 import pytest
 
-from app import workspace_tools
-
 
 class _Request:
     def __init__(self, key="plane_api_deadbeef"):
