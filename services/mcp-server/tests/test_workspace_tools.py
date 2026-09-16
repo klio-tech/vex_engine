@@ -9,6 +9,8 @@ guessed for.
 
 from unittest.mock import MagicMock
 
+import asyncio
+
 import pytest
 
 from app import workspace_tools
@@ -349,7 +351,7 @@ ITEM = {
     "id": "ff289b42-0307-4de8-a0ab-86fb76bf025b",
     "name": "Purge the old data for YYT",
     "sequence_id": 8,
-    "project_id": "project-1",
+    "project_id": "6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
     "state": "state-1",
     "priority": "priority-1",
     "description_html": "<p>Drop everything before 2024.</p>",
@@ -394,7 +396,7 @@ async def test_read_returns_the_body_and_the_thread(monkeypatch):
     result = await workspace_tools.read_work_item(
         _Request(),
         slug="yummy",
-        project_id="project-1",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
         work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
     )
 
@@ -406,7 +408,7 @@ async def test_read_returns_the_body_and_the_thread(monkeypatch):
     assert result["comments"][0]["author"] == "Oren"
     assert calls[0] == (
         "GET",
-        "/api/v1/workspaces/yummy/projects/project-1/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/",
+        "/api/v1/workspaces/yummy/projects/6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/",
         None,
     )
 
@@ -450,7 +452,10 @@ async def test_read_needs_something_to_read(monkeypatch):
     monkeypatch.setattr(workspace_tools, "_call", _fake_call({}, []))
 
     result = await workspace_tools.read_work_item(
-        _Request(), slug="yummy", project_id="project-1", work_item_id=None
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id=None,
     )
 
     assert result["error"] == "missing_argument"
@@ -470,7 +475,7 @@ async def test_a_refusal_from_the_workspace_is_passed_through(monkeypatch):
     result = await workspace_tools.read_work_item(
         _Request(),
         slug="yummy",
-        project_id="project-1",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
         work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
     )
 
@@ -487,7 +492,7 @@ async def test_an_unreadable_thread_does_not_cost_the_body(monkeypatch):
     result = await workspace_tools.read_work_item(
         _Request(),
         slug="yummy",
-        project_id="project-1",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
         work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
     )
 
@@ -510,7 +515,7 @@ async def test_unresolvable_lookups_still_return_the_item(monkeypatch):
     result = await workspace_tools.read_work_item(
         _Request(),
         slug="yummy",
-        project_id="project-1",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
         work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
     )
 
@@ -529,8 +534,129 @@ async def test_an_empty_answer_is_not_found(monkeypatch):
     result = await workspace_tools.read_work_item(
         _Request(),
         slug="yummy",
-        project_id="project-1",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
         work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
     )
 
     assert result["error"] == "not_found"
+
+
+class TestIdValidation:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "ff289b42-0307-4de8-a0ab-86fb76bf025b",
+            " ff289b42-0307-4de8-a0ab-86fb76bf025b ",
+            "FF289B42-0307-4DE8-A0AB-86FB76BF025B",
+        ],
+    )
+    def test_uuids_are_accepted(self, value):
+        assert workspace_tools._is_uuid(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["../../projects", "not-a-uuid", "", None, 7, "ff289b42-0307-4de8-a0ab"],
+    )
+    def test_everything_else_is_not_an_id(self, value):
+        assert not workspace_tools._is_uuid(value)
+
+
+@pytest.mark.anyio
+async def test_a_ref_that_is_not_an_id_never_reaches_the_workspace(monkeypatch):
+    """Ids are interpolated into a path on an authenticated client."""
+    calls = []
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call({}, calls))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id="../../../workspaces/other/projects",
+    )
+
+    assert result["error"] == "invalid_argument"
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_a_project_id_that_is_not_an_id_is_refused(monkeypatch):
+    calls = []
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call({}, calls))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="../../..",
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert result["error"] == "invalid_argument"
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_a_key_read_checks_the_project_the_workspace_returned(monkeypatch):
+    """The key path takes its project from the payload; it is still a path."""
+    calls = []
+    monkeypatch.setattr(
+        workspace_tools,
+        "_call",
+        _fake_call(
+            {
+                "/work-items/YUMMY-8/": (
+                    {
+                        "id": "ff289b42-0307-4de8-a0ab-86fb76bf025b",
+                        "project_id": "../x",
+                    },
+                    None,
+                )
+            },
+            calls,
+        ),
+    )
+
+    result = await workspace_tools.read_work_item(
+        _Request(), slug="yummy", project_id=None, work_item_id="YUMMY-8"
+    )
+
+    assert result["error"] == "invalid_argument"
+    assert len(calls) == 1
+
+
+@pytest.mark.anyio
+async def test_the_three_lookups_go_together(monkeypatch):
+    """States, priorities and comments do not depend on each other, so the
+    read pays for one round trip rather than three."""
+    started = []
+    finished = []
+    finished_when_started = []
+
+    async def _call(request, method, path, *, params=None, json_body=None):
+        started.append(path)
+        if path.endswith("/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/"):
+            return ITEM, None
+        finished_when_started.append(len(finished))
+        # Yield: a sequential implementation would complete each call before
+        # the next one starts, and see a rising count above.
+        await asyncio.sleep(0)
+        finished.append(path)
+        if path.endswith("/comments/"):
+            return {"results": []}, None
+        return {"results": []}, None
+
+    monkeypatch.setattr(workspace_tools, "_call", _call)
+
+    await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert sorted(path.rsplit("/", 2)[-2] for path in started[1:4]) == [
+        "comments",
+        "priorities",
+        "states",
+    ]
+    # Each of the three began while none of them had finished.
+    assert finished_when_started == [0, 0, 0]

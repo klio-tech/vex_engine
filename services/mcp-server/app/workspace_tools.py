@@ -25,10 +25,12 @@ Design notes:
   name one with ``workspace``.
 """
 
+import asyncio
 import html
 import logging
 import os
 import re
+import uuid as uuid_module
 from typing import Any, Optional
 
 import httpx
@@ -118,6 +120,23 @@ def _rows(payload: Any) -> list:
     if isinstance(payload, dict):
         return payload.get("results", [])
     return payload if isinstance(payload, list) else []
+
+
+def _is_uuid(value: Any) -> bool:
+    """Whether ``value`` is a uuid, and so safe to put in a URL path.
+
+    Ids reach these tools from an agent, not from the workspace, and every
+    one of them is interpolated into a path on an AUTHENTICATED client: a
+    ref carrying ``/`` or ``..`` would address a different resource
+    entirely. Parse it rather than pattern-match it.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        uuid_module.UUID(value.strip())
+    except (ValueError, AttributeError, TypeError):
+        return False
+    return True
 
 
 def _is_work_item_key(ref: Any) -> bool:
@@ -280,6 +299,17 @@ def _not_a_workspace_key(token: str) -> dict:
     }
 
 
+def _not_an_id(value: Any) -> dict:
+    """Refuse an id that is not one, before it reaches a URL."""
+    return {
+        "error": "invalid_argument",
+        "detail": (
+            f"{value!r} is not a work item id. Pass the item's uuid, or the "
+            "key from the board (e.g. YUMMY-8)."
+        ),
+    }
+
+
 async def _call(
     request: Any,
     method: str,
@@ -398,6 +428,8 @@ async def read_work_item(
                     "(e.g. YUMMY-8) to read without one."
                 ),
             }
+        if not _is_uuid(ref) or not _is_uuid(project_id):
+            return _not_an_id(ref if not _is_uuid(ref) else project_id)
         payload, error = await _call(
             request,
             "GET",
@@ -411,14 +443,30 @@ async def read_work_item(
     if not item_id or not project_id:
         return {"error": "not_found", "detail": f"No work item {ref} in {slug}."}
 
+    # The project came back from the workspace on the key path; it still
+    # goes into a path, so it is checked on both.
+    if not _is_uuid(item_id) or not _is_uuid(project_id):
+        return _not_an_id(item_id if not _is_uuid(item_id) else project_id)
+
     root = f"/api/v1/workspaces/{slug}/projects/{project_id}"
 
-    # State and priority are ids on the row. Resolving them is best effort:
-    # the body is what was asked for, and an unreadable lookup must not cost
-    # the caller the read.
-    states_payload, _states_error = await _call(request, "GET", f"{root}/states/")
-    priorities_payload, _priorities_error = await _call(
-        request, "GET", f"{root}/priorities/"
+    # Three independent lookups, so they go together rather than one after
+    # another: a read is meant to be the cheap thing an agent does before
+    # acting. State and priority are ids on the row, and resolving them is
+    # best effort — an unreadable lookup must not cost the caller the read.
+    (
+        (states_payload, _states_error),
+        (priorities_payload, _priorities_error),
+        (comments_payload, comments_error),
+    ) = await asyncio.gather(
+        _call(request, "GET", f"{root}/states/"),
+        _call(request, "GET", f"{root}/priorities/"),
+        _call(
+            request,
+            "GET",
+            f"{root}/issues/{item_id}/comments/",
+            params={"per_page": max(1, min(int(limit or 50), 100))},
+        ),
     )
 
     result: dict = {
@@ -430,12 +478,6 @@ async def read_work_item(
         ),
     }
 
-    comments_payload, comments_error = await _call(
-        request,
-        "GET",
-        f"{root}/issues/{item_id}/comments/",
-        params={"per_page": max(1, min(int(limit or 50), 100))},
-    )
     if comments_error:
         # Say so rather than implying the thread is empty.
         result["comments_error"] = comments_error
