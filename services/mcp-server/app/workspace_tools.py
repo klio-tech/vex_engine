@@ -68,13 +68,25 @@ _PAGE_FIELDS = ("id", "name", "access", "is_locked", "created_at", "updated_at")
 
 #: Extra fields worth returning when ONE item is read rather than listed.
 _ITEM_DETAIL_FIELDS = _ITEM_FIELDS + (
+    "project",
     "project_id",
     "start_date",
     "completed_at",
     "sub_issues_count",
+    "assignees",
+    "created_by",
 )
 
 _COMMENT_FIELDS = ("id", "created_at", "updated_at", "created_by")
+
+#: Activity fields whose values are ids rather than words, and so need the
+#: project's own lookups before a person can read them. `state` stores names
+#: already; `priority` stores ids. Found by reading production rows.
+_ID_VALUED_ACTIVITY_FIELDS = ("priority",)
+
+#: Activity whose values are markup or noise: the entry is worth reporting,
+#: the diff is not.
+_OPAQUE_ACTIVITY_FIELDS = ("description", "description_binary")
 
 #: The key a person reads off the board, e.g. ``YUMMY-8``. Accepted wherever
 #: a work item id is: nobody carries the uuid of the item they are looking at.
@@ -200,11 +212,15 @@ def _shape_comment(row: Any, author_names: dict) -> dict:
     return out
 
 
-def _shape_work_item(row: Any, *, states: dict, priorities: dict) -> dict:
-    """One work item as something to act on: the body as text, and state and
-    priority as the words on the board rather than their ids."""
+def _shape_work_item(
+    row: Any, *, states: dict, priorities: dict, people: Optional[dict] = None
+) -> dict:
+    """One work item as something to act on: the body as text, and state,
+    priority, assignees and author as the words on the board rather than
+    their ids."""
     if not isinstance(row, dict):
         return {"value": row}
+    people = people or {}
     out = _slim(row, _ITEM_DETAIL_FIELDS)
     description = row.get("description_stripped") or _plain_text(
         row.get("description_html")
@@ -218,6 +234,12 @@ def _shape_work_item(row: Any, *, states: dict, priorities: dict) -> dict:
     priority = out.get("priority")
     if priority:
         out["priority"] = priorities.get(str(priority), priority)
+    assignees = out.get("assignees")
+    if isinstance(assignees, list):
+        out["assignees"] = [people.get(str(one), str(one)) for one in assignees]
+    author = out.get("created_by")
+    if author:
+        out["created_by"] = people.get(str(author), str(author))
     return out
 
 
@@ -384,6 +406,60 @@ async def _call(
         }
 
 
+def _describe_activity(row: dict, *, names: dict, people: dict) -> str:
+    """One activity row as a sentence.
+
+    The board is where the conversation happens on a team that changes
+    state and assignees rather than commenting: on YUMMY-10, four activity
+    rows and no comments. The raw row is ids and half-sentences
+    ("updated the priority to", old_value=<uuid>), so it is assembled here
+    rather than handed over as it is.
+    """
+    field = row.get("field")
+    verb = (row.get("verb") or "").strip()
+    old_value = (row.get("old_value") or "").strip()
+    new_value = (row.get("new_value") or "").strip()
+
+    if not field:
+        return f"{verb} the work item".strip() if verb else "changed the work item"
+
+    if field in _OPAQUE_ACTIVITY_FIELDS:
+        return "updated the description"
+
+    if field in _ID_VALUED_ACTIVITY_FIELDS:
+        old_value = names.get(old_value, old_value)
+        new_value = names.get(new_value, new_value)
+
+    if field == "assignees":
+        if new_value:
+            return f"added {people.get(new_value, new_value)} as assignee"
+        if old_value:
+            return f"removed {people.get(old_value, old_value)} as assignee"
+        return "changed the assignees"
+
+    label = field.replace("_", " ")
+    if old_value and new_value:
+        return f"changed {label} from {old_value} to {new_value}"
+    if new_value:
+        return f"set {label} to {new_value}"
+    if old_value:
+        return f"cleared {label} (was {old_value})"
+    return f"{verb} {label}".strip()
+
+
+def _shape_activity(row: Any, *, names: dict, people: dict) -> Optional[dict]:
+    if not isinstance(row, dict):
+        return None
+    actor = row.get("actor")
+    shaped = {
+        "at": row.get("created_at"),
+        "who": people.get(str(actor), str(actor)) if actor else None,
+        "field": row.get("field") or "work item",
+        "change": _describe_activity(row, names=names, people=people),
+    }
+    return {k: v for k, v in shaped.items() if v not in (None, "")}
+
+
 async def read_work_item(
     request: Any,
     *,
@@ -457,47 +533,73 @@ async def read_work_item(
 
     root = f"/api/v1/workspaces/{slug}/projects/{project_id}"
 
-    # Three independent lookups, so they go together rather than one after
+    # Five independent lookups, so they go together rather than one after
     # another: a read is meant to be the cheap thing an agent does before
-    # acting. State and priority are ids on the row, and resolving them is
-    # best effort — an unreadable lookup must not cost the caller the read.
+    # acting. Ids on the row and in the activity feed are resolved from
+    # these, and every one of them is best effort — an unreadable lookup
+    # must not cost the caller the read.
+    per_page = max(1, min(int(limit or 50), 100))
     (
         (states_payload, _states_error),
         (priorities_payload, _priorities_error),
+        (members_payload, _members_error),
         (comments_payload, comments_error),
+        (activity_payload, activity_error),
     ) = await asyncio.gather(
         _call(request, "GET", f"{root}/states/"),
         _call(request, "GET", f"{root}/priorities/"),
+        _call(request, "GET", f"{root}/members/"),
         _call(
             request,
             "GET",
             f"{root}/issues/{item_id}/comments/",
-            params={"per_page": max(1, min(int(limit or 50), 100))},
+            params={"per_page": per_page},
+        ),
+        _call(
+            request,
+            "GET",
+            f"{root}/issues/{item_id}/activities/",
+            params={"per_page": per_page},
         ),
     )
+
+    states = _names_by_id(states_payload)
+    priorities = _names_by_id(priorities_payload)
+    people = _member_names(members_payload)
 
     result: dict = {
         "workspace": slug,
         "work_item": _shape_work_item(
             item,
-            states=_names_by_id(states_payload),
-            priorities=_names_by_id(priorities_payload),
+            states=states,
+            priorities=priorities,
+            people=people,
         ),
     }
+
+    # What happened to this item, oldest first. On a board where people
+    # move state and reassign rather than comment, this IS the discussion:
+    # the item that prompted it had four activity rows and no comments.
+    if activity_error:
+        result["activity_error"] = activity_error
+    else:
+        activity = [
+            shaped
+            for shaped in (
+                _shape_activity(row, names=priorities, people=people)
+                for row in _rows(activity_payload)
+            )
+            if shaped
+        ]
+        activity.sort(key=lambda row: str(row.get("at") or ""))
+        result["activity"] = activity
 
     if comments_error:
         # Say so rather than implying the thread is empty.
         result["comments_error"] = comments_error
         return result
 
-    rows = _rows(comments_payload)
-    if not rows:
-        result["comments"] = []
-        return result
-
-    members_payload, _members_error = await _call(request, "GET", f"{root}/members/")
-    author_names = _member_names(members_payload)
-    comments = [_shape_comment(row, author_names) for row in rows]
+    comments = [_shape_comment(row, people) for row in _rows(comments_payload)]
     # Oldest first: a thread reads as a conversation, not as a stack.
     comments.sort(key=lambda row: str(row.get("created_at") or ""))
     result["comments"] = comments
@@ -611,7 +713,7 @@ def register(mcp: Any) -> None:
             "'comment' | 'states'); project_id (required for everything "
             "except reading by key); for read: work_item_id, which accepts "
             "the key from the board (e.g. YUMMY-8, no project_id needed) or "
-            "the item's uuid — it returns the body and the comment thread, "
+            "the item's uuid — it returns the body, the comment thread and what has happened to the item, and `list` returns none of that; "
             "and `list` returns neither; for create: name, optional description, "
             "priority ('urgent'|'high'|'medium'|'low'|'none'), state_id; for "
             "update: work_item_id plus any of name/description/priority/"
