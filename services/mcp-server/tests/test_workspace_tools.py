@@ -320,6 +320,25 @@ class TestShaping:
         )
         assert shaped["author"] == "user-9"
 
+    def test_the_project_members_shape_production_serves(self):
+        """The members endpoint returns the user rows themselves. Reading
+        them as membership rows left every actor as a raw uuid."""
+        names = workspace_tools._member_names(
+            {
+                "results": [
+                    {"id": "u1", "display_name": "spencer.yip", "email": "s@x.test"},
+                    {"id": "u2", "first_name": "Oren", "last_name": "Bennett"},
+                    {"id": "u3", "email": "omar@x.test"},
+                    {"id": "u4"},
+                ]
+            }
+        )
+        assert names == {
+            "u1": "spencer.yip",
+            "u2": "Oren Bennett",
+            "u3": "omar@x.test",
+        }
+
     def test_member_rows_map_ids_to_names(self):
         names = workspace_tools._member_names(
             {

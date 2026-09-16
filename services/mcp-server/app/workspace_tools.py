@@ -180,20 +180,50 @@ def _names_by_id(payload: Any) -> dict:
     return out
 
 
+def _person_name(source: dict) -> Optional[str]:
+    """What to call someone, from whatever the row carries."""
+    if not isinstance(source, dict):
+        return None
+    display = (source.get("display_name") or "").strip()
+    if display:
+        return display
+    full = " ".join(
+        part
+        for part in (
+            (source.get("first_name") or "").strip(),
+            (source.get("last_name") or "").strip(),
+        )
+        if part
+    )
+    return full or (source.get("email") or "").strip() or None
+
+
 def _member_names(payload: Any) -> dict:
-    """``{user id: display name}``, for attributing comments to people."""
+    """``{user id: name}``, for naming the people on an item.
+
+    Two shapes reach this. The project members endpoint returns the USER
+    rows themselves (``id``, ``display_name``, ``first_name``, ``email``) --
+    that is what production serves, and reading it as the other shape is
+    why every actor came back as a raw uuid. Membership rows that wrap the
+    user under ``member`` are still accepted, because other workspace
+    routes return that.
+    """
     out = {}
     for row in _rows(payload):
         if not isinstance(row, dict):
             continue
+
         member = row.get("member")
-        member_dict = member if isinstance(member, dict) else {}
-        user_id = member_dict.get("id") or (member if isinstance(member, str) else None)
-        name = (
-            row.get("display_name")
-            or member_dict.get("display_name")
-            or member_dict.get("email")
-        )
+        if member is not None:
+            member_dict = member if isinstance(member, dict) else {}
+            user_id = member_dict.get("id") or (
+                member if isinstance(member, str) else None
+            )
+            name = _person_name(row) or _person_name(member_dict)
+        else:
+            user_id = row.get("id")
+            name = _person_name(row)
+
         if user_id and name:
             out[str(user_id)] = name
     return out
