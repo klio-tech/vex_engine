@@ -25,8 +25,10 @@ Design notes:
   name one with ``workspace``.
 """
 
+import html
 import logging
 import os
+import re
 from typing import Any, Optional
 
 import httpx
@@ -61,6 +63,25 @@ _ITEM_FIELDS = (
 _PROJECT_FIELDS = ("id", "name", "identifier", "description", "created_at")
 
 _PAGE_FIELDS = ("id", "name", "access", "is_locked", "created_at", "updated_at")
+
+#: Extra fields worth returning when ONE item is read rather than listed.
+_ITEM_DETAIL_FIELDS = _ITEM_FIELDS + (
+    "project_id",
+    "start_date",
+    "completed_at",
+    "sub_issues_count",
+)
+
+_COMMENT_FIELDS = ("id", "created_at", "updated_at", "created_by")
+
+#: The key a person reads off the board, e.g. ``YUMMY-8``. Accepted wherever
+#: a work item id is: nobody carries the uuid of the item they are looking at.
+_WORK_ITEM_KEY = re.compile(r"^[A-Za-z][A-Za-z0-9_]*-\d+$")
+
+_TAG = re.compile(r"<[^>]+>")
+_INLINE_SPACE = re.compile(r"[ \t]+")
+#: Block tags whose boundary is a line break once the markup is gone.
+_BLOCK_BREAK = re.compile(r"</(p|div|li|h[1-6]|tr|blockquote|pre)>|<br\s*/?>", re.I)
 
 
 def _base_url() -> Optional[str]:
@@ -97,6 +118,88 @@ def _rows(payload: Any) -> list:
     if isinstance(payload, dict):
         return payload.get("results", [])
     return payload if isinstance(payload, list) else []
+
+
+def _is_work_item_key(ref: Any) -> bool:
+    """Whether ``ref`` is a board key (``YUMMY-8``) rather than a uuid."""
+    return bool(isinstance(ref, str) and _WORK_ITEM_KEY.match(ref.strip()))
+
+
+def _plain_text(markup: Any) -> str:
+    """Readable text from the workspace's stored HTML.
+
+    An agent asked to act on a work item needs the words, not the markup,
+    and the API only fills ``description_stripped`` for items edited through
+    surfaces that maintain it.
+    """
+    if not isinstance(markup, str) or not markup:
+        return ""
+    text = html.unescape(_TAG.sub("", _BLOCK_BREAK.sub("\n", markup)))
+    lines = [_INLINE_SPACE.sub(" ", line).strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def _names_by_id(payload: Any) -> dict:
+    """``{id: name}`` for states and priorities, so a read returns neither
+    raw uuid nor a second round trip for the caller to make."""
+    out = {}
+    for row in _rows(payload):
+        if isinstance(row, dict) and row.get("id") and row.get("name"):
+            out[str(row["id"])] = row["name"]
+    return out
+
+
+def _member_names(payload: Any) -> dict:
+    """``{user id: display name}``, for attributing comments to people."""
+    out = {}
+    for row in _rows(payload):
+        if not isinstance(row, dict):
+            continue
+        member = row.get("member")
+        member_dict = member if isinstance(member, dict) else {}
+        user_id = member_dict.get("id") or (member if isinstance(member, str) else None)
+        name = (
+            row.get("display_name")
+            or member_dict.get("display_name")
+            or member_dict.get("email")
+        )
+        if user_id and name:
+            out[str(user_id)] = name
+    return out
+
+
+def _shape_comment(row: Any, author_names: dict) -> dict:
+    if not isinstance(row, dict):
+        return {"value": row}
+    out = _slim(row, _COMMENT_FIELDS)
+    body = row.get("comment_stripped") or _plain_text(row.get("comment_html"))
+    author = out.pop("created_by", None)
+    if author:
+        out["author"] = author_names.get(str(author), str(author))
+    if body:
+        out["comment"] = body
+    return out
+
+
+def _shape_work_item(row: Any, *, states: dict, priorities: dict) -> dict:
+    """One work item as something to act on: the body as text, and state and
+    priority as the words on the board rather than their ids."""
+    if not isinstance(row, dict):
+        return {"value": row}
+    out = _slim(row, _ITEM_DETAIL_FIELDS)
+    description = row.get("description_stripped") or _plain_text(
+        row.get("description_html")
+    )
+    out.pop("description_stripped", None)
+    if description:
+        out["description"] = description
+    state = out.get("state")
+    if state:
+        out["state"] = states.get(str(state), state)
+    priority = out.get("priority")
+    if priority:
+        out["priority"] = priorities.get(str(priority), priority)
+    return out
 
 
 def resolve_workspace_slug(
@@ -251,6 +354,107 @@ async def _call(
         }
 
 
+async def read_work_item(
+    request: Any,
+    *,
+    slug: str,
+    project_id: Optional[str],
+    work_item_id: Optional[str],
+    limit: int = 50,
+) -> dict:
+    """One work item, its body and its comment thread.
+
+    Everything else here writes; without this an agent could comment on an
+    item it had never read. `list` returns titles only, so "read this work
+    item and act on it" meant leaving the MCP for the REST API.
+
+    Accepts the board key (``YUMMY-8``) as well as the uuid — the key is
+    what a person has in front of them, and it needs no project id.
+    """
+    ref = (work_item_id or "").strip()
+    if not ref:
+        return {
+            "error": "missing_argument",
+            "detail": (
+                "read needs work_item_id: the key from the board (e.g. YUMMY-8) "
+                "or the item's uuid."
+            ),
+        }
+
+    if _is_work_item_key(ref):
+        payload, error = await _call(
+            request, "GET", f"/api/v1/workspaces/{slug}/work-items/{ref.upper()}/"
+        )
+        if error:
+            return error
+        item = payload if isinstance(payload, dict) else {}
+        project_id = item.get("project_id") or item.get("project") or project_id
+    else:
+        if not project_id:
+            return {
+                "error": "missing_argument",
+                "detail": (
+                    "Reading by uuid needs project_id. Pass the board key "
+                    "(e.g. YUMMY-8) to read without one."
+                ),
+            }
+        payload, error = await _call(
+            request,
+            "GET",
+            f"/api/v1/workspaces/{slug}/projects/{project_id}/issues/{ref}/",
+        )
+        if error:
+            return error
+        item = payload if isinstance(payload, dict) else {}
+
+    item_id = item.get("id")
+    if not item_id or not project_id:
+        return {"error": "not_found", "detail": f"No work item {ref} in {slug}."}
+
+    root = f"/api/v1/workspaces/{slug}/projects/{project_id}"
+
+    # State and priority are ids on the row. Resolving them is best effort:
+    # the body is what was asked for, and an unreadable lookup must not cost
+    # the caller the read.
+    states_payload, _states_error = await _call(request, "GET", f"{root}/states/")
+    priorities_payload, _priorities_error = await _call(
+        request, "GET", f"{root}/priorities/"
+    )
+
+    result: dict = {
+        "workspace": slug,
+        "work_item": _shape_work_item(
+            item,
+            states=_names_by_id(states_payload),
+            priorities=_names_by_id(priorities_payload),
+        ),
+    }
+
+    comments_payload, comments_error = await _call(
+        request,
+        "GET",
+        f"{root}/issues/{item_id}/comments/",
+        params={"per_page": max(1, min(int(limit or 50), 100))},
+    )
+    if comments_error:
+        # Say so rather than implying the thread is empty.
+        result["comments_error"] = comments_error
+        return result
+
+    rows = _rows(comments_payload)
+    if not rows:
+        result["comments"] = []
+        return result
+
+    members_payload, _members_error = await _call(request, "GET", f"{root}/members/")
+    author_names = _member_names(members_payload)
+    comments = [_shape_comment(row, author_names) for row in rows]
+    # Oldest first: a thread reads as a conversation, not as a stack.
+    comments.sort(key=lambda row: str(row.get("created_at") or ""))
+    result["comments"] = comments
+    return result
+
+
 def register(mcp: Any) -> None:
     """Add the workspace tools to the Klio MCP server."""
     from typing import Annotated, Literal  # noqa: PLC0415 -- local to the schema
@@ -351,12 +555,15 @@ def register(mcp: Any) -> None:
     @mcp.tool(
         name="work_items",
         description=(
-            "Work items (issues) on a workspace project — create them, list "
-            "them, move them, comment on them. This is how you DO the work "
-            "you remember. "
-            "Args: action ('list' default | 'create' | 'update' | 'comment' | "
-            "'states'); project_id (required except for 'states' listing, "
-            "which also needs it); for create: name, optional description, "
+            "Work items (issues) on a workspace project — read them, create "
+            "them, list them, move them, comment on them. This is how you DO "
+            "the work you remember. "
+            "Args: action ('list' default | 'read' | 'create' | 'update' | "
+            "'comment' | 'states'); project_id (required for everything "
+            "except reading by key); for read: work_item_id, which accepts "
+            "the key from the board (e.g. YUMMY-8, no project_id needed) or "
+            "the item's uuid — it returns the body and the comment thread, "
+            "and `list` returns neither; for create: name, optional description, "
             "priority ('urgent'|'high'|'medium'|'low'|'none'), state_id; for "
             "update: work_item_id plus any of name/description/priority/"
             "state_id; for comment: work_item_id and comment. "
@@ -367,14 +574,20 @@ def register(mcp: Any) -> None:
     async def work_items(
         ctx: Context,
         action: Annotated[
-            Literal["list", "create", "update", "comment", "states"],
+            Literal["list", "read", "create", "update", "comment", "states"],
             Field(description="What to do."),
         ] = "list",
         project_id: Annotated[
             Optional[str], Field(description="Workspace project id.")
         ] = None,
         work_item_id: Annotated[
-            Optional[str], Field(description="Work item id (update, comment).")
+            Optional[str],
+            Field(
+                description=(
+                    "Work item id (read, update, comment). For read this may "
+                    "also be the board key, e.g. YUMMY-8."
+                )
+            ),
         ] = None,
         name: Annotated[
             Optional[str], Field(description="Title (create/update).")
@@ -416,6 +629,17 @@ def register(mcp: Any) -> None:
         slug, error = resolve_workspace_slug(request, workspace)
         if error:
             return error
+
+        # Reading by board key needs no project: the key names it.
+        if action == "read":
+            return await read_work_item(
+                request,
+                slug=slug,
+                project_id=project_id,
+                work_item_id=work_item_id,
+                limit=limit,
+            )
+
         if not project_id:
             return {
                 "error": "missing_argument",
