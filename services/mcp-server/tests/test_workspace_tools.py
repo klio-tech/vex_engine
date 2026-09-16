@@ -165,8 +165,8 @@ async def test_workspace_refusals_are_passed_through_not_masked(monkeypatch):
     assert error["error"] == "forbidden"
 
 
-def test_slim_keeps_every_api_field_including_empty_and_unlisted():
-    """Agents implement from titles when the body is dropped. Pass the row through."""
+def test_catalog_omits_description_and_keeps_empty_assignees():
+    """List is a cheap index: enough to pick a row, not the spec or chat log."""
     row = {
         "id": "418c1654",
         "name": "Chat channels need the ability to be deleted",
@@ -180,37 +180,40 @@ def test_slim_keeps_every_api_field_including_empty_and_unlisted():
         "target_date": None,
         "created_at": "2026-09-01T00:00:00Z",
     }
-    out = workspace_tools._slim(row, ("id", "name", "priority"))
-    assert out["description_stripped"].startswith("Put deleted")
-    assert out["description_html"].startswith("<p>")
+    out = workspace_tools.catalog_work_item(row)
+    assert out["id"] == "418c1654"
+    assert out["name"].startswith("Chat channels")
     assert out["assignees"] == []
     assert out["labels"] == []
-    assert out["priority"] is None
-    assert out["target_date"] is None
-    assert out["sequence_id"] == 102
+    assert "description_html" not in out
+    assert "description_stripped" not in out
 
 
-def test_work_item_list_rows_are_not_slimmed():
-    payload = {
+def test_work_item_detail_includes_description_and_comments():
+    """Get is the expensive call: body plus the comment thread."""
+    issue = {
+        "id": "1",
+        "name": "Ship it",
+        "description_stripped": "Put deleted channels in a recycle bin.",
+        "description_html": "<p>Put deleted channels in a recycle bin.</p>",
+        "assignees": ["user-1"],
+    }
+    comments = {
         "results": [
             {
-                "id": "1",
-                "name": "Ship it",
-                "priority": None,
-                "description_stripped": "",
-                "description_html": "<p></p>",
-                "assignees": ["user-1"],
+                "id": "c1",
+                "comment_html": "<p>Also add a restore path.</p>",
+                "comment_stripped": "Also add a restore path.",
+                "actor": "user-2",
+                "created_at": "2026-09-02T00:00:00Z",
             }
         ]
     }
-    items = [
-        workspace_tools._slim(row, workspace_tools._ITEM_FIELDS)
-        for row in workspace_tools._rows(payload)
-    ]
-    assert items[0]["assignees"] == ["user-1"]
-    assert items[0]["description_html"] == "<p></p>"
-    assert items[0]["priority"] is None
-    assert "description_stripped" in items[0]
+    out = workspace_tools.work_item_detail(issue, comments)
+    assert out["description_stripped"].startswith("Put deleted")
+    assert out["description_html"].startswith("<p>")
+    assert out["comments"][0]["comment_stripped"] == "Also add a restore path."
+    assert out["comments"][0]["actor"] == "user-2"
 
 
 def test_rows_handles_both_paginated_and_bare_payloads():

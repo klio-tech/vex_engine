@@ -44,18 +44,31 @@ WORKSPACE_API_URL_ENV = "WORKSPACE_API_URL"
 
 REQUEST_TIMEOUT_SECONDS = 20
 
-# Kept for tests and call sites that still pass a field list. The list is
-# ignored: agents need the full workspace API row, including empty values.
+#: Catalog fields for list. Description and comments belong on get.
 _ITEM_FIELDS = (
     "id",
     "name",
     "sequence_id",
     "priority",
     "state",
-    "description_stripped",
+    "assignees",
+    "labels",
     "created_at",
     "updated_at",
     "target_date",
+)
+
+#: Empty lists still matter for filtering (unassigned vs assigned).
+_KEEP_EMPTY = frozenset({"assignees", "labels", "priority", "state", "target_date"})
+
+_COMMENT_FIELDS = (
+    "id",
+    "comment_html",
+    "comment_stripped",
+    "actor",
+    "created_by",
+    "created_at",
+    "updated_at",
 )
 
 _PROJECT_FIELDS = ("id", "name", "identifier", "description", "created_at")
@@ -79,14 +92,30 @@ def _unconfigured() -> dict:
 
 
 def _slim(row: Any, fields: tuple[str, ...] = ()) -> dict:
-    """Pass through the workspace API row.
-
-    ``fields`` is ignored. A whitelist that also dropped empty values hid
-    work-item descriptions, so agents implemented from titles only.
-    """
+    """Keep the named fields. Empty assignees/labels stay; other empties drop."""
     if not isinstance(row, dict):
         return {"value": row}
-    return dict(row)
+    out = {}
+    for field in fields:
+        if field not in row:
+            continue
+        value = row[field]
+        if value in (None, "", []) and field not in _KEEP_EMPTY:
+            continue
+        out[field] = value
+    return out
+
+
+def catalog_work_item(row: Any) -> dict:
+    """List row: identity and filters, not the spec or chat log."""
+    return _slim(row, _ITEM_FIELDS)
+
+
+def work_item_detail(issue_payload: Any, comments_payload: Any = None) -> dict:
+    """One work item with its body and comment thread."""
+    item = dict(issue_payload) if isinstance(issue_payload, dict) else {"value": issue_payload}
+    item["comments"] = [_slim(row, _COMMENT_FIELDS) for row in _rows(comments_payload)]
+    return item
 
 
 def _rows(payload: Any) -> list:
@@ -308,11 +337,15 @@ def register(mcp: Any) -> None:
         name="work_items",
         description=(
             "Work items (issues) on a workspace project — create them, list "
-            "them, move them, comment on them. This is how you DO the work "
-            "you remember. "
-            "Args: action ('list' default | 'create' | 'update' | 'comment' | "
-            "'states'); project_id (required except for 'states' listing, "
-            "which also needs it); for create: name, optional description, "
+            "them, read them, move them, comment on them. This is how you DO "
+            "the work you remember. "
+            "Args: action ('list' default | 'get' | 'create' | 'update' | "
+            "'comment' | 'states'); project_id (required except for 'states' "
+            "listing, which also needs it). "
+            "'list' is a cheap catalog (id, title, state, assignees, dates) — "
+            "use it to pick rows. 'get' needs work_item_id and returns the "
+            "full body plus the comment thread (the chat log). "
+            "For create: name, optional description, "
             "priority ('urgent'|'high'|'medium'|'low'|'none'), state_id; for "
             "update: work_item_id plus any of name/description/priority/"
             "state_id; for comment: work_item_id and comment. "
@@ -323,14 +356,14 @@ def register(mcp: Any) -> None:
     async def work_items(
         ctx: Context,
         action: Annotated[
-            Literal["list", "create", "update", "comment", "states"],
-            Field(description="What to do."),
+            Literal["list", "get", "create", "update", "comment", "states"],
+            Field(description="What to do. list = catalog; get = full item + comments."),
         ] = "list",
         project_id: Annotated[
             Optional[str], Field(description="Workspace project id.")
         ] = None,
         work_item_id: Annotated[
-            Optional[str], Field(description="Work item id (update, comment).")
+            Optional[str], Field(description="Work item id (get, update, comment).")
         ] = None,
         name: Annotated[
             Optional[str], Field(description="Title (create/update).")
@@ -399,7 +432,33 @@ def register(mcp: Any) -> None:
             )
             if error:
                 return error
-            return {"work_items": [_slim(row, _ITEM_FIELDS) for row in _rows(payload)]}
+            return {
+                "work_items": [catalog_work_item(row) for row in _rows(payload)]
+            }
+
+        if action == "get":
+            if not work_item_id:
+                return {
+                    "error": "missing_argument",
+                    "detail": "get needs work_item_id.",
+                }
+            payload, error = await _call(
+                request, "GET", f"{root}/issues/{work_item_id}/"
+            )
+            if error:
+                return error
+            comments_payload, comments_error = await _call(
+                request,
+                "GET",
+                f"{root}/issues/{work_item_id}/comments/",
+                params={"per_page": 100},
+            )
+            detail = work_item_detail(
+                payload, comments_payload if not comments_error else None
+            )
+            if comments_error:
+                detail["comments_error"] = comments_error
+            return {"work_item": detail}
 
         if action == "create":
             if not name:
