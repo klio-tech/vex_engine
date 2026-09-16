@@ -9,7 +9,8 @@ guessed for.
 
 from unittest.mock import MagicMock
 
-import app.workspace_tools as workspace_tools
+import asyncio
+
 import pytest
 
 from app import workspace_tools
@@ -211,4 +212,501 @@ class TestCredentialKind:
     def test_unauthorized_is_not_reported_as_forbidden(self):
         """`forbidden` means "recognised you, refused you". Reporting an
         unusable credential that way sends people to the permissions UI."""
-        assert workspace_tools._not_a_workspace_key("ag_live_abc")["error"] != "forbidden"
+        assert (
+            workspace_tools._not_a_workspace_key("ag_live_abc")["error"] != "forbidden"
+        )
+
+
+class TestWorkItemKeys:
+    """The key a person reads off the board is accepted as an id."""
+
+    @pytest.mark.parametrize("ref", ["YUMMY-8", "yummy-8", " KLIO-1234 ", "A1-2"])
+    def test_board_keys_are_recognised(self, ref):
+        assert workspace_tools._is_work_item_key(ref)
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "ff289b42-0307-4de8-a0ab-86fb76bf025b",
+            "YUMMY",
+            "8",
+            "YUMMY-",
+            "",
+            None,
+            12,
+        ],
+    )
+    def test_everything_else_is_a_uuid_or_nonsense(self, ref):
+        assert not workspace_tools._is_work_item_key(ref)
+
+
+class TestPlainText:
+    def test_markup_becomes_readable_lines(self):
+        assert (
+            workspace_tools._plain_text(
+                "<p>Purge <strong>old</strong> data</p><ul><li>drop table</li>"
+                "<li>vacuum</li></ul>"
+            )
+            == "Purge old data\ndrop table\nvacuum"
+        )
+
+    def test_entities_are_decoded_and_breaks_kept(self):
+        assert workspace_tools._plain_text("<p>a &amp; b<br>c</p>") == "a & b\nc"
+
+    def test_empty_markup_is_empty(self):
+        assert workspace_tools._plain_text("<p></p>") == ""
+        assert workspace_tools._plain_text(None) == ""
+
+
+class TestShaping:
+    def test_state_and_priority_come_back_as_words(self):
+        item = workspace_tools._shape_work_item(
+            {
+                "id": "ff289b42-0307-4de8-a0ab-86fb76bf025b",
+                "name": "Purge the old data",
+                "state": "state-1",
+                "priority": "priority-1",
+                "description_html": "<p>Drop the 2019 rows.</p>",
+            },
+            states={"state-1": "In Progress"},
+            priorities={"priority-1": "High"},
+        )
+        assert item["state"] == "In Progress"
+        assert item["priority"] == "High"
+        assert item["description"] == "Drop the 2019 rows."
+        assert "description_stripped" not in item
+
+    def test_unknown_ids_are_returned_as_they_are(self):
+        item = workspace_tools._shape_work_item(
+            {"id": "i", "state": "state-x", "priority": "priority-x"},
+            states={},
+            priorities={},
+        )
+        assert item["state"] == "state-x"
+        assert item["priority"] == "priority-x"
+
+    def test_the_stored_plain_text_wins_over_the_markup(self):
+        item = workspace_tools._shape_work_item(
+            {
+                "id": "i",
+                "description_stripped": "already plain",
+                "description_html": "<p>markup</p>",
+            },
+            states={},
+            priorities={},
+        )
+        assert item["description"] == "already plain"
+
+    def test_a_comment_is_attributed_to_a_person(self):
+        shaped = workspace_tools._shape_comment(
+            {
+                "id": "c1",
+                "created_at": "2026-09-16T10:00:00Z",
+                "created_by": "user-1",
+                "comment_html": "<p>Ask Oren first.</p>",
+            },
+            {"user-1": "Abhishek"},
+        )
+        assert shaped == {
+            "id": "c1",
+            "created_at": "2026-09-16T10:00:00Z",
+            "author": "Abhishek",
+            "comment": "Ask Oren first.",
+        }
+
+    def test_an_unknown_author_keeps_their_id(self):
+        shaped = workspace_tools._shape_comment(
+            {"id": "c1", "created_by": "user-9", "comment_stripped": "hi"}, {}
+        )
+        assert shaped["author"] == "user-9"
+
+    def test_member_rows_map_ids_to_names(self):
+        names = workspace_tools._member_names(
+            {
+                "results": [
+                    {"member": {"id": "u1", "display_name": "Oren"}, "role": 20},
+                    {"member": "u2", "display_name": "Paul"},
+                    {"member": {"id": "u3", "email": "omar@example.test"}},
+                    {"nothing": True},
+                ]
+            }
+        )
+        assert names == {"u1": "Oren", "u2": "Paul", "u3": "omar@example.test"}
+
+
+def _fake_call(responses, calls):
+    """Stand in for `_call`, answering by path and recording the order."""
+
+    async def _call(request, method, path, *, params=None, json_body=None):
+        calls.append((method, path, params))
+        for suffix, answer in responses.items():
+            if path.endswith(suffix):
+                return answer
+        return {}, None
+
+    return _call
+
+
+ITEM = {
+    "id": "ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    "name": "Purge the old data for YYT",
+    "sequence_id": 8,
+    "project_id": "6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+    "state": "state-1",
+    "priority": "priority-1",
+    "description_html": "<p>Drop everything before 2024.</p>",
+}
+
+LOOKUPS = {
+    "/states/": ({"results": [{"id": "state-1", "name": "Todo"}]}, None),
+    "/priorities/": ({"results": [{"id": "priority-1", "name": "Urgent"}]}, None),
+    "/members/": (
+        {"results": [{"member": {"id": "user-1", "display_name": "Oren"}}]},
+        None,
+    ),
+}
+
+
+@pytest.mark.anyio
+async def test_read_returns_the_body_and_the_thread(monkeypatch):
+    calls = []
+    responses = dict(LOOKUPS)
+    responses["/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/"] = (ITEM, None)
+    responses["/comments/"] = (
+        {
+            "results": [
+                {
+                    "id": "c2",
+                    "created_at": "2026-09-16T12:00:00Z",
+                    "created_by": "user-1",
+                    "comment_html": "<p>Second</p>",
+                },
+                {
+                    "id": "c1",
+                    "created_at": "2026-09-16T09:00:00Z",
+                    "created_by": "user-1",
+                    "comment_html": "<p>First</p>",
+                },
+            ]
+        },
+        None,
+    )
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call(responses, calls))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert result["work_item"]["description"] == "Drop everything before 2024."
+    assert result["work_item"]["state"] == "Todo"
+    assert result["work_item"]["priority"] == "Urgent"
+    # A thread reads oldest first.
+    assert [c["id"] for c in result["comments"]] == ["c1", "c2"]
+    assert result["comments"][0]["author"] == "Oren"
+    assert calls[0] == (
+        "GET",
+        "/api/v1/workspaces/yummy/projects/6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/",
+        None,
+    )
+
+
+@pytest.mark.anyio
+async def test_a_board_key_needs_no_project_id(monkeypatch):
+    calls = []
+    responses = dict(LOOKUPS)
+    responses["/work-items/YUMMY-8/"] = (ITEM, None)
+    responses["/comments/"] = ({"results": []}, None)
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call(responses, calls))
+
+    result = await workspace_tools.read_work_item(
+        _Request(), slug="yummy", project_id=None, work_item_id="yummy-8"
+    )
+
+    assert calls[0][1] == "/api/v1/workspaces/yummy/work-items/YUMMY-8/"
+    assert result["work_item"]["name"] == "Purge the old data for YYT"
+    assert result["comments"] == []
+    # No thread, no reason to ask who the members are.
+    assert not any(path.endswith("/members/") for _, path, _ in calls)
+
+
+@pytest.mark.anyio
+async def test_reading_by_uuid_without_a_project_says_what_to_do(monkeypatch):
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call({}, []))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id=None,
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert result["error"] == "missing_argument"
+    assert "YUMMY-8" in result["detail"]
+
+
+@pytest.mark.anyio
+async def test_read_needs_something_to_read(monkeypatch):
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call({}, []))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id=None,
+    )
+
+    assert result["error"] == "missing_argument"
+
+
+@pytest.mark.anyio
+async def test_a_refusal_from_the_workspace_is_passed_through(monkeypatch):
+    refusal = {"error": "forbidden", "detail": "This token may not do that."}
+    monkeypatch.setattr(
+        workspace_tools,
+        "_call",
+        _fake_call(
+            {"/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/": (None, refusal)}, []
+        ),
+    )
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert result == refusal
+
+
+@pytest.mark.anyio
+async def test_an_unreadable_thread_does_not_cost_the_body(monkeypatch):
+    responses = dict(LOOKUPS)
+    responses["/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/"] = (ITEM, None)
+    responses["/comments/"] = (None, {"error": "unreachable", "detail": "no answer"})
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call(responses, []))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert result["work_item"]["name"] == "Purge the old data for YYT"
+    # Silence would read as "no comments", which is a different fact.
+    assert result["comments_error"]["error"] == "unreachable"
+    assert "comments" not in result
+
+
+@pytest.mark.anyio
+async def test_unresolvable_lookups_still_return_the_item(monkeypatch):
+    responses = {
+        "/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/": (ITEM, None),
+        "/states/": (None, {"error": "unreachable", "detail": "x"}),
+        "/priorities/": (None, {"error": "unreachable", "detail": "x"}),
+        "/comments/": ({"results": []}, None),
+    }
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call(responses, []))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert result["work_item"]["state"] == "state-1"
+    assert result["work_item"]["priority"] == "priority-1"
+
+
+@pytest.mark.anyio
+async def test_an_empty_answer_is_not_found(monkeypatch):
+    monkeypatch.setattr(
+        workspace_tools,
+        "_call",
+        _fake_call({"/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/": ({}, None)}, []),
+    )
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert result["error"] == "not_found"
+
+
+class TestIdValidation:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "ff289b42-0307-4de8-a0ab-86fb76bf025b",
+            " ff289b42-0307-4de8-a0ab-86fb76bf025b ",
+            "FF289B42-0307-4DE8-A0AB-86FB76BF025B",
+        ],
+    )
+    def test_uuids_are_accepted(self, value):
+        assert workspace_tools._is_uuid(value)
+
+    @pytest.mark.parametrize(
+        "value",
+        ["../../projects", "not-a-uuid", "", None, 7, "ff289b42-0307-4de8-a0ab"],
+    )
+    def test_everything_else_is_not_an_id(self, value):
+        assert not workspace_tools._is_uuid(value)
+
+
+@pytest.mark.anyio
+async def test_a_ref_that_is_not_an_id_never_reaches_the_workspace(monkeypatch):
+    """Ids are interpolated into a path on an authenticated client."""
+    calls = []
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call({}, calls))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id="../../../workspaces/other/projects",
+    )
+
+    assert result["error"] == "invalid_argument"
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_a_project_id_that_is_not_an_id_is_refused(monkeypatch):
+    calls = []
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call({}, calls))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="../../..",
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert result["error"] == "invalid_argument"
+    assert calls == []
+
+
+@pytest.mark.anyio
+async def test_a_key_read_checks_the_project_the_workspace_returned(monkeypatch):
+    """The key path takes its project from the payload; it is still a path."""
+    calls = []
+    monkeypatch.setattr(
+        workspace_tools,
+        "_call",
+        _fake_call(
+            {
+                "/work-items/YUMMY-8/": (
+                    {
+                        "id": "ff289b42-0307-4de8-a0ab-86fb76bf025b",
+                        "project_id": "../x",
+                    },
+                    None,
+                )
+            },
+            calls,
+        ),
+    )
+
+    result = await workspace_tools.read_work_item(
+        _Request(), slug="yummy", project_id=None, work_item_id="YUMMY-8"
+    )
+
+    assert result["error"] == "invalid_argument"
+    assert len(calls) == 1
+
+
+@pytest.mark.anyio
+async def test_the_three_lookups_go_together(monkeypatch):
+    """States, priorities and comments do not depend on each other, so the
+    read pays for one round trip rather than three."""
+    started = []
+    finished = []
+    finished_when_started = []
+
+    async def _call(request, method, path, *, params=None, json_body=None):
+        started.append(path)
+        if path.endswith("/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/"):
+            return ITEM, None
+        finished_when_started.append(len(finished))
+        # Yield: a sequential implementation would complete each call before
+        # the next one starts, and see a rising count above.
+        await asyncio.sleep(0)
+        finished.append(path)
+        if path.endswith("/comments/"):
+            return {"results": []}, None
+        return {"results": []}, None
+
+    monkeypatch.setattr(workspace_tools, "_call", _call)
+
+    await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert sorted(path.rsplit("/", 2)[-2] for path in started[1:4]) == [
+        "comments",
+        "priorities",
+        "states",
+    ]
+    # Each of the three began while none of them had finished.
+    assert finished_when_started == [0, 0, 0]
+
+
+@pytest.mark.anyio
+async def test_padded_ids_reach_the_workspace_clean(monkeypatch):
+    """`_is_uuid` parses a stripped value, so the value that goes into the
+    path has to be the stripped one too — a space there is a 404."""
+    calls = []
+    responses = dict(LOOKUPS)
+    responses["/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/"] = (ITEM, None)
+    responses["/comments/"] = ({"results": []}, None)
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call(responses, calls))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="  6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f  ",
+        work_item_id="  ff289b42-0307-4de8-a0ab-86fb76bf025b  ",
+    )
+
+    assert "work_item" in result
+    assert all(" " not in path and "%20" not in path for _, path, _ in calls)
+    assert calls[0] == (
+        "GET",
+        "/api/v1/workspaces/yummy/projects/6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f"
+        "/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/",
+        None,
+    )
+
+
+@pytest.mark.anyio
+async def test_a_padded_project_from_the_workspace_is_cleaned_too(monkeypatch):
+    calls = []
+    responses = dict(LOOKUPS)
+    responses["/work-items/YUMMY-8/"] = (
+        {
+            "id": "ff289b42-0307-4de8-a0ab-86fb76bf025b",
+            "project_id": " 6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f ",
+            "name": "Purge the old data for YYT",
+        },
+        None,
+    )
+    responses["/comments/"] = ({"results": []}, None)
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call(responses, calls))
+
+    result = await workspace_tools.read_work_item(
+        _Request(), slug="yummy", project_id=None, work_item_id="YUMMY-8"
+    )
+
+    assert "work_item" in result
+    assert all(" " not in path for _, path, _ in calls)
