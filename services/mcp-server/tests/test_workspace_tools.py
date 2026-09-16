@@ -358,8 +358,17 @@ ITEM = {
 }
 
 LOOKUPS = {
+    "/activities/": ({"results": []}, None),
     "/states/": ({"results": [{"id": "state-1", "name": "Todo"}]}, None),
-    "/priorities/": ({"results": [{"id": "priority-1", "name": "Urgent"}]}, None),
+    "/priorities/": (
+        {
+            "results": [
+                {"id": "priority-1", "name": "Urgent"},
+                {"id": "priority-2", "name": "High"},
+            ]
+        },
+        None,
+    ),
     "/members/": (
         {"results": [{"member": {"id": "user-1", "display_name": "Oren"}}]},
         None,
@@ -428,8 +437,9 @@ async def test_a_board_key_needs_no_project_id(monkeypatch):
     assert calls[0][1] == "/api/v1/workspaces/yummy/work-items/YUMMY-8/"
     assert result["work_item"]["name"] == "Purge the old data for YYT"
     assert result["comments"] == []
-    # No thread, no reason to ask who the members are.
-    assert not any(path.endswith("/members/") for _, path, _ in calls)
+    # Members are fetched regardless now: they name the people in the
+    # activity feed, which exists even when nobody commented.
+    assert any(path.endswith("/members/") for _, path, _ in calls)
 
 
 @pytest.mark.anyio
@@ -625,8 +635,8 @@ async def test_a_key_read_checks_the_project_the_workspace_returned(monkeypatch)
 
 @pytest.mark.anyio
 async def test_the_three_lookups_go_together(monkeypatch):
-    """States, priorities and comments do not depend on each other, so the
-    read pays for one round trip rather than three."""
+    """The five lookups do not depend on each other, so the read pays for
+    one round trip rather than five."""
     started = []
     finished = []
     finished_when_started = []
@@ -653,13 +663,15 @@ async def test_the_three_lookups_go_together(monkeypatch):
         work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
     )
 
-    assert sorted(path.rsplit("/", 2)[-2] for path in started[1:4]) == [
+    assert sorted(path.rsplit("/", 2)[-2] for path in started[1:6]) == [
+        "activities",
         "comments",
+        "members",
         "priorities",
         "states",
     ]
-    # Each of the three began while none of them had finished.
-    assert finished_when_started == [0, 0, 0]
+    # Each of the five began while none of them had finished.
+    assert finished_when_started == [0, 0, 0, 0, 0]
 
 
 @pytest.mark.anyio
@@ -710,3 +722,203 @@ async def test_a_padded_project_from_the_workspace_is_cleaned_too(monkeypatch):
 
     assert "work_item" in result
     assert all(" " not in path for _, path, _ in calls)
+
+
+class TestActivitySentences:
+    PEOPLE = {"user-1": "Oren", "user-2": "Paul"}
+    PRIORITIES = {"pri-1": "Medium", "pri-2": "High"}
+
+    def describe(self, row):
+        return workspace_tools._describe_activity(
+            row, names=self.PRIORITIES, people=self.PEOPLE
+        )
+
+    def test_creation_reads_as_creation(self):
+        assert (
+            self.describe({"verb": "created", "field": None}) == "created the work item"
+        )
+
+    def test_a_priority_id_becomes_the_word_on_the_board(self):
+        assert (
+            self.describe(
+                {
+                    "verb": "updated",
+                    "field": "priority",
+                    "old_value": "pri-1",
+                    "new_value": "pri-2",
+                }
+            )
+            == "changed priority from Medium to High"
+        )
+
+    def test_state_values_are_already_words(self):
+        assert (
+            self.describe(
+                {
+                    "verb": "updated",
+                    "field": "state",
+                    "old_value": "Backlog",
+                    "new_value": "In Progress",
+                }
+            )
+            == "changed state from Backlog to In Progress"
+        )
+
+    def test_an_assignee_added_and_removed(self):
+        assert (
+            self.describe(
+                {"verb": "updated", "field": "assignees", "new_value": "Paul"}
+            )
+            == "added Paul as assignee"
+        )
+        assert (
+            self.describe(
+                {"verb": "updated", "field": "assignees", "old_value": "Paul"}
+            )
+            == "removed Paul as assignee"
+        )
+
+    def test_setting_and_clearing_a_field(self):
+        assert (
+            self.describe(
+                {"verb": "updated", "field": "target_date", "new_value": "2026-09-16"}
+            )
+            == "set target date to 2026-09-16"
+        )
+        assert (
+            self.describe(
+                {"verb": "updated", "field": "target_date", "old_value": "2026-09-16"}
+            )
+            == "cleared target date (was 2026-09-16)"
+        )
+
+    def test_the_description_diff_is_never_repeated_back(self):
+        assert (
+            self.describe(
+                {
+                    "verb": "updated",
+                    "field": "description",
+                    "old_value": "<p></p>",
+                    "new_value": "<p class='editor-paragraph'>lots of markup</p>",
+                }
+            )
+            == "updated the description"
+        )
+
+    def test_a_row_that_is_not_a_row_is_dropped(self):
+        assert workspace_tools._shape_activity("nonsense", names={}, people={}) is None
+
+    def test_the_actor_is_named(self):
+        shaped = workspace_tools._shape_activity(
+            {
+                "created_at": "2026-09-16T17:32:00Z",
+                "actor": "user-1",
+                "verb": "updated",
+                "field": "assignees",
+                "new_value": "Abhishek",
+            },
+            names={},
+            people=self.PEOPLE,
+        )
+        assert shaped == {
+            "at": "2026-09-16T17:32:00Z",
+            "who": "Oren",
+            "field": "assignees",
+            "change": "added Abhishek as assignee",
+        }
+
+
+@pytest.mark.anyio
+async def test_read_returns_what_happened_to_the_item(monkeypatch):
+    """The case this was built for: no comments, four activity rows."""
+    responses = dict(LOOKUPS)
+    responses["/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/"] = (ITEM, None)
+    responses["/comments/"] = ({"results": []}, None)
+    responses["/activities/"] = (
+        {
+            "results": [
+                {
+                    "created_at": "2026-09-16T19:27:00Z",
+                    "actor": "user-1",
+                    "verb": "updated",
+                    "field": "priority",
+                    "old_value": "priority-2",
+                    "new_value": "priority-1",
+                },
+                {
+                    "created_at": "2026-09-10T19:38:00Z",
+                    "actor": "user-1",
+                    "verb": "created",
+                    "field": None,
+                },
+            ]
+        },
+        None,
+    )
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call(responses, []))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert result["comments"] == []
+    # Oldest first, and the priority id resolved to the word on the board.
+    assert [row["change"] for row in result["activity"]] == [
+        "created the work item",
+        "changed priority from High to Urgent",
+    ]
+    assert {row["who"] for row in result["activity"]} == {"Oren"}
+
+
+@pytest.mark.anyio
+async def test_an_unreadable_activity_feed_does_not_cost_the_body(monkeypatch):
+    responses = dict(LOOKUPS)
+    responses["/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/"] = (ITEM, None)
+    responses["/comments/"] = ({"results": []}, None)
+    responses["/activities/"] = (None, {"error": "unreachable", "detail": "no answer"})
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call(responses, []))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f",
+        work_item_id="ff289b42-0307-4de8-a0ab-86fb76bf025b",
+    )
+
+    assert result["work_item"]["name"] == "Purge the old data for YYT"
+    assert result["activity_error"]["error"] == "unreachable"
+    assert "activity" not in result
+
+
+def test_assignees_and_author_are_people_not_ids():
+    item = workspace_tools._shape_work_item(
+        {
+            "id": "i",
+            "assignees": ["user-1", "user-9"],
+            "created_by": "user-2",
+        },
+        states={},
+        priorities={},
+        people={"user-1": "Oren", "user-2": "Paul"},
+    )
+    assert item["assignees"] == ["Oren", "user-9"]
+    assert item["created_by"] == "Paul"
+
+
+def test_an_unresolvable_id_in_the_activity_is_left_as_it_is():
+    """Better a raw id than a sentence that invents a value."""
+    shaped = workspace_tools._shape_activity(
+        {
+            "created_at": "2026-09-16T19:27:00Z",
+            "verb": "updated",
+            "field": "priority",
+            "old_value": "priority-gone",
+            "new_value": "priority-1",
+        },
+        names={"priority-1": "Urgent"},
+        people={},
+    )
+    assert shaped["change"] == "changed priority from priority-gone to Urgent"
