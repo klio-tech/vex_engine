@@ -165,10 +165,52 @@ async def test_workspace_refusals_are_passed_through_not_masked(monkeypatch):
     assert error["error"] == "forbidden"
 
 
-def test_slim_drops_empty_fields_but_keeps_real_ones():
-    row = {"id": "1", "name": "Ship it", "priority": None, "description_stripped": ""}
-    out = workspace_tools._slim(row, ("id", "name", "priority", "description_stripped"))
-    assert out == {"id": "1", "name": "Ship it"}
+def test_slim_keeps_every_api_field_including_empty_and_unlisted():
+    """Agents implement from titles when the body is dropped. Pass the row through."""
+    row = {
+        "id": "418c1654",
+        "name": "Chat channels need the ability to be deleted",
+        "sequence_id": 102,
+        "priority": None,
+        "state": "62ceb0d8",
+        "description_stripped": "Put deleted channels in a recycle bin.",
+        "description_html": "<p>Put deleted channels in a recycle bin.</p>",
+        "assignees": [],
+        "labels": [],
+        "target_date": None,
+        "created_at": "2026-09-01T00:00:00Z",
+    }
+    out = workspace_tools._slim(row, ("id", "name", "priority"))
+    assert out["description_stripped"].startswith("Put deleted")
+    assert out["description_html"].startswith("<p>")
+    assert out["assignees"] == []
+    assert out["labels"] == []
+    assert out["priority"] is None
+    assert out["target_date"] is None
+    assert out["sequence_id"] == 102
+
+
+def test_work_item_list_rows_are_not_slimmed():
+    payload = {
+        "results": [
+            {
+                "id": "1",
+                "name": "Ship it",
+                "priority": None,
+                "description_stripped": "",
+                "description_html": "<p></p>",
+                "assignees": ["user-1"],
+            }
+        ]
+    }
+    items = [
+        workspace_tools._slim(row, workspace_tools._ITEM_FIELDS)
+        for row in workspace_tools._rows(payload)
+    ]
+    assert items[0]["assignees"] == ["user-1"]
+    assert items[0]["description_html"] == "<p></p>"
+    assert items[0]["priority"] is None
+    assert "description_stripped" in items[0]
 
 
 def test_rows_handles_both_paginated_and_bare_payloads():

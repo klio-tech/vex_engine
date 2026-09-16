@@ -44,8 +44,8 @@ WORKSPACE_API_URL_ENV = "WORKSPACE_API_URL"
 
 REQUEST_TIMEOUT_SECONDS = 20
 
-#: Work-item fields worth returning; the raw API rows are large and most of
-#: it is presentation state an agent has no use for.
+# Kept for tests and call sites that still pass a field list. The list is
+# ignored: agents need the full workspace API row, including empty values.
 _ITEM_FIELDS = (
     "id",
     "name",
@@ -78,18 +78,15 @@ def _unconfigured() -> dict:
     }
 
 
-def _slim(row: Any, fields: tuple[str, ...]) -> dict:
+def _slim(row: Any, fields: tuple[str, ...] = ()) -> dict:
+    """Pass through the workspace API row.
+
+    ``fields`` is ignored. A whitelist that also dropped empty values hid
+    work-item descriptions, so agents implemented from titles only.
+    """
     if not isinstance(row, dict):
         return {"value": row}
-    out = {}
-    for field in fields:
-        if field not in row:
-            continue
-        value = row[field]
-        if value in (None, "", []):
-            continue
-        out[field] = value
-    return out
+    return dict(row)
 
 
 def _rows(payload: Any) -> list:
