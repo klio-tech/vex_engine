@@ -660,3 +660,53 @@ async def test_the_three_lookups_go_together(monkeypatch):
     ]
     # Each of the three began while none of them had finished.
     assert finished_when_started == [0, 0, 0]
+
+
+@pytest.mark.anyio
+async def test_padded_ids_reach_the_workspace_clean(monkeypatch):
+    """`_is_uuid` parses a stripped value, so the value that goes into the
+    path has to be the stripped one too — a space there is a 404."""
+    calls = []
+    responses = dict(LOOKUPS)
+    responses["/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/"] = (ITEM, None)
+    responses["/comments/"] = ({"results": []}, None)
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call(responses, calls))
+
+    result = await workspace_tools.read_work_item(
+        _Request(),
+        slug="yummy",
+        project_id="  6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f  ",
+        work_item_id="  ff289b42-0307-4de8-a0ab-86fb76bf025b  ",
+    )
+
+    assert "work_item" in result
+    assert all(" " not in path and "%20" not in path for _, path, _ in calls)
+    assert calls[0] == (
+        "GET",
+        "/api/v1/workspaces/yummy/projects/6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f"
+        "/issues/ff289b42-0307-4de8-a0ab-86fb76bf025b/",
+        None,
+    )
+
+
+@pytest.mark.anyio
+async def test_a_padded_project_from_the_workspace_is_cleaned_too(monkeypatch):
+    calls = []
+    responses = dict(LOOKUPS)
+    responses["/work-items/YUMMY-8/"] = (
+        {
+            "id": "ff289b42-0307-4de8-a0ab-86fb76bf025b",
+            "project_id": " 6b3a1f2c-1111-4c2d-9f77-0a1b2c3d4e5f ",
+            "name": "Purge the old data for YYT",
+        },
+        None,
+    )
+    responses["/comments/"] = ({"results": []}, None)
+    monkeypatch.setattr(workspace_tools, "_call", _fake_call(responses, calls))
+
+    result = await workspace_tools.read_work_item(
+        _Request(), slug="yummy", project_id=None, work_item_id="YUMMY-8"
+    )
+
+    assert "work_item" in result
+    assert all(" " not in path for _, path, _ in calls)

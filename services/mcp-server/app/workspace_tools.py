@@ -401,7 +401,11 @@ async def read_work_item(
     Accepts the board key (``YUMMY-8``) as well as the uuid — the key is
     what a person has in front of them, and it needs no project id.
     """
+    # Normalised once, here: `_is_uuid` parses a stripped value, so a padded
+    # id would validate and then be interpolated into the path with its
+    # spaces intact.
     ref = (work_item_id or "").strip()
+    project_id = (project_id or "").strip() or None
     if not ref:
         return {
             "error": "missing_argument",
@@ -418,7 +422,9 @@ async def read_work_item(
         if error:
             return error
         item = payload if isinstance(payload, dict) else {}
-        project_id = item.get("project_id") or item.get("project") or project_id
+        from_payload = item.get("project_id") or item.get("project")
+        if isinstance(from_payload, str) and from_payload.strip():
+            project_id = from_payload.strip()
     else:
         if not project_id:
             return {
@@ -440,6 +446,7 @@ async def read_work_item(
         item = payload if isinstance(payload, dict) else {}
 
     item_id = item.get("id")
+    item_id = item_id.strip() if isinstance(item_id, str) else item_id
     if not item_id or not project_id:
         return {"error": "not_found", "detail": f"No work item {ref} in {slug}."}
 
