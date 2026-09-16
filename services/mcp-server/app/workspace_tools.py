@@ -173,6 +173,36 @@ def resolve_workspace_slug(
     }
 
 
+#: Prefixes the WORKSPACE API can authenticate. An engine key (``ag_live_…``)
+#: is a valid Klio credential for memory and meaningless here: the two
+#: credential systems are separate, and only these reach ``api_tokens``.
+_WORKSPACE_KEY_PREFIXES = ("klio_pat_", "klio_bot_", "plane_api_")
+
+
+def _is_workspace_key(token: str) -> bool:
+    """Whether ``token`` is the kind of key the workspace API can validate."""
+    return token.startswith(_WORKSPACE_KEY_PREFIXES)
+
+
+def _not_a_workspace_key(token: str) -> dict:
+    """The error for a credential the workspace cannot authenticate.
+
+    Names the fix, because the caller cannot see their own MCP config from
+    here and the previous wording ("may not do that in this workspace")
+    described a permission problem that was never the cause.
+    """
+    kind = "an engine key" if token.startswith("ag_live_") else "not a workspace token"
+    return {
+        "error": "unauthorized",
+        "detail": (
+            f"This key is {kind}, so the workspace cannot authenticate it. "
+            "Workspace actions need a personal access token (klio_pat_…) "
+            "minted in Klio under Settings; set it as X-Klio-Key on the MCP "
+            "server. Memory tools keep working with either key."
+        ),
+    }
+
+
 async def _call(
     request: Any,
     method: str,
@@ -188,6 +218,13 @@ async def _call(
     token = key_header(request)
     if not token:
         return None, {"error": "unauthorized", "detail": "No API key on the request."}
+    # Fail before the round trip when the key CANNOT work here. An engine
+    # key authenticates to the memory API perfectly well and is unknown to
+    # the workspace, so forwarding it returns an indistinguishable 403 and
+    # the caller goes looking for a permissions problem that does not
+    # exist. This cost a full debugging session on 2026-09-03.
+    if not _is_workspace_key(token):
+        return None, _not_a_workspace_key(token)
 
     try:
         async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT_SECONDS) as client:
@@ -205,7 +242,11 @@ async def _call(
             "detail": "The workspace API did not respond.",
         }
 
-    if response.status_code in (401, 403):
+    if response.status_code == 401:
+        return None, _not_a_workspace_key(token)
+    if response.status_code == 403:
+        # A credential the workspace RECOGNISED and then refused: a real
+        # permission answer, and the workspace stays the authority on it.
         return None, {
             "error": "forbidden",
             "detail": "This token may not do that in this workspace.",

@@ -289,12 +289,17 @@ class RecallRequest(BaseModel):
         description="Search text; empty falls back to most-recent memories.",
     )
     limit: int = Field(default=12, ge=1, description="Max memories to return.")
-    scope: Literal["org", "agent", "private"] = Field(
+    scope: Literal["org", "agent", "private", "agent_only"] = Field(
         default="org",
         description=(
             "'org' (default) returns the visibility ladder — the shared brain "
             "plus the caller's own private and project memories. 'private' "
-            "narrows to the caller's own memories alone. 'agent' is deprecated."
+            "narrows to the caller's own memories alone. 'agent_only' returns "
+            "ONLY memories written by the calling X-Vex-Agent and nothing "
+            "shared — the read for a client that partitions its end users by "
+            "agent; pair it with scope='agent' on the write, or there will be "
+            "no agent rows to find. 'agent' is deprecated: it unions the org "
+            "tier and so can only widen a read, never isolate one."
         ),
     )
     space: Optional[str] = Field(default=None, description="Optional space slug.")
@@ -366,6 +371,25 @@ def _hook_write_scope(
         # other declared value still falls back to the private default.
         if declared_scope == "org" and getattr(key_info, "is_service", False):
             return "org", user_id
+        # The second exception: an explicit 'agent' declaration. Without it
+        # `agent_only` recall can never match -- no row is written with
+        # scope='agent', so `scope = 'agent' AND agent_id = :agent_id`
+        # matches nothing forever and the isolation it promises is silently
+        # inert. An integration key IS attributable (shared.auth sets
+        # KeyInfo.user_id from the key's created_by), so every such capture
+        # was landing as private and the partition the client believed it had
+        # did not exist.
+        #
+        # Unlike 'org' this needs no service token, because it is not a
+        # publication: a default read's ladder is (org | private-mine |
+        # project-mine) with NO agent arm, so an agent row never reaches the
+        # team brain. Attribution is kept -- the agent arm carries no user
+        # predicate, so it does not change who can read the row.
+        #
+        # Hooks are unaffected either way: they never declare a scope, so the
+        # private default that protects them is untouched.
+        if declared_scope == "agent":
+            return "agent", user_id
         return "private", user_id
     logger.warning(
         "capture: request could not be attributed to a user; writing scope=%s "

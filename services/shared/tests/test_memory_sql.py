@@ -460,3 +460,82 @@ async def test_later_tiers_only_fill_the_slots_left(monkeypatch):
     assert calls[0]["limit"] == 10, "tier 1 gets the full budget"
     assert calls[1]["limit"] == 4, "tier 2 gets only what tier 1 left"
     assert calls[1]["candidate_pool"] == ranking.candidate_pool(4)
+
+
+# ---------------------------------------------------------------------------
+# `agent_only`: a read that returns ONLY the caller's agent rows.
+#
+# `scope="agent"` unconditionally unions `scope = 'org'` into the ladder, so
+# it can only ever WIDEN a read. A consumer that partitions its end users by
+# X-Vex-Agent therefore got every org row back whatever agent it declared —
+# which is how one studio's agent quoted another studio's memory. `agent_only`
+# is the narrow read that `agent` never was.
+#
+# It is a READ mode over existing `scope='agent'` rows, not a new row value:
+# MEMORY_SCOPES and the ck_session_memories_scope constraint are untouched, so
+# there is no migration.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_only_excludes_the_org_tier(monkeypatch):
+    """The isolation guarantee: no org arm, so no other tenant's rows."""
+    cap = await _run_recall_sql_capture(
+        monkeypatch, scope="agent_only", agent_id="mf-userA-game1"
+    )
+    sql = cap["vector"][0][0]
+
+    assert "scope = 'agent' AND agent_id = :agent_id" in sql
+    # The leak, asserted as absent.
+    assert "scope = 'org'" not in sql
+    assert "scope = 'private'" not in sql
+    assert "scope = 'project'" not in sql
+
+
+@pytest.mark.asyncio
+async def test_agent_only_binds_the_agent_id(monkeypatch):
+    """The agent must be a bound parameter, never interpolated."""
+    cap = await _run_recall_sql_capture(
+        monkeypatch, scope="agent_only", agent_id="mf-userA-game1"
+    )
+    _sql, params = cap["vector"][0]
+
+    assert params["agent_id"] == "mf-userA-game1"
+
+
+@pytest.mark.asyncio
+async def test_agent_only_ignores_user_id_and_stays_narrow(monkeypatch):
+    """An attributable caller must not silently widen an agent_only read
+    back to the ladder — that would re-open the leak for exactly the
+    callers most likely to hit it."""
+    cap = await _run_recall_sql_capture(
+        monkeypatch,
+        scope="agent_only",
+        agent_id="mf-userA-game1",
+        user_id="00000000-0000-0000-0000-0000000000aa",
+    )
+    sql = cap["vector"][0][0]
+
+    assert "scope = 'org'" not in sql
+    assert "scope = 'private'" not in sql
+
+
+@pytest.mark.asyncio
+async def test_agent_scope_still_unions_org(monkeypatch):
+    """The deprecated `agent` read is UNCHANGED. It is still read so existing
+    rows do not vanish, and consumers relying on it keep their behaviour."""
+    cap = await _run_recall_sql_capture(
+        monkeypatch, scope="agent", agent_id="agent-1"
+    )
+    sql = cap["vector"][0][0]
+
+    assert "scope = 'org'" in sql
+    assert "(scope = 'agent' AND agent_id = :agent_id)" in sql
+
+
+@pytest.mark.asyncio
+async def test_agent_only_without_an_agent_id_is_refused(monkeypatch):
+    """Failing closed matters more here than anywhere: silently dropping the
+    agent would return the whole org to a caller that asked for isolation."""
+    with pytest.raises(ValueError):
+        await _run_recall_sql_capture(monkeypatch, scope="agent_only")
