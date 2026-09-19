@@ -48,41 +48,87 @@ logger = logging.getLogger("agentguard.shared.memory")
 # ---------------------------------------------------------------------------
 
 
-def _parse_dedup_threshold() -> float:
-    """Read, validate, and clamp ``KLIO_DEDUP_THRESHOLD`` from the environment.
+def parse_similarity_threshold(env_name: str, default: float) -> float:
+    """Read, validate, and clamp a cosine-similarity cutoff from *env_name*.
 
     A malformed (non-numeric) or out-of-range value must never crash module
     import — an operator typo in one env var would otherwise take down every
-    process that imports this module. Instead we log a warning and fall back to
-    the ``0.95`` default. The value is also clamped to the valid cosine-similarity
-    range ``[0.0, 1.0]`` (a threshold outside it is meaningless: below 0 collapses
-    everything, above 1 disables dedup entirely).
+    process that imports it. Instead we log a warning and fall back to
+    *default*. The valid range is ``[0.0, 1.0]``: a cutoff outside it is
+    meaningless (below 0 matches everything, above 1 matches nothing).
+
+    Every cutoff read this way is a property of the EMBEDDING MODEL, not of the
+    data: the same pair of texts scores differently under different models.
+    They are env-configurable so a model change can be recalibrated without a
+    code change — see :data:`DEFAULT_EMBEDDING_MODEL` for the current values'
+    provenance.
     """
-    raw = os.environ.get("KLIO_DEDUP_THRESHOLD", "0.95")
+    raw = os.environ.get(env_name)
+    if raw is None or raw.strip() == "":
+        return default
     try:
         value = float(raw)
     except ValueError:
-        logger.warning("invalid KLIO_DEDUP_THRESHOLD=%r; using 0.95", raw)
-        return 0.95
+        logger.warning("invalid %s=%r; using %s", env_name, raw, default)
+        return default
     if not 0.0 <= value <= 1.0:
-        logger.warning("KLIO_DEDUP_THRESHOLD=%s out of [0,1]; using 0.95", value)
-        return 0.95
+        logger.warning("%s=%s out of [0,1]; using %s", env_name, value, default)
+        return default
     return value
 
 
+DEFAULT_DEDUP_THRESHOLD: float = 0.96
+"""Calibrated for ``alibaba/qwen3-embedding-0.6b`` — see :data:`DEFAULT_EMBEDDING_MODEL`."""
+
+
+def _parse_dedup_threshold() -> float:
+    """``KLIO_DEDUP_THRESHOLD``, validated; :data:`DEFAULT_DEDUP_THRESHOLD` otherwise."""
+    return parse_similarity_threshold("KLIO_DEDUP_THRESHOLD", DEFAULT_DEDUP_THRESHOLD)
+
+
 DEDUP_THRESHOLD: float = _parse_dedup_threshold()
-"""Cosine similarity threshold above which two memories are treated as duplicates.
+"""Cosine similarity above which a write is treated as a duplicate of an existing row.
 
-Default ``0.95``, overridable at process start via the ``KLIO_DEDUP_THRESHOLD``
-env var. Raised from the historical ``0.92`` because same-topic technical text
-(code, JSON, config, prose on one subject) embeds very tightly: at 0.92
-genuinely distinct notes cleared the bar and were collapsed into a single row
-by :func:`find_similar_memory`. 0.95 keeps near-identical dedup while letting
-distinct same-topic notes coexist. Read from the environment so it can be tuned
-per deployment without a code change."""
+Default :data:`DEFAULT_DEDUP_THRESHOLD` (``0.96``), overridable at process start
+via ``KLIO_DEDUP_THRESHOLD``. A match folds the new write into the existing row,
+so a cutoff set too LOW silently drops a distinct memory, while one set too high
+only lets a near-duplicate through. It errs high on purpose.
 
-DEFAULT_EMBEDDING_MODEL: str = "intfloat/multilingual-e5-large-instruct"
-"""Default model used for embedding generation when env var is unset."""
+Calibrated 2026-09-18 on 6,000 same-session production pairs (the window
+:func:`find_similar_memory` actually compares within): at ``>= 0.96`` qwen3
+matches genuine duplicates (identical re-captures score 1.000); between 0.92
+and 0.96 it matches different facts in the same sentence frame ("Daily new
+accounts 08-24: 2519" / "08-26: 2969"), which must not merge. The previous
+model's ``0.95`` merged pairs qwen3 correctly keeps apart ("Ireland purchases:
+1" / "Ireland buyers: 1" scored 0.977 under e5, 0.729 under qwen3).
+
+Known limit, independent of the model: rows that differ only in a date or a
+number ("D30 retention 07-11: 0.2%" / "07-12: 0.3%") score above 0.99 under
+either model, so embedding similarity alone cannot tell them apart."""
+
+DEFAULT_EMBEDDING_MODEL: str = "alibaba/qwen3-embedding-0.6b"
+"""Embedding model used when ``MEMORY_EMBEDDING_MODEL`` is unset.
+
+Replaced ``intfloat/multilingual-e5-large-instruct`` on 2026-09-18, when Together
+AI stopped serving any embedding model serverless and every embed call — so
+every memory write — began failing with ``model_not_available``.
+
+Chosen because it is the only model on the Vercel AI Gateway that is at once
+**native 1024-dimensional** (the ``vector(1024)`` columns take it unchanged —
+measured, not taken from docs), **zero data retention**, no training on inputs,
+and multilingual. It follows the same asymmetric convention as e5-instruct —
+documents bare, queries optionally ``Instruct: …\nQuery: …`` — so
+:mod:`shared.embedding_prompt` applies to it as-is.
+
+Vectors from two models are not comparable, so a model change requires every
+stored vector to be recomputed: ``python -m scripts.reembed_memories``.
+
+The model-specific cosine cutoffs were recalibrated against it on real
+production pairs: :data:`DEDUP_THRESHOLD` (0.95 → 0.96),
+``curator.RECONCILE_SIMILARITY_THRESHOLD`` and
+``claims.COLLISION_THRESHOLD`` (0.85 → 0.50: e5 scored even unrelated text
+around 0.80, qwen3 spreads the same pairs from ~0.37 to ~0.97, and 0.50 is the
+qwen3 cutoff that reproduces e5's 0.85 decisions with F1 0.94)."""
 
 DEFAULT_LLM_MODEL: str = "claude-haiku-4-5-20251001"
 """Fallback model for LLM calls when VERIFICATION_MODEL is unset."""
@@ -93,8 +139,11 @@ DEFAULT_LLM_TIMEOUT_S: float = 10.0
 MAX_EMBED_CHARS: int = 1800
 """Head-truncation budget for embedding input (first attempt).
 
-The default embedding model caps input at 512 tokens; at ~4 chars/token a
-1800-char head stays under that (≈450 tokens) for typical text. But this is a
+Sized for the previous model's 512-token cap; at ~4 chars/token a 1800-char
+head stays under that (≈450 tokens) for typical text. qwen3 accepts ~32K
+tokens, but the budget is deliberately unchanged: the re-embed job applies the
+same head truncation, so a re-embedded row and a fresh write of the same
+content produce the same vector. But this is a
 *char* proxy for a *token* cap: dense code/JSON/base64 packs >1 token/char, so
 a 1800-char head can still exceed 512 tokens and make the backend raise. That
 residual risk is handled by :func:`embed_text`'s progressive-truncation retry
@@ -144,6 +193,26 @@ the embedding service being genuinely unavailable → ``None``; it is NOT the
 path for "the content was long". Consequently a short input that fails returns
 ``None`` on a single attempt (no needless retries), while a long/dense input is
 shrunk repeatedly until it fits under the model's token cap."""
+
+#: Backend errors that a second attempt of the SAME input can succeed on.
+#: Everything else either needs a different input (over-length: see the
+#: truncation retry) or will not recover in seconds (auth, bad model).
+TRANSIENT_EMBED_ERRORS: tuple[type[BaseException], ...] = (
+    litellm.ServiceUnavailableError,
+    litellm.RateLimitError,
+    litellm.APIConnectionError,
+    litellm.InternalServerError,
+)
+
+EMBED_TRANSIENT_BACKOFF_S: tuple[float, ...] = (0.5, 1.5)
+"""Pauses before each retry of a transient embedding failure — two retries.
+
+The gateway serves ``alibaba/qwen3-embedding-0.6b`` from a single provider with
+no fallback (``fallbacksAvailable: []``), and that provider returned bursts of
+503 during the 2026-09-19 re-embed. Without a retry, every write that lands in
+such a burst loses its embedding. Bounded and short on purpose: two seconds in
+total, well inside the per-attempt timeout, so a genuinely down backend still
+degrades to ``None`` quickly instead of stacking up writes."""
 
 DEFAULT_EMBED_TIMEOUT_S: float = 15.0
 """Default per-attempt bound on one ``litellm.aembedding`` call, in seconds.
@@ -594,6 +663,7 @@ async def embed_text(
     else:
         candidate = text_input
 
+    transient_attempts = 0
     while True:
         try:
             vector = await _aembedding_call(candidate, prefix)
@@ -613,6 +683,26 @@ async def embed_text(
                 _embed_timeout_s(),
             )
             return None
+        except TRANSIENT_EMBED_ERRORS:
+            # Same input, short pause: a 503 burst is not fixed by shrinking
+            # the text, and shrinking would store a TRUNCATED vector for full
+            # content once the burst cleared. Retry as-is, a bounded number of
+            # times, then fall back to the "backend error -> None" contract.
+            if transient_attempts >= len(EMBED_TRANSIENT_BACKOFF_S):
+                logger.warning(
+                    "embed_text: transient backend error persisted after %d retries; returning None",
+                    transient_attempts,
+                    exc_info=True,
+                )
+                return None
+            delay = EMBED_TRANSIENT_BACKOFF_S[transient_attempts]
+            transient_attempts += 1
+            logger.info(
+                "embed_text: transient backend error; retry %d in %.1fs",
+                transient_attempts,
+                delay,
+            )
+            await asyncio.sleep(delay)
         except (litellm.ContextWindowExceededError, litellm.BadRequestError):
             # Over-length-shaped rejection: shrinking the vector input can make
             # the SAME backend accept it, so retry with harder truncation rather

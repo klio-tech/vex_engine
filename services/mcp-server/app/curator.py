@@ -142,6 +142,7 @@ from shared.memory import (
     call_llm,
     embed_text,
     generate_summary,
+    parse_similarity_threshold,
     supersede_memory,
 )
 from shared.taxonomy import (
@@ -249,7 +250,13 @@ _CURATOR_SOURCE: str = "curator"
 # Reconciliation: a new fact supersedes an older one only on DIRECT
 # contradiction. Conservative by design — a stale fact surviving is
 # acceptable; a live fact hidden is not.
-RECONCILE_SIMILARITY_THRESHOLD = 0.85
+# Model-specific: 0.50 under qwen3 reproduces the previous model's 0.85
+# candidate set (see ``shared.memory.DEFAULT_EMBEDDING_MODEL``). Only gates
+# which neighbours reach the LLM judge; it never supersedes anything by itself.
+# Overridable via ``KLIO_RECONCILE_THRESHOLD``.
+RECONCILE_SIMILARITY_THRESHOLD = parse_similarity_threshold(
+    "KLIO_RECONCILE_THRESHOLD", 0.50
+)
 RECONCILE_CANDIDATES_PER_FACT = 5
 
 # Relations the extraction pass may draw. Deliberately NOT the full closed set
@@ -999,7 +1006,7 @@ async def _synthesize_and_store(
                 # fact against STORED facts, so both sides of the comparison
                 # are documents and neither is phrased as a search. Wrapping
                 # this one in the query template would shift every similarity
-                # against a fixed 0.90 threshold — either no reconciliation at
+                # against RECONCILE_SIMILARITY_THRESHOLD — either no reconciliation at
                 # all, or an LLM judge asked to arbitrate random pairs.
                 fact_embedding = await embed_text(
                     item.content, role=embedding_prompt.ROLE_PASSAGE

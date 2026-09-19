@@ -102,7 +102,9 @@ def test_scope_label_is_the_linked_project_display_name(channel_kind):
         fetchone_results=[_agent_row(), message],
         fetchall_results=[[], []],  # participants, history
     )
-    linked = SimpleNamespace(id="proj-1", org_id="org-1", display_name="Launch Readiness")
+    linked = SimpleNamespace(
+        id="proj-1", org_id="org-1", display_name="Launch Readiness"
+    )
     engine_conn = _conn(
         fetchone_results=[SimpleNamespace(org_id="org-1"), linked],
     )
