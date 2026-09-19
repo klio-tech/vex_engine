@@ -524,9 +524,7 @@ async def test_agent_only_ignores_user_id_and_stays_narrow(monkeypatch):
 async def test_agent_scope_still_unions_org(monkeypatch):
     """The deprecated `agent` read is UNCHANGED. It is still read so existing
     rows do not vanish, and consumers relying on it keep their behaviour."""
-    cap = await _run_recall_sql_capture(
-        monkeypatch, scope="agent", agent_id="agent-1"
-    )
+    cap = await _run_recall_sql_capture(monkeypatch, scope="agent", agent_id="agent-1")
     sql = cap["vector"][0][0]
 
     assert "scope = 'org'" in sql

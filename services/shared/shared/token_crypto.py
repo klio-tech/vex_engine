@@ -54,7 +54,13 @@ _KDF_SALT = b"klio-bot-token-v1"
 _KDF_ITERATIONS = 200_000
 SECRET_ENV = "BOT_TOKEN_CIPHER_KEY"
 
-__all__ = ["InvalidToken", "SECRET_ENV", "decrypt_bot_token", "derive_key", "hash_token"]
+__all__ = [
+    "InvalidToken",
+    "SECRET_ENV",
+    "decrypt_bot_token",
+    "derive_key",
+    "hash_token",
+]
 
 
 def hash_token(raw: str) -> str:
@@ -72,7 +78,9 @@ def derive_key(secret: str) -> bytes:
     """
     if not secret:
         raise ValueError("bot-token cipher secret is empty")
-    dk = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), _KDF_SALT, _KDF_ITERATIONS)
+    dk = hashlib.pbkdf2_hmac(
+        "sha256", secret.encode("utf-8"), _KDF_SALT, _KDF_ITERATIONS
+    )
     return base64.urlsafe_b64encode(dk)
 
 
