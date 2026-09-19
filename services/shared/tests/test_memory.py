@@ -531,9 +531,10 @@ async def test_find_similar_memory_above_threshold():
     """find_similar_memory should return record when similarity >= threshold."""
     row = _make_db_row(content="existing fact")
     db_session = MagicMock()
-    # fetchone returns (row..., similarity_score)
+    # fetchone returns (row..., similarity_score). Relative to the cutoff, not a
+    # literal: the cutoff is model-specific and moves when the model does.
     mock_result = MagicMock()
-    mock_result.fetchone = MagicMock(return_value=(*row, 0.95))
+    mock_result.fetchone = MagicMock(return_value=(*row, DEDUP_THRESHOLD + 0.01))
     db_session.execute = MagicMock(return_value=mock_result)
 
     with patch(
@@ -670,8 +671,8 @@ def test_supersede_memory_falls_back_to_flip_time_when_lookup_fails():
 
 def test_constants():
     """Verify module constants are set correctly."""
-    assert DEDUP_THRESHOLD == 0.95
-    assert DEFAULT_EMBEDDING_MODEL == "intfloat/multilingual-e5-large-instruct"
+    assert DEDUP_THRESHOLD == 0.96
+    assert DEFAULT_EMBEDDING_MODEL == "alibaba/qwen3-embedding-0.6b"
 
 
 def test_dedup_threshold_env_override(monkeypatch):
@@ -695,14 +696,14 @@ def test_dedup_threshold_env_override(monkeypatch):
         sig = inspect.signature(reloaded.find_similar_memory)
         assert sig.parameters["threshold"].default == 0.97
     finally:
-        # Restore module to its default state so later tests see 0.95.
+        # Restore module to its default state so later tests see the default.
         monkeypatch.delenv("KLIO_DEDUP_THRESHOLD", raising=False)
         importlib.reload(memory_mod)
 
 
 def test_dedup_threshold_malformed_falls_back_to_default(monkeypatch):
     """A non-numeric KLIO_DEDUP_THRESHOLD must NOT crash module import: it falls
-    back to the 0.95 default (with a logged warning)."""
+    back to the 0.96 default (with a logged warning)."""
     import importlib
 
     import shared.memory as memory_mod
@@ -710,7 +711,7 @@ def test_dedup_threshold_malformed_falls_back_to_default(monkeypatch):
     monkeypatch.setenv("KLIO_DEDUP_THRESHOLD", "not-a-number")
     try:
         reloaded = importlib.reload(memory_mod)
-        assert reloaded.DEDUP_THRESHOLD == 0.95
+        assert reloaded.DEDUP_THRESHOLD == 0.96
     finally:
         monkeypatch.delenv("KLIO_DEDUP_THRESHOLD", raising=False)
         importlib.reload(memory_mod)
@@ -718,7 +719,7 @@ def test_dedup_threshold_malformed_falls_back_to_default(monkeypatch):
 
 @pytest.mark.parametrize("bad_value", ["1.5", "-0.1", "2", "-3.0"])
 def test_dedup_threshold_out_of_range_falls_back_to_default(monkeypatch, bad_value):
-    """A KLIO_DEDUP_THRESHOLD outside [0.0, 1.0] is clamped back to the 0.95
+    """A KLIO_DEDUP_THRESHOLD outside [0.0, 1.0] is clamped back to the 0.96
     default (a similarity threshold outside that range is meaningless)."""
     import importlib
 
@@ -727,7 +728,7 @@ def test_dedup_threshold_out_of_range_falls_back_to_default(monkeypatch, bad_val
     monkeypatch.setenv("KLIO_DEDUP_THRESHOLD", bad_value)
     try:
         reloaded = importlib.reload(memory_mod)
-        assert reloaded.DEDUP_THRESHOLD == 0.95
+        assert reloaded.DEDUP_THRESHOLD == 0.96
     finally:
         monkeypatch.delenv("KLIO_DEDUP_THRESHOLD", raising=False)
         importlib.reload(memory_mod)
@@ -998,3 +999,34 @@ async def test_extract_typed_memories_bounds_every_interpolated_field():
 async def test_extract_typed_memories_is_empty_on_llm_failure():
     with patch("shared.memory.call_llm", new=AsyncMock(return_value=None)):
         assert await memory_module.extract_typed_memories("anything") == []
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        (None, 0.42),
+        ("", 0.42),
+        ("0.7", 0.7),
+        ("0", 0.0),
+        ("1", 1.0),
+        ("nope", 0.42),
+        ("1.2", 0.42),
+        ("-0.1", 0.42),
+    ],
+)
+def test_parse_similarity_threshold(monkeypatch, raw, expected):
+    """Every model-specific cutoff shares one parser: unset/blank/bad -> default."""
+    from shared.memory import parse_similarity_threshold
+
+    if raw is None:
+        monkeypatch.delenv("KLIO_TEST_THRESHOLD", raising=False)
+    else:
+        monkeypatch.setenv("KLIO_TEST_THRESHOLD", raw)
+    assert parse_similarity_threshold("KLIO_TEST_THRESHOLD", 0.42) == expected
+
+
+def test_claim_collision_and_reconcile_cutoffs_are_calibrated_for_qwen3():
+    """0.85 was an e5 number: under qwen3 it would surface almost nothing."""
+    from shared import claims
+
+    assert claims.COLLISION_THRESHOLD == 0.50

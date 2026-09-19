@@ -1,6 +1,19 @@
 """How a SEARCH STRING is phrased to the embedding model. Read path only.
 
-The production model is ``intfloat/multilingual-e5-large-instruct``. The
+**Model change, 2026-09-18.** Production now embeds with
+``alibaba/qwen3-embedding-0.6b`` (see ``shared.memory.DEFAULT_EMBEDDING_MODEL``).
+Qwen3's embedding models use the same asymmetric convention described below —
+documents bare, queries ``Instruct: {task}\nQuery: {q}`` — so this module needed
+no change. Re-measured on 4,000 production rows and the same 17 queries,
+``instruct`` put the right project first on 3 of 17 queries against 2 for
+``bare``, with a lower mean margin: still not enough evidence to change the
+default, which stays ``bare``. Raw cosine margins are not comparable across the
+two models, because qwen3 spreads scores roughly four times wider than e5.
+
+The history below is the e5-era measurement; its conclusion — the project
+fence, not the embedding, is what separates projects — still holds.
+
+The previous production model was ``intfloat/multilingual-e5-large-instruct``. The
 2026-08-16 ranking diagnosis identified a real defect here — the engine sends
 bare text and E5 is trained on asymmetric prompts — and proposed the ``e5-base``
 convention: ``passage: `` on every stored document, ``query: `` on every

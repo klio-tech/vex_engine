@@ -23,12 +23,15 @@ from typing import Any, Optional
 
 from sqlalchemy import text
 
-from shared.memory import embed_text
+from shared.memory import embed_text, parse_similarity_threshold
 
 logger = logging.getLogger("klio.claims")
 
 #: Cosine similarity at/above which a live claim is surfaced as a collision.
-COLLISION_THRESHOLD = 0.85
+#: Model-specific: 0.50 under qwen3 reproduces the previous model's 0.85
+#: decisions (see ``shared.memory.DEFAULT_EMBEDDING_MODEL``). Overridable via
+#: ``KLIO_CLAIM_COLLISION_THRESHOLD``.
+COLLISION_THRESHOLD = parse_similarity_threshold("KLIO_CLAIM_COLLISION_THRESHOLD", 0.50)
 
 #: TTL clamp, minutes. A caller-supplied ttl_minutes outside this range is
 #: silently clamped rather than rejected -- an advisory claim with a
