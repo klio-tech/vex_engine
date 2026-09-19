@@ -7,10 +7,14 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
+import argparse  # noqa: E402
+
 from reembed_memories import (  # noqa: E402
     TABLES,
     embed_page,
     model_input,
+    positive_int,
+    qualified,
     vector_literal,
     write_vectors,
 )
@@ -109,14 +113,71 @@ class FakeDB:
 def test_a_row_that_could_not_be_embedded_keeps_its_old_vector():
     db = FakeDB()
     written, skipped = write_vectors(
-        db, "session_memories", ["id-1", "id-2"], [[0.1], None]
+        db, "session_memories", ["id-1", "id-2", "id-3"], [[0.1], None, [0.3]]
     )
 
-    assert (written, skipped) == (1, 1)
-    assert len(db.statements) == 1
+    assert (written, skipped) == (2, 1)
+    assert len(db.statements) == 1, "one executemany per page, not a round trip per row"
     sql, params = db.statements[0]
-    assert "UPDATE session_memories SET embedding" in sql
-    assert params == {"v": "[0.1]", "id": "id-1"}
+    assert "UPDATE public.session_memories SET embedding" in sql
+    assert params == [{"v": "[0.1]", "id": "id-1"}, {"v": "[0.3]", "id": "id-3"}]
+
+
+def test_a_page_with_nothing_to_write_touches_nothing():
+    db = FakeDB()
+    assert write_vectors(db, "work_claims", ["id-1"], [None]) == (0, 1)
+    assert db.statements == []
+
+
+def test_table_names_are_qualified_and_allowlisted():
+    assert qualified("session_memories") == "public.session_memories"
+    with pytest.raises(ValueError):
+        qualified("session_memories; DROP TABLE x")
+    with pytest.raises(ValueError):
+        qualified("entities")
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_a_concurrency_that_would_hang_or_crash_is_refused(value):
+    with pytest.raises(argparse.ArgumentTypeError):
+        positive_int(value)
+
+
+def test_a_positive_concurrency_is_accepted():
+    assert positive_int("8") == 8
+
+
+def test_embed_page_refuses_zero_concurrency_instead_of_hanging():
+    async def never(_):
+        raise AssertionError("must not be called")
+
+    with pytest.raises(ValueError):
+        run(embed_page(["a"], embed_batch=never, embed_one=never, concurrency=0))
+
+
+def test_after_without_a_table_is_refused(monkeypatch):
+    """A cursor is an id in ONE table; silently dropping it restarts a long job."""
+    import reembed_memories
+
+    monkeypatch.setattr(sys, "argv", ["reembed_memories.py", "--after", "0000"])
+    with pytest.raises(SystemExit) as exit_info:
+        reembed_memories.main()
+    assert exit_info.value.code == 2
+
+
+def test_a_batch_failure_is_logged_by_type_only(caplog):
+    """Gateway exceptions carry response bodies; the log line must not."""
+
+    async def embed_batch(_):
+        raise RuntimeError("body with sk-secret-looking-token and a prompt")
+
+    async def embed_one(_):
+        return [1.0]
+
+    with caplog.at_level("WARNING"):
+        run(embed_page(["a"], embed_batch=embed_batch, embed_one=embed_one))
+    assert "RuntimeError" in caplog.text
+    assert "sk-secret" not in caplog.text
 
 
 @pytest.mark.parametrize("table", sorted(TABLES))
