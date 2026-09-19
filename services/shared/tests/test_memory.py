@@ -1030,3 +1030,60 @@ def test_claim_collision_and_reconcile_cutoffs_are_calibrated_for_qwen3():
     from shared import claims
 
     assert claims.COLLISION_THRESHOLD == 0.50
+
+
+def _service_unavailable():
+    import litellm
+
+    return litellm.ServiceUnavailableError(
+        message="Service temporarily unavailable", llm_provider="openai", model="m"
+    )
+
+
+@pytest.mark.asyncio
+async def test_embed_text_retries_a_transient_503_with_the_same_input(monkeypatch):
+    """The gateway serves qwen3 from one provider with no fallback, and it
+    returned 503 bursts. A burst must not cost the write its embedding — and
+    must NOT be treated as over-length: shrinking would store a truncated
+    vector for full content."""
+    import shared.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "EMBED_TRANSIENT_BACKOFF_S", (0.0, 0.0))
+    inputs: list[str] = []
+    ok = MagicMock()
+    ok.data = [{"embedding": SAMPLE_EMBEDDING}]
+
+    async def backend(**kwargs):
+        inputs.append(kwargs["input"][0])
+        if len(inputs) == 1:
+            raise _service_unavailable()
+        return ok
+
+    with patch("shared.memory.aembedding", side_effect=backend):
+        result = await embed_text("transient-retry note " + "y" * 600)
+
+    assert result == SAMPLE_EMBEDDING
+    assert len(inputs) == 2
+    assert inputs[0] == inputs[1], (
+        "a transient error must be retried as-is, never truncated"
+    )
+
+
+@pytest.mark.asyncio
+async def test_embed_text_gives_up_after_bounded_transient_retries(monkeypatch):
+    """A backend that stays down degrades to None quickly: two retries, no more."""
+    import shared.memory as memory_mod
+
+    monkeypatch.setattr(memory_mod, "EMBED_TRANSIENT_BACKOFF_S", (0.0, 0.0))
+    calls: list[str] = []
+
+    async def backend(**kwargs):
+        calls.append(kwargs["input"][0])
+        raise _service_unavailable()
+
+    with patch("shared.memory.aembedding", side_effect=backend):
+        result = await embed_text("always-down note")
+
+    assert result is None
+    assert len(calls) == 1 + len(memory_mod.EMBED_TRANSIENT_BACKOFF_S)
+    assert len(set(calls)) == 1

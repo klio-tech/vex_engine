@@ -194,6 +194,26 @@ path for "the content was long". Consequently a short input that fails returns
 ``None`` on a single attempt (no needless retries), while a long/dense input is
 shrunk repeatedly until it fits under the model's token cap."""
 
+#: Backend errors that a second attempt of the SAME input can succeed on.
+#: Everything else either needs a different input (over-length: see the
+#: truncation retry) or will not recover in seconds (auth, bad model).
+TRANSIENT_EMBED_ERRORS: tuple[type[BaseException], ...] = (
+    litellm.ServiceUnavailableError,
+    litellm.RateLimitError,
+    litellm.APIConnectionError,
+    litellm.InternalServerError,
+)
+
+EMBED_TRANSIENT_BACKOFF_S: tuple[float, ...] = (0.5, 1.5)
+"""Pauses before each retry of a transient embedding failure — two retries.
+
+The gateway serves ``alibaba/qwen3-embedding-0.6b`` from a single provider with
+no fallback (``fallbacksAvailable: []``), and that provider returned bursts of
+503 during the 2026-09-19 re-embed. Without a retry, every write that lands in
+such a burst loses its embedding. Bounded and short on purpose: two seconds in
+total, well inside the per-attempt timeout, so a genuinely down backend still
+degrades to ``None`` quickly instead of stacking up writes."""
+
 DEFAULT_EMBED_TIMEOUT_S: float = 15.0
 """Default per-attempt bound on one ``litellm.aembedding`` call, in seconds.
 
@@ -643,6 +663,7 @@ async def embed_text(
     else:
         candidate = text_input
 
+    transient_attempts = 0
     while True:
         try:
             vector = await _aembedding_call(candidate, prefix)
@@ -662,6 +683,26 @@ async def embed_text(
                 _embed_timeout_s(),
             )
             return None
+        except TRANSIENT_EMBED_ERRORS:
+            # Same input, short pause: a 503 burst is not fixed by shrinking
+            # the text, and shrinking would store a TRUNCATED vector for full
+            # content once the burst cleared. Retry as-is, a bounded number of
+            # times, then fall back to the "backend error -> None" contract.
+            if transient_attempts >= len(EMBED_TRANSIENT_BACKOFF_S):
+                logger.warning(
+                    "embed_text: transient backend error persisted after %d retries; returning None",
+                    transient_attempts,
+                    exc_info=True,
+                )
+                return None
+            delay = EMBED_TRANSIENT_BACKOFF_S[transient_attempts]
+            transient_attempts += 1
+            logger.info(
+                "embed_text: transient backend error; retry %d in %.1fs",
+                transient_attempts,
+                delay,
+            )
+            await asyncio.sleep(delay)
         except (litellm.ContextWindowExceededError, litellm.BadRequestError):
             # Over-length-shaped rejection: shrinking the vector input can make
             # the SAME backend accept it, so retry with harder truncation rather
