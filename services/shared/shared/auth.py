@@ -96,15 +96,17 @@ _PAT_TEAM_SERVER_PROBE_LIMIT = 2
 #: active member of. Same liveness predicates as the membership guard, so a
 #: server chosen here always passes it. ``EXISTS`` rather than a join: one
 #: server must be one row however many membership rows point at it.
+#: Schema-qualified so the answer to "which server" can never come from a
+#: same-named relation earlier on the search path.
 _PAT_TEAM_SERVERS_SQL = text(
     """
     SELECT w.id, w.slug, w.is_personal, w.owner_id
-    FROM workspaces w
+    FROM public.workspaces w
     WHERE w.deleted_at IS NULL
       AND w.is_personal = false
       AND w.kind = :kind
       AND EXISTS (
-          SELECT 1 FROM workspace_members m
+          SELECT 1 FROM public.workspace_members m
           WHERE m.workspace_id = w.id
             AND m.member_id = CAST(:uid AS uuid)
             AND m.is_active = true
