@@ -9,7 +9,7 @@ ENV PYTHONPATH="/app/lib/shared"
 ENV PYTHONUNBUFFERED=1
 
 # Install shared package dependencies (pydantic, sqlalchemy, psycopg2).
-RUN pip install --no-cache-dir pydantic>=2.0.0 sqlalchemy>=2.0.0 psycopg2-binary>=2.9.0
+RUN pip install --no-cache-dir "pydantic>=2.0.0" "sqlalchemy>=2.0.0,<2.1" "psycopg2-binary>=2.9.0"
 
 # Install the storage worker service.
 COPY services/storage-worker/pyproject.toml /app/

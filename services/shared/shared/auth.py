@@ -83,8 +83,43 @@ _PAT_WORKSPACE_SQL = text(
     """
 )
 
-#: Workspace DB: a workspace-less (user-level) token resolves to its user's
-#: living personal workspace.
+#: ``workspaces.kind`` of a team server (the workspace's
+#: ``WORKSPACE_KIND_TEAM``). A community is a public room rather than the
+#: caller's own team, so it is never a default destination for their memory.
+_PAT_TEAM_SERVER_KIND = "team"
+
+#: Two rows are enough to tell "exactly one" from "several"; which of the
+#: several is never asked, because several means the caller has to choose.
+_PAT_TEAM_SERVER_PROBE_LIMIT = 2
+
+#: Workspace DB: the living team servers a workspace-less token's user is an
+#: active member of. Same liveness predicates as the membership guard, so a
+#: server chosen here always passes it. ``EXISTS`` rather than a join: one
+#: server must be one row however many membership rows point at it.
+#: Schema-qualified so the answer to "which server" can never come from a
+#: same-named relation earlier on the search path.
+_PAT_TEAM_SERVERS_SQL = text(
+    """
+    SELECT w.id, w.slug, w.is_personal, w.owner_id
+    FROM public.workspaces w
+    WHERE w.deleted_at IS NULL
+      AND w.is_personal = false
+      AND w.kind = :kind
+      AND EXISTS (
+          SELECT 1 FROM public.workspace_members m
+          WHERE m.workspace_id = w.id
+            AND m.member_id = CAST(:uid AS uuid)
+            AND m.is_active = true
+            AND m.deleted_at IS NULL
+      )
+    ORDER BY w.id
+    LIMIT :probe_limit
+    """
+)
+
+#: Workspace DB: the fallback for a workspace-less (user-level) token whose
+#: user has no single unambiguous team server — their living personal
+#: workspace.
 _PAT_PERSONAL_WORKSPACE_SQL = text(
     """
     SELECT id, slug, is_personal, owner_id
@@ -854,8 +889,8 @@ class KeyValidator:
         """Resolve a workspace personal access token to a cached entry.
 
         A PAT is a USER credential: ``user_id`` is the token's workspace
-        user, and the org is the token's workspace org (or the user's
-        personal workspace for a workspace-less token), ensured via
+        user, and the org is the token's workspace org (for a workspace-less
+        token, the one ``_pat_default_workspace`` picks), ensured via
         :func:`shared.membership.ensure_org_for_workspace` on first use.
         Everything downstream — the membership guard, node selection,
         project reach — already keys off those two fields, so NO authz is
@@ -868,7 +903,7 @@ class KeyValidator:
         Returns ``None`` — which the caller turns into the SAME 401 as an
         unknown key — for: no workspace engine configured, unknown token,
         inactive/expired/soft-deleted token, or a token whose workspace
-        (or personal workspace) cannot be resolved. No oracle distinguishes
+        (or default workspace) cannot be resolved. No oracle distinguishes
         "revoked" from "never existed".
 
         Two databases, joined in Python: the workspace connection answers
@@ -894,10 +929,11 @@ class KeyValidator:
                         {"ws": str(token_row.workspace_id)},
                     ).fetchone()
                 else:
-                    ws_row = conn.execute(
-                        _PAT_PERSONAL_WORKSPACE_SQL,
-                        {"uid": str(token_row.user_id)},
-                    ).fetchone()
+                    ws_row = self._pat_default_workspace(
+                        conn,
+                        str(token_row.user_id),
+                        is_service=bool(token_row.is_service),
+                    )
                 if ws_row is None:
                     return None
         except Exception:
@@ -909,6 +945,48 @@ class KeyValidator:
         entry = self._pat_cached_key(token_row, ws_row)
         self._touch_pat_last_used(str(token_row.id))
         return entry
+
+    @staticmethod
+    def _pat_default_workspace(conn, user_id: str, *, is_service: bool):
+        """The workspace a workspace-less (user-level) token acts in.
+
+        The user's ONLY team server when they are an active member of exactly
+        one, else their personal workspace. Someone with one server means that
+        server when they say "my projects"; landing them on an empty personal
+        node reads as lost data, because the call succeeds and returns
+        nothing.
+
+        Several team servers is a choice only the caller can make (the
+        ``X-Klio-Node`` header): guessing would file a person's memory in the
+        wrong company, so that case stays personal. Community servers never
+        count, neither as the default nor as a reason to call it ambiguous.
+
+        A service token is never defaulted into a server. It may publish at
+        org scope, so its destination has to be stated — by binding the token
+        to a workspace — and is not inferred from its user's memberships.
+
+        The answer is cached with the rest of the entry, so a user who joins
+        a second team server keeps the old default for up to ``cache_ttl_s``
+        and then moves to the personal workspace until they select a node.
+
+        Returns ``None`` when there is neither a single team server nor a
+        living personal workspace.
+        """
+        if is_service:
+            return conn.execute(
+                _PAT_PERSONAL_WORKSPACE_SQL, {"uid": user_id}
+            ).fetchone()
+        team_servers = conn.execute(
+            _PAT_TEAM_SERVERS_SQL,
+            {
+                "uid": user_id,
+                "kind": _PAT_TEAM_SERVER_KIND,
+                "probe_limit": _PAT_TEAM_SERVER_PROBE_LIMIT,
+            },
+        ).fetchall()
+        if len(team_servers) == 1:
+            return team_servers[0]
+        return conn.execute(_PAT_PERSONAL_WORKSPACE_SQL, {"uid": user_id}).fetchone()
 
     @staticmethod
     def _pat_token_alive(token_row) -> bool:

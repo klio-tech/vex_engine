@@ -3,7 +3,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install migration dependencies
-RUN pip install --no-cache-dir alembic>=1.12.0 psycopg2-binary>=2.9.0 sqlalchemy>=2.0.0
+RUN pip install --no-cache-dir "alembic>=1.12.0" "psycopg2-binary>=2.9.0" "sqlalchemy>=2.0.0,<2.1"
 
 # Copy migration files
 COPY services/migrations/alembic.ini /app/alembic.ini

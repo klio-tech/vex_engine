@@ -3,8 +3,9 @@
 A PAT (the workspace's ``api_tokens`` row — stored as a SHA-256 ``token_hash``
 since 2026-09-02; raw form ``klio_pat_<32hex>``, legacy ``plane_api_``) is a USER
 credential: ``KeyInfo.user_id`` is the token's workspace user and the org is
-the token's workspace org (or the user's personal workspace for a
-workspace-less token). The engine-keys lookup stays FIRST; the PAT arm runs
+the token's workspace org. A workspace-less token lands on the user's ONLY
+team server when they belong to exactly one, and on their personal workspace
+otherwise. The engine-keys lookup stays FIRST; the PAT arm runs
 only on an engine-keys miss, and an unset workspace engine means PATs simply
 do not validate while engine keys are untouched.
 
@@ -42,6 +43,9 @@ PERSONAL_WS = "beadfeed-0000-4000-8000-000000000002"
 
 TEAM_SLUG = "pat-team-alpha"
 PERSONAL_SLUG = "pat-personal-owner"
+
+SECOND_TEAM_WS = "beadfeed-0000-4000-8000-000000000003"
+COMMUNITY_WS = "beadfeed-0000-4000-8000-000000000004"
 
 
 def _pat(prefix: str = "klio_pat_") -> str:
@@ -113,6 +117,7 @@ def pat_fixture():
                     slug text UNIQUE,
                     owner_id uuid,
                     is_personal boolean NOT NULL DEFAULT false,
+                    kind varchar NOT NULL DEFAULT 'team',
                     deleted_at timestamptz
                 )
                 """
@@ -182,6 +187,7 @@ def _insert_token(
     is_active: bool = True,
     expired_at: str | None = None,
     deleted_at: str | None = None,
+    is_service: bool = False,
 ) -> str:
     # Callers hand in the RAW token, exactly as a user would present it; the
     # row stores only its hash, exactly as the workspace does since
@@ -190,9 +196,10 @@ def _insert_token(
     conn.execute(
         text(
             "INSERT INTO api_tokens "
-            "(id, token_hash, user_id, workspace_id, is_active, expired_at, deleted_at) "
+            "(id, token_hash, user_id, workspace_id, is_active, expired_at, "
+            "deleted_at, is_service) "
             "VALUES (:id, :token_hash, :uid, :ws, :active, "
-            "CAST(:expired AS timestamptz), CAST(:deleted AS timestamptz))"
+            "CAST(:expired AS timestamptz), CAST(:deleted AS timestamptz), :service)"
         ),
         {
             "id": token_id,
@@ -202,6 +209,7 @@ def _insert_token(
             "active": is_active,
             "expired": expired_at,
             "deleted": deleted_at,
+            "service": is_service,
         },
     )
     return token_id
@@ -291,22 +299,224 @@ def test_already_linked_org_is_reused_not_reminted(pat_fixture):
 
 
 # ---------------------------------------------------------------------------
-# Rule 2: workspace-less token resolves the user's personal workspace
+# Rule 2: a workspace-less token lands on the user's ONLY team server, and on
+# their personal workspace whenever there is no single unambiguous one
 # ---------------------------------------------------------------------------
 
 
+def _add_workspace(
+    conn,
+    *,
+    ws_id: str,
+    slug: str,
+    kind: str = "team",
+    member: str | None = USER,
+    member_active: bool = True,
+    deleted_at: str | None = None,
+) -> None:
+    """One more non-personal workspace, with ``member`` in it (or nobody)."""
+    conn.execute(
+        text(
+            "INSERT INTO workspaces (id, slug, owner_id, is_personal, kind, deleted_at) "
+            "VALUES (:id, :slug, :owner, false, :kind, CAST(:deleted AS timestamptz))"
+        ),
+        {
+            "id": ws_id,
+            "slug": slug,
+            "owner": OTHER_USER,
+            "kind": kind,
+            "deleted": deleted_at,
+        },
+    )
+    if member is not None:
+        conn.execute(
+            text(
+                "INSERT INTO workspace_members (workspace_id, member_id, is_active) "
+                "VALUES (:ws, :uid, :active)"
+            ),
+            {"ws": ws_id, "uid": member, "active": member_active},
+        )
+
+
+def _leave_team(conn) -> None:
+    """Take USER out of the fixture's team server, leaving only the personal one."""
+    conn.execute(
+        text(
+            "DELETE FROM workspace_members "
+            "WHERE workspace_id = CAST(:ws AS uuid) AND member_id = CAST(:uid AS uuid)"
+        ),
+        {"ws": TEAM_WS, "uid": USER},
+    )
+
+
+def _workspace_less_org(pat_fixture, *, user_id: str = USER) -> str:
+    raw = _pat()
+    _insert_token(pat_fixture.conn, token=raw, user_id=user_id, workspace_id=None)
+    return _validator(pat_fixture).validate(raw).org_id
+
+
 @requires_db("the workspace PAT tests")
-def test_workspace_less_token_lands_on_the_personal_workspace_org(pat_fixture):
+def test_workspace_less_token_lands_on_the_users_only_team_server(pat_fixture):
+    """The fixture user is in one team server plus their personal workspace.
+
+    A person with exactly one server means that server when they say "my
+    projects"; landing them on an empty personal node reads as lost data.
+    """
+    assert _workspace_less_org(pat_fixture) == f"ws_{TEAM_WS}"
+
+
+@requires_db("the workspace PAT tests")
+def test_workspace_less_token_in_its_only_team_server_passes_the_member_guard(
+    pat_fixture,
+):
     raw = _pat()
     _insert_token(pat_fixture.conn, token=raw, workspace_id=None)
 
     info = _validator(pat_fixture).validate(raw)
 
-    assert info.org_id == f"ws_{PERSONAL_WS}"
+    assert info.org_id == f"ws_{TEAM_WS}"
+    assert info.user_id == USER
 
 
 @requires_db("the workspace PAT tests")
-def test_workspace_less_token_with_no_personal_workspace_is_401(pat_fixture):
+def test_workspace_less_token_adopts_the_legacy_org_of_its_only_team_server(
+    pat_fixture,
+):
+    """A server whose org predates the workspace link holds its memory under a
+    legacy org id. Minting a fresh ``ws_`` org instead would hide all of it."""
+    pat_fixture.conn.execute(
+        text(
+            "INSERT INTO organizations (org_id, name, account_slug) "
+            "VALUES ('pat-legacy-team-org', :slug, :slug)"
+        ),
+        {"slug": TEAM_SLUG},
+    )
+
+    assert _workspace_less_org(pat_fixture) == "pat-legacy-team-org"
+    linked = pat_fixture.conn.execute(
+        text(
+            "SELECT workspace_id FROM organizations WHERE org_id = 'pat-legacy-team-org'"
+        )
+    ).scalar()
+    assert str(linked) == TEAM_WS
+
+
+@requires_db("the workspace PAT tests")
+def test_workspace_less_token_with_only_a_personal_workspace_lands_there(pat_fixture):
+    _leave_team(pat_fixture.conn)
+
+    assert _workspace_less_org(pat_fixture) == f"ws_{PERSONAL_WS}"
+
+
+@requires_db("the workspace PAT tests")
+def test_workspace_less_token_with_several_team_servers_stays_personal(pat_fixture):
+    """Two servers is a choice only the caller can make (``X-Klio-Node``);
+    guessing one would file a person's memory in the wrong company."""
+    _add_workspace(pat_fixture.conn, ws_id=SECOND_TEAM_WS, slug="pat-team-beta")
+
+    assert _workspace_less_org(pat_fixture) == f"ws_{PERSONAL_WS}"
+
+
+@requires_db("the workspace PAT tests")
+def test_a_community_server_is_never_the_default(pat_fixture):
+    """A community is a public room, not the caller's team: memory must not
+    start flowing into one because it happens to be their only server."""
+    _leave_team(pat_fixture.conn)
+    _add_workspace(
+        pat_fixture.conn, ws_id=COMMUNITY_WS, slug="pat-community", kind="community"
+    )
+
+    assert _workspace_less_org(pat_fixture) == f"ws_{PERSONAL_WS}"
+
+
+@requires_db("the workspace PAT tests")
+def test_a_community_server_does_not_make_the_only_team_server_ambiguous(
+    pat_fixture,
+):
+    _add_workspace(
+        pat_fixture.conn, ws_id=COMMUNITY_WS, slug="pat-community", kind="community"
+    )
+
+    assert _workspace_less_org(pat_fixture) == f"ws_{TEAM_WS}"
+
+
+@requires_db("the workspace PAT tests")
+@pytest.mark.parametrize(
+    "second_server",
+    [
+        {"deleted_at": "2020-01-01T00:00:00+00:00"},
+        {"member_active": False},
+        {"member": None},
+    ],
+    ids=["deleted-server", "inactive-membership", "not-a-member"],
+)
+def test_only_living_servers_the_user_is_active_in_count(pat_fixture, second_server):
+    """A second team server the user cannot actually reach is not a second
+    candidate: the remaining one is still unambiguous."""
+    _add_workspace(
+        pat_fixture.conn, ws_id=SECOND_TEAM_WS, slug="pat-team-beta", **second_server
+    )
+
+    assert _workspace_less_org(pat_fixture) == f"ws_{TEAM_WS}"
+
+
+@requires_db("the workspace PAT tests")
+def test_a_repeated_membership_row_does_not_make_one_server_look_like_two(
+    pat_fixture,
+):
+    """The workspace forbids two living membership rows for one server, but
+    this side must not depend on a constraint it cannot see: one server
+    counted twice would read as "several" and send the user back to the empty
+    personal node the default exists to avoid."""
+    pat_fixture.conn.execute(
+        text(
+            "INSERT INTO workspace_members (workspace_id, member_id) VALUES (:ws, :uid)"
+        ),
+        {"ws": TEAM_WS, "uid": USER},
+    )
+
+    assert _workspace_less_org(pat_fixture) == f"ws_{TEAM_WS}"
+
+
+@requires_db("the workspace PAT tests")
+def test_workspace_less_service_token_is_never_defaulted_to_a_team_server(
+    pat_fixture,
+):
+    """A service token may publish at org scope, so where it writes is never
+    inferred: defaulting it into a team server would let a bot start writing
+    to a whole team's shared memory with nobody having pointed it there."""
+    raw = _pat(prefix="klio_bot_")
+    _insert_token(pat_fixture.conn, token=raw, workspace_id=None, is_service=True)
+
+    info = _validator(pat_fixture).validate(raw)
+
+    assert info.org_id == f"ws_{PERSONAL_WS}"
+    assert info.is_service is True
+
+
+@requires_db("the workspace PAT tests")
+def test_workspace_bound_service_token_still_acts_in_its_own_server(pat_fixture):
+    raw = _pat(prefix="klio_bot_")
+    _insert_token(pat_fixture.conn, token=raw, workspace_id=TEAM_WS, is_service=True)
+
+    assert _validator(pat_fixture).validate(raw).org_id == f"ws_{TEAM_WS}"
+
+
+@requires_db("the workspace PAT tests")
+def test_workspace_less_token_with_one_team_server_and_no_personal_workspace(
+    pat_fixture,
+):
+    _add_workspace(
+        pat_fixture.conn, ws_id=SECOND_TEAM_WS, slug="pat-team-beta", member=OTHER_USER
+    )
+
+    assert (
+        _workspace_less_org(pat_fixture, user_id=OTHER_USER) == f"ws_{SECOND_TEAM_WS}"
+    )
+
+
+@requires_db("the workspace PAT tests")
+def test_workspace_less_token_with_no_workspace_at_all_is_401(pat_fixture):
     raw = _pat()
     _insert_token(pat_fixture.conn, token=raw, user_id=OTHER_USER, workspace_id=None)
 
