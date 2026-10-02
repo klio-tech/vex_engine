@@ -19,7 +19,7 @@ ENV PYTHONPATH="/app/lib/shared"
 # boto3 is not a lazy failure, it is a crash loop on container start.
 RUN pip install --no-cache-dir \
     "pydantic>=2.0.0" \
-    "sqlalchemy>=2.0.0" \
+    "sqlalchemy>=2.0.0,<2.1" \
     "psycopg2-binary>=2.9.0" \
     "pgvector>=0.3.0" \
     "litellm>=1.0.0" \

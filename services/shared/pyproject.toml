@@ -8,7 +8,10 @@ version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
     "pydantic>=2.0.0",
-    "sqlalchemy>=2.0.0",
+    # Below 2.1 on purpose: 2.1 resolves a bare ``postgresql://`` URL to the
+    # psycopg (v3) driver, and every service here ships psycopg2. Lift this
+    # only together with a deliberate driver migration.
+    "sqlalchemy>=2.0.0,<2.1",
     "psycopg2-binary>=2.9.0",
     "pgvector>=0.3.0",
     "litellm>=1.0.0",

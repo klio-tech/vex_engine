@@ -146,7 +146,7 @@ jobs:
         # database exactly the way they used to.
         run: pip install -e services/shared
       - name: Install migration tooling
-        run: pip install "alembic>=1.12.0" "psycopg2-binary>=2.9.0" "sqlalchemy>=2.0.0" pytest
+        run: pip install "alembic>=1.12.0" "psycopg2-binary>=2.9.0" "sqlalchemy>=2.0.0,<2.1" pytest
       - name: Migrate the test database
         working-directory: services/migrations
         run: alembic upgrade head
