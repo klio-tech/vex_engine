@@ -675,7 +675,8 @@ class KeyValidator:
             return bool(row[0]) if row is not None else False
         except Exception:
             logger.error(
-                "workspace user lookup failed for key owner %s", user_id, exc_info=True
+                "workspace user lookup failed while checking an engine key's owner",
+                exc_info=True,
             )
             raise AuthError(
                 503, "Authentication backend temporarily unavailable"
