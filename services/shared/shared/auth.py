@@ -131,6 +131,12 @@ _PAT_PERSONAL_WORKSPACE_SQL = text(
     """
 )
 
+#: Workspace DB: whether a key owner's uuid is a workspace-issued identity at
+#: all (see ``_linked_org_key_membership``).
+_WORKSPACE_USER_EXISTS_SQL = text(
+    "SELECT EXISTS (SELECT 1 FROM public.users WHERE id = CAST(:uid AS uuid))"
+)
+
 #: Workspace DB: best-effort usage stamp (see ``_touch_pat_last_used``).
 _PAT_TOUCH_SQL = text("UPDATE api_tokens SET last_used = now() WHERE id = :id")
 
@@ -624,6 +630,57 @@ class KeyValidator:
                 503, "Authentication backend temporarily unavailable"
             ) from None
 
+    def _linked_org_key_membership(
+        self, workspace_id: str, user_id: str | None, *, supabase_answer: bool | None
+    ) -> bool | None:
+        """Membership for an engine key on a workspace-linked org.
+
+        The workspace answers whenever it CAN answer: a key whose owner is a
+        workspace user is judged by ``workspace_members`` alone, so removing
+        someone from the server stops their key regardless of anything the
+        legacy system still says.
+
+        A key minted before the org was linked is different: its
+        ``created_by`` is a SUPABASE user uuid, which the workspace has never
+        heard of, so "not a member" there is a fact about which identity
+        system minted the key, not about the person. Refusing it turned
+        every pre-handshake key into a 403 the moment its org was adopted by
+        a workspace — on 2026-10-02 that silently dropped every capture from
+        a customer whose only server was adopted when her PAT first landed
+        on it. For such a key the system that minted it is still the only
+        one that can say whether its owner belongs, so its answer stands,
+        with the same ``None`` = "could not check" contract.
+        """
+        workspace_answer = self._query_membership_from_workspace(workspace_id, user_id)
+        if workspace_answer is not False:
+            return workspace_answer
+        if self._is_workspace_user(user_id):
+            return False
+        return supabase_answer
+
+    def _is_workspace_user(self, user_id: str | None) -> bool:
+        """Whether ``user_id`` is an identity the workspace itself issued.
+
+        Only asked after the membership query answered ``False``, so the
+        workspace engine is configured and ``user_id`` is a uuid. A failure
+        is a 503 for the same reason a failed membership query is: treating
+        "could not tell" as "legacy identity" would hand the decision to the
+        legacy system on every workspace-DB outage.
+        """
+        try:
+            with self._workspace_engine.connect() as conn:
+                row = conn.execute(
+                    _WORKSPACE_USER_EXISTS_SQL, {"uid": user_id}
+                ).fetchone()
+            return bool(row[0]) if row is not None else False
+        except Exception:
+            logger.error(
+                "workspace user lookup failed for key owner %s", user_id, exc_info=True
+            )
+            raise AuthError(
+                503, "Authentication backend temporarily unavailable"
+            ) from None
+
     def _warn_workspace_unconfigured_once(self, workspace_id: str) -> None:
         with self._warn_lock:
             if self._warned_workspace_unconfigured:
@@ -854,8 +911,8 @@ class KeyValidator:
         # orgs the handshake has not touched.
         workspace_id = row[3] if len(row) > 3 else None
         if workspace_id is not None:
-            is_member = self._query_membership_from_workspace(
-                str(workspace_id), user_id
+            is_member = self._linked_org_key_membership(
+                str(workspace_id), user_id, supabase_answer=is_member
             )
         plan_config = get_plan_config(plan_val, plan_overrides_val)
 

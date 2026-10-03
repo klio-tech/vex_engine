@@ -119,11 +119,16 @@ def test_workspace_member_passes_even_though_supabase_knows_nothing():
 
 
 def test_workspace_non_member_is_refused():
+    # OWNER is a workspace-issued identity (the klio-internal admin), so the
+    # workspace's "not a member" is the whole answer.
     entry, raw = _entry_and_key()
     v = _validator(
         entry,
         workspace_row=WS_ID,
-        workspace_engine_rows=[("workspace_members", (False,))],
+        workspace_engine_rows=[
+            ("workspace_members", (False,)),
+            ("FROM public.users", (True,)),
+        ],
     )
     with pytest.raises(AuthError) as e:
         v.validate(raw)
@@ -161,3 +166,88 @@ def test_workspace_truth_overrides_whatever_supabase_would_say():
     v._query_plan_from_supabase = MagicMock(return_value=("free", None, False))
     info = v.validate(raw)
     assert info.org_id == "be3b0e93-org"
+
+
+# ---------------------------------------------------------------------------
+# A key minted before its org was linked carries a SUPABASE owner uuid. The
+# workspace has never heard of that identity, so its "not a member" says which
+# system minted the key, not whether the person belongs. Found live
+# 2026-10-02: an org adopted by a workspace refused its pre-handshake key 718
+# times in nine hours, dropping every capture its owner made.
+# ---------------------------------------------------------------------------
+
+
+def _legacy_key_validator(*, supabase_answer, owner_is_workspace_user=False):
+    entry, raw = _entry_and_key()
+    v = _validator(
+        entry,
+        workspace_row=WS_ID,
+        workspace_engine_rows=[
+            ("workspace_members", (False,)),
+            ("FROM public.users", (owner_is_workspace_user,)),
+        ],
+    )
+    v._query_plan_from_supabase = MagicMock(
+        return_value=("free", None, supabase_answer)
+    )
+    return v, raw
+
+
+def test_a_pre_handshake_key_whose_owner_belongs_keeps_working_after_adoption():
+    v, raw = _legacy_key_validator(supabase_answer=True)
+
+    assert v.validate(raw).org_id == "be3b0e93-org"
+
+
+def test_a_pre_handshake_key_whose_owner_left_is_still_refused():
+    v, raw = _legacy_key_validator(supabase_answer=False)
+
+    with pytest.raises(AuthError) as e:
+        v.validate(raw)
+    assert e.value.status_code == 403
+
+
+def test_a_workspace_user_removed_from_the_server_is_refused_whatever_supabase_says():
+    """The legacy answer is only for identities the workspace cannot judge;
+    it must never re-admit someone the workspace removed."""
+    v, raw = _legacy_key_validator(supabase_answer=True, owner_is_workspace_user=True)
+
+    with pytest.raises(AuthError) as e:
+        v.validate(raw)
+    assert e.value.status_code == 403
+
+
+def test_a_member_never_pays_for_the_identity_lookup():
+    entry, raw = _entry_and_key()
+    v = _validator(
+        entry,
+        workspace_row=WS_ID,
+        workspace_engine_rows=[("workspace_members", (True,))],
+    )
+
+    v.validate(raw)
+
+    assert not any("public.users" in sql for sql, _ in v._workspace_engine.calls)
+
+
+def test_a_failed_identity_lookup_is_a_503_not_a_handoff_to_the_legacy_answer():
+    v, raw = _legacy_key_validator(supabase_answer=True)
+    real_connect = v._workspace_engine.connect
+
+    def connect():
+        conn = real_connect()
+        original = conn.execute
+
+        def execute(sql, params=None):
+            if "public.users" in str(sql):
+                raise RuntimeError("workspace DB down")
+            return original(sql, params)
+
+        conn.execute = execute
+        return conn
+
+    v._workspace_engine.connect = connect
+
+    with pytest.raises(AuthError) as e:
+        v.validate(raw)
+    assert e.value.status_code == 503
